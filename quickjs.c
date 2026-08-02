@@ -44351,6 +44351,9 @@ enum {
     PDS_EXPR2, PDS_EXPR2_ELEM, PDS_PAREN, PDS_PAREN_DONE,
     PDS_CND_TRUE, PDS_CND_FALSE,
     PDS_ASGN, PDS_ASGN_YIELD, PDS_ASGN_COND, PDS_ASGN_RHS, PDS_ASGN_LOGRHS,
+    PDS_POSTFIX, PDS_PFX_PAREN, PDS_PFX_NEW, PDS_PFX_IMPORT1, PDS_PFX_IMPORT2,
+    PDS_PFX_ARG, PDS_PFX_SPREAD_ELL, PDS_PFX_SPREAD_ITEM, PDS_PFX_INDEX,
+    PDS_UNA_POSTFIX,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op);
@@ -45024,12 +45027,6 @@ static __exception int js_parse_object_literal(JSParseState *s)
 }
 
 
-static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags);
-
-static __exception int js_parse_left_hand_side_expr(JSParseState *s)
-{
-    return js_parse_postfix_expr(s, PF_POSTFIX_CALL);
-}
 
 /* find field in the current scope */
 static int find_private_class_field(JSContext *ctx, JSFunctionDef *fd,
@@ -45257,7 +45254,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
         class_flags = JS_DEFINE_CLASS_HAS_HERITAGE;
         if (next_token(s))
             goto fail;
-        if (js_parse_left_hand_side_expr(s))
+        if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
             goto fail;
     } else {
         emit_op(s, OP_undefined);
@@ -46373,7 +46370,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     label_lvalue = -1;
                     depth_lvalue = 0;
                 } else {
-                    if (js_parse_left_hand_side_expr(s))
+                    if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
                         return -1;
 
                     if (get_lvalue(s, &opcode, &scope, &var_name,
@@ -46486,7 +46483,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                         goto lvalue;
                     }
                 } else {
-                    if (js_parse_left_hand_side_expr(s))
+                    if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
                         goto prop_error;
                 lvalue:
                     if (get_lvalue(s, &opcode, &scope, &var_name,
@@ -46683,7 +46680,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     opcode = OP_scope_get_var;
                     scope = s->cur_func->scope_level;
                 } else {
-                    if (js_parse_left_hand_side_expr(s))
+                    if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
                         return -1;
                     if (get_lvalue(s, &opcode, &scope, &var_name,
                                    &label_lvalue, &enum_depth, false, '[')) {
@@ -46796,696 +46793,6 @@ static void optional_chain_test(JSParseState *s, int *poptional_chaining_label,
 }
 
 /* allowed parse_flags: PF_POSTFIX_CALL */
-static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
-{
-    FuncCallType call_type;
-    int optional_chaining_label;
-    bool accept_lparen = (parse_flags & PF_POSTFIX_CALL) != 0;
-    /* WHERE A CALL IS, for the stack trace that will name it: the start of the expression being called —
-       `geval` in `geval(source)`, `a` in `a.b()`, the `new` in `new Plonk()`. Taken here because this is where
-       that expression begins, and kept for the whole postfix chain so `f()()` attributes both calls to `f`. */
-    int call_line_num = s->token.line_num, call_col_num = s->token.col_num;
-
-    call_type = FUNC_CALL_NORMAL;
-    switch(s->token.val) {
-    case TOK_NUMBER:
-        {
-            JSValue val;
-            val = s->token.u.num.val;
-
-            if (JS_VALUE_GET_TAG(val) == JS_TAG_INT) {
-                emit_op(s, OP_push_i32);
-                emit_u32(s, JS_VALUE_GET_INT(val));
-            } else if (JS_VALUE_GET_TAG(val) == JS_TAG_SHORT_BIG_INT) {
-                int64_t v;
-                v = JS_VALUE_GET_SHORT_BIG_INT(val);
-                if (v >= INT32_MIN && v <= INT32_MAX) {
-                    emit_op(s, OP_push_bigint_i32);
-                    emit_u32(s, v);
-                } else {
-                    goto large_number;
-                }
-            } else {
-            large_number:
-                if (emit_push_const(s, val, 0) < 0)
-                    return -1;
-            }
-        }
-        if (next_token(s))
-            return -1;
-        break;
-    case TOK_TEMPLATE:
-        if (js_parse_template(s, 0, NULL))
-            return -1;
-        break;
-    case TOK_STRING:
-        if (emit_push_const(s, s->token.u.str.str, 1))
-            return -1;
-        if (next_token(s))
-            return -1;
-        break;
-
-    case TOK_DIV_ASSIGN:
-        s->buf_ptr -= 2;
-        goto parse_regexp;
-    case '/':
-        s->buf_ptr--;
-    parse_regexp:
-        {
-            JSValue str;
-            int ret, backtrace_flags;
-            if (!s->ctx->compile_regexp)
-                return js_parse_error(s, "RegExp are not supported");
-            /* the previous token is '/' or '/=', so no need to free */
-            if (js_parse_regexp(s))
-                return -1;
-            ret = emit_push_const(s, s->token.u.regexp.body, 0);
-            str = s->ctx->compile_regexp(s->ctx, s->token.u.regexp.body,
-                                         s->token.u.regexp.flags);
-            if (JS_IsException(str)) {
-                /* add the line number info */
-                backtrace_flags = 0;
-                if (s->cur_func && s->cur_func->backtrace_barrier)
-                    backtrace_flags = JS_BACKTRACE_FLAG_SINGLE_LEVEL;
-                build_backtrace(s->ctx, s->ctx->rt->current_exception, JS_UNDEFINED,
-                                s->filename,
-                                s->token.line_num,
-                                s->token.col_num,
-                                backtrace_flags);
-                return -1;
-            }
-            ret = emit_push_const(s, str, 0);
-            JS_FreeValue(s->ctx, str);
-            if (ret)
-                return -1;
-            /* we use a specific opcode to be sure the correct
-               function is called (otherwise the bytecode would have
-               to be verified by the RegExp constructor) */
-            emit_op(s, OP_regexp);
-            if (next_token(s))
-                return -1;
-        }
-        break;
-    case '(':
-        if (js_parse_descent(s, PDS_PAREN, 0, 0, 0))
-            return -1;
-        break;
-    case TOK_FUNCTION:
-        if (js_parse_function_decl(s, JS_PARSE_FUNC_EXPR,
-                                   JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                   s->token.ptr,
-                                   s->token.line_num,
-                                   s->token.col_num, PF_IN_ACCEPTED))
-            return -1;
-        break;
-    case TOK_CLASS:
-        if (js_parse_class(s, true, JS_PARSE_EXPORT_NONE))
-            return -1;
-        break;
-    case TOK_NULL:
-        if (next_token(s))
-            return -1;
-        emit_op(s, OP_null);
-        break;
-    case TOK_THIS:
-        if (next_token(s))
-            return -1;
-        emit_op(s, OP_scope_get_var);
-        emit_atom(s, JS_ATOM_this);
-        emit_u16(s, 0);
-        break;
-    case TOK_FALSE:
-        if (next_token(s))
-            return -1;
-        emit_op(s, OP_push_false);
-        break;
-    case TOK_TRUE:
-        if (next_token(s))
-            return -1;
-        emit_op(s, OP_push_true);
-        break;
-    case TOK_IDENT:
-        {
-            JSAtom name;
-            int identifier_line_num = s->token.line_num;
-            const uint8_t *identifier_line_start = s->token.ptr;
-            while (identifier_line_start > s->buf_start &&
-                   identifier_line_start[-1] != '\n' &&
-                   identifier_line_start[-1] != '\r')
-                identifier_line_start--;
-            int identifier_col_num =
-                (int)(s->token.ptr - identifier_line_start) + 1;
-            if (s->token.u.ident.is_reserved) {
-                return js_parse_error_reserved_identifier(s);
-            }
-            if (token_is_pseudo_keyword(s, JS_ATOM_async) &&
-                peek_token(s, true) != '\n') {
-                const uint8_t *source_ptr;
-                int source_line_num;
-                int source_col_num;
-
-                source_ptr = s->token.ptr;
-                source_line_num = s->token.line_num;
-                source_col_num = s->token.col_num;
-                if (next_token(s))
-                    return -1;
-                if (s->token.val == TOK_FUNCTION) {
-                    if (js_parse_function_decl(s, JS_PARSE_FUNC_EXPR,
-                                               JS_FUNC_ASYNC, JS_ATOM_NULL,
-                                               source_ptr,
-                                               source_line_num,
-                                               source_col_num, PF_IN_ACCEPTED))
-                        return -1;
-                } else {
-                    name = JS_DupAtom(s->ctx, JS_ATOM_async);
-                    goto do_get_var;
-                }
-            } else {
-                if (s->token.u.ident.atom == JS_ATOM_arguments &&
-                    !s->cur_func->arguments_allowed) {
-                    js_parse_error(s, "'arguments' identifier is not allowed in class field initializer");
-                    return -1;
-                }
-                name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
-                if (next_token(s)) { /* update line number before emitting code */
-                    JS_FreeAtom(s->ctx, name);
-                    return -1;
-                }
-            do_get_var:
-                emit_source_loc_at(s, identifier_line_num, identifier_col_num);
-                emit_op(s, OP_scope_get_var);
-                emit_u32(s, name);
-                emit_u16(s, s->cur_func->scope_level);
-            }
-        }
-        break;
-    case '{':
-    case '[':
-        /* Always a LITERAL here. The AssignmentPattern reparse belongs to the AssignmentExpression
-           production and lives in js_parse_descent's PDS_ASGN. */
-        if (s->token.val == '{') {
-            if (js_parse_object_literal(s))
-                return -1;
-        } else {
-            if (js_parse_array_literal(s))
-                return -1;
-        }
-        break;
-    case TOK_NEW:
-        if (next_token(s))
-            return -1;
-        if (s->token.val == '.') {
-            if (next_token(s))
-                return -1;
-            if (!token_is_pseudo_keyword(s, JS_ATOM_target))
-                return js_parse_error(s, "expecting target");
-            if (!s->cur_func->new_target_allowed)
-                return js_parse_error(s, "new.target only allowed within functions");
-            if (next_token(s))
-                return -1;
-            emit_op(s, OP_scope_get_var);
-            emit_atom(s, JS_ATOM_new_target);
-            emit_u16(s, 0);
-        } else {
-            emit_source_loc(s);
-            if (js_parse_postfix_expr(s, 0))
-                return -1;
-            accept_lparen = true;
-            if (s->token.val != '(') {
-                /* new operator on an object */
-                emit_op(s, OP_dup);
-                emit_op(s, OP_call_constructor);
-                emit_u16(s, 0);
-            } else {
-                call_type = FUNC_CALL_NEW;
-            }
-        }
-        break;
-    case TOK_SUPER:
-        if (next_token(s))
-            return -1;
-        if (s->token.val == '(') {
-            if (!s->cur_func->super_call_allowed)
-                return js_parse_error(s, "super() is only valid in a derived class constructor");
-            call_type = FUNC_CALL_SUPER_CTOR;
-        } else if (s->token.val == '.' || s->token.val == '[') {
-            if (!s->cur_func->super_allowed)
-                return js_parse_error(s, "'super' is only valid in a method");
-            emit_op(s, OP_scope_get_var);
-            emit_atom(s, JS_ATOM_this);
-            emit_u16(s, 0);
-            emit_op(s, OP_scope_get_var);
-            emit_atom(s, JS_ATOM_home_object);
-            emit_u16(s, 0);
-            emit_op(s, OP_get_super);
-        } else {
-            return js_parse_error(s, "invalid use of 'super'");
-        }
-        break;
-    case TOK_IMPORT:
-        if (next_token(s))
-            return -1;
-        if (s->token.val == '.') {
-            if (next_token(s))
-                return -1;
-            if (!token_is_pseudo_keyword(s, JS_ATOM_meta))
-                return js_parse_error(s, "meta expected");
-            if (!s->is_module)
-                return js_parse_error(s, "import.meta only valid in module code");
-            if (next_token(s))
-                return -1;
-            emit_op(s, OP_special_object);
-            emit_u8(s, OP_SPECIAL_OBJECT_IMPORT_META);
-        } else {
-            if (js_parse_expect(s, '('))
-                return -1;
-            if (!accept_lparen)
-                return js_parse_error(s, "invalid use of 'import()'");
-            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                return -1;
-            if (s->token.val == ',') {
-                if (next_token(s))
-                    return -1;
-                if (s->token.val != ')') {
-                    if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                        return -1;
-                    /* accept a trailing comma */
-                    if (s->token.val == ',') {
-                        if (next_token(s))
-                            return -1;
-                    }
-                } else {
-                    emit_op(s, OP_undefined);
-                }
-            } else {
-                emit_op(s, OP_undefined);
-            }
-            if (js_parse_expect(s, ')'))
-                return -1;
-            emit_op(s, OP_import);
-        }
-        break;
-    default:
-        return js_parse_error(s, "unexpected token in expression: '%.*s'",
-                              (int)(s->buf_ptr - s->token.ptr), s->token.ptr);
-    }
-
-    optional_chaining_label = -1;
-    for(;;) {
-        JSFunctionDef *fd = s->cur_func;
-        bool has_optional_chain = false;
-
-        if (s->token.val == TOK_QUESTION_MARK_DOT) {
-            /* optional chaining */
-            if (!accept_lparen) {
-                /* NewExpression : new MemberExpression Arguments. An OptionalChain is reachable only from
-                   LeftHandSideExpression : OptionalExpression, never from a MemberExpression, so `new o?.C()`
-                   and `new o?.["C"]()` are Syntax Errors — the same grammar fact the tagged-template rule one
-                   branch down already states for its own production. `accept_lparen` IS "this is a
-                   MemberExpression": the `new` callee is the one thing parsed with PF_POSTFIX_CALL clear,
-                   because a call is not part of that production either. */
-                return js_parse_error(s, "invalid optional chain in a `new` expression");
-            }
-            if (next_token(s))
-                return -1;
-            has_optional_chain = true;
-            if (s->token.val == '(' && accept_lparen) {
-                goto parse_func_call;
-            } else if (s->token.val == '[') {
-                goto parse_array_access;
-            } else {
-                goto parse_property;
-            }
-        } else if (s->token.val == TOK_TEMPLATE &&
-                   call_type == FUNC_CALL_NORMAL) {
-            if (optional_chaining_label >= 0) {
-                return js_parse_error(s, "template literal cannot appear in an optional chain");
-            }
-            call_type = FUNC_CALL_TEMPLATE;
-            goto parse_func_call2;
-        } else if (s->token.val == '(' && accept_lparen) {
-            int opcode, arg_count, drop_count;
-
-            /* function call */
-        parse_func_call:
-            if (next_token(s))
-                return -1;
-
-            if (call_type == FUNC_CALL_NORMAL) {
-            parse_func_call2:
-                emit_source_loc(s);
-                switch(opcode = get_prev_opcode(fd)) {
-                case OP_get_field:
-                    /* keep the object on the stack */
-                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
-                    drop_count = 2;
-                    break;
-                case OP_get_field_opt_chain:
-                    {
-                        int opt_chain_label, next_label;
-                        opt_chain_label = get_u32(fd->byte_code.buf +
-                                                  fd->last_opcode_pos + 1 + 4 + 1);
-                        /* keep the object on the stack */
-                        fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
-                        fd->byte_code.size = fd->last_opcode_pos + 1 + 4;
-                        next_label = emit_goto(s, OP_goto, -1);
-                        emit_label(s, opt_chain_label);
-                        /* need an additional undefined value for the
-                           case where the optional field does not
-                           exists */
-                        emit_op(s, OP_undefined);
-                        emit_label(s, next_label);
-                        drop_count = 2;
-                        opcode = OP_get_field;
-                    }
-                    break;
-                case OP_scope_get_private_field:
-                    /* keep the object on the stack */
-                    fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_get_private_field2;
-                    drop_count = 2;
-                    break;
-                case OP_get_array_el:
-                    /* keep the object on the stack */
-                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el2;
-                    drop_count = 2;
-                    break;
-                case OP_get_array_el_opt_chain:
-                    {
-                        int opt_chain_label, next_label;
-                        opt_chain_label = get_u32(fd->byte_code.buf +
-                                                  fd->last_opcode_pos + 1 + 1);
-                        /* keep the object on the stack */
-                        fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el2;
-                        fd->byte_code.size = fd->last_opcode_pos + 1;
-                        next_label = emit_goto(s, OP_goto, -1);
-                        emit_label(s, opt_chain_label);
-                        /* need an additional undefined value for the
-                           case where the optional field does not
-                           exists */
-                        emit_op(s, OP_undefined);
-                        emit_label(s, next_label);
-                        drop_count = 2;
-                        opcode = OP_get_array_el;
-                    }
-                    break;
-                case OP_scope_get_var:
-                    {
-                        JSAtom name;
-                        int scope;
-                        name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
-                        scope = get_u16(fd->byte_code.buf + fd->last_opcode_pos + 5);
-                        if (name == JS_ATOM_eval && call_type == FUNC_CALL_NORMAL && !has_optional_chain) {
-                            /* direct 'eval' */
-                            opcode = OP_eval;
-                        } else {
-                            /* verify if function name resolves to a simple
-                               get_loc/get_arg: a function call inside a `with`
-                               statement can resolve to a method call of the
-                               `with` context object
-                             */
-                            /* XXX: always generate the OP_scope_get_ref
-                               and remove it in variable resolution
-                               pass ? */
-                            if (has_with_scope(fd, scope)) {
-                                opcode = OP_scope_get_ref;
-                                fd->byte_code.buf[fd->last_opcode_pos] = opcode;
-                            }
-                        }
-                        drop_count = 1;
-                    }
-                    break;
-                case OP_get_super_value:
-                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el;
-                    /* on stack: this func_obj */
-                    opcode = OP_get_array_el;
-                    drop_count = 2;
-                    break;
-                default:
-                    opcode = OP_invalid;
-                    drop_count = 1;
-                    break;
-                }
-                if (has_optional_chain) {
-                    optional_chain_test(s, &optional_chaining_label,
-                                        drop_count);
-                }
-            } else {
-                opcode = OP_invalid;
-            }
-
-            if (call_type == FUNC_CALL_TEMPLATE) {
-                if (js_parse_template(s, 1, &arg_count))
-                    return -1;
-                goto emit_func_call;
-            } else if (call_type == FUNC_CALL_SUPER_CTOR) {
-                emit_op(s, OP_scope_get_var);
-                emit_atom(s, JS_ATOM_this_active_func);
-                emit_u16(s, 0);
-
-                emit_op(s, OP_get_super);
-
-                emit_op(s, OP_scope_get_var);
-                emit_atom(s, JS_ATOM_new_target);
-                emit_u16(s, 0);
-            } else if (call_type == FUNC_CALL_NEW) {
-                emit_op(s, OP_dup); /* new.target = function */
-            }
-
-            /* parse arguments */
-            arg_count = 0;
-            while (s->token.val != ')') {
-                if (arg_count >= 65535) {
-                    return js_parse_error(s, "Too many arguments in function call (only %d allowed)",
-                                          65535 - 1);
-                }
-                if (s->token.val == TOK_ELLIPSIS)
-                    break;
-                if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                    return -1;
-                arg_count++;
-                if (s->token.val == ')')
-                    break;
-                /* accept a trailing comma before the ')' */
-                if (js_parse_expect(s, ','))
-                    return -1;
-            }
-            if (s->token.val == TOK_ELLIPSIS) {
-                emit_op(s, OP_array_from);
-                emit_u16(s, arg_count);
-                emit_op(s, OP_push_i32);
-                emit_u32(s, arg_count);
-
-                /* on stack: array idx */
-                while (s->token.val != ')') {
-                    if (s->token.val == TOK_ELLIPSIS) {
-                        if (next_token(s))
-                            return -1;
-                        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                            return -1;
-                        /* XXX: could pass is_last indicator? */
-                        emit_op(s, OP_append);
-                    } else {
-                        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                            return -1;
-                        /* array idx val */
-                        emit_op(s, OP_define_array_el);
-                        emit_op(s, OP_inc);
-                    }
-                    if (s->token.val == ')')
-                        break;
-                    /* accept a trailing comma before the ')' */
-                    if (js_parse_expect(s, ','))
-                        return -1;
-                }
-                if (next_token(s))
-                    return -1;
-                /* drop the index */
-                emit_op(s, OP_drop);
-
-                /* apply function call */
-                switch(opcode) {
-                case OP_get_field:
-                case OP_scope_get_private_field:
-                case OP_get_array_el:
-                case OP_scope_get_ref:
-                    /* obj func array -> func obj array */
-                    emit_op(s, OP_perm3);
-                    emit_op(s, OP_apply);
-                    emit_u16(s, call_type == FUNC_CALL_NEW);
-                    break;
-                case OP_eval:
-                    emit_op(s, OP_apply_eval);
-                    emit_u16(s, fd->scope_level);
-                    fd->has_eval_call = true;
-                    break;
-                default:
-                    if (call_type == FUNC_CALL_SUPER_CTOR) {
-                        emit_op(s, OP_apply);
-                        emit_u16(s, 1);
-                        /* set the 'this' value */
-                        emit_op(s, OP_dup);
-                        emit_op(s, OP_scope_put_var_init);
-                        emit_atom(s, JS_ATOM_this);
-                        emit_u16(s, 0);
-
-                        emit_class_field_init(s);
-                    } else if (call_type == FUNC_CALL_NEW) {
-                        /* obj func array -> func obj array */
-                        emit_op(s, OP_perm3);
-                        emit_op(s, OP_apply);
-                        emit_u16(s, 1);
-                    } else {
-                        /* func array -> func undef array */
-                        emit_op(s, OP_undefined);
-                        emit_op(s, OP_swap);
-                        emit_op(s, OP_apply);
-                        emit_u16(s, 0);
-                    }
-                    break;
-                }
-            } else {
-                if (next_token(s))
-                    return -1;
-            emit_func_call:
-                /* The call opcode's OWN position, emitted here rather than before the arguments — an argument
-                   is an expression and emits positions of its own, so the marker left at the head of the call
-                   was overwritten by the last one parsed. Every stack trace pointed at the final argument:
-                   `a(   )` reported the `)`, and V8's eval-origin test, which pins the column of the eval
-                   call, disagreed by five. */
-                emit_source_loc_at(s, call_line_num, call_col_num);
-                switch(opcode) {
-                case OP_get_field:
-                case OP_scope_get_private_field:
-                case OP_get_array_el:
-                case OP_scope_get_ref:
-                    emit_op(s, OP_call_method);
-                    emit_u16(s, arg_count);
-                    break;
-                case OP_eval:
-                    emit_op(s, OP_eval);
-                    emit_u16(s, arg_count);
-                    emit_u16(s, fd->scope_level);
-                    fd->has_eval_call = true;
-                    break;
-                default:
-                    if (call_type == FUNC_CALL_SUPER_CTOR) {
-                        emit_op(s, OP_call_constructor);
-                        emit_u16(s, arg_count);
-
-                        /* set the 'this' value */
-                        emit_op(s, OP_dup);
-                        emit_op(s, OP_scope_put_var_init);
-                        emit_atom(s, JS_ATOM_this);
-                        emit_u16(s, 0);
-
-                        emit_class_field_init(s);
-                    } else if (call_type == FUNC_CALL_NEW) {
-                        emit_op(s, OP_call_constructor);
-                        emit_u16(s, arg_count);
-                    } else {
-                        emit_op(s, OP_call);
-                        emit_u16(s, arg_count);
-                    }
-                    break;
-                }
-            }
-            fd->last_opcode_is_template_call = (call_type == FUNC_CALL_TEMPLATE);
-            call_type = FUNC_CALL_NORMAL;
-        } else if (s->token.val == '.') {
-            if (next_token(s))
-                return -1;
-        parse_property:
-            if (s->token.val == TOK_PRIVATE_NAME) {
-                /* private class field */
-                if (get_prev_opcode(fd) == OP_get_super) {
-                    return js_parse_error(s, "private class field forbidden after super");
-                }
-                if (has_optional_chain) {
-                    optional_chain_test(s, &optional_chaining_label, 1);
-                }
-                emit_op(s, OP_scope_get_private_field);
-                emit_atom(s, s->token.u.ident.atom);
-                emit_u16(s, s->cur_func->scope_level);
-            } else {
-                if (!token_is_ident(s->token.val)) {
-                    return js_parse_error(s, "expecting field name");
-                }
-                if (get_prev_opcode(fd) == OP_get_super) {
-                    JSValue val;
-                    int ret;
-                    val = JS_AtomToValue(s->ctx, s->token.u.ident.atom);
-                    ret = emit_push_const(s, val, 1);
-                    JS_FreeValue(s->ctx, val);
-                    if (ret)
-                        return -1;
-                    emit_op(s, OP_get_super_value);
-                } else {
-                    if (has_optional_chain) {
-                        optional_chain_test(s, &optional_chaining_label, 1);
-                    }
-                    emit_op(s, OP_get_field);
-                    emit_atom(s, s->token.u.ident.atom);
-                }
-            }
-            if (next_token(s))
-                return -1;
-        } else if (s->token.val == '[') {
-            int prev_op;
-
-        parse_array_access:
-            prev_op = get_prev_opcode(fd);
-            if (prev_op == OP_get_super) {
-                /* 13.3.4 SuperProperty : super [ Expression ] evaluates the KEY before step 7's
-                   MakeSuperPropertyReference, so GetSuperBase has not run yet — `super[ruin()]`, where ruin()
-                   sets the home object's prototype to null, is a TypeError and not a read through a base that
-                   was captured too early. The primary emitted that read already because every other `super`
-                   form wants it there; take it back off and re-emit it after the key. */
-                DCHECK(fd->byte_code.buf[fd->last_opcode_pos] == OP_get_super,
-                       "get_prev_opcode named an opcode that is not at last_opcode_pos");
-                fd->byte_code.size = fd->last_opcode_pos;
-                fd->last_opcode_pos = -1;
-            }
-            if (has_optional_chain) {
-                optional_chain_test(s, &optional_chaining_label, 1);
-            }
-            if (next_token(s))
-                return -1;
-            if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-                return -1;
-            if (js_parse_expect(s, ']'))
-                return -1;
-            if (prev_op == OP_get_super) {
-                emit_op(s, OP_swap);        /* this home key -> this key home */
-                emit_op(s, OP_get_super);   /*              -> this key base  */
-                emit_op(s, OP_swap);        /*              -> this base key  */
-                emit_op(s, OP_get_super_value);
-            } else {
-                emit_op(s, OP_get_array_el);
-            }
-        } else {
-            break;
-        }
-    }
-    if (optional_chaining_label >= 0) {
-        JSFunctionDef *fd = s->cur_func;
-        int opcode;
-        emit_label_raw(s, optional_chaining_label);
-        /* modify the last opcode so that it is an indicator of an
-           optional chain */
-        opcode = get_prev_opcode(fd);
-        if (opcode == OP_get_field || opcode == OP_get_array_el) {
-            if (opcode == OP_get_field)
-                opcode = OP_get_field_opt_chain;
-            else
-                opcode = OP_get_array_el_opt_chain;
-            fd->byte_code.buf[fd->last_opcode_pos] = opcode;
-        } else {
-            fd->last_opcode_pos = -1;
-        }
-    }
-    return 0;
-}
-
 static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                                     bool export_flag);
 
@@ -47531,6 +46838,14 @@ struct JSParseFrame {
     bool    is_star;    /* AssignmentExpression: `yield *` */
     JSAtom  name0;      /* BORROWED (never dup'd), the identifier before '=' for the OP_set_name pattern */
     int     scope, label, depth_lvalue;   /* get_lvalue's reference, held across the RHS descent */
+    /* MemberExpression / CallExpression: state carried across an argument or index descent */
+    int     call_type;
+    int     call_line_num, call_col_num;
+    int     opt_label;      /* the optional chain's join label, or -1 */
+    int     arg_count;
+    int     prev_op;
+    bool    accept_lparen;  /* PF_POSTFIX_CALL: this is a CallExpression, not a bare MemberExpression */
+    bool    has_opt_chain;
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -47545,7 +46860,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
        drains back to it, leaving any outer activation's frames untouched. */
     JSParseFrame *fr = s->pd_fr, *f = NULL;
     int size = s->pd_size, sp = s->pd_sp, base = s->pd_sp, ret = 0;
-    int tok, opcode = 0;
+    int tok, opcode = 0, drop_count = 0;
 
 /* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
    (`f->level - 1`), and the push moves `f` to the callee's. */
@@ -47558,6 +46873,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->label1 = -1; f->label2 = -1; f->opcode = 0; f->atom = JS_ATOM_NULL;   \
         f->comma = false; f->is_star = false; f->name0 = JS_ATOM_NULL;           \
         f->scope = 0; f->label = -1; f->depth_lvalue = 0;                        \
+        f->call_type = 0; f->call_line_num = 0; f->call_col_num = 0;             \
+        f->opt_label = -1; f->arg_count = 0; f->prev_op = 0;                     \
+        f->accept_lparen = false; f->has_opt_chain = false;                      \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -47571,6 +46889,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                "a parse frame was popped still owning an atom — it leaks");     \
         ret = (v_); sp--; goto dispatch;                                        \
     } while (0)
+/* js_parse_error returns -1, so an error IS a return value — variadic because the parser's messages are
+   formatted. */
+#define PD_RET_ERR(...) PD_RET(js_parse_error(__VA_ARGS__))
 
     PD_PUSH(entry, level, parse_flags, op);
 
@@ -47614,6 +46935,16 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_ASGN_COND:   goto assign_cond_done;
     case PDS_ASGN_RHS:    goto assign_rhs_done;
     case PDS_ASGN_LOGRHS: goto assign_logrhs_done;
+    case PDS_POSTFIX:         goto pfx_entry;
+    case PDS_PFX_PAREN:       goto pfx_paren_done;
+    case PDS_PFX_NEW:         goto pfx_new_done;
+    case PDS_PFX_IMPORT1:     goto pfx_import1_done;
+    case PDS_PFX_IMPORT2:     goto pfx_import2_done;
+    case PDS_PFX_ARG:         goto pfx_arg_done;
+    case PDS_PFX_SPREAD_ELL:  goto pfx_spread_ell_done;
+    case PDS_PFX_SPREAD_ITEM: goto pfx_spread_item_done;
+    case PDS_PFX_INDEX:       goto pfx_index_done;
+    case PDS_UNA_POSTFIX:     goto una_postfix_done;
     }
     DFAIL("parse descent resumed at a state that does not exist");
     goto unwind;
@@ -47859,10 +47190,13 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_RET(-1);
         PD_CALL(PDS_UNA, 0, PF_POW_FORBIDDEN, 0, PDS_UNA_AWAIT);
     default:
-        /* LeftHandSideExpression — still a recursive C call, and it is the bracket/statement cone that owns
-           the remaining depth. */
-        if (js_parse_postfix_expr(s, PF_POSTFIX_CALL))
-            PD_RET(-1);
+        PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_UNA_POSTFIX);
+    }
+
+ una_postfix_done:
+    if (ret)
+        PD_RET(-1);
+    {
         if (!s->got_lf &&
             (s->token.val == TOK_DEC || s->token.val == TOK_INC)) {
             int opcode, post_op, scope, label;
@@ -47876,8 +47210,8 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             if (next_token(s))
                 PD_RET(-1);
         }
-        goto una_tail;
     }
+    goto una_tail;
 
  una_prefix_done:
     if (ret)
@@ -48395,6 +47729,707 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     emit_label(s, f->label2);
     PD_RET(0);
 
+/* ---- MemberExpression / CallExpression / OptionalExpression — the PRIMARY expression and the postfix chain
+   that follows it. `(` Expression `)` and `new MemberExpression` and every argument list descend from here, so
+   this is the production that held the remaining source-controlled parser depth: nested parens, nested calls,
+   nested index expressions. allowed parse_flags: PF_POSTFIX_CALL ---- */
+ pfx_entry:
+    f->call_type = FUNC_CALL_NORMAL;
+    f->accept_lparen = (f->flags & PF_POSTFIX_CALL) != 0;
+    /* WHERE A CALL IS, for the stack trace that will name it: the start of the expression being called —
+       `geval` in `geval(source)`, `a` in `a.b()`, the `new` in `new Plonk()`. Taken here because this is where
+       that expression begins, and kept for the whole postfix chain so `f()()` attributes both calls to `f`. */
+    f->call_line_num = s->token.line_num;
+    f->call_col_num = s->token.col_num;
+    switch(s->token.val) {
+    case TOK_NUMBER:
+        {
+            JSValue val;
+            val = s->token.u.num.val;
+
+            if (JS_VALUE_GET_TAG(val) == JS_TAG_INT) {
+                emit_op(s, OP_push_i32);
+                emit_u32(s, JS_VALUE_GET_INT(val));
+            } else if (JS_VALUE_GET_TAG(val) == JS_TAG_SHORT_BIG_INT) {
+                int64_t v;
+                v = JS_VALUE_GET_SHORT_BIG_INT(val);
+                if (v >= INT32_MIN && v <= INT32_MAX) {
+                    emit_op(s, OP_push_bigint_i32);
+                    emit_u32(s, v);
+                } else {
+                    goto large_number;
+                }
+            } else {
+            large_number:
+                if (emit_push_const(s, val, 0) < 0)
+                    PD_RET(-1);
+            }
+        }
+        if (next_token(s))
+            PD_RET(-1);
+        break;
+    case TOK_TEMPLATE:
+        if (js_parse_template(s, 0, NULL))
+            PD_RET(-1);
+        break;
+    case TOK_STRING:
+        if (emit_push_const(s, s->token.u.str.str, 1))
+            PD_RET(-1);
+        if (next_token(s))
+            PD_RET(-1);
+        break;
+
+    case TOK_DIV_ASSIGN:
+        s->buf_ptr -= 2;
+        goto parse_regexp;
+    case '/':
+        s->buf_ptr--;
+    parse_regexp:
+        {
+            JSValue str;
+            int ret, backtrace_flags;
+            if (!s->ctx->compile_regexp)
+                PD_RET_ERR(s, "RegExp are not supported");
+            /* the previous token is '/' or '/=', so no need to free */
+            if (js_parse_regexp(s))
+                PD_RET(-1);
+            ret = emit_push_const(s, s->token.u.regexp.body, 0);
+            str = s->ctx->compile_regexp(s->ctx, s->token.u.regexp.body,
+                                         s->token.u.regexp.flags);
+            if (JS_IsException(str)) {
+                /* add the line number info */
+                backtrace_flags = 0;
+                if (s->cur_func && s->cur_func->backtrace_barrier)
+                    backtrace_flags = JS_BACKTRACE_FLAG_SINGLE_LEVEL;
+                build_backtrace(s->ctx, s->ctx->rt->current_exception, JS_UNDEFINED,
+                                s->filename,
+                                s->token.line_num,
+                                s->token.col_num,
+                                backtrace_flags);
+                PD_RET(-1);
+            }
+            ret = emit_push_const(s, str, 0);
+            JS_FreeValue(s->ctx, str);
+            if (ret)
+                PD_RET(-1);
+            /* we use a specific f->opcode to be sure the correct
+               function is called (otherwise the bytecode would have
+               to be verified by the RegExp constructor) */
+            emit_op(s, OP_regexp);
+            if (next_token(s))
+                PD_RET(-1);
+        }
+        break;
+    case '(':
+        PD_CALL(PDS_PAREN, 0, 0, 0, PDS_PFX_PAREN);
+ pfx_paren_done:
+        if (ret)
+            PD_RET(-1);
+        goto pfx_after_switch;
+    case TOK_FUNCTION:
+        if (js_parse_function_decl(s, JS_PARSE_FUNC_EXPR,
+                                   JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                   s->token.ptr,
+                                   s->token.line_num,
+                                   s->token.col_num, PF_IN_ACCEPTED))
+            PD_RET(-1);
+        break;
+    case TOK_CLASS:
+        if (js_parse_class(s, true, JS_PARSE_EXPORT_NONE))
+            PD_RET(-1);
+        break;
+    case TOK_NULL:
+        if (next_token(s))
+            PD_RET(-1);
+        emit_op(s, OP_null);
+        break;
+    case TOK_THIS:
+        if (next_token(s))
+            PD_RET(-1);
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, JS_ATOM_this);
+        emit_u16(s, 0);
+        break;
+    case TOK_FALSE:
+        if (next_token(s))
+            PD_RET(-1);
+        emit_op(s, OP_push_false);
+        break;
+    case TOK_TRUE:
+        if (next_token(s))
+            PD_RET(-1);
+        emit_op(s, OP_push_true);
+        break;
+    case TOK_IDENT:
+        {
+            JSAtom name;
+            int identifier_line_num = s->token.line_num;
+            const uint8_t *identifier_line_start = s->token.ptr;
+            while (identifier_line_start > s->buf_start &&
+                   identifier_line_start[-1] != '\n' &&
+                   identifier_line_start[-1] != '\r')
+                identifier_line_start--;
+            int identifier_col_num =
+                (int)(s->token.ptr - identifier_line_start) + 1;
+            if (s->token.u.ident.is_reserved) {
+                PD_RET(js_parse_error_reserved_identifier(s));
+            }
+            if (token_is_pseudo_keyword(s, JS_ATOM_async) &&
+                peek_token(s, true) != '\n') {
+                const uint8_t *source_ptr;
+                int source_line_num;
+                int source_col_num;
+
+                source_ptr = s->token.ptr;
+                source_line_num = s->token.line_num;
+                source_col_num = s->token.col_num;
+                if (next_token(s))
+                    PD_RET(-1);
+                if (s->token.val == TOK_FUNCTION) {
+                    if (js_parse_function_decl(s, JS_PARSE_FUNC_EXPR,
+                                               JS_FUNC_ASYNC, JS_ATOM_NULL,
+                                               source_ptr,
+                                               source_line_num,
+                                               source_col_num, PF_IN_ACCEPTED))
+                        PD_RET(-1);
+                } else {
+                    name = JS_DupAtom(s->ctx, JS_ATOM_async);
+                    goto do_get_var;
+                }
+            } else {
+                if (s->token.u.ident.atom == JS_ATOM_arguments &&
+                    !s->cur_func->arguments_allowed) {
+                    js_parse_error(s, "'arguments' identifier is not allowed in class field initializer");
+                    PD_RET(-1);
+                }
+                name = JS_DupAtom(s->ctx, s->token.u.ident.atom);
+                if (next_token(s)) { /* update line number before emitting code */
+                    JS_FreeAtom(s->ctx, name);
+                    PD_RET(-1);
+                }
+            do_get_var:
+                emit_source_loc_at(s, identifier_line_num, identifier_col_num);
+                emit_op(s, OP_scope_get_var);
+                emit_u32(s, name);
+                emit_u16(s, s->cur_func->scope_level);
+            }
+        }
+        break;
+    case '{':
+    case '[':
+        /* Always a LITERAL here. The AssignmentPattern reparse belongs to the AssignmentExpression
+           production and lives in js_parse_descent's PDS_ASGN. */
+        if (s->token.val == '{') {
+            if (js_parse_object_literal(s))
+                PD_RET(-1);
+        } else {
+            if (js_parse_array_literal(s))
+                PD_RET(-1);
+        }
+        break;
+    case TOK_NEW:
+        if (next_token(s))
+            PD_RET(-1);
+        if (s->token.val == '.') {
+            if (next_token(s))
+                PD_RET(-1);
+            if (!token_is_pseudo_keyword(s, JS_ATOM_target))
+                PD_RET_ERR(s, "expecting target");
+            if (!s->cur_func->new_target_allowed)
+                PD_RET_ERR(s, "new.target only allowed within functions");
+            if (next_token(s))
+                PD_RET(-1);
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, JS_ATOM_new_target);
+            emit_u16(s, 0);
+        } else {
+            emit_source_loc(s);
+            PD_CALL(PDS_POSTFIX, 0, 0, 0, PDS_PFX_NEW);
+ pfx_new_done:
+            if (ret)
+                PD_RET(-1);
+            f->accept_lparen = true;
+            if (s->token.val != '(') {
+                /* new operator on an object */
+                emit_op(s, OP_dup);
+                emit_op(s, OP_call_constructor);
+                emit_u16(s, 0);
+            } else {
+                f->call_type = FUNC_CALL_NEW;
+            }
+        }
+        break;
+    case TOK_SUPER:
+        if (next_token(s))
+            PD_RET(-1);
+        if (s->token.val == '(') {
+            if (!s->cur_func->super_call_allowed)
+                PD_RET_ERR(s, "super() is only valid in a derived class constructor");
+            f->call_type = FUNC_CALL_SUPER_CTOR;
+        } else if (s->token.val == '.' || s->token.val == '[') {
+            if (!s->cur_func->super_allowed)
+                PD_RET_ERR(s, "'super' is only valid in a method");
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, JS_ATOM_this);
+            emit_u16(s, 0);
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, JS_ATOM_home_object);
+            emit_u16(s, 0);
+            emit_op(s, OP_get_super);
+        } else {
+            PD_RET_ERR(s, "invalid use of 'super'");
+        }
+        break;
+    case TOK_IMPORT:
+        if (next_token(s))
+            PD_RET(-1);
+        if (s->token.val == '.') {
+            if (next_token(s))
+                PD_RET(-1);
+            if (!token_is_pseudo_keyword(s, JS_ATOM_meta))
+                PD_RET_ERR(s, "meta expected");
+            if (!s->is_module)
+                PD_RET_ERR(s, "import.meta only valid in module code");
+            if (next_token(s))
+                PD_RET(-1);
+            emit_op(s, OP_special_object);
+            emit_u8(s, OP_SPECIAL_OBJECT_IMPORT_META);
+        } else {
+            if (js_parse_expect(s, '('))
+                PD_RET(-1);
+            if (!f->accept_lparen)
+                PD_RET_ERR(s, "invalid use of 'import()'");
+            PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_IMPORT1);
+ pfx_import1_done:
+            if (ret)
+                PD_RET(-1);
+            if (s->token.val == ',') {
+                if (next_token(s))
+                    PD_RET(-1);
+                if (s->token.val != ')') {
+                    PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_IMPORT2);
+ pfx_import2_done:
+                    if (ret)
+                        PD_RET(-1);
+                    /* accept a trailing comma */
+                    if (s->token.val == ',') {
+                        if (next_token(s))
+                            PD_RET(-1);
+                    }
+                } else {
+                    emit_op(s, OP_undefined);
+                }
+            } else {
+                emit_op(s, OP_undefined);
+            }
+            if (js_parse_expect(s, ')'))
+                PD_RET(-1);
+            emit_op(s, OP_import);
+        }
+        break;
+    default:
+        PD_RET_ERR(s, "unexpected token in expression: '%.*s'",
+                              (int)(s->buf_ptr - s->token.ptr), s->token.ptr);
+    }
+
+ pfx_after_switch:
+    f->opt_label = -1;
+    for(;;) {
+        /* per ITERATION, not per production: the recursive body carried this on the declaration of a block
+           local, and moving the state to the frame is exactly where that reset can go missing. */
+        f->has_opt_chain = false;
+        if (s->token.val == TOK_QUESTION_MARK_DOT) {
+            /* optional chaining */
+            if (!f->accept_lparen) {
+                /* NewExpression : new MemberExpression Arguments. An OptionalChain is reachable only from
+                   LeftHandSideExpression : OptionalExpression, never from a MemberExpression, so `new o?.C()`
+                   and `new o?.["C"]()` are Syntax Errors — the same grammar fact the tagged-template rule one
+                   branch down already states for its own production. `f->accept_lparen` IS "this is a
+                   MemberExpression": the `new` callee is the one thing parsed with PF_POSTFIX_CALL clear,
+                   because a call is not part of that production either. */
+                PD_RET_ERR(s, "invalid optional chain in a `new` expression");
+            }
+            if (next_token(s))
+                PD_RET(-1);
+            f->has_opt_chain = true;
+            if (s->token.val == '(' && f->accept_lparen) {
+                goto parse_func_call;
+            } else if (s->token.val == '[') {
+                goto parse_array_access;
+            } else {
+                goto parse_property;
+            }
+        } else if (s->token.val == TOK_TEMPLATE &&
+                   f->call_type == FUNC_CALL_NORMAL) {
+            if (f->opt_label >= 0) {
+                PD_RET_ERR(s, "template literal cannot appear in an optional chain");
+            }
+            f->call_type = FUNC_CALL_TEMPLATE;
+            goto parse_func_call2;
+        } else if (s->token.val == '(' && f->accept_lparen) {
+            /* function call */
+        parse_func_call:
+            if (next_token(s))
+                PD_RET(-1);
+
+            if (f->call_type == FUNC_CALL_NORMAL) {
+            parse_func_call2:
+                emit_source_loc(s);
+                switch(f->opcode = get_prev_opcode(s->cur_func)) {
+                case OP_get_field:
+                    /* keep the object on the stack */
+                    s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] = OP_get_field2;
+                    drop_count = 2;
+                    break;
+                case OP_get_field_opt_chain:
+                    {
+                        int opt_chain_label, next_label;
+                        opt_chain_label = get_u32(s->cur_func->byte_code.buf +
+                                                  s->cur_func->last_opcode_pos + 1 + 4 + 1);
+                        /* keep the object on the stack */
+                        s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] = OP_get_field2;
+                        s->cur_func->byte_code.size = s->cur_func->last_opcode_pos + 1 + 4;
+                        next_label = emit_goto(s, OP_goto, -1);
+                        emit_label(s, opt_chain_label);
+                        /* need an additional undefined value for the
+                           case where the optional field does not
+                           exists */
+                        emit_op(s, OP_undefined);
+                        emit_label(s, next_label);
+                        drop_count = 2;
+                        f->opcode = OP_get_field;
+                    }
+                    break;
+                case OP_scope_get_private_field:
+                    /* keep the object on the stack */
+                    s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] = OP_scope_get_private_field2;
+                    drop_count = 2;
+                    break;
+                case OP_get_array_el:
+                    /* keep the object on the stack */
+                    s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] = OP_get_array_el2;
+                    drop_count = 2;
+                    break;
+                case OP_get_array_el_opt_chain:
+                    {
+                        int opt_chain_label, next_label;
+                        opt_chain_label = get_u32(s->cur_func->byte_code.buf +
+                                                  s->cur_func->last_opcode_pos + 1 + 1);
+                        /* keep the object on the stack */
+                        s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] = OP_get_array_el2;
+                        s->cur_func->byte_code.size = s->cur_func->last_opcode_pos + 1;
+                        next_label = emit_goto(s, OP_goto, -1);
+                        emit_label(s, opt_chain_label);
+                        /* need an additional undefined value for the
+                           case where the optional field does not
+                           exists */
+                        emit_op(s, OP_undefined);
+                        emit_label(s, next_label);
+                        drop_count = 2;
+                        f->opcode = OP_get_array_el;
+                    }
+                    break;
+                case OP_scope_get_var:
+                    {
+                        JSAtom name;
+                        int scope;
+                        name = get_u32(s->cur_func->byte_code.buf + s->cur_func->last_opcode_pos + 1);
+                        scope = get_u16(s->cur_func->byte_code.buf + s->cur_func->last_opcode_pos + 5);
+                        if (name == JS_ATOM_eval && f->call_type == FUNC_CALL_NORMAL && !f->has_opt_chain) {
+                            /* direct 'eval' */
+                            f->opcode = OP_eval;
+                        } else {
+                            /* verify if function name resolves to a simple
+                               get_loc/get_arg: a function call inside a `with`
+                               statement can resolve to a method call of the
+                               `with` context object
+                             */
+                            /* XXX: always generate the OP_scope_get_ref
+                               and remove it in variable resolution
+                               pass ? */
+                            if (has_with_scope(s->cur_func, scope)) {
+                                f->opcode = OP_scope_get_ref;
+                                s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] = f->opcode;
+                            }
+                        }
+                        drop_count = 1;
+                    }
+                    break;
+                case OP_get_super_value:
+                    s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] = OP_get_array_el;
+                    /* on stack: this func_obj */
+                    f->opcode = OP_get_array_el;
+                    drop_count = 2;
+                    break;
+                default:
+                    f->opcode = OP_invalid;
+                    drop_count = 1;
+                    break;
+                }
+                if (f->has_opt_chain) {
+                    optional_chain_test(s, &f->opt_label,
+                                        drop_count);
+                }
+            } else {
+                f->opcode = OP_invalid;
+            }
+
+            if (f->call_type == FUNC_CALL_TEMPLATE) {
+                if (js_parse_template(s, 1, &f->arg_count))
+                    PD_RET(-1);
+                goto emit_func_call;
+            } else if (f->call_type == FUNC_CALL_SUPER_CTOR) {
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, JS_ATOM_this_active_func);
+                emit_u16(s, 0);
+
+                emit_op(s, OP_get_super);
+
+                emit_op(s, OP_scope_get_var);
+                emit_atom(s, JS_ATOM_new_target);
+                emit_u16(s, 0);
+            } else if (f->call_type == FUNC_CALL_NEW) {
+                emit_op(s, OP_dup); /* new.target = function */
+            }
+
+            /* parse arguments */
+            f->arg_count = 0;
+            while (s->token.val != ')') {
+                if (f->arg_count >= 65535) {
+                    PD_RET_ERR(s, "Too many arguments in function call (only %d allowed)",
+                                          65535 - 1);
+                }
+                if (s->token.val == TOK_ELLIPSIS)
+                    break;
+                PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_ARG);
+ pfx_arg_done:
+                if (ret)
+                    PD_RET(-1);
+                f->arg_count++;
+                if (s->token.val == ')')
+                    break;
+                /* accept a trailing comma before the ')' */
+                if (js_parse_expect(s, ','))
+                    PD_RET(-1);
+            }
+            if (s->token.val == TOK_ELLIPSIS) {
+                emit_op(s, OP_array_from);
+                emit_u16(s, f->arg_count);
+                emit_op(s, OP_push_i32);
+                emit_u32(s, f->arg_count);
+
+                /* on stack: array idx */
+                while (s->token.val != ')') {
+                    if (s->token.val == TOK_ELLIPSIS) {
+                        if (next_token(s))
+                            PD_RET(-1);
+                        PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_SPREAD_ELL);
+ pfx_spread_ell_done:
+                        if (ret)
+                            PD_RET(-1);
+                        /* XXX: could pass is_last indicator? */
+                        emit_op(s, OP_append);
+                    } else {
+                        PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_PFX_SPREAD_ITEM);
+ pfx_spread_item_done:
+                        if (ret)
+                            PD_RET(-1);
+                        /* array idx val */
+                        emit_op(s, OP_define_array_el);
+                        emit_op(s, OP_inc);
+                    }
+                    if (s->token.val == ')')
+                        break;
+                    /* accept a trailing comma before the ')' */
+                    if (js_parse_expect(s, ','))
+                        PD_RET(-1);
+                }
+                if (next_token(s))
+                    PD_RET(-1);
+                /* drop the index */
+                emit_op(s, OP_drop);
+
+                /* apply function call */
+                switch(f->opcode) {
+                case OP_get_field:
+                case OP_scope_get_private_field:
+                case OP_get_array_el:
+                case OP_scope_get_ref:
+                    /* obj func array -> func obj array */
+                    emit_op(s, OP_perm3);
+                    emit_op(s, OP_apply);
+                    emit_u16(s, f->call_type == FUNC_CALL_NEW);
+                    break;
+                case OP_eval:
+                    emit_op(s, OP_apply_eval);
+                    emit_u16(s, s->cur_func->scope_level);
+                    s->cur_func->has_eval_call = true;
+                    break;
+                default:
+                    if (f->call_type == FUNC_CALL_SUPER_CTOR) {
+                        emit_op(s, OP_apply);
+                        emit_u16(s, 1);
+                        /* set the 'this' value */
+                        emit_op(s, OP_dup);
+                        emit_op(s, OP_scope_put_var_init);
+                        emit_atom(s, JS_ATOM_this);
+                        emit_u16(s, 0);
+
+                        emit_class_field_init(s);
+                    } else if (f->call_type == FUNC_CALL_NEW) {
+                        /* obj func array -> func obj array */
+                        emit_op(s, OP_perm3);
+                        emit_op(s, OP_apply);
+                        emit_u16(s, 1);
+                    } else {
+                        /* func array -> func undef array */
+                        emit_op(s, OP_undefined);
+                        emit_op(s, OP_swap);
+                        emit_op(s, OP_apply);
+                        emit_u16(s, 0);
+                    }
+                    break;
+                }
+            } else {
+                if (next_token(s))
+                    PD_RET(-1);
+            emit_func_call:
+                /* The call f->opcode's OWN position, emitted here rather than before the arguments — an argument
+                   is an expression and emits positions of its own, so the marker left at the head of the call
+                   was overwritten by the last one parsed. Every stack trace pointed at the final argument:
+                   `a(   )` reported the `)`, and V8's eval-origin test, which pins the column of the eval
+                   call, disagreed by five. */
+                emit_source_loc_at(s, f->call_line_num, f->call_col_num);
+                switch(f->opcode) {
+                case OP_get_field:
+                case OP_scope_get_private_field:
+                case OP_get_array_el:
+                case OP_scope_get_ref:
+                    emit_op(s, OP_call_method);
+                    emit_u16(s, f->arg_count);
+                    break;
+                case OP_eval:
+                    emit_op(s, OP_eval);
+                    emit_u16(s, f->arg_count);
+                    emit_u16(s, s->cur_func->scope_level);
+                    s->cur_func->has_eval_call = true;
+                    break;
+                default:
+                    if (f->call_type == FUNC_CALL_SUPER_CTOR) {
+                        emit_op(s, OP_call_constructor);
+                        emit_u16(s, f->arg_count);
+
+                        /* set the 'this' value */
+                        emit_op(s, OP_dup);
+                        emit_op(s, OP_scope_put_var_init);
+                        emit_atom(s, JS_ATOM_this);
+                        emit_u16(s, 0);
+
+                        emit_class_field_init(s);
+                    } else if (f->call_type == FUNC_CALL_NEW) {
+                        emit_op(s, OP_call_constructor);
+                        emit_u16(s, f->arg_count);
+                    } else {
+                        emit_op(s, OP_call);
+                        emit_u16(s, f->arg_count);
+                    }
+                    break;
+                }
+            }
+            s->cur_func->last_opcode_is_template_call = (f->call_type == FUNC_CALL_TEMPLATE);
+            f->call_type = FUNC_CALL_NORMAL;
+        } else if (s->token.val == '.') {
+            if (next_token(s))
+                PD_RET(-1);
+        parse_property:
+            if (s->token.val == TOK_PRIVATE_NAME) {
+                /* private class field */
+                if (get_prev_opcode(s->cur_func) == OP_get_super) {
+                    PD_RET_ERR(s, "private class field forbidden after super");
+                }
+                if (f->has_opt_chain) {
+                    optional_chain_test(s, &f->opt_label, 1);
+                }
+                emit_op(s, OP_scope_get_private_field);
+                emit_atom(s, s->token.u.ident.atom);
+                emit_u16(s, s->cur_func->scope_level);
+            } else {
+                if (!token_is_ident(s->token.val)) {
+                    PD_RET_ERR(s, "expecting field name");
+                }
+                if (get_prev_opcode(s->cur_func) == OP_get_super) {
+                    JSValue val;
+                    int ret;
+                    val = JS_AtomToValue(s->ctx, s->token.u.ident.atom);
+                    ret = emit_push_const(s, val, 1);
+                    JS_FreeValue(s->ctx, val);
+                    if (ret)
+                        PD_RET(-1);
+                    emit_op(s, OP_get_super_value);
+                } else {
+                    if (f->has_opt_chain) {
+                        optional_chain_test(s, &f->opt_label, 1);
+                    }
+                    emit_op(s, OP_get_field);
+                    emit_atom(s, s->token.u.ident.atom);
+                }
+            }
+            if (next_token(s))
+                PD_RET(-1);
+        } else if (s->token.val == '[') {
+        parse_array_access:
+            f->prev_op = get_prev_opcode(s->cur_func);
+            if (f->prev_op == OP_get_super) {
+                /* 13.3.4 SuperProperty : super [ Expression ] evaluates the KEY before step 7's
+                   MakeSuperPropertyReference, so GetSuperBase has not run yet — `super[ruin()]`, where ruin()
+                   sets the home object's prototype to null, is a TypeError and not a read through a base that
+                   was captured too early. The primary emitted that read already because every other `super`
+                   form wants it there; take it back off and re-emit it after the key. */
+                DCHECK(s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] == OP_get_super,
+                       "get_prev_opcode named an f->opcode that is not at last_opcode_pos");
+                s->cur_func->byte_code.size = s->cur_func->last_opcode_pos;
+                s->cur_func->last_opcode_pos = -1;
+            }
+            if (f->has_opt_chain) {
+                optional_chain_test(s, &f->opt_label, 1);
+            }
+            if (next_token(s))
+                PD_RET(-1);
+            PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_PFX_INDEX);
+ pfx_index_done:
+            if (ret)
+                PD_RET(-1);
+            if (js_parse_expect(s, ']'))
+                PD_RET(-1);
+            if (f->prev_op == OP_get_super) {
+                emit_op(s, OP_swap);        /* this home key -> this key home */
+                emit_op(s, OP_get_super);   /*              -> this key base  */
+                emit_op(s, OP_swap);        /*              -> this base key  */
+                emit_op(s, OP_get_super_value);
+            } else {
+                emit_op(s, OP_get_array_el);
+            }
+        } else {
+            break;
+        }
+    }
+    if (f->opt_label >= 0) {
+        emit_label_raw(s, f->opt_label);
+        /* modify the last f->opcode so that it is an indicator of an
+           optional chain */
+        f->opcode = get_prev_opcode(s->cur_func);
+        if (f->opcode == OP_get_field || f->opcode == OP_get_array_el) {
+            if (f->opcode == OP_get_field)
+                f->opcode = OP_get_field_opt_chain;
+            else
+                f->opcode = OP_get_array_el_opt_chain;
+            s->cur_func->byte_code.buf[s->cur_func->last_opcode_pos] = f->opcode;
+        } else {
+            s->cur_func->last_opcode_pos = -1;
+        }
+    }
+    PD_RET(0);
+
  done:
     DCHECK(sp == base, "the parse descent returned with frames of its own still on the stack");
     goto leave;
@@ -48420,6 +48455,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 #undef PD_PUSH
 #undef PD_CALL
 #undef PD_RET
+#undef PD_RET_ERR
 }
 
 /* allowed parse_flags: PF_IN_ACCEPTED */
@@ -49083,7 +49119,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
                 return -1;
         } else {
             int lvalue_label;
-            if (js_parse_left_hand_side_expr(s))
+            if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
                 return -1;
             if (get_lvalue(s, &opcode, &scope, &var_name, &lvalue_label,
                            NULL, false, TOK_FOR))
