@@ -3630,15 +3630,51 @@ static uint32_t hash_string(JSString *str, uint32_t h)
     return h;
 }
 
+typedef struct {
+    JSValueConst stack[JS_STRING_ROPE_MAX_DEPTH];
+    int stack_len;
+} JSStringRopeIter;
+
+static void string_rope_iter_init(JSStringRopeIter *s, JSValueConst val)
+{
+    s->stack_len = 0;
+    s->stack[s->stack_len++] = val;
+}
+
+/* iterate thru a rope and return the strings in order */
+static JSString *string_rope_iter_next(JSStringRopeIter *s)
+{
+    JSValueConst val;
+    JSStringRope *r;
+
+    if (s->stack_len == 0)
+        return NULL;
+    val = s->stack[--s->stack_len];
+    for(;;) {
+        if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
+            return JS_VALUE_GET_STRING(val);
+        r = JS_VALUE_GET_STRING_ROPE(val);
+        DCHECK(s->stack_len < JS_STRING_ROPE_MAX_DEPTH, "s->stack_len < JS_STRING_ROPE_MAX_DEPTH");
+        s->stack[s->stack_len++] = r->right;
+        val = r->left;
+    }
+}
+
+/* Uses the rope ITERATOR that already exists rather than a second walker: string_rope_iter_next yields the
+   leaves left to right, which is exactly the order this recursion visited them in, and the iterator's own
+   stack is the one the tree needs. The recursion was a duplicate traversal of a structure that already had a
+   flat one — the fix was to notice that, not to write a third. */
 static uint32_t hash_string_rope(JSValueConst val, uint32_t h)
 {
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
+    JSStringRopeIter it;
+    JSString *p;
+
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
         return hash_string(JS_VALUE_GET_STRING(val), h);
-    } else {
-        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
-        h = hash_string_rope(r->left, h);
-        return hash_string_rope(r->right, h);
-    }
+    string_rope_iter_init(&it, val);
+    while ((p = string_rope_iter_next(&it)) != NULL)
+        h = hash_string(p, h);
+    return h;
 }
 
 static __maybe_unused void JS_DumpString(JSRuntime *rt, JSString *p)
@@ -5473,51 +5509,27 @@ static uint32_t string_rope_get_len(JSValueConst val)
         return JS_VALUE_GET_STRING_ROPE(val)->len;
 }
 
+/* A LOOP, not a recursion: both of the descents this used to make were TAIL calls — the result of the chosen
+   side IS the result — so the only thing the C frame carried was the argument, and re-assigning it says the
+   same thing with no frame. Nothing about the rope changed; the recursion was simply never load-bearing. */
 static int string_rope_get(JSValueConst val, uint32_t idx)
 {
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
-        return string_get(JS_VALUE_GET_STRING(val), idx);
-    } else {
-        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
+    for (;;) {
+        JSStringRope *r;
         uint32_t len;
+        if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
+            return string_get(JS_VALUE_GET_STRING(val), idx);
+        r = JS_VALUE_GET_STRING_ROPE(val);
         if (JS_VALUE_GET_TAG(r->left) == JS_TAG_STRING)
             len = JS_VALUE_GET_STRING(r->left)->len;
         else
             len = JS_VALUE_GET_STRING_ROPE(r->left)->len;
-        if (idx < len)
-            return string_rope_get(r->left, idx);
-        else
-            return string_rope_get(r->right, idx - len);
-    }
-}
-
-typedef struct {
-    JSValueConst stack[JS_STRING_ROPE_MAX_DEPTH];
-    int stack_len;
-} JSStringRopeIter;
-
-static void string_rope_iter_init(JSStringRopeIter *s, JSValueConst val)
-{
-    s->stack_len = 0;
-    s->stack[s->stack_len++] = val;
-}
-
-/* iterate thru a rope and return the strings in order */
-static JSString *string_rope_iter_next(JSStringRopeIter *s)
-{
-    JSValueConst val;
-    JSStringRope *r;
-
-    if (s->stack_len == 0)
-        return NULL;
-    val = s->stack[--s->stack_len];
-    for(;;) {
-        if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
-            return JS_VALUE_GET_STRING(val);
-        r = JS_VALUE_GET_STRING_ROPE(val);
-        DCHECK(s->stack_len < JS_STRING_ROPE_MAX_DEPTH, "s->stack_len < JS_STRING_ROPE_MAX_DEPTH");
-        s->stack[s->stack_len++] = r->right;
-        val = r->left;
+        if (idx < len) {
+            val = r->left;
+        } else {
+            val = r->right;
+            idx -= len;
+        }
     }
 }
 
