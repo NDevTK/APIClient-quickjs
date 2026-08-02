@@ -41454,7 +41454,7 @@ enum {
     TOK_TEMPLATE,
     TOK_IDENT,
     TOK_REGEXP,
-    /* warning: order matters (see js_parse_assign_expr) */
+    /* warning: order matters (see the PDS_ASGN production in js_parse_descent) */
     TOK_MUL_ASSIGN,
     TOK_DIV_ASSIGN,
     TOK_MOD_ASSIGN,
@@ -41841,9 +41841,9 @@ typedef struct JSParseState {
        which is always the outer wrapper: nothing inside its parameter list is parsed before it exists. */
     bool fn_ctor_toplevel;
     /* THE PARSE DESCENT'S FRAME STACK — see js_parse_descent. It belongs to the PARSE, not to a driver
-       activation: productions the driver does not own yet (js_parse_assign_expr2, js_parse_postfix_expr,
-       js_parse_statement_or_decl) sit between converted ones, so the driver is re-entered, and a per-activation
-       array would put the descent's working set back on the C stack. Measured: a 16-frame inline array cost
+       activation: productions the driver does not own yet (js_parse_postfix_expr, js_parse_statement_or_decl)
+       sit between converted ones, so the driver is re-entered, and a per-activation array would put the
+       descent's working set back on the C stack. Measured: a 16-frame inline array cost
        more paren depth than the recursion it replaced. Owned here, released when the stack empties. */
     struct JSParseFrame *pd_fr;
     int pd_sp, pd_size;
@@ -44348,7 +44348,9 @@ enum {
     PDS_UNA, PDS_UNA_PREFIX, PDS_UNA_INCDEC, PDS_UNA_TYPEOF, PDS_UNA_AWAIT,
     PDS_UNA_DELETE, PDS_UNA_POW,
     PDS_DEL, PDS_DEL_OPERAND,
-    PDS_EXPR2, PDS_PAREN, PDS_PAREN_DONE,
+    PDS_EXPR2, PDS_EXPR2_ELEM, PDS_PAREN, PDS_PAREN_DONE,
+    PDS_CND_TRUE, PDS_CND_FALSE,
+    PDS_ASGN, PDS_ASGN_YIELD, PDS_ASGN_COND, PDS_ASGN_RHS, PDS_ASGN_LOGRHS,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op);
@@ -44382,8 +44384,6 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                                                JSParseExportEnum export_flag,
                                                JSFunctionDef **pfd,
                                                int parse_flags);
-static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
-static __exception int js_parse_assign_expr(JSParseState *s);
 static void push_break_entry(JSFunctionDef *fd, BlockEnv *be,
                              JSAtom label_name,
                              int label_break, int label_cont,
@@ -44639,7 +44639,7 @@ static int __exception js_parse_property_name(JSParseState *s,
         /* An ASSIGNMENT expression, not an Expression: the production is `[ AssignmentExpression ]`, so a comma
            expression is not one of these — `({[1, 2]: 3})` and `({set [1, 2](a) {}})` are Syntax Errors. Member
            access `a[x, y]` is `[ Expression ]` and keeps the comma; the two spellings are different grammars. */
-        if (js_parse_assign_expr(s))
+        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
             goto fail;
         if (js_parse_expect(s, ']'))
             goto fail;
@@ -44929,7 +44929,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
         if (s->token.val == TOK_ELLIPSIS) {
             if (next_token(s))
                 return -1;
-            if (js_parse_assign_expr(s))
+            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                 return -1;
             emit_op(s, OP_null);  /* dummy excludeList */
             emit_op(s, OP_copy_data_properties);
@@ -44988,7 +44988,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
         } else {
             if (js_parse_expect(s, ':'))
                 goto fail;
-            if (js_parse_assign_expr(s))
+            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                 goto fail;
             if (name == JS_ATOM_NULL) {
                 set_object_name_computed(s);
@@ -45522,7 +45522,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             if (s->token.val == '=') {
                 if (next_token(s))
                     goto fail;
-                if (js_parse_assign_expr(s))
+                if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                     goto fail;
             } else {
                 emit_op(s, OP_undefined);
@@ -45759,7 +45759,7 @@ static __exception int js_parse_array_literal(JSParseState *s)
     while (s->token.val != ']' && idx < 32) {
         if (s->token.val == ',' || s->token.val == TOK_ELLIPSIS)
             break;
-        if (js_parse_assign_expr(s))
+        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
             return -1;
         idx++;
         /* accept trailing comma */
@@ -45780,7 +45780,7 @@ static __exception int js_parse_array_literal(JSParseState *s)
             break;
         need_length = true;
         if (s->token.val != ',') {
-            if (js_parse_assign_expr(s))
+            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                 return -1;
             emit_op(s, OP_define_field);
             emit_u32(s, __JS_AtomFromUInt32(idx));
@@ -45815,13 +45815,13 @@ static __exception int js_parse_array_literal(JSParseState *s)
         if (s->token.val == TOK_ELLIPSIS) {
             if (next_token(s))
                 return -1;
-            if (js_parse_assign_expr(s))
+            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                 return -1;
             emit_op(s, OP_append);
         } else {
             need_length = true;
             if (s->token.val != ',') {
-                if (js_parse_assign_expr(s))
+                if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                     return -1;
                 /* a idx val */
                 emit_op(s, OP_define_array_el);
@@ -46597,7 +46597,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                 if (next_token(s))
                     goto var_error;
                 emit_op(s, OP_drop);
-                if (js_parse_assign_expr(s))
+                if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                     goto var_error;
                 if (opcode == OP_scope_get_var || opcode == OP_get_ref_value)
                     set_object_name(s, var_name);
@@ -46707,7 +46707,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     if (next_token(s))
                         goto var_error;
                     emit_op(s, OP_drop);
-                    if (js_parse_assign_expr(s))
+                    if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                         goto var_error;
                     if (opcode == OP_scope_get_var || opcode == OP_get_ref_value)
                         set_object_name(s, var_name);
@@ -46743,7 +46743,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
         emit_label(s, label_parse);
         if (hasval)
             emit_op(s, OP_drop);
-        if (js_parse_assign_expr(s))
+        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
             return -1;
         emit_goto(s, OP_goto, label_assign);
         emit_label(s, label_done);
@@ -46982,7 +46982,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
     case '{':
     case '[':
         /* Always a LITERAL here. The AssignmentPattern reparse belongs to the AssignmentExpression
-           production and lives in js_parse_assign_expr2. */
+           production and lives in js_parse_descent's PDS_ASGN. */
         if (s->token.val == '{') {
             if (js_parse_object_literal(s))
                 return -1;
@@ -47061,13 +47061,13 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                 return -1;
             if (!accept_lparen)
                 return js_parse_error(s, "invalid use of 'import()'");
-            if (js_parse_assign_expr(s))
+            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                 return -1;
             if (s->token.val == ',') {
                 if (next_token(s))
                     return -1;
                 if (s->token.val != ')') {
-                    if (js_parse_assign_expr(s))
+                    if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                         return -1;
                     /* accept a trailing comma */
                     if (s->token.val == ',') {
@@ -47260,7 +47260,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                 }
                 if (s->token.val == TOK_ELLIPSIS)
                     break;
-                if (js_parse_assign_expr(s))
+                if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                     return -1;
                 arg_count++;
                 if (s->token.val == ')')
@@ -47280,12 +47280,12 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     if (s->token.val == TOK_ELLIPSIS) {
                         if (next_token(s))
                             return -1;
-                        if (js_parse_assign_expr(s))
+                        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                             return -1;
                         /* XXX: could pass is_last indicator? */
                         emit_op(s, OP_append);
                     } else {
-                        if (js_parse_assign_expr(s))
+                        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                             return -1;
                         /* array idx val */
                         emit_op(s, OP_define_array_el);
@@ -47528,6 +47528,9 @@ struct JSParseFrame {
     int     opcode;     /* expr_binary: the operator whose operands are being parsed */
     JSAtom  atom;       /* owned, or JS_ATOM_NULL. The unwind path releases it. */
     bool    comma;      /* Expression: a ',' has been consumed, so the last operand is not an lvalue */
+    bool    is_star;    /* AssignmentExpression: `yield *` */
+    JSAtom  name0;      /* BORROWED (never dup'd), the identifier before '=' for the OP_set_name pattern */
+    int     scope, label, depth_lvalue;   /* get_lvalue's reference, held across the RHS descent */
 };
 typedef struct JSParseFrame JSParseFrame;
 
@@ -47553,7 +47556,8 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f = &fr[sp++];                                                          \
         f->state = e_; f->level = lv_; f->flags = fl_; f->op = o_;               \
         f->label1 = -1; f->label2 = -1; f->opcode = 0; f->atom = JS_ATOM_NULL;   \
-        f->comma = false;                                                        \
+        f->comma = false; f->is_star = false; f->name0 = JS_ATOM_NULL;           \
+        f->scope = 0; f->label = -1; f->depth_lvalue = 0;                        \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -47600,8 +47604,16 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_DEL:         goto del_entry;
     case PDS_DEL_OPERAND: goto del_operand_done;
     case PDS_EXPR2:       goto expr2_entry;
+    case PDS_EXPR2_ELEM:  goto expr2_elem_done;
     case PDS_PAREN:       goto paren_entry;
     case PDS_PAREN_DONE:  goto paren_done;
+    case PDS_CND_TRUE:    goto cnd_true_done;
+    case PDS_CND_FALSE:   goto cnd_false_done;
+    case PDS_ASGN:        goto assign_entry;
+    case PDS_ASGN_YIELD:  goto assign_yield_done;
+    case PDS_ASGN_COND:   goto assign_cond_done;
+    case PDS_ASGN_RHS:    goto assign_rhs_done;
+    case PDS_ASGN_LOGRHS: goto assign_logrhs_done;
     }
     DFAIL("parse descent resumed at a state that does not exist");
     goto unwind;
@@ -47799,13 +47811,19 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     if (next_token(s))
         PD_RET(-1);
     f->label1 = emit_goto(s, OP_if_false, -1);
-    if (js_parse_assign_expr(s))
+    PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_CND_TRUE);
+
+ cnd_true_done:
+    if (ret)
         PD_RET(-1);
     if (js_parse_expect(s, ':'))
         PD_RET(-1);
     f->label2 = emit_goto(s, OP_goto, -1);
     emit_label(s, f->label1);
-    if (js_parse_assign_expr2(s, f->flags & PF_IN_ACCEPTED))
+    PD_CALL(PDS_ASGN, 0, f->flags & PF_IN_ACCEPTED, 0, PDS_CND_FALSE);
+
+ cnd_false_done:
+    if (ret)
         PD_RET(-1);
     emit_label(s, f->label2);
     PD_RET(0);
@@ -48035,9 +48053,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
 /* ---- Expression : AssignmentExpression (',' AssignmentExpression)* ---- */
  expr2_entry:
-    /* AssignmentExpression is still a recursive C call — js_parse_assign_expr2 and js_parse_postfix_expr are
-       the bracket/statement cone, and they are what still caps nested parens. */
-    if (js_parse_assign_expr2(s, f->flags))
+    PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_EXPR2_ELEM);
+
+ expr2_elem_done:
+    if (ret)
         PD_RET(-1);
     if (f->comma) {
         /* prevent get_lvalue from using the last expression as an lvalue. This also prevents the conversion
@@ -48063,67 +48082,106 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         PD_RET(-1);
     PD_RET(js_parse_expect(s, ')'));
 
- done:
-    DCHECK(sp == base, "the parse descent returned with frames of its own still on the stack");
-    goto leave;
-
- unwind:
-    /* The frame array could not grow: OOM. This is the ONE exit that does not run a production's own release,
-       so it settles the atom of every frame THIS activation pushed. An outer activation's frames are its own
-       and are settled when its unwind runs. */
-    while (sp > base)
-        JS_FreeAtom(ctx, fr[--sp].atom);
-    ret = -1;
- leave:
-    s->pd_fr = fr;
-    s->pd_size = size;
-    s->pd_sp = sp;
-    if (sp == 0) {
-        /* the whole descent drained — the parse owns nothing until the next one starts */
-        js_free(ctx, fr);
-        s->pd_fr = NULL;
-        s->pd_size = 0;
-    }
-    return ret;
-#undef PD_PUSH
-#undef PD_CALL
-#undef PD_RET
-}
-
-/* allowed parse_flags: PF_IN_ACCEPTED */
-static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
-{
-    int opcode, op, scope;
-    JSAtom name0 = JS_ATOM_NULL;
-    JSAtom name;
-
+/* ---- AssignmentExpression. Three of its productions take an AssignmentExpression operand — `yield x`,
+   `a = x`, `a ??= x` — so the recursive parser spent a C frame per `=` in `a=b=c=…` and per `yield` in a
+   generator. The lvalue NAME is owned across the RHS descent, so it lives in the frame's atom slot and the
+   unwind path releases it. allowed parse_flags: PF_IN_ACCEPTED ---- */
+ assign_entry:
+    f->name0 = JS_ATOM_NULL;
     if (s->token.val == TOK_YIELD) {
-        bool is_star = false, is_async;
-
+        f->is_star = false;
         if (!(s->cur_func->func_kind & JS_FUNC_GENERATOR))
-            return js_parse_error(s, "unexpected 'yield' keyword");
+            PD_RET(js_parse_error(s, "unexpected 'yield' keyword"));
         if (!s->cur_func->in_function_body)
-            return js_parse_error(s, "yield in default expression");
+            PD_RET(js_parse_error(s, "yield in default expression"));
         if (next_token(s))
-            return -1;
-        /* XXX: is there a better method to detect 'yield' without
-           parameters ? */
+            PD_RET(-1);
+        /* XXX: is there a better method to detect 'yield' without parameters ? */
         if (s->token.val != ';' && s->token.val != ')' &&
             s->token.val != ']' && s->token.val != '}' &&
             s->token.val != ',' && s->token.val != ':' && !s->got_lf) {
             if (s->token.val == '*') {
-                is_star = true;
+                f->is_star = true;
                 if (next_token(s))
-                    return -1;
+                    PD_RET(-1);
             }
-            if (js_parse_assign_expr2(s, parse_flags))
-                return -1;
-        } else {
-            emit_op(s, OP_undefined);
+            PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_ASGN_YIELD);
         }
-        is_async = (s->cur_func->func_kind == JS_FUNC_ASYNC_GENERATOR);
+        emit_op(s, OP_undefined);
+        goto assign_yield_emit;
+    }
+    if (s->token.val == '(' &&
+        js_parse_skip_parens_token(s, NULL, true) == TOK_ARROW) {
+        PD_RET(js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
+                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                      s->token.ptr, s->token.line_num,
+                                      s->token.col_num, f->flags));
+    }
+    if (token_is_pseudo_keyword(s, JS_ATOM_async)) {
+        const uint8_t *source_ptr;
+        int atok, source_line_num, source_col_num;
+        JSParsePos pos;
 
-        if (is_star) {
+        /* fast test */
+        atok = peek_token(s, true);
+        if (atok == TOK_FUNCTION || atok == '\n')
+            goto assign_next;
+
+        source_ptr = s->token.ptr;
+        source_line_num = s->token.line_num;
+        source_col_num = s->token.col_num;
+        js_parse_get_pos(s, &pos);
+        if (next_token(s))
+            PD_RET(-1);
+        if ((s->token.val == '(' &&
+             js_parse_skip_parens_token(s, NULL, true) == TOK_ARROW) ||
+            (s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved &&
+             peek_token(s, true) == TOK_ARROW)) {
+            PD_RET(js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
+                                          JS_FUNC_ASYNC, JS_ATOM_NULL,
+                                          source_ptr, source_line_num,
+                                          source_col_num, f->flags));
+        }
+        /* undo the token parsing */
+        if (js_parse_seek_token(s, &pos))
+            PD_RET(-1);
+    } else if (s->token.val == TOK_IDENT &&
+               peek_token(s, true) == TOK_ARROW) {
+        PD_RET(js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
+                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                      s->token.ptr, s->token.line_num,
+                                      s->token.col_num, f->flags));
+    }
+ assign_next:
+    if (s->token.val == '[' || s->token.val == '{') {
+        int skip_bits;
+        if (js_parse_skip_parens_token(s, &skip_bits, false) == '=') {
+            /* 13.15 AssignmentExpression : ObjectLiteral|ArrayLiteral = AssignmentExpression — the literal is
+               REPARSED through the AssignmentPattern cover grammar. That production exists only at
+               AssignmentExpression level, so the test belongs HERE. Doing it in the primary-expression parser
+               accepted the `=` at any operand position, e.g. `#f in {} = 0`, where the grammar allows only a
+               ShiftExpression. */
+            /* it returns has_initializer (1) on success, not 0 */
+            if (js_parse_destructuring_element(s, 0, false, false,
+                                               skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
+                PD_RET(-1);
+            PD_RET(0);
+        }
+    }
+    if (s->token.val == TOK_IDENT) {
+        /* name0 is used to check for OP_set_name pattern, not duplicated */
+        f->name0 = s->token.u.ident.atom;
+    }
+    PD_CALL(PDS_CND, 0, f->flags, 0, PDS_ASGN_COND);
+
+ assign_yield_done:
+    if (ret)
+        PD_RET(-1);
+ assign_yield_emit:
+    {
+        bool is_async = (s->cur_func->func_kind == JS_FUNC_ASYNC_GENERATOR);
+
+        if (f->is_star) {
             int label_loop, label_return, label_next;
             int label_return1, label_yield, label_throw, label_throw1;
             int label_throw2;
@@ -48233,169 +48291,138 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             emit_return(s, true);
             emit_label(s, label_next);
         }
-        return 0;
-    } else if (s->token.val == '(' &&
-               js_parse_skip_parens_token(s, NULL, true) == TOK_ARROW) {
-        return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
-                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                      s->token.ptr, s->token.line_num,
-                                      s->token.col_num, parse_flags);
-    } else if (token_is_pseudo_keyword(s, JS_ATOM_async)) {
-        const uint8_t *source_ptr;
-        int tok, source_line_num, source_col_num;
-        JSParsePos pos;
+    }
+    PD_RET(0);
 
-        /* fast test */
-        tok = peek_token(s, true);
-        if (tok == TOK_FUNCTION || tok == '\n')
-            goto next;
-
-        source_ptr = s->token.ptr;
-        source_line_num = s->token.line_num;
-        source_col_num = s->token.col_num;
-        js_parse_get_pos(s, &pos);
+ assign_cond_done:
+    if (ret)
+        PD_RET(-1);
+    f->op = s->token.val;
+    if (f->op == '=' || (f->op >= TOK_MUL_ASSIGN && f->op <= TOK_POW_ASSIGN)) {
         if (next_token(s))
-            return -1;
-        if ((s->token.val == '(' &&
-             js_parse_skip_parens_token(s, NULL, true) == TOK_ARROW) ||
-            (s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved &&
-             peek_token(s, true) == TOK_ARROW)) {
-            return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
-                                          JS_FUNC_ASYNC, JS_ATOM_NULL,
-                                          source_ptr, source_line_num,
-                                          source_col_num, parse_flags);
-        } else {
-            /* undo the token parsing */
-            if (js_parse_seek_token(s, &pos))
-                return -1;
-        }
-    } else if (s->token.val == TOK_IDENT &&
-               peek_token(s, true) == TOK_ARROW) {
-        return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
-                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                      s->token.ptr, s->token.line_num,
-                                      s->token.col_num, parse_flags);
-    }
- next:
-    if (s->token.val == '[' || s->token.val == '{') {
-        int skip_bits;
-        if (js_parse_skip_parens_token(s, &skip_bits, false) == '=') {
-            /* 13.15 AssignmentExpression : ObjectLiteral|ArrayLiteral = AssignmentExpression — the literal is
-               REPARSED through the AssignmentPattern cover grammar. That production exists only at
-               AssignmentExpression level, so the test belongs HERE. Doing it in the primary-expression parser
-               accepted the `=` at any operand position, e.g. `#f in {} = 0`, where the grammar allows only a
-               ShiftExpression. */
-            /* it returns has_initializer (1) on success, not 0 */
-            if (js_parse_destructuring_element(s, 0, false, false,
-                                               skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
-                return -1;
-            return 0;
-        }
-    }
-    if (s->token.val == TOK_IDENT) {
-        /* name0 is used to check for OP_set_name pattern, not duplicated */
-        name0 = s->token.u.ident.atom;
-    }
-    /* ConditionalExpression. allowed parse_flags: PF_IN_ACCEPTED */
-    if (js_parse_descent(s, PDS_CND, 0, parse_flags, 0))
-        return -1;
-
-    op = s->token.val;
-    if (op == '=' || (op >= TOK_MUL_ASSIGN && op <= TOK_POW_ASSIGN)) {
-        int label;
-        if (next_token(s))
-            return -1;
-        if (get_lvalue(s, &opcode, &scope, &name, &label, NULL, (op != '='), op) < 0)
-            return -1;
+            PD_RET(-1);
+        if (get_lvalue(s, &f->opcode, &f->scope, &f->atom, &f->label, NULL,
+                       (f->op != '='), f->op) < 0)
+            PD_RET(-1);
 
         /* No key coercion is emitted around the RHS: a write-only member reference holds its key raw and
            OP_put_array_el runs ToObject(base) then ToPropertyKey(key) at PutValue time, which is the whole
            of the "obtuse" order. The former workaround here re-emitted a nullish-base test so the key could
            be coerced EARLY on the object-base path — the pre-ES2022 order, before a Reference Record was
            allowed to hold an un-coerced [[ReferencedName]]. */
-        if (js_parse_assign_expr2(s, parse_flags)) {
-            JS_FreeAtom(s->ctx, name);
-            return -1;
-        }
-
-        if (op == '=') {
-            if ((opcode == OP_get_ref_value || opcode == OP_scope_get_var) && name == name0) {
-                set_object_name(s, name);
-            }
-        } else {
-            emit_op(s, op - TOK_MUL_ASSIGN + OP_mul);
-        }
-        put_lvalue(s, opcode, scope, name, label, PUT_LVALUE_KEEP_TOP, false);
-    } else if (op >= TOK_LAND_ASSIGN && op <= TOK_DOUBLE_QUESTION_MARK_ASSIGN) {
-        int label, label1, depth_lvalue, label2;
-
+        PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_ASGN_RHS);
+    }
+    if (f->op >= TOK_LAND_ASSIGN && f->op <= TOK_DOUBLE_QUESTION_MARK_ASSIGN) {
         if (next_token(s))
-            return -1;
-        if (get_lvalue(s, &opcode, &scope, &name, &label,
-                       &depth_lvalue, true, op) < 0)
-            return -1;
+            PD_RET(-1);
+        if (get_lvalue(s, &f->opcode, &f->scope, &f->atom, &f->label,
+                       &f->depth_lvalue, true, f->op) < 0)
+            PD_RET(-1);
 
         emit_op(s, OP_dup);
-        if (op == TOK_DOUBLE_QUESTION_MARK_ASSIGN)
+        if (f->op == TOK_DOUBLE_QUESTION_MARK_ASSIGN)
             emit_op(s, OP_is_undefined_or_null);
-        label1 = emit_goto(s, op == TOK_LOR_ASSIGN ? OP_if_true : OP_if_false,
-                           -1);
+        f->label1 = emit_goto(s, f->op == TOK_LOR_ASSIGN ? OP_if_true : OP_if_false,
+                              -1);
         emit_op(s, OP_drop);
 
-        if (js_parse_assign_expr2(s, parse_flags)) {
-            JS_FreeAtom(s->ctx, name);
-            return -1;
-        }
-
-        if ((opcode == OP_get_ref_value || opcode == OP_scope_get_var) && name == name0) {
-            set_object_name(s, name);
-        }
-
-        switch(depth_lvalue) {
-        case 0:
-            emit_op(s, OP_dup);
-            break;
-        case 1:
-            emit_op(s, OP_insert2);
-            break;
-        case 2:
-            emit_op(s, OP_insert3);
-            break;
-        case 3:
-            emit_op(s, OP_insert4);
-            break;
-        default:
-            abort();
-        }
-
-        /* The shaping above IS PUT_LVALUE_KEEP_TOP's, so it looks like a duplicate — it is not, and it must not
-           be collapsed into one. put_lvalue emits a reference's LABEL before the shaping opcode, which is the
-           pattern resolve_scope_var's optimizer recognises, and that optimizer REMOVES the reference's two stack
-           slots. The short-circuit path below pops those slots by the parse-time `depth_lvalue`, which cannot
-           know whether the optimizer will fire; letting it fire underflows that path. Hence NOKEEP_DEPTH here
-           and the label after the shape: this form keeps a real reference on purpose. */
-        put_lvalue(s, opcode, scope, name, label, PUT_LVALUE_NOKEEP_DEPTH,
-                   false);
-        label2 = emit_goto(s, OP_goto, -1);
-
-        emit_label(s, label1);
-
-        /* remove the lvalue stack entries */
-        while (depth_lvalue != 0) {
-            emit_op(s, OP_nip);
-            depth_lvalue--;
-        }
-
-        emit_label(s, label2);
+        PD_CALL(PDS_ASGN, 0, f->flags, 0, PDS_ASGN_LOGRHS);
     }
-    return 0;
+    PD_RET(0);
+
+ assign_rhs_done:
+    if (ret) {
+        JS_FreeAtom(ctx, f->atom);
+        f->atom = JS_ATOM_NULL;
+        PD_RET(-1);
+    }
+    if (f->op == '=') {
+        if ((f->opcode == OP_get_ref_value || f->opcode == OP_scope_get_var) &&
+            f->atom == f->name0) {
+            set_object_name(s, f->atom);
+        }
+    } else {
+        emit_op(s, f->op - TOK_MUL_ASSIGN + OP_mul);
+    }
+    /* put_lvalue CONSUMES the name, so the frame stops owning it here — the PD_RET DCHECK is what makes a
+       missed hand-off crash instead of leaking. */
+    put_lvalue(s, f->opcode, f->scope, f->atom, f->label, PUT_LVALUE_KEEP_TOP, false);
+    f->atom = JS_ATOM_NULL;
+    PD_RET(0);
+
+ assign_logrhs_done:
+    if (ret) {
+        JS_FreeAtom(ctx, f->atom);
+        f->atom = JS_ATOM_NULL;
+        PD_RET(-1);
+    }
+    if ((f->opcode == OP_get_ref_value || f->opcode == OP_scope_get_var) &&
+        f->atom == f->name0) {
+        set_object_name(s, f->atom);
+    }
+
+    switch (f->depth_lvalue) {
+    case 0: emit_op(s, OP_dup); break;
+    case 1: emit_op(s, OP_insert2); break;
+    case 2: emit_op(s, OP_insert3); break;
+    case 3: emit_op(s, OP_insert4); break;
+    default:
+        /* get_lvalue's own contract: a reference occupies at most four stack slots. */
+        DFAIL("logical-assignment lvalue occupies a stack depth get_lvalue cannot produce");
+        JS_FreeAtom(ctx, f->atom);
+        f->atom = JS_ATOM_NULL;
+        PD_RET(-1);
+    }
+
+    /* The shaping above IS PUT_LVALUE_KEEP_TOP's, so it looks like a duplicate — it is not, and it must not
+       be collapsed into one. put_lvalue emits a reference's LABEL before the shaping opcode, which is the
+       pattern resolve_scope_var's optimizer recognises, and that optimizer REMOVES the reference's two stack
+       slots. The short-circuit path below pops those slots by the parse-time `depth_lvalue`, which cannot
+       know whether the optimizer will fire; letting it fire underflows that path. Hence NOKEEP_DEPTH here
+       and the label after the shape: this form keeps a real reference on purpose. */
+    put_lvalue(s, f->opcode, f->scope, f->atom, f->label, PUT_LVALUE_NOKEEP_DEPTH, false);
+    f->atom = JS_ATOM_NULL;
+    f->label2 = emit_goto(s, OP_goto, -1);
+
+    emit_label(s, f->label1);
+
+    /* remove the lvalue stack entries */
+    while (f->depth_lvalue != 0) {
+        emit_op(s, OP_nip);
+        f->depth_lvalue--;
+    }
+
+    emit_label(s, f->label2);
+    PD_RET(0);
+
+ done:
+    DCHECK(sp == base, "the parse descent returned with frames of its own still on the stack");
+    goto leave;
+
+ unwind:
+    /* The frame array could not grow: OOM. This is the ONE exit that does not run a production's own release,
+       so it settles the atom of every frame THIS activation pushed. An outer activation's frames are its own
+       and are settled when its unwind runs. */
+    while (sp > base)
+        JS_FreeAtom(ctx, fr[--sp].atom);
+    ret = -1;
+ leave:
+    s->pd_fr = fr;
+    s->pd_size = size;
+    s->pd_sp = sp;
+    if (sp == 0) {
+        /* the whole descent drained — the parse owns nothing until the next one starts */
+        js_free(ctx, fr);
+        s->pd_fr = NULL;
+        s->pd_size = 0;
+    }
+    return ret;
+#undef PD_PUSH
+#undef PD_CALL
+#undef PD_RET
 }
 
-static __exception int js_parse_assign_expr(JSParseState *s)
-{
-    return js_parse_assign_expr2(s, PF_IN_ACCEPTED);
-}
-
+/* allowed parse_flags: PF_IN_ACCEPTED */
 static void push_break_entry(JSFunctionDef *fd, BlockEnv *be,
                              JSAtom label_name,
                              int label_break, int label_cont,
@@ -48746,7 +48773,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                     emit_u16(s, fd->scope_level);
                     if (get_lvalue(s, &opcode, &scope, &name1, &label, NULL, false, '=') < 0)
                         goto var_error;
-                    if (js_parse_assign_expr2(s, parse_flags)) {
+                    if (js_parse_descent(s, PDS_ASGN, 0, parse_flags, 0)) {
                         JS_FreeAtom(ctx, name1);
                         goto var_error;
                     }
@@ -48775,7 +48802,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                         }
                     }
 
-                    if (js_parse_assign_expr2(s, parse_flags))
+                    if (js_parse_descent(s, PDS_ASGN, 0, parse_flags, 0))
                         goto var_error;
                     set_object_name(s, name);
 
@@ -49076,7 +49103,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
         /* parse and evaluate initializer prior to evaluating the
            object (only used with "for in" with a non lexical variable
            in non strict mode */
-        if (next_token(s) || js_parse_assign_expr2(s, 0)) {
+        if (next_token(s) || js_parse_descent(s, PDS_ASGN, 0, 0, 0)) {
             JS_FreeAtom(ctx, var_name);
             return -1;
         }
@@ -49114,7 +49141,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     if (next_token(s))
         return -1;
     if (is_for_of) {
-        if (js_parse_assign_expr(s))
+        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
             return -1;
     } else {
         if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
@@ -53320,7 +53347,7 @@ static __exception int js_parse_export(JSParseState *s)
                                            s->token.col_num,
                                            JS_PARSE_EXPORT_DEFAULT, NULL, PF_IN_ACCEPTED);
         } else {
-            if (js_parse_assign_expr(s))
+            if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                 return -1;
         }
         /* set the name of anonymous functions */
@@ -54359,7 +54386,7 @@ static int optimize_scope_make_ref(JSContext *ctx, JSFunctionDef *s,
 
 /* Rewrite the WRITE through a reference to a `const` binding into its TypeError, in place, leaving the
    reference and its read alone. Where the optimizer cannot collapse the reference — the logical forms keep a
-   real one on purpose, see js_parse_assign_expr2 — the put still sits immediately after its OP_label, and those
+   real one on purpose, see js_parse_descent's PDS_ASGN_LOGRHS — the put still sits immediately after its OP_label, and those
    two are 5 + 1 bytes, exactly the six an OP_throw_error needs. Returns false when the put is not where it is
    expected, in which case the caller falls back to throwing at the reference itself. */
 static bool scope_make_ref_put_ro(JSContext *ctx, uint8_t *bc_buf, LabelSlot *ls, JSAtom var_name)
@@ -58443,7 +58470,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     emit_op(s, OP_strict_eq);
                     emit_goto(s, OP_if_false, label);
                     emit_op(s, OP_drop);
-                    if (js_parse_assign_expr(s))
+                    if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
                         goto fail;
                     set_object_name(s, name);
                     emit_op(s, OP_dup);
@@ -58549,7 +58576,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             if (js_parse_function_check_names(s, fd, func_name))
                 goto fail;
 
-            if (js_parse_assign_expr2(s, parse_flags & PF_IN_ACCEPTED))
+            if (js_parse_descent(s, PDS_ASGN, 0, parse_flags & PF_IN_ACCEPTED, 0))
                 goto fail;
 
             if (func_kind != JS_FUNC_NORMAL)
