@@ -45990,6 +45990,10 @@ struct JSParseFrame {
     int     label2;
     int     opcode;     /* expr_binary: the operator whose operands are being parsed */
     JSAtom  atom;       /* owned, or JS_ATOM_NULL. The unwind path releases it. */
+    JSAtom  atom3, atom4;  /* ClassDeclaration holds FOUR owned atoms across one descent: the member name,
+                              the class binding, its var-scope alias and the current field's hidden var. All
+                              four are released by the same unwind — a frame owns everything in its atom
+                              slots, and the PD_RET DCHECK covers every one. */
     JSAtom  atom2;      /* a SECOND owned atom, for a production holding two across one descent —
                            VariableDeclaration holds the binding's name AND get_lvalue's reference name.
                            Released by the same unwind: a frame owns everything in its atom slots. */
@@ -46111,7 +46115,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 #define PD_INIT()                                                               \
         f->state = e_; f->level = lv_; f->flags = fl_; f->op = o_;               \
         f->label1 = -1; f->label2 = -1; f->opcode = 0; f->atom = JS_ATOM_NULL;   \
-        f->atom2 = JS_ATOM_NULL;                                                 \
+        f->atom2 = JS_ATOM_NULL; f->atom3 = JS_ATOM_NULL; f->atom4 = JS_ATOM_NULL; \
         f->comma = false; f->is_star = false; f->name0 = JS_ATOM_NULL;           \
         f->scope = 0; f->label = -1; f->depth_lvalue = 0;                        \
         f->call_type = 0; f->call_line_num = 0; f->call_col_num = 0;             \
@@ -46160,7 +46164,8 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
 /* A production finished: its return code becomes the caller's `pd_ret`. */
 #define PD_RET(v_) do {                                                         \
-        DCHECK(f->atom == JS_ATOM_NULL && f->atom2 == JS_ATOM_NULL,              \
+        DCHECK(f->atom == JS_ATOM_NULL && f->atom2 == JS_ATOM_NULL &&            \
+               f->atom3 == JS_ATOM_NULL && f->atom4 == JS_ATOM_NULL,             \
                "a parse frame was popped still owning an atom — it leaks");     \
         pd_ret = (v_); s->pd_sp--; goto dispatch;                                  \
     } while (0)
@@ -50303,6 +50308,8 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         s->pd_sp--;
         JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom);
         JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom2);
+        JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom3);
+        JS_FreeAtom(ctx, PD_FRAME(s->pd_sp)->atom4);
     }
     pd_ret = -1;
  leave:
