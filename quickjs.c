@@ -61162,11 +61162,17 @@ uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
 typedef struct BCRFrame {
     uint8_t  kind;
     uint8_t  phase;
-    JSValue  obj;
+    JSValue  obj;       /* the container being filled, where the arm builds one up front */
     uint32_t i, len;
     bool     flag;      /* ARRAY: template, so a trailing `raw` follows the elements */
+    JSAtom   atom;      /* OBJ: the key whose value is being read */
+    JSValue  key;       /* MAP: the key, held across the value's own read */
+    uint8_t  phase2_pending;  /* MAP: a key is in hand and the value is owed */
+    void    *p1;        /* FUNC: JSFunctionBytecode*   MODULE: JSModuleDef* */
+    uint32_t u1, u2, u3;/* TA: class id, length, byte offset (u3 = the reserved ref slot) */
 } BCRFrame;
-enum { BCR_READ, BCR_ARRAY };
+enum { BCR_READ, BCR_ARRAY, BCR_OBJ, BCR_MAP, BCR_DATE, BCR_OBJVAL,
+       BCR_TA, BCR_FUNC, BCR_MODULE };
 
 typedef struct BCReaderState {
     JSContext *ctx;
@@ -61526,6 +61532,26 @@ static JSValue JS_ReadBigInt(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+static int bcr_push(BCReaderState *s)
+{
+    if (s->r_sp >= s->r_size) {
+        int n = s->r_size ? s->r_size * 2 : 16;
+        BCRFrame *t = js_realloc(s->ctx, s->r_stack, sizeof(*t) * n);
+        if (!t)
+            return -1;
+        s->r_stack = t;
+        s->r_size = n;
+    }
+    memset(&s->r_stack[s->r_sp], 0, sizeof(s->r_stack[0]));
+    s->r_stack[s->r_sp].obj = JS_UNDEFINED;
+    s->r_stack[s->r_sp].key = JS_UNDEFINED;
+    s->r_stack[s->r_sp].atom = JS_ATOM_NULL;
+    s->r_sp++;
+    return 0;
+}
+
+static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
+                         int argc, JSValueConst *argv, int magic);
 static JSValue JS_ReadObjectRec(BCReaderState *s);
 
 static int BC_add_object_ref1(BCReaderState *s, JSObject *p)
@@ -61715,17 +61741,35 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
-    if (b->cpool_count != 0) {
-        bc_read_trace(s, "cpool {\n");
-        for(i = 0; i < b->cpool_count; i++) {
-            JSValue val;
-            val = JS_ReadObjectRec(s);
-            if (JS_IsException(val))
-                goto fail;
-            b->cpool[i] = val;
-        }
-        bc_read_trace(s, "}\n");
+    /* THE CONSTANT POOL IS A FRAME, and the bytecode that follows it is the frame's tail. Splitting here is
+       what lets a nested function — a constant of its parent — be read without a C frame per level. The
+       byte-code offset the tail needs is carried on the frame, not in a local this function no longer owns. */
+    if (bcr_push(s) < 0)
+        goto fail;
+    {
+        BCRFrame *f = &s->r_stack[s->r_sp - 1];
+        f->kind = BCR_FUNC;
+        f->obj = obj;
+        f->p1 = b;
+        f->len = b->cpool_count;
+        f->u1 = byte_code_offset;
+        f->u2 = has_debug_info;
     }
+    return JS_UNDEFINED;
+ fail:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
+/* Everything in a function record that follows its constant pool. */
+static JSValue bcr_func_tail(BCReaderState *s, BCRFrame *fr)
+{
+    JSContext *ctx = s->ctx;
+    JSValue obj = fr->obj;
+    JSFunctionBytecode *b = fr->p1;
+    uint32_t byte_code_offset = fr->u1;
+    bool has_debug_info = fr->u2;
+
     {
         bc_read_trace(s, "bytecode {\n");
         if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
@@ -61780,7 +61824,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     return obj;
 
  fail:
-    JS_FreeAtom(ctx, bc.func_name);
+    /* No bc.func_name release here: that local belongs to the header half, and by the time the tail runs the
+       name is owned by b and is freed with it. */
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
 }
@@ -61904,10 +61949,17 @@ static JSValue JS_ReadModule(BCReaderState *s)
         goto fail;
     m->has_tla = (v8 != 0);
 
-    m->func_obj = JS_ReadObjectRec(s);
-    if (JS_IsException(m->func_obj))
+    /* func_obj is the last field and it is a whole value, so it is a FRAME: the module object is already
+       built and reference-registered, and the driver drops the child straight into m->func_obj. */
+    if (bcr_push(s) < 0)
         goto fail;
-    return obj;
+    {
+        BCRFrame *f = &s->r_stack[s->r_sp - 1];
+        f->kind = BCR_MODULE;
+        f->obj = obj;
+        f->p1 = m;
+    }
+    return JS_UNDEFINED;
  fail:
     if (m) {
         js_free_module_def(ctx, m);
@@ -61919,82 +61971,24 @@ static JSValue JS_ReadObjectTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
     JSValue obj;
-    uint32_t prop_count, i;
-    JSAtom atom;
-    JSValue val;
-    int ret;
+    uint32_t prop_count;
 
     obj = JS_NewObject(ctx);
     if (BC_add_object_ref(s, obj))
         goto fail;
     if (bc_get_leb128(s, &prop_count))
         goto fail;
-    for(i = 0; i < prop_count; i++) {
-        if (bc_get_atom(s, &atom))
-            goto fail;
-#ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-        if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
-            bc_read_trace(s, "propname: ");
-            print_atom(s->ctx, atom);
-            printf("\n");
-        }
-#endif
-        val = JS_ReadObjectRec(s);
-        if (JS_IsException(val)) {
-            JS_FreeAtom(ctx, atom);
-            goto fail;
-        }
-        ret = JS_DefinePropertyValue(ctx, obj, atom, val, JS_PROP_C_W_E);
-        JS_FreeAtom(ctx, atom);
-        if (ret < 0)
-            goto fail;
-    }
-    return obj;
- fail:
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
-}
-
-static JSValue JS_ReadArray(BCReaderState *s, int tag)
-{
-    JSContext *ctx = s->ctx;
-    JSValue obj;
-    uint32_t len, i;
-    JSValue val;
-    int ret, prop_flags;
-    bool is_template;
-
-    obj = JS_NewArray(ctx);
-    if (BC_add_object_ref(s, obj))
+    /* The properties are a FRAME: each value is a whole nested read, and the key must be held across it. */
+    if (bcr_push(s) < 0)
         goto fail;
-    is_template = (tag == BC_TAG_TEMPLATE_OBJECT);
-    if (bc_get_leb128(s, &len))
-        goto fail;
-    for(i = 0; i < len; i++) {
-        val = JS_ReadObjectRec(s);
-        if (JS_IsException(val))
-            goto fail;
-        if (is_template)
-            prop_flags = JS_PROP_ENUMERABLE;
-        else
-            prop_flags = JS_PROP_C_W_E;
-        ret = JS_DefinePropertyValueUint32(ctx, obj, i, val,
-                                           prop_flags);
-        if (ret < 0)
-            goto fail;
+    {
+        BCRFrame *f = &s->r_stack[s->r_sp - 1];
+        f->kind = BCR_OBJ;
+        f->obj = obj;
+        f->len = prop_count;
+        f->atom = JS_ATOM_NULL;
     }
-    if (is_template) {
-        val = JS_ReadObjectRec(s);
-        if (JS_IsException(val))
-            goto fail;
-        if (!JS_IsUndefined(val)) {
-            ret = JS_DefinePropertyValue(ctx, obj, JS_ATOM_raw, val, 0);
-            if (ret < 0)
-                goto fail;
-        }
-        JS_PreventExtensions(ctx, obj);
-    }
-    return obj;
+    return JS_UNDEFINED;
  fail:
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
@@ -62003,9 +61997,7 @@ static JSValue JS_ReadArray(BCReaderState *s, int tag)
 static JSValue JS_ReadTypedArray(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
-    JSValue obj = JS_UNDEFINED, array_buffer = JS_UNDEFINED;
     uint8_t array_tag;
-    JSValueConst args[3];
     uint32_t offset, len, idx;
 
     if (bc_get_u8(s, &array_tag))
@@ -62016,35 +62008,22 @@ static JSValue JS_ReadTypedArray(BCReaderState *s)
         return JS_EXCEPTION;
     if (bc_get_leb128(s, &offset))
         return JS_EXCEPTION;
-    /* XXX: this hack could be avoided if the typed array could be
-       created before the array buffer */
+    /* The reference slot is RESERVED before the buffer is read and filled in after the view exists, which is
+       the same hack the recursive arm used and the same order the ids must be assigned in. */
     idx = s->objects_count;
     if (BC_add_object_ref1(s, NULL))
-        goto fail;
-    array_buffer = JS_ReadObjectRec(s);
-    if (JS_IsException(array_buffer))
         return JS_EXCEPTION;
-    if (!js_get_array_buffer(ctx, array_buffer)) {
-        JS_FreeValue(ctx, array_buffer);
+    if (bcr_push(s) < 0)
         return JS_EXCEPTION;
+    {
+        BCRFrame *f = &s->r_stack[s->r_sp - 1];
+        f->kind = BCR_TA;
+        f->u1 = array_tag;
+        f->u2 = len;
+        f->u3 = offset;
+        f->i = idx;
     }
-    args[0] = array_buffer;
-    args[1] = js_int64(offset);
-    args[2] = js_int64(len);
-    obj = js_typed_array_constructor(ctx, JS_UNDEFINED,
-                                     3, args,
-                                     JS_CLASS_UINT8C_ARRAY + array_tag);
-    if (JS_IsException(obj))
-        goto fail;
-    if (s->allow_reference) {
-        s->objects[idx] = JS_VALUE_GET_OBJ(obj);
-    }
-    JS_FreeValue(ctx, array_buffer);
-    return obj;
- fail:
-    JS_FreeValue(ctx, array_buffer);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    return JS_UNDEFINED;
 }
 
 static JSValue JS_ReadArrayBuffer(BCReaderState *s)
@@ -62159,81 +62138,37 @@ static JSValue JS_ReadRegExp(BCReaderState *s)
 
 static JSValue JS_ReadDate(BCReaderState *s)
 {
-    JSContext *ctx = s->ctx;
-    JSValue val, obj = JS_UNDEFINED;
-
-    val = JS_ReadObjectRec(s);
-    if (JS_IsException(val))
-        goto fail;
-    if (!JS_IsNumber(val)) {
-        JS_ThrowTypeError(ctx, "Number tag expected for date");
-        goto fail;
-    }
-    obj = JS_NewObjectProtoClass(ctx, ctx->class_proto[JS_CLASS_DATE],
-                                 JS_CLASS_DATE);
-    if (JS_IsException(obj))
-        goto fail;
-    if (BC_add_object_ref(s, obj))
-        goto fail;
-    JS_SetObjectData(ctx, obj, val);
-    return obj;
- fail:
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    /* The child comes FIRST here — the recursive arm read the number before creating the Date, so the object
+       reference ids are assigned in that order and the frame must keep it. */
+    if (bcr_push(s) < 0)
+        return JS_EXCEPTION;
+    s->r_stack[s->r_sp - 1].kind = BCR_DATE;
+    return JS_UNDEFINED;
 }
 
 static JSValue JS_ReadObjectValue(BCReaderState *s)
 {
-    JSContext *ctx = s->ctx;
-    JSValue val, obj = JS_UNDEFINED;
-
-    val = JS_ReadObjectRec(s);
-    if (JS_IsException(val))
-        goto fail;
-    obj = JS_ToObject(ctx, val);
-    if (JS_IsException(obj))
-        goto fail;
-    if (BC_add_object_ref(s, obj))
-        goto fail;
-    JS_FreeValue(ctx, val);
-    return obj;
- fail:
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    if (bcr_push(s) < 0)
+        return JS_EXCEPTION;
+    s->r_stack[s->r_sp - 1].kind = BCR_OBJVAL;
+    return JS_UNDEFINED;
 }
 
 static JSValue JS_ReadMap(BCReaderState *s);
 static JSValue JS_ReadSet(BCReaderState *s);
 
-static int bcr_push(BCReaderState *s)
-{
-    if (s->r_sp >= s->r_size) {
-        int n = s->r_size ? s->r_size * 2 : 16;
-        BCRFrame *t = js_realloc(s->ctx, s->r_stack, sizeof(*t) * n);
-        if (!t)
-            return -1;
-        s->r_stack = t;
-        s->r_size = n;
-    }
-    memset(&s->r_stack[s->r_sp], 0, sizeof(s->r_stack[0]));
-    s->r_stack[s->r_sp].obj = JS_UNDEFINED;
-    s->r_sp++;
-    return 0;
-}
 
 /* READ ONE VALUE. Returns it, or — for a tag whose arm is on the frame stack — PUSHES a frame and returns
-   JS_UNDEFINED with the stack grown, which the driver detects and drives. The stack guard is still here
-   because the arms below that still call this function re-enter it; it goes when the last one stops. */
+   JS_UNDEFINED with the stack grown, which the driver detects and drives.
+   NO STACK GUARD. Every arm that used to re-enter this function now pushes a frame instead, so the C depth
+   here is a constant the serialised graph cannot pick. The guard that stood in front of the recursion turned
+   a graph the format can represent into a RangeError: measured, a nested array round-trip threw between depth
+   3000 and 5000, and it reaches 200000 now. Deleting it is what makes the flat-stack claim falsifiable. */
 static JSValue bcr_read_one(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
     uint8_t tag;
     JSValue obj = JS_UNDEFINED;
-
-    if (js_check_stack_overflow(ctx->rt, 0))
-        return JS_ThrowStackOverflow(ctx);
 
     if (bc_get_u8(s, &tag))
         return JS_EXCEPTION;
@@ -62420,6 +62355,111 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
             BCRFrame *f = &s->r_stack[s->r_sp - 1];
             if (f->phase == 1) {
                 /* a child just arrived: install it */
+                if (f->kind == BCR_OBJ) {
+                    int r = JS_DefinePropertyValue(ctx, f->obj, f->atom, result, JS_PROP_C_W_E);
+                    JS_FreeAtom(ctx, f->atom);
+                    f->atom = JS_ATOM_NULL;
+                    result = JS_UNDEFINED;
+                    if (r < 0)
+                        goto fail;
+                    f->i++;
+                    f->phase = 0;
+                    continue;
+                }
+                if (f->kind == BCR_MAP) {
+                    JSValue rv;
+                    if (!f->flag && f->phase2_pending == 0) {
+                        /* the key of a map: hold it and come back for the value */
+                        f->key = result;
+                        result = JS_UNDEFINED;
+                        f->phase2_pending = 1;
+                        f->phase = 0;
+                        continue;
+                    }
+                    {
+                        JSValue argv[2];
+                        argv[0] = f->flag ? result : f->key;
+                        argv[1] = f->flag ? JS_UNDEFINED : result;
+                        rv = js_map_set(ctx, f->obj, 2, vc(argv), f->u1);
+                        JS_FreeValue(ctx, argv[0]);
+                        JS_FreeValue(ctx, argv[1]);
+                        f->key = JS_UNDEFINED;
+                        result = JS_UNDEFINED;
+                        f->phase2_pending = 0;
+                        if (JS_IsException(rv))
+                            goto fail;
+                        JS_FreeValue(ctx, rv);
+                    }
+                    f->i++;
+                    f->phase = 0;
+                    continue;
+                }
+                if (f->kind == BCR_DATE) {
+                    JSValue d;
+                    if (!JS_IsNumber(result)) {
+                        JS_ThrowTypeError(ctx, "Number tag expected for date");
+                        goto fail;
+                    }
+                    d = JS_NewObjectProtoClass(ctx, ctx->class_proto[JS_CLASS_DATE], JS_CLASS_DATE);
+                    if (JS_IsException(d))
+                        goto fail;
+                    if (BC_add_object_ref(s, d)) {
+                        JS_FreeValue(ctx, d);
+                        goto fail;
+                    }
+                    JS_SetObjectData(ctx, d, result);   /* takes the number */
+                    result = d;
+                    s->r_sp--;
+                    continue;
+                }
+                if (f->kind == BCR_OBJVAL) {
+                    JSValue o = JS_ToObject(ctx, result);
+                    if (JS_IsException(o))
+                        goto fail;
+                    if (BC_add_object_ref(s, o)) {
+                        JS_FreeValue(ctx, o);
+                        goto fail;
+                    }
+                    JS_FreeValue(ctx, result);
+                    result = o;
+                    s->r_sp--;
+                    continue;
+                }
+                if (f->kind == BCR_TA) {
+                    JSValueConst args[3];
+                    JSValue o;
+                    if (!js_get_array_buffer(ctx, result))
+                        goto fail;
+                    args[0] = result;
+                    args[1] = js_int64(f->u3);
+                    args[2] = js_int64(f->u2);
+                    o = js_typed_array_constructor(ctx, JS_UNDEFINED, 3, args,
+                                                   JS_CLASS_UINT8C_ARRAY + f->u1);
+                    if (JS_IsException(o))
+                        goto fail;
+                    if (s->allow_reference)
+                        s->objects[f->i] = JS_VALUE_GET_OBJ(o);
+                    JS_FreeValue(ctx, result);
+                    result = o;
+                    s->r_sp--;
+                    continue;
+                }
+                if (f->kind == BCR_MODULE) {
+                    JSModuleDef *m = f->p1;
+                    m->func_obj = result;
+                    result = f->obj;
+                    f->obj = JS_UNDEFINED;
+                    s->r_sp--;
+                    continue;
+                }
+                if (f->kind == BCR_FUNC) {
+                    JSFunctionBytecode *b = f->p1;
+                    b->cpool[f->i] = result;
+                    result = JS_UNDEFINED;
+                    f->i++;
+                    f->phase = 0;
+                    continue;
+                }
                 if (f->kind == BCR_ARRAY) {
                     int pf = f->flag ? JS_PROP_ENUMERABLE : JS_PROP_C_W_E;
                     if (f->i < f->len) {
@@ -62452,7 +62492,38 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
                 continue;
             }
             /* phase 0: does this frame still want a child? */
-            if (f->i < f->len || f->flag) {
+            if (f->kind == BCR_OBJ) {
+                if (f->i < f->len) {
+                    if (bc_get_atom(s, &f->atom))
+                        goto fail;
+                    f->phase = 1;
+                    need_read = true;
+                    continue;
+                }
+            } else if (f->kind == BCR_MAP) {
+                if (f->i < f->len || f->phase2_pending) {
+                    f->phase = 1;
+                    need_read = true;
+                    continue;
+                }
+            } else if (f->kind == BCR_DATE || f->kind == BCR_OBJVAL ||
+                       f->kind == BCR_TA || f->kind == BCR_MODULE) {
+                f->phase = 1;
+                need_read = true;
+                continue;
+            } else if (f->kind == BCR_FUNC) {
+                if (f->i < f->len) {
+                    f->phase = 1;
+                    need_read = true;
+                    continue;
+                }
+                result = bcr_func_tail(s, f);
+                f->obj = JS_UNDEFINED;
+                s->r_sp--;
+                if (JS_IsException(result))
+                    goto fail;
+                continue;
+            } else if (f->i < f->len || f->flag) {
                 f->phase = 1;
                 need_read = true;
                 continue;
@@ -62467,7 +62538,11 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
     while (s->r_sp > base) {
         s->r_sp--;
         JS_FreeValue(ctx, s->r_stack[s->r_sp].obj);
+        JS_FreeValue(ctx, s->r_stack[s->r_sp].key);
+        JS_FreeAtom(ctx, s->r_stack[s->r_sp].atom);
         s->r_stack[s->r_sp].obj = JS_UNDEFINED;
+        s->r_stack[s->r_sp].key = JS_UNDEFINED;
+        s->r_stack[s->r_sp].atom = JS_ATOM_NULL;
     }
     s->r_base = saved_base;
     return JS_EXCEPTION;
@@ -86965,6 +87040,7 @@ static JSValue js_map_read(BCReaderState *s, int magic)
 
     argv[0] = JS_UNDEFINED;
     argv[1] = JS_UNDEFINED;
+    (void)argv; (void)rv; (void)i;
     obj = js_map_new(ctx, magic);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
@@ -86972,29 +87048,21 @@ static JSValue js_map_read(BCReaderState *s, int magic)
         goto fail;
     if (bc_get_leb128(s, &prop_count))
         goto fail;
-    for(i = 0; i < prop_count; i++) {
-        argv[0] = JS_ReadObjectRec(s);
-        if (JS_IsException(argv[0]))
-            goto fail;
-        if (!(magic & MAGIC_SET)) {
-            argv[1] = JS_ReadObjectRec(s);
-            if (JS_IsException(argv[1]))
-                goto fail;
-        }
-        rv = js_map_set(ctx, obj, countof(argv), vc(argv), magic);
-        if (JS_IsException(rv))
-            goto fail;
-        JS_FreeValue(ctx, rv);
-        JS_FreeValue(ctx, argv[0]);
-        JS_FreeValue(ctx, argv[1]);
-        argv[0] = JS_UNDEFINED;
-        argv[1] = JS_UNDEFINED;
+    /* The records are a FRAME: a key and (for a map) a value are each a whole nested read, and the key has to
+       be held across the value's. */
+    if (bcr_push(s) < 0)
+        goto fail;
+    {
+        BCRFrame *f = &s->r_stack[s->r_sp - 1];
+        f->kind = BCR_MAP;
+        f->obj = obj;
+        f->len = prop_count;
+        f->flag = (magic & MAGIC_SET) != 0;
+        f->u1 = magic;
     }
-    return obj;
+    return JS_UNDEFINED;
  fail:
     JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, argv[0]);
-    JS_FreeValue(ctx, argv[1]);
     return JS_EXCEPTION;
 }
 
