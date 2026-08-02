@@ -12728,6 +12728,26 @@ void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id)
     return p->u.opaque;
 }
 
+/* THE LAST C-DRIVES-JS PATH IN ToPrimitive, and what is left of it is ONE site.
+   This function runs user code — @@toPrimitive, valueOf, toString — through JS_CallFree, the single edge that
+   holds 417 of the interpreter cycle's 433 functions (engine/check_recursion.mjs --why-blob). The trampolined
+   form already exists (JSToPrim, operand and machine mode) and the operator dispatch, the key coercions and
+   every PRIMARGS builtin use it.
+   WHICH CALLERS STILL REACH IT WAS MEASURED, not read: a DCHECK on the path below, run over the whole corpus,
+   names them one at a time. Round one was BigInt.prototype.toString coercing its radix from C — fixed by
+   declaring it PRIMARGS, the mechanism that already existed. Round two is:
+
+     obj stored into a BigInt typed array element
+     JS_SetPropertyValue -> JS_ToBigInt64Free -> JS_ToBigIntFree -> JS_ToPrimitiveFree
+
+   That one is not a builtin's argument, so PRIMARGS does not reach it: the coercion happens inside the
+   ELEMENT STORE, so the interpreter has to route the VALUE at OP_put_array_el the way it already routes an
+   operand (TPR_ADD_AFTER_COERCE) and a computed key (TPR_GET_ARRAY_EL) — coerce on the tramp, resume, redo the
+   store. Numeric typed arrays reach the same place through JS_ToNumberFree and are only unobserved because the
+   probe aborts at the first firing, so expect more than one once that store is routed.
+   Do NOT leave the DCHECK enabled to force this: it aborts on input the corpus does not happen to cover, which
+   ships a crash for unbuilt work rather than a forcing function. Re-arm it deliberately, fix what it names,
+   remove it again. */
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
 {
     int i;
