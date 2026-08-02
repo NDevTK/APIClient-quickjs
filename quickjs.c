@@ -44422,7 +44422,10 @@ static void emit_async_iterator_close(JSParseState *s);
 #define DE_PACK(is_arg_, hasval_, allow_init_, export_, ellipsis_)              \
     (((is_arg_) ? DE_IS_ARG : 0) | ((hasval_) ? DE_HASVAL : 0) |                \
      ((allow_init_) ? DE_ALLOW_INIT : 0) | ((export_) ? DE_EXPORT : 0) |        \
-     ((((ellipsis_) + 1) & 3) << 4))
+     ((((ellipsis_) < 0 ? 0 : ((ellipsis_) ? 2 : 1))) << 4))
+/* has_ellipsis is TRI-STATE but callers pass `skip_bits & SKIP_HAS_ELLIPSIS`, a BITMASK whose set value is not
+   1 — so it is normalised on the way in (negative -> -1, zero -> 0, anything else -> 1) rather than biased
+   arithmetically, which packed garbage for every masked caller. */
 
 static __exception int js_parse_function_decl(JSParseState *s,
                                               JSParseFunctionEnum func_type,
@@ -46122,7 +46125,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->st_mask = 0; f->st_tok = 0; f->st_bits = 0;                           \
         f->st_line = 0; f->st_col = 0; f->st_idx = 0; f->st_is_async = false;    \
         f->st_flag = false;                                                      \
-        f->st_b1 = false; f->st_b2 = false; f->st_b3 = false;                    \
+        f->st_b1 = false; f->st_b2 = false; f->st_b3 = false; \
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
         f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;
 
@@ -50133,7 +50136,6 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         bool has_spread;
         int enum_depth;
         int source_line_num, source_col_num;
-        BlockEnv block_env;
 
         source_line_num = s->token.line_num;
         source_col_num = s->token.col_num;
@@ -50141,9 +50143,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             goto de_fail;
         /* the block environment is only needed in generators in case
            'yield' triggers a 'return' */
-        push_break_entry(s->cur_func, &block_env,
+        push_break_entry(s->cur_func, &f->st_be,
                          JS_ATOM_NULL, -1, -1, 2);
-        block_env.has_iterator = true;
+        f->st_be.has_iterator = true;
         emit_op(s, OP_for_of_start);
         has_spread = false;
         while (s->token.val != ']') {
