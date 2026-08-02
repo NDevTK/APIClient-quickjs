@@ -45497,6 +45497,13 @@ struct JSParseFrame {
        so it needs a second BlockEnv slot; both rely on the frame's address being stable. */
     BlockEnv st_be2;
     bool    st_b1, st_b2, st_b3;
+    /* NON-INTEGER descent arguments. The driver's (entry, level, flags, op) shape carries four ints, which
+       covered every production until FunctionDeclaration: it takes nine parameters including a source POINTER
+       and a JSFunctionDef** OUT-parameter. Packing a pointer into an int slot is not portable and an
+       out-parameter has no slot at all, so they are seeded on the callee's frame by PD_CALL_P — the same
+       arrangement PD_CALL_AT already uses for a source position. */
+    const uint8_t *st_ptr;
+    JSFunctionDef **st_pfd;
     /* TemplateLiteral: the tagged form's cooked and raw arrays, LIVE ACROSS the substitution descent — a
        nested template is a nested FRAME, and holding these in a driver local let the inner one reset the
        outer's to JS_UNDEFINED. Ownership matches the recursive body: template_object is released after
@@ -45596,6 +45603,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->st_line = 0; f->st_col = 0; f->st_idx = 0; f->st_is_async = false;    \
         f->st_flag = false;                                                      \
         f->st_b1 = false; f->st_b2 = false; f->st_b3 = false; \
+        f->st_ptr = NULL; f->st_pfd = NULL;                                      \
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
         f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;
 
@@ -45625,6 +45633,21 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
         PD_INIT()                                                               \
         f->st_line = ln_; f->st_col = cl_;                                      \
+        goto dispatch;                                                          \
+    } while (0)
+
+/* A descent that also seeds the callee's POINTER arguments — see JSParseFrame.st_ptr / st_pfd. */
+#define PD_CALL_P(entry_, level_, flags_, op_, ptr_, pfd_, line_, col_, resume_) do { \
+        int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
+        const uint8_t *p_ = (ptr_);                                             \
+        JSFunctionDef **pf_ = (pfd_);                                           \
+        int ln_ = (line_), cl_ = (col_);                                        \
+        f->state = (resume_);                                                   \
+        if (pd_reserve(ctx, s, s->pd_sp + 1))                                   \
+            goto unwind;                                                        \
+        f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
+        PD_INIT()                                                               \
+        f->st_ptr = p_; f->st_pfd = pf_; f->st_line = ln_; f->st_col = cl_;     \
         goto dispatch;                                                          \
     } while (0)
 
@@ -50585,6 +50608,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 #undef PD_RET
 #undef PD_RET_ERR
 #undef PD_CALL_AT
+#undef PD_CALL_P
 #undef PD_INIT
 #undef PD_FRAME
 #undef PD_CHUNK
