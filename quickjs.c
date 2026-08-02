@@ -44371,6 +44371,7 @@ enum {
     PDS_ARR, PDS_ARR_E1, PDS_ARR_E2, PDS_ARR_SPREAD, PDS_ARR_E3, PDS_PFX_ARRAY,
     PDS_OBJ, PDS_OBJ_SPREAD, PDS_OBJ_VALUE, PDS_PFX_OBJECT,
     PDS_PROPNAME, PDS_PN_COMPUTED, PDS_OBJ_KEY,
+    PDS_TEMPLATE, PDS_TPL_SUB, PDS_PFX_TEMPLATE, PDS_PFX_TAGGED,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op);
@@ -44434,119 +44435,6 @@ static int seal_template_obj(JSContext *ctx, JSValue obj)
     p->extensible = false;
     return 0;
 }
-
-static __exception int js_parse_template(JSParseState *s, int call, int *argc)
-{
-    JSContext *ctx = s->ctx;
-    JSValue raw_array, template_object;
-    JSToken cooked;
-    int depth, pd_ret;
-
-    raw_array = JS_UNDEFINED; /* avoid warning */
-    template_object = JS_UNDEFINED; /* avoid warning */
-    if (call) {
-        /* Create a template object: an array of cooked strings */
-        /* Create an array of raw strings and store it to the raw property */
-        template_object = JS_NewArray(ctx);
-        if (JS_IsException(template_object))
-            return -1;
-        //        pool_idx = s->cur_func->cpool_count;
-        pd_ret = emit_push_const(s, template_object, 0);
-        JS_FreeValue(ctx, template_object);
-        if (pd_ret)
-            return -1;
-        raw_array = JS_NewArray(ctx);
-        if (JS_IsException(raw_array))
-            return -1;
-        if (JS_DefinePropertyValue(ctx, template_object, JS_ATOM_raw,
-                                   raw_array, JS_PROP_THROW) < 0) {
-            return -1;
-        }
-    }
-
-    depth = 0;
-    while (s->token.val == TOK_TEMPLATE) {
-        const uint8_t *p = s->token.ptr + 1;
-        cooked = s->token;
-        if (call) {
-            if (JS_DefinePropertyValueUint32(ctx, raw_array, depth,
-                                             js_dup(s->token.u.str.str),
-                                             JS_PROP_ENUMERABLE | JS_PROP_THROW) < 0) {
-                return -1;
-            }
-            /* re-parse the string with escape sequences but do not throw a
-               syntax error if it contains invalid sequences
-             */
-            if (js_parse_string(s, '`', false, p, &cooked, &p)) {
-                cooked.u.str.str = JS_UNDEFINED;
-            }
-            if (JS_DefinePropertyValueUint32(ctx, template_object, depth,
-                                             cooked.u.str.str,
-                                             JS_PROP_ENUMERABLE | JS_PROP_THROW) < 0) {
-                return -1;
-            }
-        } else {
-            JSString *str;
-            /* re-parse the string with escape sequences and throw a
-               syntax error if it contains invalid sequences
-             */
-            JS_FreeValue(ctx, s->token.u.str.str);
-            s->token.u.str.str = JS_UNDEFINED;
-            if (js_parse_string(s, '`', true, p, &cooked, &p))
-                return -1;
-            str = JS_VALUE_GET_STRING(cooked.u.str.str);
-            if (str->len != 0 || depth == 0) {
-                pd_ret = emit_push_const(s, cooked.u.str.str, 1);
-                JS_FreeValue(s->ctx, cooked.u.str.str);
-                if (pd_ret)
-                    return -1;
-                if (depth == 0) {
-                    if (s->token.u.str.sep == '`')
-                        goto done1;
-                    emit_op(s, OP_get_field2);
-                    emit_atom(s, JS_ATOM_concat);
-                }
-                depth++;
-            } else {
-                JS_FreeValue(s->ctx, cooked.u.str.str);
-            }
-        }
-        if (s->token.u.str.sep == '`')
-            goto done;
-        if (next_token(s))
-            return -1;
-        if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-            return -1;
-        depth++;
-        if (s->token.val != '}') {
-            return js_parse_error(s, "expected '}' after template expression");
-        }
-        /* XXX: should convert to string at this stage? */
-        free_token(s, &s->token);
-        /* Resume TOK_TEMPLATE parsing (s->token.line_num and
-         * s->token.ptr are OK) */
-        s->got_lf = false;
-        s->last_line_num = s->token.line_num;
-        s->last_col_num = s->token.col_num;
-        if (js_parse_template_part(s, s->buf_ptr))
-            return -1;
-    }
-    return js_parse_expect(s, TOK_TEMPLATE);
-
- done:
-    if (call) {
-        /* Seal the objects */
-        seal_template_obj(ctx, raw_array);
-        seal_template_obj(ctx, template_object);
-        *argc = depth + 1;
-    } else {
-        emit_op(s, OP_call_method);
-        emit_u16(s, depth - 1);
-    }
- done1:
-    return next_token(s);
-}
-
 
 #define PROP_TYPE_IDENT 0
 #define PROP_TYPE_VAR   1
@@ -45223,16 +45111,16 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                 emit_op(s, OP_scope_put_var_init);
                 if (is_set) {
                     JSAtom setter_name;
-                    int pd_ret;
+                    int ret;
 
                     setter_name = get_private_setter_name(ctx, name);
                     if (setter_name == JS_ATOM_NULL)
                         goto fail;
                     emit_atom(s, setter_name);
-                    pd_ret = add_private_class_field(s, fd, setter_name,
+                    ret = add_private_class_field(s, fd, setter_name,
                                                   JS_VAR_PRIVATE_SETTER, is_static);
                     JS_FreeAtom(ctx, setter_name);
-                    if (pd_ret < 0)
+                    if (ret < 0)
                         goto fail;
                 } else {
                     emit_atom(s, name);
@@ -46520,7 +46408,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
  * an explicit frame stack, the shape json_parse_step already uses for JSON in this
  * file: a descent is a PUSH recording where to resume, a finished production POPs
  * and delivers its return code to the frame below, where the resume state inspects
- * `pd_ret` exactly as the recursive call site inspected the callee's return value.
+ * `ret` exactly as the recursive call site inspected the callee's return value.
  *
  * The four recursive bodies this replaces are DELETED, not kept beside it: there
  * is one implementation of each production and nothing to fall back to.
@@ -46619,6 +46507,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
        label reads it immediately. Published to s->pd_name on the way out for C callers. */
     JSAtom out_name = JS_ATOM_NULL;
     bool is_non_reserved_ident = false;
+    /* TemplateLiteral scratch — never live across a PD_CALL (the substitution descent is the only one, and
+       `cooked` is consumed before it). */
+    JSValue raw_array = JS_UNDEFINED, template_object = JS_UNDEFINED;
+    JSToken cooked;
+    int emit_ret;
 
 /* The arguments are read into temporaries FIRST: they are almost always expressions over the CALLER's frame
    (`f->level - 1`), and the push moves `f` to the callee's. */
@@ -46720,6 +46613,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_PROPNAME:        goto pn_entry;
     case PDS_PN_COMPUTED:     goto pn_computed_done;
     case PDS_OBJ_KEY:         goto obj_key_done;
+    case PDS_TEMPLATE:        goto tpl_entry;
+    case PDS_TPL_SUB:         goto tpl_sub_done;
+    case PDS_PFX_TEMPLATE:    goto pfx_template_done;
+    case PDS_PFX_TAGGED:      goto pfx_tagged_done;
     }
     DFAIL("parse descent resumed at a state that does not exist");
     goto unwind;
@@ -47544,9 +47441,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_RET(-1);
         break;
     case TOK_TEMPLATE:
-        if (js_parse_template(s, 0, NULL))
+        PD_CALL(PDS_TEMPLATE, 0, 0, 0, PDS_PFX_TEMPLATE);
+ pfx_template_done:
+        if (pd_ret)
             PD_RET(-1);
-        break;
+        goto pfx_after_switch;
     case TOK_STRING:
         if (emit_push_const(s, s->token.u.str.str, 1))
             PD_RET(-1);
@@ -47957,8 +47856,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
 
             if (f->call_type == FUNC_CALL_TEMPLATE) {
-                if (js_parse_template(s, 1, &f->arg_count))
+                PD_CALL(PDS_TEMPLATE, 0, 0, 1, PDS_PFX_TAGGED);
+ pfx_tagged_done:
+                if (pd_ret < 0)
                     PD_RET(-1);
+                f->arg_count = pd_ret;
                 goto emit_func_call;
             } else if (f->call_type == FUNC_CALL_SUPER_CTOR) {
                 emit_op(s, OP_scope_get_var);
@@ -48563,6 +48465,117 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
  pn_fail:
     out_name = JS_ATOM_NULL;
     PD_RET(-1);
+
+/* ---- TemplateLiteral. Its substitutions are Expressions, which the descent owns, so `` `${`${…}`}` `` is a
+   closed cycle once this lands. `op` is the TAGGED flag (call). On success the status IS the tagged form's
+   argument count — a count is non-negative, so it needs no out-channel; the untagged form returns 0. `depth`
+   is the only state live across the substitution descent, so it is the frame's. ---- */
+ tpl_entry:
+    raw_array = JS_UNDEFINED;       /* avoid warning */
+    template_object = JS_UNDEFINED; /* avoid warning */
+    if (f->op) {
+        /* Create a template object: an array of cooked strings */
+        /* Create an array of raw strings and store it to the raw property */
+        template_object = JS_NewArray(ctx);
+        if (JS_IsException(template_object))
+            PD_RET(-1);
+        emit_ret = emit_push_const(s, template_object, 0);
+        JS_FreeValue(ctx, template_object);
+        if (emit_ret)
+            PD_RET(-1);
+        raw_array = JS_NewArray(ctx);
+        if (JS_IsException(raw_array))
+            PD_RET(-1);
+        if (JS_DefinePropertyValue(ctx, template_object, JS_ATOM_raw,
+                                   raw_array, JS_PROP_THROW) < 0) {
+            PD_RET(-1);
+        }
+    }
+
+    f->arg_count = 0;   /* `depth` */
+    while (s->token.val == TOK_TEMPLATE) {
+        const uint8_t *p = s->token.ptr + 1;
+        cooked = s->token;
+        if (f->op) {
+            if (JS_DefinePropertyValueUint32(ctx, raw_array, f->arg_count,
+                                             js_dup(s->token.u.str.str),
+                                             JS_PROP_ENUMERABLE | JS_PROP_THROW) < 0) {
+                PD_RET(-1);
+            }
+            /* re-parse the string with escape sequences but do not throw a
+               syntax error if it contains invalid sequences
+             */
+            if (js_parse_string(s, '`', false, p, &cooked, &p)) {
+                cooked.u.str.str = JS_UNDEFINED;
+            }
+            if (JS_DefinePropertyValueUint32(ctx, template_object, f->arg_count,
+                                             cooked.u.str.str,
+                                             JS_PROP_ENUMERABLE | JS_PROP_THROW) < 0) {
+                PD_RET(-1);
+            }
+        } else {
+            JSString *str;
+            /* re-parse the string with escape sequences and throw a
+               syntax error if it contains invalid sequences
+             */
+            JS_FreeValue(ctx, s->token.u.str.str);
+            s->token.u.str.str = JS_UNDEFINED;
+            if (js_parse_string(s, '`', true, p, &cooked, &p))
+                PD_RET(-1);
+            str = JS_VALUE_GET_STRING(cooked.u.str.str);
+            if (str->len != 0 || f->arg_count == 0) {
+                emit_ret = emit_push_const(s, cooked.u.str.str, 1);
+                JS_FreeValue(ctx, cooked.u.str.str);
+                if (emit_ret)
+                    PD_RET(-1);
+                if (f->arg_count == 0) {
+                    if (s->token.u.str.sep == '`')
+                        goto tpl_done1;
+                    emit_op(s, OP_get_field2);
+                    emit_atom(s, JS_ATOM_concat);
+                }
+                f->arg_count++;
+            } else {
+                JS_FreeValue(ctx, cooked.u.str.str);
+            }
+        }
+        if (s->token.u.str.sep == '`')
+            goto tpl_done;
+        if (next_token(s))
+            PD_RET(-1);
+        PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_TPL_SUB);
+ tpl_sub_done:
+        if (pd_ret)
+            PD_RET(-1);
+        f->arg_count++;
+        if (s->token.val != '}')
+            PD_RET_ERR(s, "expected '}' after template expression");
+        /* XXX: should convert to string at this stage? */
+        free_token(s, &s->token);
+        /* Resume TOK_TEMPLATE parsing (s->token.line_num and
+         * s->token.ptr are OK) */
+        s->got_lf = false;
+        s->last_line_num = s->token.line_num;
+        s->last_col_num = s->token.col_num;
+        if (js_parse_template_part(s, s->buf_ptr))
+            PD_RET(-1);
+    }
+    PD_RET(js_parse_expect(s, TOK_TEMPLATE));
+
+ tpl_done:
+    if (f->op) {
+        /* Seal the objects */
+        seal_template_obj(ctx, raw_array);
+        seal_template_obj(ctx, template_object);
+    } else {
+        emit_op(s, OP_call_method);
+        emit_u16(s, f->arg_count - 1);
+    }
+ tpl_done1:
+    if (next_token(s))
+        PD_RET(-1);
+    /* the tagged form's argument count travels as the STATUS; the untagged form has none */
+    PD_RET(f->op ? f->arg_count + 1 : 0);
 
  done:
     goto leave;
