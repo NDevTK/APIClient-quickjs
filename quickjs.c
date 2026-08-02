@@ -44373,9 +44373,26 @@ enum {
     PDS_PROPNAME, PDS_PN_COMPUTED, PDS_OBJ_KEY,
     PDS_TEMPLATE, PDS_TPL_SUB, PDS_PFX_TEMPLATE, PDS_PFX_TAGGED,
     PDS_VAR, PDS_VAR_LV, PDS_VAR_INIT,
+    PDS_SOD, PDS_BLOCK, PDS_BLK_STMT, PDS_IFC, PDS_IFC_DONE,
+    PDS_SOD_01, PDS_SOD_02, PDS_SOD_03, PDS_SOD_04, PDS_SOD_05, PDS_SOD_06, PDS_SOD_07, PDS_SOD_08, PDS_SOD_09, PDS_SOD_10, PDS_SOD_11, PDS_SOD_12, PDS_SOD_13, PDS_SOD_14, PDS_SOD_15, PDS_SOD_16, PDS_SOD_17, PDS_SOD_18, PDS_SOD_19, PDS_SOD_20, PDS_SOD_21, PDS_SOD_22, PDS_SOD_23, PDS_SOD_24, PDS_SOD_25, PDS_SOD_26, PDS_SOD_27, PDS_SOD_28, PDS_SOD_29,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op);
+
+#define DECL_MASK_FUNC  (1 << 0) /* allow normal function declaration */
+/* ored with DECL_MASK_FUNC if function declarations are allowed with a label */
+#define DECL_MASK_FUNC_WITH_LABEL (1 << 1)
+#define DECL_MASK_OTHER (1 << 2) /* all other declarations */
+#define DECL_MASK_ALL   (DECL_MASK_FUNC | DECL_MASK_FUNC_WITH_LABEL | DECL_MASK_OTHER)
+static bool is_label(JSParseState *s);
+static __exception int emit_break(JSParseState *s, JSAtom name, int is_cont);
+static int is_let(JSParseState *s, int decl_mask);
+static int is_using(JSParseState *s, bool is_for_of);
+static void set_eval_ret_undefined(JSParseState *s);
+static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
+                                          bool is_async,
+                                          int source_line_num,
+                                          int source_col_num);
 
 /* allow the 'in' binary operator. It is the [In] parameter of the production being parsed, and it reaches the
    function parsers too: an arrow's ConciseBody is ExpressionBody[?In, ~Await], so `for (x => 0 in 1;;)` must
@@ -46453,6 +46470,7 @@ struct JSParseFrame {
     int     st_scope_a, st_scope_b;                   /* block_scope_level, for_scope_level */
     int     st_mask, st_tok, st_bits, st_line, st_col, st_idx;
     bool    st_is_async;
+    bool    st_flag;          /* Block: a using-BlockEnv is pushed. IfClause: it opened its own scope. */
     /* TemplateLiteral: the tagged form's cooked and raw arrays, LIVE ACROSS the substitution descent — a
        nested template is a nested FRAME, and holding these in a driver local let the inner one reset the
        outer's to JS_UNDEFINED. Ownership matches the recursive body: template_object is released after
@@ -46552,6 +46570,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         f->st_pos_a = 0; f->st_pos_b = 0; f->st_scope_a = 0; f->st_scope_b = 0;  \
         f->st_mask = 0; f->st_tok = 0; f->st_bits = 0;                           \
         f->st_line = 0; f->st_col = 0; f->st_idx = 0; f->st_is_async = false;    \
+        f->st_flag = false;                                                      \
         f->raw_array = JS_UNDEFINED; f->template_object = JS_UNDEFINED;          \
         f->start_ptr = NULL; f->start_line = 0; f->start_col = 0;                \
         goto dispatch;                                                          \
@@ -46641,6 +46660,40 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_VAR:             goto var_entry;
     case PDS_VAR_LV:          goto var_lv_done;
     case PDS_VAR_INIT:        goto var_init_done;
+    case PDS_SOD:             goto sod_entry;
+    case PDS_BLOCK:           goto blk_entry;
+    case PDS_BLK_STMT:        goto blk_stmt_done;
+    case PDS_IFC:             goto ifc_entry;
+    case PDS_IFC_DONE:        goto ifc_done;
+    case PDS_SOD_01:         goto sod_01;
+    case PDS_SOD_02:         goto sod_02;
+    case PDS_SOD_03:         goto sod_03;
+    case PDS_SOD_04:         goto sod_04;
+    case PDS_SOD_05:         goto sod_05;
+    case PDS_SOD_06:         goto sod_06;
+    case PDS_SOD_07:         goto sod_07;
+    case PDS_SOD_08:         goto sod_08;
+    case PDS_SOD_09:         goto sod_09;
+    case PDS_SOD_10:         goto sod_10;
+    case PDS_SOD_11:         goto sod_11;
+    case PDS_SOD_12:         goto sod_12;
+    case PDS_SOD_13:         goto sod_13;
+    case PDS_SOD_14:         goto sod_14;
+    case PDS_SOD_15:         goto sod_15;
+    case PDS_SOD_16:         goto sod_16;
+    case PDS_SOD_17:         goto sod_17;
+    case PDS_SOD_18:         goto sod_18;
+    case PDS_SOD_19:         goto sod_19;
+    case PDS_SOD_20:         goto sod_20;
+    case PDS_SOD_21:         goto sod_21;
+    case PDS_SOD_22:         goto sod_22;
+    case PDS_SOD_23:         goto sod_23;
+    case PDS_SOD_24:         goto sod_24;
+    case PDS_SOD_25:         goto sod_25;
+    case PDS_SOD_26:         goto sod_26;
+    case PDS_SOD_27:         goto sod_27;
+    case PDS_SOD_28:         goto sod_28;
+    case PDS_SOD_29:         goto sod_29;
     case PDS_TEMPLATE:        goto tpl_entry;
     case PDS_TPL_SUB:         goto tpl_sub_done;
     case PDS_PFX_TEMPLATE:    goto pfx_template_done;
@@ -48741,6 +48794,1031 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     f->atom2 = JS_ATOM_NULL;
     PD_RET(-1);
 
+/* ---- Statement / Declaration, and the three productions that only exist to wrap it. This is the hub: every
+   nesting construct in the language — block, if, while, do, for, switch, try, with, labelled — reaches its own
+   body through here, so until it is on the frame stack `{{{{…}}}}` is C recursion no matter what else was
+   converted. The BlockEnv lives in the FRAME (see JSParseFrame.st_be) because push_break_entry links its
+   ADDRESS into JSFunctionDef.top_break and leaves it there across the body's descent. ---- */
+ sod_entry:
+
+    /* specific label handling */
+    /* XXX: support multiple labels on loop statements */
+    f->atom = JS_ATOM_NULL;
+    if (is_label(s)) {
+        BlockEnv *be;
+
+        f->atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+
+        for (be = s->cur_func->top_break; be; be = be->prev) {
+            if (be->label_name == f->atom) {
+                js_parse_error(s, "duplicate label name");
+                goto sod_fail;
+            }
+        }
+
+        if (next_token(s))
+            goto sod_fail;
+        if (js_parse_expect(s, ':'))
+            goto sod_fail;
+        if (s->token.val != TOK_FOR
+        &&  s->token.val != TOK_DO
+        &&  s->token.val != TOK_WHILE) {
+            /* labelled regular statement */
+            JSFunctionDef *fd = s->cur_func;
+
+            f->st_lbl_a = new_label(s);
+            push_break_entry(fd, &f->st_be, f->atom, f->st_lbl_a, -1, 0);
+            fd->top_break->is_regular_stmt = 1;
+            if (!fd->is_strict_mode &&
+                (f->flags & DECL_MASK_FUNC_WITH_LABEL)) {
+                f->st_mask = DECL_MASK_FUNC | DECL_MASK_FUNC_WITH_LABEL;
+            } else {
+                f->st_mask = 0;
+            }
+            PD_CALL(PDS_SOD, 0, f->st_mask, 0, PDS_SOD_01);
+ sod_01:
+            if (pd_ret)
+                goto sod_fail;
+            emit_label(s, f->st_lbl_a);
+            pop_break_entry(fd);
+            goto sod_done;
+        }
+    }
+
+    switch(f->op = s->token.val) {
+    case '{':
+        PD_CALL(PDS_BLOCK, 0, 0, 0, PDS_SOD_02);
+ sod_02:
+        if (pd_ret)
+            goto sod_fail;
+        break;
+    case TOK_RETURN:
+        if (s->cur_func->is_eval) {
+            js_parse_error(s, "return not in a function");
+            goto sod_fail;
+        }
+        if (s->cur_func->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT) {
+            js_parse_error(s, "return in a static initializer block");
+            goto sod_fail;
+        }
+        if (next_token(s))
+            goto sod_fail;
+        if (s->token.val != ';' && s->token.val != '}' && !s->got_lf) {
+            PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_03);
+ sod_03:
+            if (pd_ret)
+                goto sod_fail;
+            emit_return(s, true);
+        } else {
+            emit_return(s, false);
+        }
+        if (js_parse_expect_semi(s))
+            goto sod_fail;
+        break;
+    case TOK_THROW:
+        if (next_token(s))
+            goto sod_fail;
+        if (s->got_lf) {
+            js_parse_error(s, "line terminator not allowed after throw");
+            goto sod_fail;
+        }
+        emit_source_loc(s);
+        PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_04);
+ sod_04:
+        if (pd_ret)
+            goto sod_fail;
+        emit_op(s, OP_throw);
+        if (js_parse_expect_semi(s))
+            goto sod_fail;
+        break;
+    case TOK_AWAIT:
+        /* Check for 'await using' declaration */
+        if (s->cur_func->func_kind & JS_FUNC_ASYNC) {
+            JSParsePos pos;
+            int u;
+            js_parse_get_pos(s, &pos);
+            if (next_token(s)) /* skip 'await' */
+                goto sod_fail;
+            u = is_using(s, false);
+            if (u < 0)
+                goto sod_fail;
+            if (u) {
+                if (!(f->flags & DECL_MASK_OTHER)) {
+                    js_parse_error(s, "lexical declarations can't appear in single-statement context");
+                    goto sod_fail;
+                }
+                s->cur_func->has_await = true;
+                if (next_token(s)) /* skip 'using' */
+                    goto sod_fail;
+                PD_CALL(PDS_VAR, (false), PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING, PDS_SOD_05);
+ sod_05:
+                if (pd_ret)
+                    goto sod_fail;
+                if (js_parse_expect_semi(s))
+                    goto sod_fail;
+                break;
+            }
+            /* Not 'await using': restore to parse as expression */
+            if (js_parse_seek_token(s, &pos))
+                goto sod_fail;
+        }
+        goto hasexpr;
+    case TOK_LET:
+    case TOK_CONST:
+    haslet:
+        if (!(f->flags & DECL_MASK_OTHER)) {
+            js_parse_error(s, "lexical declarations can't appear in single-statement context");
+            goto sod_fail;
+        }
+        /* fall thru */
+    case TOK_VAR:
+        if (next_token(s))
+            goto sod_fail;
+        PD_CALL(PDS_VAR, (false), PF_IN_ACCEPTED, f->op, PDS_SOD_06);
+ sod_06:
+        if (pd_ret)
+            goto sod_fail;
+        if (js_parse_expect_semi(s))
+            goto sod_fail;
+        break;
+    case TOK_IF:
+        {
+            if (next_token(s))
+                goto sod_fail;
+            /* create a new scope for `let f;if(1) function f(){}` */
+            push_scope(s);
+            set_eval_ret_undefined(s);
+            PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_07);
+ sod_07:
+            if (pd_ret)
+                goto sod_fail;
+            f->st_lbl_a = emit_goto(s, OP_if_false, -1);
+            if (s->cur_func->is_strict_mode)
+                f->st_mask = 0;
+            else
+                f->st_mask = DECL_MASK_FUNC; /* Annex B.3.4 */
+
+            /* B.3.4 makes `if (x) function f(){}` mean `if (x) { function f(){} }` — each CLAUSE is its own
+               Block, so each has its own binding for the name. The scope pushed above is the if-statement's own
+               (it is what lets `let f; if (1) function f(){}` be legal); sharing it between the two clauses put
+               both declarations in ONE scope, where the scope-entry hoisting created them both and the later
+               one won regardless of which branch ran. */
+            PD_CALL(PDS_IFC, 0, f->st_mask, 0, PDS_SOD_08);
+ sod_08:
+            if (pd_ret)
+                goto sod_fail;
+
+            if (s->token.val == TOK_ELSE) {
+                f->st_lbl_b = emit_goto(s, OP_goto, -1);
+                if (next_token(s))
+                    goto sod_fail;
+
+                emit_label(s, f->st_lbl_a);
+                PD_CALL(PDS_IFC, 0, f->st_mask, 0, PDS_SOD_09);
+ sod_09:
+                if (pd_ret)
+                    goto sod_fail;
+
+                f->st_lbl_a = f->st_lbl_b;
+            }
+            emit_label(s, f->st_lbl_a);
+            pop_scope(s);
+        }
+        break;
+    case TOK_WHILE:
+        {
+
+            f->st_lbl_a = new_label(s);
+            f->st_lbl_b = new_label(s);
+
+            push_break_entry(s->cur_func, &f->st_be,
+                             f->atom, f->st_lbl_b, f->st_lbl_a, 0);
+
+            if (next_token(s))
+                goto sod_fail;
+
+            set_eval_ret_undefined(s);
+
+            emit_label(s, f->st_lbl_a);
+            PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_10);
+ sod_10:
+            if (pd_ret)
+                goto sod_fail;
+            emit_goto(s, OP_if_false, f->st_lbl_b);
+
+            PD_CALL(PDS_SOD, 0, 0, 0, PDS_SOD_11);
+ sod_11:
+            if (pd_ret)
+                goto sod_fail;
+            emit_goto(s, OP_goto, f->st_lbl_a);
+
+            emit_label(s, f->st_lbl_b);
+
+            pop_break_entry(s->cur_func);
+        }
+        break;
+    case TOK_DO:
+        {
+
+            f->st_lbl_a = new_label(s);
+            f->st_lbl_b = new_label(s);
+            f->st_lbl_c = new_label(s);
+
+            push_break_entry(s->cur_func, &f->st_be,
+                             f->atom, f->st_lbl_b, f->st_lbl_a, 0);
+
+            if (next_token(s))
+                goto sod_fail;
+
+            emit_label(s, f->st_lbl_c);
+
+            set_eval_ret_undefined(s);
+
+            PD_CALL(PDS_SOD, 0, 0, 0, PDS_SOD_12);
+ sod_12:
+            if (pd_ret)
+                goto sod_fail;
+
+            emit_label(s, f->st_lbl_a);
+            if (js_parse_expect(s, TOK_WHILE))
+                goto sod_fail;
+            PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_13);
+ sod_13:
+            if (pd_ret)
+                goto sod_fail;
+            /* Insert semicolon if missing */
+            if (s->token.val == ';') {
+                if (next_token(s))
+                    goto sod_fail;
+            }
+            emit_goto(s, OP_if_true, f->st_lbl_c);
+
+            emit_label(s, f->st_lbl_b);
+
+            pop_break_entry(s->cur_func);
+        }
+        break;
+    case TOK_FOR:
+        {
+
+            f->st_line = s->token.line_num;
+            f->st_col = s->token.col_num;
+            if (next_token(s))
+                goto sod_fail;
+
+            set_eval_ret_undefined(s);
+            f->st_bits = 0;
+            f->st_is_async = false;
+            if (s->token.val == '(') {
+                js_parse_skip_parens_token(s, &f->st_bits, false);
+            } else if (s->token.val == TOK_AWAIT) {
+                if (!(s->cur_func->func_kind & JS_FUNC_ASYNC)) {
+                    js_parse_error(s, "for await is only valid in asynchronous functions");
+                    goto sod_fail;
+                }
+                f->st_is_async = true;
+                if (next_token(s))
+                    goto sod_fail;
+                s->cur_func->has_await = true;
+            }
+            if (js_parse_expect(s, '('))
+                goto sod_fail;
+
+            if (!(f->st_bits & SKIP_HAS_SEMI)) {
+                /* parse for/in or for/of */
+                if (js_parse_for_in_of(s, f->atom, f->st_is_async,
+                                       f->st_line, f->st_col))
+                    goto sod_fail;
+                break;
+            }
+            f->st_scope_a = s->cur_func->scope_level;
+
+            /* create scope for the lexical variables declared in the initial,
+               test and increment expressions */
+            push_scope(s);
+            f->st_scope_b = s->cur_func->scope_level;
+            /* initial expression */
+            f->st_tok = s->token.val;
+            if (f->st_tok != ';') {
+                switch (is_let(s, DECL_MASK_OTHER)) {
+                case true:
+                    f->st_tok = TOK_LET;
+                    break;
+                case false:
+                    break;
+                default:
+                    goto sod_fail;
+                }
+                if (f->st_tok != TOK_VAR && f->st_tok != TOK_LET && f->st_tok != TOK_CONST &&
+                    token_is_pseudo_keyword(s, JS_ATOM_using)) {
+                    int u = is_using(s, false);
+                    if (u < 0)
+                        goto sod_fail;
+                    if (u)
+                        f->st_tok = TOK_USING;
+                }
+                if (f->st_tok == TOK_AWAIT &&
+                    (s->cur_func->func_kind & JS_FUNC_ASYNC)) {
+                    /* Check for `await using` declaration head */
+                    JSParsePos pos;
+                    int u;
+                    js_parse_get_pos(s, &pos);
+                    if (next_token(s)) /* skip 'await' */
+                        goto sod_fail;
+                    u = is_using(s, false);
+                    if (u < 0)
+                        goto sod_fail;
+                    if (u) {
+                        s->cur_func->has_await = true;
+                        f->st_tok = TOK_USING;
+                        if (next_token(s)) /* skip 'using' */
+                            goto sod_fail;
+                        PD_CALL(PDS_VAR, (false), PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING, PDS_SOD_14);
+ sod_14:
+                        if (pd_ret)
+                            goto sod_fail;
+                        goto for_init_done;
+                    }
+                    if (js_parse_seek_token(s, &pos))
+                        goto sod_fail;
+                }
+                if (f->st_tok == TOK_VAR
+                || f->st_tok == TOK_LET
+                || f->st_tok == TOK_CONST
+                || f->st_tok == TOK_USING) {
+                    int pf = 0;
+                    if (f->st_tok == TOK_USING && f->st_is_async)
+                        pf |= PF_AWAIT_USING;
+                    if (next_token(s))
+                        goto sod_fail;
+                    PD_CALL(PDS_VAR, (false), pf, f->st_tok, PDS_SOD_15);
+ sod_15:
+                    if (pd_ret)
+                        goto sod_fail;
+                } else {
+                    PD_CALL(PDS_EXPR2, 0, 0, 0, PDS_SOD_16);
+ sod_16:
+                    if (pd_ret)
+                        goto sod_fail;
+                    emit_op(s, OP_drop);
+                }
+
+            for_init_done:
+                /* close the closures before the first iteration */
+                close_scopes(s, s->cur_func->scope_level, f->st_scope_a);
+            }
+            if (js_parse_expect(s, ';'))
+                goto sod_fail;
+
+            f->st_lbl_d = new_label(s);
+            f->st_lbl_a = new_label(s);
+            f->st_lbl_c = new_label(s);
+            f->st_lbl_b = new_label(s);
+
+            push_break_entry(s->cur_func, &f->st_be,
+                             f->atom, f->st_lbl_b, f->st_lbl_a, 0);
+            if (s->cur_func->scopes[f->st_scope_b].has_using) {
+                f->st_be.has_using = true;
+                f->st_be.using_scope_level = f->st_scope_b;
+                f->st_be.drop_count = 1; /* catch_offset from OP_catch */
+            }
+
+            /* test expression */
+            if (s->token.val == ';') {
+                /* no test expression */
+                f->st_lbl_d = f->st_lbl_c;
+            } else {
+                emit_label(s, f->st_lbl_d);
+                PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_17);
+ sod_17:
+                if (pd_ret)
+                    goto sod_fail;
+                emit_goto(s, OP_if_false, f->st_lbl_b);
+            }
+            if (js_parse_expect(s, ';'))
+                goto sod_fail;
+
+            if (s->token.val == ')') {
+                /* no end expression */
+                f->st_be.label_cont = f->st_lbl_a = f->st_lbl_d;
+                f->st_pos_a = 0; /* avoid warning */
+            } else {
+                /* skip the end expression */
+                emit_goto(s, OP_goto, f->st_lbl_c);
+
+                f->st_pos_a = s->cur_func->byte_code.size;
+                emit_label(s, f->st_lbl_a);
+                PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_18);
+ sod_18:
+                if (pd_ret)
+                    goto sod_fail;
+                emit_op(s, OP_drop);
+                if (f->st_lbl_d != f->st_lbl_c)
+                    emit_goto(s, OP_goto, f->st_lbl_d);
+            }
+            if (js_parse_expect(s, ')'))
+                goto sod_fail;
+
+            f->st_pos_b = s->cur_func->byte_code.size;
+            emit_label(s, f->st_lbl_c);
+            PD_CALL(PDS_SOD, 0, 0, 0, PDS_SOD_19);
+ sod_19:
+            if (pd_ret)
+                goto sod_fail;
+
+            /* close the closures before the next iteration */
+            /* XXX: check continue case */
+            close_scopes(s, s->cur_func->scope_level, f->st_scope_a);
+
+            if (f->st_lbl_d != f->st_lbl_c && f->st_lbl_a != f->st_lbl_d) {
+                /* move the increment code here */
+                DynBuf *bc = &s->cur_func->byte_code;
+                int chunk_size = f->st_pos_b - f->st_pos_a;
+                int offset = bc->size - f->st_pos_a;
+                int i;
+                if (dbuf_claim(bc, chunk_size))
+                    goto sod_fail;
+                dbuf_put(bc, bc->buf + f->st_pos_a, chunk_size);
+                memset(bc->buf + f->st_pos_a, OP_nop, chunk_size);
+                /* increment part ends with a goto */
+                s->cur_func->last_opcode_pos = bc->size - 5;
+                /* relocate labels */
+                for (i = f->st_lbl_a; i < s->cur_func->label_count; i++) {
+                    LabelSlot *ls = &s->cur_func->label_slots[i];
+                    if (ls->pos >= f->st_pos_a && ls->pos < f->st_pos_b)
+                        ls->pos += offset;
+                }
+            } else {
+                emit_goto(s, OP_goto, f->st_lbl_a);
+            }
+
+            emit_label(s, f->st_lbl_b);
+
+            pop_break_entry(s->cur_func);
+
+            if (s->cur_func->scopes[f->st_scope_b].has_using) {
+                int label_catch = s->cur_func->scopes[f->st_scope_b].using_label_catch;
+                int label_end = s->cur_func->scopes[f->st_scope_b].using_label_end;
+
+                /* Normal exit: drop catch_offset, dispose */
+                emit_op(s, OP_drop);
+                emit_op(s, OP_using_dispose_init);
+                emit_op(s, OP_dispose_scope);
+                emit_u16(s, f->st_scope_b);
+                emit_op(s, OP_using_dispose_end);
+                emit_goto(s, OP_goto, label_end);
+
+                /* Catch handler: exception on stack */
+                emit_label(s, label_catch);
+                emit_op(s, OP_dispose_scope);
+                emit_u16(s, f->st_scope_b);
+                emit_op(s, OP_throw);
+
+                emit_label(s, label_end);
+            }
+            pop_scope(s);
+        }
+        break;
+    case TOK_BREAK:
+    case TOK_CONTINUE:
+        {
+            int is_cont = s->token.val - TOK_BREAK;
+            int label;
+
+            if (next_token(s))
+                goto sod_fail;
+            if (!s->got_lf && s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)
+                label = s->token.u.ident.atom;
+            else
+                label = JS_ATOM_NULL;
+            if (emit_break(s, label, is_cont))
+                goto sod_fail;
+            if (label != JS_ATOM_NULL) {
+                if (next_token(s))
+                    goto sod_fail;
+            }
+            if (js_parse_expect_semi(s))
+                goto sod_fail;
+        }
+        break;
+    case TOK_SWITCH:
+        {
+
+            if (next_token(s))
+                goto sod_fail;
+
+            set_eval_ret_undefined(s);
+            PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_20);
+ sod_20:
+            if (pd_ret)
+                goto sod_fail;
+
+            push_scope(s);
+            f->st_lbl_b = new_label(s);
+            push_break_entry(s->cur_func, &f->st_be,
+                             f->atom, f->st_lbl_b, -1, 1);
+
+            if (js_parse_expect(s, '{'))
+                goto sod_fail;
+
+            f->st_pos_a = -1;
+            f->st_lbl_a = -1;
+            while (s->token.val != '}') {
+                if (s->token.val == TOK_CASE) {
+                    f->st_lbl_c = -1;
+                    if (f->st_lbl_a >= 0) {
+                        /* skip the case if needed */
+                        f->st_lbl_c = emit_goto(s, OP_goto, -1);
+                    }
+                    emit_label(s, f->st_lbl_a);
+                    f->st_lbl_a = -1;
+                    for (;;) {
+                        /* parse a sequence of case clauses */
+                        if (next_token(s))
+                            goto sod_fail;
+                        emit_op(s, OP_dup);
+                        PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_21);
+ sod_21:
+                        if (pd_ret)
+                            goto sod_fail;
+                        if (js_parse_expect(s, ':'))
+                            goto sod_fail;
+                        emit_op(s, OP_strict_eq);
+                        if (s->token.val == TOK_CASE) {
+                            f->st_lbl_c = emit_goto(s, OP_if_true, f->st_lbl_c);
+                        } else {
+                            f->st_lbl_a = emit_goto(s, OP_if_false, -1);
+                            emit_label(s, f->st_lbl_c);
+                            break;
+                        }
+                    }
+                } else if (s->token.val == TOK_DEFAULT) {
+                    if (next_token(s))
+                        goto sod_fail;
+                    if (js_parse_expect(s, ':'))
+                        goto sod_fail;
+                    if (f->st_pos_a >= 0) {
+                        js_parse_error(s, "duplicate default");
+                        goto sod_fail;
+                    }
+                    if (f->st_lbl_a < 0) {
+                        /* falling thru direct from switch expression */
+                        f->st_lbl_a = emit_goto(s, OP_goto, -1);
+                    }
+                    /* Emit a dummy label opcode. Label will be patched after
+                       the end of the switch body. Do not use emit_label(s, 0)
+                       because it would clobber label 0 address, preventing
+                       proper optimizer operation.
+                     */
+                    emit_op(s, OP_label);
+                    emit_u32(s, 0);
+                    f->st_pos_a = s->cur_func->byte_code.size - 4;
+                } else {
+                    if (f->st_lbl_a < 0) {
+                        /* falling thru direct from switch expression */
+                        js_parse_error(s, "invalid switch statement");
+                        goto sod_fail;
+                    }
+                    /* `using` / `await using` declarations are not allowed
+                       directly within a CaseClause or DefaultClause
+                       (early error per spec). */
+                    if (token_is_pseudo_keyword(s, JS_ATOM_using)) {
+                        int u = is_using(s, false);
+                        if (u < 0)
+                            goto sod_fail;
+                        if (u) {
+                            js_parse_error(s, "using declaration is not allowed in this context");
+                            goto sod_fail;
+                        }
+                    }
+                    if (s->token.val == TOK_AWAIT &&
+                        (s->cur_func->func_kind & JS_FUNC_ASYNC)) {
+                        JSParsePos pos;
+                        int u;
+                        js_parse_get_pos(s, &pos);
+                        if (next_token(s))
+                            goto sod_fail;
+                        u = is_using(s, false);
+                        if (u < 0)
+                            goto sod_fail;
+                        if (js_parse_seek_token(s, &pos))
+                            goto sod_fail;
+                        if (u) {
+                            js_parse_error(s, "await using declaration is not allowed in this context");
+                            goto sod_fail;
+                        }
+                    }
+                    PD_CALL(PDS_SOD, 0, DECL_MASK_ALL, 0, PDS_SOD_22);
+ sod_22:
+                    if (pd_ret)
+                        goto sod_fail;
+                }
+            }
+            if (js_parse_expect(s, '}'))
+                goto sod_fail;
+            if (f->st_pos_a >= 0) {
+                /* Ugly patch for the `default` label, shameful and risky */
+                put_u32(s->cur_func->byte_code.buf + f->st_pos_a,
+                        f->st_lbl_a);
+                s->cur_func->label_slots[f->st_lbl_a].pos = f->st_pos_a + 4;
+            } else {
+                emit_label(s, f->st_lbl_a);
+            }
+            emit_label(s, f->st_lbl_b);
+            emit_op(s, OP_drop); /* drop the switch expression */
+
+            pop_break_entry(s->cur_func);
+            pop_scope(s);
+        }
+        break;
+    case TOK_TRY:
+        {
+
+            set_eval_ret_undefined(s);
+            if (next_token(s))
+                goto sod_fail;
+            f->st_lbl_a = new_label(s);
+            f->st_lbl_b = new_label(s);
+            f->st_lbl_c = new_label(s);
+            f->st_lbl_d = new_label(s);
+
+            emit_goto(s, OP_catch, f->st_lbl_a);
+
+            push_break_entry(s->cur_func, &f->st_be,
+                             JS_ATOM_NULL, -1, -1, 1);
+            f->st_be.label_finally = f->st_lbl_c;
+
+            PD_CALL(PDS_BLOCK, 0, 0, 0, PDS_SOD_23);
+ sod_23:
+            if (pd_ret)
+                goto sod_fail;
+
+            pop_break_entry(s->cur_func);
+
+            if (js_is_live_code(s)) {
+                /* drop the catch offset */
+                emit_op(s, OP_drop);
+                /* must push dummy value to keep same stack size */
+                emit_op(s, OP_undefined);
+                emit_goto(s, OP_gosub, f->st_lbl_c);
+                emit_op(s, OP_drop);
+
+                emit_goto(s, OP_goto, f->st_lbl_d);
+            }
+
+            if (s->token.val == TOK_CATCH) {
+                if (next_token(s))
+                    goto sod_fail;
+
+                push_scope(s);  /* catch variable */
+                emit_label(s, f->st_lbl_a);
+                /* 14.15.3 steps 2-3: when the Block completed ABRUPTLY the catch clause's completion REPLACES
+                   it, so whatever the try block's last statement left in the eval-completion register is
+                   discarded. `eval("try { 'try'; throw 0; } catch (e) {}")` is undefined, not 'try'. */
+                set_eval_ret_undefined(s);
+
+                if (s->token.val == '{') {
+                    /* support optional-catch-binding feature */
+                    emit_op(s, OP_drop);    /* pop the exception object */
+                } else {
+                    if (js_parse_expect(s, '('))
+                        goto sod_fail;
+                    if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
+                        if (s->token.val == '[' || s->token.val == '{') {
+                            /* XXX: TOK_LET is not completely correct */
+                            if (js_parse_destructuring_element(s, TOK_LET, false, true, -1, true, false) < 0)
+                                goto sod_fail;
+                        } else {
+                            js_parse_error(s, "identifier expected");
+                            goto sod_fail;
+                        }
+                    } else {
+                        f->atom2 = JS_DupAtom(ctx, s->token.u.ident.atom);
+                        if (next_token(s)
+                        ||  js_define_var(s, f->atom2, TOK_CATCH) < 0) {
+                            /* sod_fail releases atom2 — freeing it here too would double-free */
+                            goto sod_fail;
+                        }
+                        /* store the exception value in the catch variable */
+                        emit_op(s, OP_scope_put_var);
+                        emit_u32(s, f->atom2);
+                        /* emit_u32 handed the atom to the bytecode, so the FRAME stops owning it. Without
+                           this the frame pops still holding it and the PD_RET DCHECK aborts — which is
+                           exactly how this hand-off was found. */
+                        f->atom2 = JS_ATOM_NULL;
+                        emit_u16(s, s->cur_func->scope_level);
+                    }
+                    if (js_parse_expect(s, ')'))
+                        goto sod_fail;
+                }
+                /* XXX: should keep the address to nop it out if there is no finally block */
+                emit_goto(s, OP_catch, f->st_lbl_b);
+
+                push_scope(s);  /* catch block */
+                push_break_entry(s->cur_func, &f->st_be, JS_ATOM_NULL,
+                                 -1, -1, 1);
+                f->st_be.label_finally = f->st_lbl_c;
+
+                PD_CALL(PDS_BLOCK, 0, 0, 0, PDS_SOD_24);
+ sod_24:
+                if (pd_ret)
+                    goto sod_fail;
+
+                pop_break_entry(s->cur_func);
+                pop_scope(s);  /* catch block */
+                pop_scope(s);  /* catch variable */
+
+                if (js_is_live_code(s)) {
+                    /* drop the catch2 offset */
+                    emit_op(s, OP_drop);
+                    /* XXX: should keep the address to nop it out if there is no finally block */
+                    /* must push dummy value to keep same stack size */
+                    emit_op(s, OP_undefined);
+                    emit_goto(s, OP_gosub, f->st_lbl_c);
+                    emit_op(s, OP_drop);
+                    emit_goto(s, OP_goto, f->st_lbl_d);
+                }
+                /* catch exceptions thrown in the catch block to execute the
+                 * finally clause and rethrow the exception */
+                emit_label(s, f->st_lbl_b);
+                /* catch value is at TOS, no need to push undefined */
+                emit_goto(s, OP_gosub, f->st_lbl_c);
+                emit_op(s, OP_throw);
+
+            } else if (s->token.val == TOK_FINALLY) {
+                /* finally without catch : execute the finally clause
+                 * and rethrow the exception */
+                emit_label(s, f->st_lbl_a);
+                /* catch value is at TOS, no need to push undefined */
+                emit_goto(s, OP_gosub, f->st_lbl_c);
+                emit_op(s, OP_throw);
+            } else {
+                js_parse_error(s, "expecting catch or finally");
+                goto sod_fail;
+            }
+            emit_label(s, f->st_lbl_c);
+            if (s->token.val == TOK_FINALLY) {
+                int saved_eval_ret_idx = 0; /* avoid warning */
+
+                if (next_token(s))
+                    goto sod_fail;
+                /* on the stack: ret_value gosub_ret_value */
+                push_break_entry(s->cur_func, &f->st_be, JS_ATOM_NULL,
+                                 -1, -1, 2);
+
+                if (s->cur_func->eval_ret_idx >= 0) {
+                    /* 'finally' updates eval_ret only if not a normal
+                       termination */
+                    saved_eval_ret_idx =
+                        add_var(s->ctx, s->cur_func, JS_ATOM__ret_);
+                    if (saved_eval_ret_idx < 0)
+                        goto sod_fail;
+                    emit_op(s, OP_get_loc);
+                    emit_u16(s, s->cur_func->eval_ret_idx);
+                    emit_op(s, OP_put_loc);
+                    emit_u16(s, saved_eval_ret_idx);
+                    set_eval_ret_undefined(s);
+                }
+
+                PD_CALL(PDS_BLOCK, 0, 0, 0, PDS_SOD_25);
+ sod_25:
+                if (pd_ret)
+                    goto sod_fail;
+
+                if (s->cur_func->eval_ret_idx >= 0) {
+                    emit_op(s, OP_get_loc);
+                    emit_u16(s, saved_eval_ret_idx);
+                    emit_op(s, OP_put_loc);
+                    emit_u16(s, s->cur_func->eval_ret_idx);
+                }
+                pop_break_entry(s->cur_func);
+            }
+            emit_op(s, OP_ret);
+            emit_label(s, f->st_lbl_d);
+        }
+        break;
+    case ';':
+        /* empty statement */
+        if (next_token(s))
+            goto sod_fail;
+        break;
+    case TOK_WITH:
+        if (s->cur_func->is_strict_mode) {
+            js_parse_error(s, "invalid keyword: with");
+            goto sod_fail;
+        } else {
+
+            if (next_token(s))
+                goto sod_fail;
+
+            PD_CALL(PDS_PAREN, 0, 0, 0, PDS_SOD_26);
+ sod_26:
+            if (pd_ret)
+                goto sod_fail;
+
+            push_scope(s);
+            f->st_idx = define_var(s, s->cur_func, JS_ATOM__with_,
+                                  JS_VAR_DEF_WITH);
+            if (f->st_idx < 0)
+                goto sod_fail;
+            emit_op(s, OP_to_object);
+            emit_op(s, OP_put_loc);
+            emit_u16(s, f->st_idx);
+
+            set_eval_ret_undefined(s);
+            PD_CALL(PDS_SOD, 0, 0, 0, PDS_SOD_27);
+ sod_27:
+            if (pd_ret)
+                goto sod_fail;
+
+            /* Popping scope drops lexical context for the with object variable */
+            pop_scope(s);
+        }
+        break;
+    case TOK_FUNCTION:
+        /* ES6 Annex B.3.2 and B.3.3 semantics */
+        if (!(f->flags & DECL_MASK_FUNC))
+            goto func_decl_error;
+        if (!(f->flags & DECL_MASK_OTHER) && peek_token(s, false) == '*')
+            goto func_decl_error;
+        goto parse_func_var;
+    case TOK_IDENT:
+        if (s->token.u.ident.is_reserved) {
+            js_parse_error_reserved_identifier(s);
+            goto sod_fail;
+        }
+        /* Determine if `let` introduces a Declaration or an ExpressionStatement */
+        switch (is_let(s, f->flags)) {
+        case true:
+            f->op = TOK_LET;
+            goto haslet;
+        case false:
+            break;
+        default:
+            goto sod_fail;
+        }
+        if (token_is_pseudo_keyword(s, JS_ATOM_using)) {
+            int u = is_using(s, false);
+            if (u < 0)
+                goto sod_fail;
+            if (u) {
+                JSFunctionDef *fd = s->cur_func;
+                if (!(f->flags & DECL_MASK_OTHER)) {
+                    js_parse_error(s, "lexical declarations can't appear in single-statement context");
+                    goto sod_fail;
+                }
+                if (fd->is_eval &&
+                    (fd->eval_type == JS_EVAL_TYPE_GLOBAL ||
+                     fd->eval_type == JS_EVAL_TYPE_DIRECT ||
+                     fd->eval_type == JS_EVAL_TYPE_INDIRECT) &&
+                    fd->scope_level == fd->body_scope) {
+                    js_parse_error(s, "using declaration is not allowed at the top level of a script");
+                    goto sod_fail;
+                }
+                if (next_token(s))
+                    goto sod_fail;
+                PD_CALL(PDS_VAR, (false), PF_IN_ACCEPTED, TOK_USING, PDS_SOD_28);
+ sod_28:
+                if (pd_ret)
+                    goto sod_fail;
+                if (js_parse_expect_semi(s))
+                    goto sod_fail;
+                break;
+            }
+        }
+        if (token_is_pseudo_keyword(s, JS_ATOM_async) &&
+            peek_token(s, true) == TOK_FUNCTION) {
+            if (!(f->flags & DECL_MASK_OTHER)) {
+            func_decl_error:
+                js_parse_error(s, "function declarations can't appear in single-statement context");
+                goto sod_fail;
+            }
+        parse_func_var:
+            if (js_parse_function_decl(s, JS_PARSE_FUNC_VAR,
+                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                       s->token.ptr,
+                                       s->token.line_num,
+                                       s->token.col_num, PF_IN_ACCEPTED))
+                goto sod_fail;
+            break;
+        }
+        goto hasexpr;
+
+    case TOK_CLASS:
+        if (!(f->flags & DECL_MASK_OTHER)) {
+            js_parse_error(s, "class declarations can't appear in single-statement context");
+            goto sod_fail;
+        }
+        if (js_parse_class(s, false, JS_PARSE_EXPORT_NONE))
+            goto sod_fail;
+        break;
+
+    case TOK_DEBUGGER:
+        /* currently no debugger, so just skip the keyword */
+        if (next_token(s))
+            goto sod_fail;
+        if (js_parse_expect_semi(s))
+            goto sod_fail;
+        break;
+
+    case TOK_ENUM:
+    case TOK_EXPORT:
+    case TOK_EXTENDS:
+        js_unsupported_keyword(s, s->token.u.ident.atom);
+        goto sod_fail;
+
+    default:
+    hasexpr:
+        emit_source_loc(s);
+        PD_CALL(PDS_EXPR2, 0, PF_IN_ACCEPTED, 0, PDS_SOD_29);
+ sod_29:
+        if (pd_ret)
+            goto sod_fail;
+        if (s->cur_func->eval_ret_idx >= 0) {
+            /* store the expression value so that it can be returned
+               by eval() */
+            emit_op(s, OP_put_loc);
+            emit_u16(s, s->cur_func->eval_ret_idx);
+        } else {
+            emit_op(s, OP_drop); /* drop the result */
+        }
+        if (js_parse_expect_semi(s))
+            goto sod_fail;
+        break;
+    }
+
+ sod_done:
+    JS_FreeAtom(ctx, f->atom);
+    f->atom = JS_ATOM_NULL;
+    PD_RET(0);
+ sod_fail:
+    JS_FreeAtom(ctx, f->atom);
+    JS_FreeAtom(ctx, f->atom2);
+    f->atom = JS_ATOM_NULL;
+    f->atom2 = JS_ATOM_NULL;
+    PD_RET(-1);
+
+/* ---- Block ---- */
+ blk_entry:
+    if (js_parse_expect(s, '{'))
+        PD_RET(-1);
+    if (s->token.val == '}')
+        goto blk_close;
+    f->st_flag = false;
+    push_scope(s);
+    f->st_scope_a = s->cur_func->scope_level;
+ blk_loop:
+    PD_CALL(PDS_SOD, 0, DECL_MASK_ALL, 0, PDS_BLK_STMT);
+ blk_stmt_done:
+    if (pd_ret)
+        PD_RET(-1);
+    if (!f->st_flag && s->cur_func->scopes[f->st_scope_a].has_using) {
+        f->st_flag = true;
+        push_break_entry(s->cur_func, &f->st_be, JS_ATOM_NULL, -1, -1, 1);
+        f->st_be.has_using = true;
+        f->st_be.using_scope_level = f->st_scope_a;
+    }
+    if (s->token.val != '}')
+        goto blk_loop;
+    if (f->st_flag) {
+        int label_catch = s->cur_func->scopes[f->st_scope_a].using_label_catch;
+        int label_end = s->cur_func->scopes[f->st_scope_a].using_label_end;
+
+        pop_break_entry(s->cur_func);
+
+        if (js_is_live_code(s)) {
+            emit_op(s, OP_drop);  /* drop catch_offset */
+            emit_op(s, OP_using_dispose_init);  /* initial error_state: no error */
+            emit_op(s, OP_dispose_scope);
+            emit_u16(s, f->st_scope_a);
+            emit_op(s, OP_using_dispose_end);
+            emit_goto(s, OP_goto, label_end);
+        }
+        emit_label(s, label_catch);
+        /* Stack: exception_value (= initial error_state) */
+        emit_op(s, OP_dispose_scope);
+        emit_u16(s, f->st_scope_a);
+        /* Stack: final_error_state (original or SuppressedError) */
+        emit_op(s, OP_throw);
+        emit_label(s, label_end);
+    }
+    pop_scope(s);
+ blk_close:
+    if (next_token(s))
+        PD_RET(-1);
+    PD_RET(0);
+
+/* ---- the if/else clause: a Statement that may open its own scope for an annex-B function declaration ---- */
+ ifc_entry:
+    f->st_flag = (f->flags & DECL_MASK_FUNC) && s->token.val == TOK_FUNCTION;
+    if (f->st_flag && push_scope(s) < 0)
+        PD_RET(-1);
+    PD_CALL(PDS_SOD, 0, f->flags, 0, PDS_IFC_DONE);
+ ifc_done:
+    if (f->st_flag)
+        pop_scope(s);
+    PD_RET(pd_ret);
+
  done:
     goto leave;
 
@@ -48989,75 +50067,7 @@ static void emit_return(JSParseState *s, bool hasval)
     }
 }
 
-#define DECL_MASK_FUNC  (1 << 0) /* allow normal function declaration */
-/* ored with DECL_MASK_FUNC if function declarations are allowed with a label */
-#define DECL_MASK_FUNC_WITH_LABEL (1 << 1)
-#define DECL_MASK_OTHER (1 << 2) /* all other declarations */
-#define DECL_MASK_ALL   (DECL_MASK_FUNC | DECL_MASK_FUNC_WITH_LABEL | DECL_MASK_OTHER)
 
-static __exception int js_parse_statement_or_decl(JSParseState *s,
-                                                  int decl_mask);
-
-static __exception int js_parse_statement(JSParseState *s)
-{
-    return js_parse_statement_or_decl(s, 0);
-}
-
-static __exception int js_parse_block(JSParseState *s)
-{
-    JSFunctionDef *fd = s->cur_func;
-
-    if (js_parse_expect(s, '{'))
-        return -1;
-    if (s->token.val != '}') {
-        BlockEnv using_be;
-        int has_using_be = 0;
-        int scope_level;
-
-        push_scope(s);
-        scope_level = fd->scope_level;
-        for(;;) {
-            if (js_parse_statement_or_decl(s, DECL_MASK_ALL))
-                return -1;
-            if (!has_using_be && fd->scopes[scope_level].has_using) {
-                has_using_be = 1;
-                push_break_entry(fd, &using_be, JS_ATOM_NULL, -1, -1, 1);
-                using_be.has_using = true;
-                using_be.using_scope_level = scope_level;
-            }
-            if (s->token.val == '}')
-                break;
-        }
-        if (has_using_be) {
-            int label_catch = fd->scopes[scope_level].using_label_catch;
-            int label_end = fd->scopes[scope_level].using_label_end;
-
-            pop_break_entry(fd);
-
-            if (js_is_live_code(s)) {
-                emit_op(s, OP_drop);  /* drop catch_offset */
-                emit_op(s, OP_using_dispose_init);  /* initial error_state: no error */
-                emit_op(s, OP_dispose_scope);
-                emit_u16(s, scope_level);
-                emit_op(s, OP_using_dispose_end);
-                emit_goto(s, OP_goto, label_end);
-            }
-
-            emit_label(s, label_catch);
-            /* Stack: exception_value (= initial error_state) */
-            emit_op(s, OP_dispose_scope);
-            emit_u16(s, scope_level);
-            /* Stack: final_error_state (original or SuppressedError) */
-            emit_op(s, OP_throw);
-
-            emit_label(s, label_end);
-        }
-        pop_scope(s);
-    }
-    if (next_token(s))
-        return -1;
-    return 0;
-}
 
 /* allowed parse_flags: PF_IN_ACCEPTED */
 /* test if the current token is a label. Use simplistic look-ahead scanner */
@@ -49403,7 +50413,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
             had_using_be = 1;
         }
 
-        if (js_parse_statement(s))
+        if (js_parse_descent(s, PDS_SOD, 0, 0, 0))
             return -1;
 
         if (had_using_be) {
@@ -49520,938 +50530,6 @@ static void set_eval_ret_undefined(JSParseState *s)
 /* One CLAUSE of an if-statement. B.3.4's productions name a FunctionDeclaration in that position and mean the
    Block `{ FunctionDeclaration }`, so the clause gets its own scope — and only then, because every other clause
    is an ordinary Statement that must not gain one. */
-static __exception int js_parse_statement_or_decl(JSParseState *s, int decl_mask);
-static __exception int js_parse_if_clause(JSParseState *s, int decl_mask)
-{
-    bool own_scope = (decl_mask & DECL_MASK_FUNC) && s->token.val == TOK_FUNCTION;
-    int ret;
-    if (own_scope && push_scope(s) < 0)
-        return -1;
-    ret = js_parse_statement_or_decl(s, decl_mask);
-    if (own_scope)
-        pop_scope(s);
-    return ret;
-}
-
-static __exception int js_parse_statement_or_decl(JSParseState *s,
-                                                  int decl_mask)
-{
-    JSContext *ctx = s->ctx;
-    JSAtom label_name;
-    int tok;
-
-    /* specific label handling */
-    /* XXX: support multiple labels on loop statements */
-    label_name = JS_ATOM_NULL;
-    if (is_label(s)) {
-        BlockEnv *be;
-
-        label_name = JS_DupAtom(ctx, s->token.u.ident.atom);
-
-        for (be = s->cur_func->top_break; be; be = be->prev) {
-            if (be->label_name == label_name) {
-                js_parse_error(s, "duplicate label name");
-                goto fail;
-            }
-        }
-
-        if (next_token(s))
-            goto fail;
-        if (js_parse_expect(s, ':'))
-            goto fail;
-        if (s->token.val != TOK_FOR
-        &&  s->token.val != TOK_DO
-        &&  s->token.val != TOK_WHILE) {
-            /* labelled regular statement */
-            JSFunctionDef *fd = s->cur_func;
-            int label_break, mask;
-            BlockEnv break_entry;
-
-            label_break = new_label(s);
-            push_break_entry(fd, &break_entry, label_name, label_break, -1, 0);
-            fd->top_break->is_regular_stmt = 1;
-            if (!fd->is_strict_mode &&
-                (decl_mask & DECL_MASK_FUNC_WITH_LABEL)) {
-                mask = DECL_MASK_FUNC | DECL_MASK_FUNC_WITH_LABEL;
-            } else {
-                mask = 0;
-            }
-            if (js_parse_statement_or_decl(s, mask))
-                goto fail;
-            emit_label(s, label_break);
-            pop_break_entry(fd);
-            goto done;
-        }
-    }
-
-    switch(tok = s->token.val) {
-    case '{':
-        if (js_parse_block(s))
-            goto fail;
-        break;
-    case TOK_RETURN:
-        if (s->cur_func->is_eval) {
-            js_parse_error(s, "return not in a function");
-            goto fail;
-        }
-        if (s->cur_func->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT) {
-            js_parse_error(s, "return in a static initializer block");
-            goto fail;
-        }
-        if (next_token(s))
-            goto fail;
-        if (s->token.val != ';' && s->token.val != '}' && !s->got_lf) {
-            if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-                goto fail;
-            emit_return(s, true);
-        } else {
-            emit_return(s, false);
-        }
-        if (js_parse_expect_semi(s))
-            goto fail;
-        break;
-    case TOK_THROW:
-        if (next_token(s))
-            goto fail;
-        if (s->got_lf) {
-            js_parse_error(s, "line terminator not allowed after throw");
-            goto fail;
-        }
-        emit_source_loc(s);
-        if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-            goto fail;
-        emit_op(s, OP_throw);
-        if (js_parse_expect_semi(s))
-            goto fail;
-        break;
-    case TOK_AWAIT:
-        /* Check for 'await using' declaration */
-        if (s->cur_func->func_kind & JS_FUNC_ASYNC) {
-            JSParsePos pos;
-            int u;
-            js_parse_get_pos(s, &pos);
-            if (next_token(s)) /* skip 'await' */
-                goto fail;
-            u = is_using(s, false);
-            if (u < 0)
-                goto fail;
-            if (u) {
-                if (!(decl_mask & DECL_MASK_OTHER)) {
-                    js_parse_error(s, "lexical declarations can't appear in single-statement context");
-                    goto fail;
-                }
-                s->cur_func->has_await = true;
-                if (next_token(s)) /* skip 'using' */
-                    goto fail;
-                if (js_parse_descent(s, PDS_VAR, (false), PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING))
-                    goto fail;
-                if (js_parse_expect_semi(s))
-                    goto fail;
-                break;
-            }
-            /* Not 'await using': restore to parse as expression */
-            if (js_parse_seek_token(s, &pos))
-                goto fail;
-        }
-        goto hasexpr;
-    case TOK_LET:
-    case TOK_CONST:
-    haslet:
-        if (!(decl_mask & DECL_MASK_OTHER)) {
-            js_parse_error(s, "lexical declarations can't appear in single-statement context");
-            goto fail;
-        }
-        /* fall thru */
-    case TOK_VAR:
-        if (next_token(s))
-            goto fail;
-        if (js_parse_descent(s, PDS_VAR, (false), PF_IN_ACCEPTED, tok))
-            goto fail;
-        if (js_parse_expect_semi(s))
-            goto fail;
-        break;
-    case TOK_IF:
-        {
-            int label1, label2, mask;
-            if (next_token(s))
-                goto fail;
-            /* create a new scope for `let f;if(1) function f(){}` */
-            push_scope(s);
-            set_eval_ret_undefined(s);
-            if (js_parse_descent(s, PDS_PAREN, 0, 0, 0))
-                goto fail;
-            label1 = emit_goto(s, OP_if_false, -1);
-            if (s->cur_func->is_strict_mode)
-                mask = 0;
-            else
-                mask = DECL_MASK_FUNC; /* Annex B.3.4 */
-
-            /* B.3.4 makes `if (x) function f(){}` mean `if (x) { function f(){} }` — each CLAUSE is its own
-               Block, so each has its own binding for the name. The scope pushed above is the if-statement's own
-               (it is what lets `let f; if (1) function f(){}` be legal); sharing it between the two clauses put
-               both declarations in ONE scope, where the scope-entry hoisting created them both and the later
-               one won regardless of which branch ran. */
-            if (js_parse_if_clause(s, mask))
-                goto fail;
-
-            if (s->token.val == TOK_ELSE) {
-                label2 = emit_goto(s, OP_goto, -1);
-                if (next_token(s))
-                    goto fail;
-
-                emit_label(s, label1);
-                if (js_parse_if_clause(s, mask))
-                    goto fail;
-
-                label1 = label2;
-            }
-            emit_label(s, label1);
-            pop_scope(s);
-        }
-        break;
-    case TOK_WHILE:
-        {
-            int label_cont, label_break;
-            BlockEnv break_entry;
-
-            label_cont = new_label(s);
-            label_break = new_label(s);
-
-            push_break_entry(s->cur_func, &break_entry,
-                             label_name, label_break, label_cont, 0);
-
-            if (next_token(s))
-                goto fail;
-
-            set_eval_ret_undefined(s);
-
-            emit_label(s, label_cont);
-            if (js_parse_descent(s, PDS_PAREN, 0, 0, 0))
-                goto fail;
-            emit_goto(s, OP_if_false, label_break);
-
-            if (js_parse_statement(s))
-                goto fail;
-            emit_goto(s, OP_goto, label_cont);
-
-            emit_label(s, label_break);
-
-            pop_break_entry(s->cur_func);
-        }
-        break;
-    case TOK_DO:
-        {
-            int label_cont, label_break, label1;
-            BlockEnv break_entry;
-
-            label_cont = new_label(s);
-            label_break = new_label(s);
-            label1 = new_label(s);
-
-            push_break_entry(s->cur_func, &break_entry,
-                             label_name, label_break, label_cont, 0);
-
-            if (next_token(s))
-                goto fail;
-
-            emit_label(s, label1);
-
-            set_eval_ret_undefined(s);
-
-            if (js_parse_statement(s))
-                goto fail;
-
-            emit_label(s, label_cont);
-            if (js_parse_expect(s, TOK_WHILE))
-                goto fail;
-            if (js_parse_descent(s, PDS_PAREN, 0, 0, 0))
-                goto fail;
-            /* Insert semicolon if missing */
-            if (s->token.val == ';') {
-                if (next_token(s))
-                    goto fail;
-            }
-            emit_goto(s, OP_if_true, label1);
-
-            emit_label(s, label_break);
-
-            pop_break_entry(s->cur_func);
-        }
-        break;
-    case TOK_FOR:
-        {
-            int label_cont, label_break, label_body, label_test;
-            int pos_cont, pos_body, block_scope_level;
-            int for_scope_level;
-            BlockEnv break_entry;
-            int tok, bits;
-            int source_line_num, source_col_num;
-            bool is_async;
-
-            source_line_num = s->token.line_num;
-            source_col_num = s->token.col_num;
-            if (next_token(s))
-                goto fail;
-
-            set_eval_ret_undefined(s);
-            bits = 0;
-            is_async = false;
-            if (s->token.val == '(') {
-                js_parse_skip_parens_token(s, &bits, false);
-            } else if (s->token.val == TOK_AWAIT) {
-                if (!(s->cur_func->func_kind & JS_FUNC_ASYNC)) {
-                    js_parse_error(s, "for await is only valid in asynchronous functions");
-                    goto fail;
-                }
-                is_async = true;
-                if (next_token(s))
-                    goto fail;
-                s->cur_func->has_await = true;
-            }
-            if (js_parse_expect(s, '('))
-                goto fail;
-
-            if (!(bits & SKIP_HAS_SEMI)) {
-                /* parse for/in or for/of */
-                if (js_parse_for_in_of(s, label_name, is_async,
-                                       source_line_num, source_col_num))
-                    goto fail;
-                break;
-            }
-            block_scope_level = s->cur_func->scope_level;
-
-            /* create scope for the lexical variables declared in the initial,
-               test and increment expressions */
-            push_scope(s);
-            for_scope_level = s->cur_func->scope_level;
-            /* initial expression */
-            tok = s->token.val;
-            if (tok != ';') {
-                switch (is_let(s, DECL_MASK_OTHER)) {
-                case true:
-                    tok = TOK_LET;
-                    break;
-                case false:
-                    break;
-                default:
-                    goto fail;
-                }
-                if (tok != TOK_VAR && tok != TOK_LET && tok != TOK_CONST &&
-                    token_is_pseudo_keyword(s, JS_ATOM_using)) {
-                    int u = is_using(s, false);
-                    if (u < 0)
-                        goto fail;
-                    if (u)
-                        tok = TOK_USING;
-                }
-                if (tok == TOK_AWAIT &&
-                    (s->cur_func->func_kind & JS_FUNC_ASYNC)) {
-                    /* Check for `await using` declaration head */
-                    JSParsePos pos;
-                    int u;
-                    js_parse_get_pos(s, &pos);
-                    if (next_token(s)) /* skip 'await' */
-                        goto fail;
-                    u = is_using(s, false);
-                    if (u < 0)
-                        goto fail;
-                    if (u) {
-                        s->cur_func->has_await = true;
-                        tok = TOK_USING;
-                        if (next_token(s)) /* skip 'using' */
-                            goto fail;
-                        if (js_parse_descent(s, PDS_VAR, (false), PF_IN_ACCEPTED | PF_AWAIT_USING, TOK_USING))
-                            goto fail;
-                        goto for_init_done;
-                    }
-                    if (js_parse_seek_token(s, &pos))
-                        goto fail;
-                }
-                if (tok == TOK_VAR
-                || tok == TOK_LET
-                || tok == TOK_CONST
-                || tok == TOK_USING) {
-                    int pf = 0;
-                    if (tok == TOK_USING && is_async)
-                        pf |= PF_AWAIT_USING;
-                    if (next_token(s))
-                        goto fail;
-                    if (js_parse_descent(s, PDS_VAR, (false), pf, tok))
-                        goto fail;
-                } else {
-                    if (js_parse_descent(s, PDS_EXPR2, 0, 0, 0))
-                        goto fail;
-                    emit_op(s, OP_drop);
-                }
-
-            for_init_done:
-                /* close the closures before the first iteration */
-                close_scopes(s, s->cur_func->scope_level, block_scope_level);
-            }
-            if (js_parse_expect(s, ';'))
-                goto fail;
-
-            label_test = new_label(s);
-            label_cont = new_label(s);
-            label_body = new_label(s);
-            label_break = new_label(s);
-
-            push_break_entry(s->cur_func, &break_entry,
-                             label_name, label_break, label_cont, 0);
-            if (s->cur_func->scopes[for_scope_level].has_using) {
-                break_entry.has_using = true;
-                break_entry.using_scope_level = for_scope_level;
-                break_entry.drop_count = 1; /* catch_offset from OP_catch */
-            }
-
-            /* test expression */
-            if (s->token.val == ';') {
-                /* no test expression */
-                label_test = label_body;
-            } else {
-                emit_label(s, label_test);
-                if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-                    goto fail;
-                emit_goto(s, OP_if_false, label_break);
-            }
-            if (js_parse_expect(s, ';'))
-                goto fail;
-
-            if (s->token.val == ')') {
-                /* no end expression */
-                break_entry.label_cont = label_cont = label_test;
-                pos_cont = 0; /* avoid warning */
-            } else {
-                /* skip the end expression */
-                emit_goto(s, OP_goto, label_body);
-
-                pos_cont = s->cur_func->byte_code.size;
-                emit_label(s, label_cont);
-                if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-                    goto fail;
-                emit_op(s, OP_drop);
-                if (label_test != label_body)
-                    emit_goto(s, OP_goto, label_test);
-            }
-            if (js_parse_expect(s, ')'))
-                goto fail;
-
-            pos_body = s->cur_func->byte_code.size;
-            emit_label(s, label_body);
-            if (js_parse_statement(s))
-                goto fail;
-
-            /* close the closures before the next iteration */
-            /* XXX: check continue case */
-            close_scopes(s, s->cur_func->scope_level, block_scope_level);
-
-            if (label_test != label_body && label_cont != label_test) {
-                /* move the increment code here */
-                DynBuf *bc = &s->cur_func->byte_code;
-                int chunk_size = pos_body - pos_cont;
-                int offset = bc->size - pos_cont;
-                int i;
-                if (dbuf_claim(bc, chunk_size))
-                    return -1;
-                dbuf_put(bc, bc->buf + pos_cont, chunk_size);
-                memset(bc->buf + pos_cont, OP_nop, chunk_size);
-                /* increment part ends with a goto */
-                s->cur_func->last_opcode_pos = bc->size - 5;
-                /* relocate labels */
-                for (i = label_cont; i < s->cur_func->label_count; i++) {
-                    LabelSlot *ls = &s->cur_func->label_slots[i];
-                    if (ls->pos >= pos_cont && ls->pos < pos_body)
-                        ls->pos += offset;
-                }
-            } else {
-                emit_goto(s, OP_goto, label_cont);
-            }
-
-            emit_label(s, label_break);
-
-            pop_break_entry(s->cur_func);
-
-            if (s->cur_func->scopes[for_scope_level].has_using) {
-                int label_catch = s->cur_func->scopes[for_scope_level].using_label_catch;
-                int label_end = s->cur_func->scopes[for_scope_level].using_label_end;
-
-                /* Normal exit: drop catch_offset, dispose */
-                emit_op(s, OP_drop);
-                emit_op(s, OP_using_dispose_init);
-                emit_op(s, OP_dispose_scope);
-                emit_u16(s, for_scope_level);
-                emit_op(s, OP_using_dispose_end);
-                emit_goto(s, OP_goto, label_end);
-
-                /* Catch handler: exception on stack */
-                emit_label(s, label_catch);
-                emit_op(s, OP_dispose_scope);
-                emit_u16(s, for_scope_level);
-                emit_op(s, OP_throw);
-
-                emit_label(s, label_end);
-            }
-            pop_scope(s);
-        }
-        break;
-    case TOK_BREAK:
-    case TOK_CONTINUE:
-        {
-            int is_cont = s->token.val - TOK_BREAK;
-            int label;
-
-            if (next_token(s))
-                goto fail;
-            if (!s->got_lf && s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)
-                label = s->token.u.ident.atom;
-            else
-                label = JS_ATOM_NULL;
-            if (emit_break(s, label, is_cont))
-                goto fail;
-            if (label != JS_ATOM_NULL) {
-                if (next_token(s))
-                    goto fail;
-            }
-            if (js_parse_expect_semi(s))
-                goto fail;
-        }
-        break;
-    case TOK_SWITCH:
-        {
-            int label_case, label_break, label1;
-            int default_label_pos;
-            BlockEnv break_entry;
-
-            if (next_token(s))
-                goto fail;
-
-            set_eval_ret_undefined(s);
-            if (js_parse_descent(s, PDS_PAREN, 0, 0, 0))
-                goto fail;
-
-            push_scope(s);
-            label_break = new_label(s);
-            push_break_entry(s->cur_func, &break_entry,
-                             label_name, label_break, -1, 1);
-
-            if (js_parse_expect(s, '{'))
-                goto fail;
-
-            default_label_pos = -1;
-            label_case = -1;
-            while (s->token.val != '}') {
-                if (s->token.val == TOK_CASE) {
-                    label1 = -1;
-                    if (label_case >= 0) {
-                        /* skip the case if needed */
-                        label1 = emit_goto(s, OP_goto, -1);
-                    }
-                    emit_label(s, label_case);
-                    label_case = -1;
-                    for (;;) {
-                        /* parse a sequence of case clauses */
-                        if (next_token(s))
-                            goto fail;
-                        emit_op(s, OP_dup);
-                        if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-                            goto fail;
-                        if (js_parse_expect(s, ':'))
-                            goto fail;
-                        emit_op(s, OP_strict_eq);
-                        if (s->token.val == TOK_CASE) {
-                            label1 = emit_goto(s, OP_if_true, label1);
-                        } else {
-                            label_case = emit_goto(s, OP_if_false, -1);
-                            emit_label(s, label1);
-                            break;
-                        }
-                    }
-                } else if (s->token.val == TOK_DEFAULT) {
-                    if (next_token(s))
-                        goto fail;
-                    if (js_parse_expect(s, ':'))
-                        goto fail;
-                    if (default_label_pos >= 0) {
-                        js_parse_error(s, "duplicate default");
-                        goto fail;
-                    }
-                    if (label_case < 0) {
-                        /* falling thru direct from switch expression */
-                        label_case = emit_goto(s, OP_goto, -1);
-                    }
-                    /* Emit a dummy label opcode. Label will be patched after
-                       the end of the switch body. Do not use emit_label(s, 0)
-                       because it would clobber label 0 address, preventing
-                       proper optimizer operation.
-                     */
-                    emit_op(s, OP_label);
-                    emit_u32(s, 0);
-                    default_label_pos = s->cur_func->byte_code.size - 4;
-                } else {
-                    if (label_case < 0) {
-                        /* falling thru direct from switch expression */
-                        js_parse_error(s, "invalid switch statement");
-                        goto fail;
-                    }
-                    /* `using` / `await using` declarations are not allowed
-                       directly within a CaseClause or DefaultClause
-                       (early error per spec). */
-                    if (token_is_pseudo_keyword(s, JS_ATOM_using)) {
-                        int u = is_using(s, false);
-                        if (u < 0)
-                            goto fail;
-                        if (u) {
-                            js_parse_error(s, "using declaration is not allowed in this context");
-                            goto fail;
-                        }
-                    }
-                    if (s->token.val == TOK_AWAIT &&
-                        (s->cur_func->func_kind & JS_FUNC_ASYNC)) {
-                        JSParsePos pos;
-                        int u;
-                        js_parse_get_pos(s, &pos);
-                        if (next_token(s))
-                            goto fail;
-                        u = is_using(s, false);
-                        if (u < 0)
-                            goto fail;
-                        if (js_parse_seek_token(s, &pos))
-                            goto fail;
-                        if (u) {
-                            js_parse_error(s, "await using declaration is not allowed in this context");
-                            goto fail;
-                        }
-                    }
-                    if (js_parse_statement_or_decl(s, DECL_MASK_ALL))
-                        goto fail;
-                }
-            }
-            if (js_parse_expect(s, '}'))
-                goto fail;
-            if (default_label_pos >= 0) {
-                /* Ugly patch for the `default` label, shameful and risky */
-                put_u32(s->cur_func->byte_code.buf + default_label_pos,
-                        label_case);
-                s->cur_func->label_slots[label_case].pos = default_label_pos + 4;
-            } else {
-                emit_label(s, label_case);
-            }
-            emit_label(s, label_break);
-            emit_op(s, OP_drop); /* drop the switch expression */
-
-            pop_break_entry(s->cur_func);
-            pop_scope(s);
-        }
-        break;
-    case TOK_TRY:
-        {
-            int label_catch, label_catch2, label_finally, label_end;
-            JSAtom name;
-            BlockEnv block_env;
-
-            set_eval_ret_undefined(s);
-            if (next_token(s))
-                goto fail;
-            label_catch = new_label(s);
-            label_catch2 = new_label(s);
-            label_finally = new_label(s);
-            label_end = new_label(s);
-
-            emit_goto(s, OP_catch, label_catch);
-
-            push_break_entry(s->cur_func, &block_env,
-                             JS_ATOM_NULL, -1, -1, 1);
-            block_env.label_finally = label_finally;
-
-            if (js_parse_block(s))
-                goto fail;
-
-            pop_break_entry(s->cur_func);
-
-            if (js_is_live_code(s)) {
-                /* drop the catch offset */
-                emit_op(s, OP_drop);
-                /* must push dummy value to keep same stack size */
-                emit_op(s, OP_undefined);
-                emit_goto(s, OP_gosub, label_finally);
-                emit_op(s, OP_drop);
-
-                emit_goto(s, OP_goto, label_end);
-            }
-
-            if (s->token.val == TOK_CATCH) {
-                if (next_token(s))
-                    goto fail;
-
-                push_scope(s);  /* catch variable */
-                emit_label(s, label_catch);
-                /* 14.15.3 steps 2-3: when the Block completed ABRUPTLY the catch clause's completion REPLACES
-                   it, so whatever the try block's last statement left in the eval-completion register is
-                   discarded. `eval("try { 'try'; throw 0; } catch (e) {}")` is undefined, not 'try'. */
-                set_eval_ret_undefined(s);
-
-                if (s->token.val == '{') {
-                    /* support optional-catch-binding feature */
-                    emit_op(s, OP_drop);    /* pop the exception object */
-                } else {
-                    if (js_parse_expect(s, '('))
-                        goto fail;
-                    if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
-                        if (s->token.val == '[' || s->token.val == '{') {
-                            /* XXX: TOK_LET is not completely correct */
-                            if (js_parse_destructuring_element(s, TOK_LET, false, true, -1, true, false) < 0)
-                                goto fail;
-                        } else {
-                            js_parse_error(s, "identifier expected");
-                            goto fail;
-                        }
-                    } else {
-                        name = JS_DupAtom(ctx, s->token.u.ident.atom);
-                        if (next_token(s)
-                        ||  js_define_var(s, name, TOK_CATCH) < 0) {
-                            JS_FreeAtom(ctx, name);
-                            goto fail;
-                        }
-                        /* store the exception value in the catch variable */
-                        emit_op(s, OP_scope_put_var);
-                        emit_u32(s, name);
-                        emit_u16(s, s->cur_func->scope_level);
-                    }
-                    if (js_parse_expect(s, ')'))
-                        goto fail;
-                }
-                /* XXX: should keep the address to nop it out if there is no finally block */
-                emit_goto(s, OP_catch, label_catch2);
-
-                push_scope(s);  /* catch block */
-                push_break_entry(s->cur_func, &block_env, JS_ATOM_NULL,
-                                 -1, -1, 1);
-                block_env.label_finally = label_finally;
-
-                if (js_parse_block(s))
-                    goto fail;
-
-                pop_break_entry(s->cur_func);
-                pop_scope(s);  /* catch block */
-                pop_scope(s);  /* catch variable */
-
-                if (js_is_live_code(s)) {
-                    /* drop the catch2 offset */
-                    emit_op(s, OP_drop);
-                    /* XXX: should keep the address to nop it out if there is no finally block */
-                    /* must push dummy value to keep same stack size */
-                    emit_op(s, OP_undefined);
-                    emit_goto(s, OP_gosub, label_finally);
-                    emit_op(s, OP_drop);
-                    emit_goto(s, OP_goto, label_end);
-                }
-                /* catch exceptions thrown in the catch block to execute the
-                 * finally clause and rethrow the exception */
-                emit_label(s, label_catch2);
-                /* catch value is at TOS, no need to push undefined */
-                emit_goto(s, OP_gosub, label_finally);
-                emit_op(s, OP_throw);
-
-            } else if (s->token.val == TOK_FINALLY) {
-                /* finally without catch : execute the finally clause
-                 * and rethrow the exception */
-                emit_label(s, label_catch);
-                /* catch value is at TOS, no need to push undefined */
-                emit_goto(s, OP_gosub, label_finally);
-                emit_op(s, OP_throw);
-            } else {
-                js_parse_error(s, "expecting catch or finally");
-                goto fail;
-            }
-            emit_label(s, label_finally);
-            if (s->token.val == TOK_FINALLY) {
-                int saved_eval_ret_idx = 0; /* avoid warning */
-
-                if (next_token(s))
-                    goto fail;
-                /* on the stack: ret_value gosub_ret_value */
-                push_break_entry(s->cur_func, &block_env, JS_ATOM_NULL,
-                                 -1, -1, 2);
-
-                if (s->cur_func->eval_ret_idx >= 0) {
-                    /* 'finally' updates eval_ret only if not a normal
-                       termination */
-                    saved_eval_ret_idx =
-                        add_var(s->ctx, s->cur_func, JS_ATOM__ret_);
-                    if (saved_eval_ret_idx < 0)
-                        goto fail;
-                    emit_op(s, OP_get_loc);
-                    emit_u16(s, s->cur_func->eval_ret_idx);
-                    emit_op(s, OP_put_loc);
-                    emit_u16(s, saved_eval_ret_idx);
-                    set_eval_ret_undefined(s);
-                }
-
-                if (js_parse_block(s))
-                    goto fail;
-
-                if (s->cur_func->eval_ret_idx >= 0) {
-                    emit_op(s, OP_get_loc);
-                    emit_u16(s, saved_eval_ret_idx);
-                    emit_op(s, OP_put_loc);
-                    emit_u16(s, s->cur_func->eval_ret_idx);
-                }
-                pop_break_entry(s->cur_func);
-            }
-            emit_op(s, OP_ret);
-            emit_label(s, label_end);
-        }
-        break;
-    case ';':
-        /* empty statement */
-        if (next_token(s))
-            goto fail;
-        break;
-    case TOK_WITH:
-        if (s->cur_func->is_strict_mode) {
-            js_parse_error(s, "invalid keyword: with");
-            goto fail;
-        } else {
-            int with_idx;
-
-            if (next_token(s))
-                goto fail;
-
-            if (js_parse_descent(s, PDS_PAREN, 0, 0, 0))
-                goto fail;
-
-            push_scope(s);
-            with_idx = define_var(s, s->cur_func, JS_ATOM__with_,
-                                  JS_VAR_DEF_WITH);
-            if (with_idx < 0)
-                goto fail;
-            emit_op(s, OP_to_object);
-            emit_op(s, OP_put_loc);
-            emit_u16(s, with_idx);
-
-            set_eval_ret_undefined(s);
-            if (js_parse_statement(s))
-                goto fail;
-
-            /* Popping scope drops lexical context for the with object variable */
-            pop_scope(s);
-        }
-        break;
-    case TOK_FUNCTION:
-        /* ES6 Annex B.3.2 and B.3.3 semantics */
-        if (!(decl_mask & DECL_MASK_FUNC))
-            goto func_decl_error;
-        if (!(decl_mask & DECL_MASK_OTHER) && peek_token(s, false) == '*')
-            goto func_decl_error;
-        goto parse_func_var;
-    case TOK_IDENT:
-        if (s->token.u.ident.is_reserved) {
-            js_parse_error_reserved_identifier(s);
-            goto fail;
-        }
-        /* Determine if `let` introduces a Declaration or an ExpressionStatement */
-        switch (is_let(s, decl_mask)) {
-        case true:
-            tok = TOK_LET;
-            goto haslet;
-        case false:
-            break;
-        default:
-            goto fail;
-        }
-        if (token_is_pseudo_keyword(s, JS_ATOM_using)) {
-            int u = is_using(s, false);
-            if (u < 0)
-                goto fail;
-            if (u) {
-                JSFunctionDef *fd = s->cur_func;
-                if (!(decl_mask & DECL_MASK_OTHER)) {
-                    js_parse_error(s, "lexical declarations can't appear in single-statement context");
-                    goto fail;
-                }
-                if (fd->is_eval &&
-                    (fd->eval_type == JS_EVAL_TYPE_GLOBAL ||
-                     fd->eval_type == JS_EVAL_TYPE_DIRECT ||
-                     fd->eval_type == JS_EVAL_TYPE_INDIRECT) &&
-                    fd->scope_level == fd->body_scope) {
-                    js_parse_error(s, "using declaration is not allowed at the top level of a script");
-                    goto fail;
-                }
-                if (next_token(s))
-                    goto fail;
-                if (js_parse_descent(s, PDS_VAR, (false), PF_IN_ACCEPTED, TOK_USING))
-                    goto fail;
-                if (js_parse_expect_semi(s))
-                    goto fail;
-                break;
-            }
-        }
-        if (token_is_pseudo_keyword(s, JS_ATOM_async) &&
-            peek_token(s, true) == TOK_FUNCTION) {
-            if (!(decl_mask & DECL_MASK_OTHER)) {
-            func_decl_error:
-                js_parse_error(s, "function declarations can't appear in single-statement context");
-                goto fail;
-            }
-        parse_func_var:
-            if (js_parse_function_decl(s, JS_PARSE_FUNC_VAR,
-                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                       s->token.ptr,
-                                       s->token.line_num,
-                                       s->token.col_num, PF_IN_ACCEPTED))
-                goto fail;
-            break;
-        }
-        goto hasexpr;
-
-    case TOK_CLASS:
-        if (!(decl_mask & DECL_MASK_OTHER)) {
-            js_parse_error(s, "class declarations can't appear in single-statement context");
-            goto fail;
-        }
-        if (js_parse_class(s, false, JS_PARSE_EXPORT_NONE))
-            return -1;
-        break;
-
-    case TOK_DEBUGGER:
-        /* currently no debugger, so just skip the keyword */
-        if (next_token(s))
-            goto fail;
-        if (js_parse_expect_semi(s))
-            goto fail;
-        break;
-
-    case TOK_ENUM:
-    case TOK_EXPORT:
-    case TOK_EXTENDS:
-        js_unsupported_keyword(s, s->token.u.ident.atom);
-        goto fail;
-
-    default:
-    hasexpr:
-        emit_source_loc(s);
-        if (js_parse_descent(s, PDS_EXPR2, 0, PF_IN_ACCEPTED, 0))
-            goto fail;
-        if (s->cur_func->eval_ret_idx >= 0) {
-            /* store the expression value so that it can be returned
-               by eval() */
-            emit_op(s, OP_put_loc);
-            emit_u16(s, s->cur_func->eval_ret_idx);
-        } else {
-            emit_op(s, OP_drop); /* drop the result */
-        }
-        if (js_parse_expect_semi(s))
-            goto fail;
-        break;
-    }
-done:
-    JS_FreeAtom(ctx, label_name);
-    return 0;
-fail:
-    JS_FreeAtom(ctx, label_name);
-    return -1;
-}
-
 #endif // QJS_DISABLE_PARSER
 
 /* 'name' is freed */
@@ -53765,7 +53843,7 @@ static __exception int js_parse_source_element(JSParseState *s)
         if (js_parse_import(s))
             return -1;
     } else {
-        if (js_parse_statement_or_decl(s, DECL_MASK_ALL))
+        if (js_parse_descent(s, PDS_SOD, 0, DECL_MASK_ALL, 0))
             return -1;
     }
     return 0;
