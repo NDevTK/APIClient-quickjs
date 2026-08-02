@@ -44355,9 +44355,11 @@ static int add_private_class_field(JSParseState *s, JSFunctionDef *fd,
    recursive functions those call sites used to name (js_parse_expr, js_parse_expr2, js_parse_expr_paren,
    js_parse_unary, js_parse_delete, and the precedence ladder) no longer exist. */
 enum {
-    PDS_BIN, PDS_BIN_PRIV, PDS_BIN_HEAD, PDS_BIN_LOOP, PDS_BIN_RHS,
-    PDS_LAO, PDS_LAO_HEAD, PDS_LAO_LOOP, PDS_LAO_RHS,
-    PDS_COA, PDS_COA_HEAD, PDS_COA_LOOP, PDS_COA_RHS,
+    /* No *_LOOP state: a precedence ladder's loop head is reached by an ordinary goto WITHIN the production,
+       never by a resume, so a dispatch entry for one is a state the frame can never hold. */
+    PDS_BIN, PDS_BIN_PRIV, PDS_BIN_HEAD, PDS_BIN_RHS,
+    PDS_LAO, PDS_LAO_HEAD, PDS_LAO_RHS,
+    PDS_COA, PDS_COA_HEAD, PDS_COA_RHS,
     PDS_CND, PDS_CND_HEAD,
     PDS_UNA, PDS_UNA_PREFIX, PDS_UNA_INCDEC, PDS_UNA_TYPEOF, PDS_UNA_AWAIT,
     PDS_UNA_DELETE, PDS_UNA_POW,
@@ -44382,7 +44384,10 @@ enum {
     PDS_ASGN_ARROW1, PDS_ASGN_ARROW2, PDS_ASGN_ARROW3,
     PDS_PFX_FUNC, PDS_PFX_ASYNCFUNC, PDS_OBJ_METHOD, PDS_SOD_FUNCVAR,
     PDS_CLS_SINIT, PDS_CLS_ACCESSOR, PDS_CLS_METHOD,
-    PDS_SE_FUNC, PDS_EXP_FUNC, PDS_EXP_DEFFUNC,
+    PDS_SE_FUNC, PDS_EXP_FUNC, PDS_EXP_DEFFUNC, PDS_CLS_KEY, PDS_DE_KEY,
+    /* the six that were still nested C ACTIVATIONS of the driver */
+    PDS_PFX_CLASS, PDS_SOD_CATCHPAT, PDS_SOD_CLASS, PDS_FIO_PAT1,
+    PDS_FIO_PAT2, PDS_SE_EXPORT,
     PDS_DESTR, PDS_DE_01, PDS_DE_02, PDS_DE_03, PDS_DE_04, PDS_DE_05,
     PDS_DE_06, PDS_DE_07, PDS_DE_08, PDS_DE_09, PDS_DE_10,
     PDS_SOD_01, PDS_SOD_02, PDS_SOD_03, PDS_SOD_04, PDS_SOD_05, PDS_SOD_06, PDS_SOD_07, PDS_SOD_08, PDS_SOD_09, PDS_SOD_10, PDS_SOD_11, PDS_SOD_12, PDS_SOD_13, PDS_SOD_14, PDS_SOD_15, PDS_SOD_16, PDS_SOD_17, PDS_SOD_18, PDS_SOD_19, PDS_SOD_20, PDS_SOD_21, PDS_SOD_22, PDS_SOD_23, PDS_SOD_24, PDS_SOD_25, PDS_SOD_26, PDS_SOD_27, PDS_SOD_28, PDS_SOD_29,
@@ -44500,25 +44505,6 @@ static bool token_starts_property_name(int tok)
            tok == '[' || tok == TOK_PRIVATE_NAME;
 }
 
-/* if the property is an expression, name = JS_ATOM_NULL */
-/* The C-signature adapter for the call sites the descent does not own yet (js_parse_class,
-   the destructuring pattern). There is ONE implementation — PDS_PROPNAME in js_parse_descent — and this
-   only reshapes the out-channel into the JSAtom* those sites pass. It CONSUMES the channel, which is what the
-   producer's DCHECK asserts. */
-static int __exception js_parse_property_name(JSParseState *s,
-                                              JSAtom *pname,
-                                              bool allow_method, bool allow_var,
-                                              bool allow_private)
-{
-    int r = js_parse_descent(s, PDS_PROPNAME, 0,
-                             (allow_method  ? PN_ALLOW_METHOD  : 0) |
-                             (allow_var     ? PN_ALLOW_VAR     : 0) |
-                             (allow_private ? PN_ALLOW_PRIVATE : 0), 0);
-    *pname = s->pd_name;
-    s->pd_name = JS_ATOM_NULL;
-    return r;
-}
-
 typedef struct JSParsePos {
     int last_line_num;
     int last_col_num;
@@ -44587,9 +44573,20 @@ static bool is_regexp_allowed(int tok)
 /* XXX: improve speed with early bailout */
 /* XXX: no longer works if regexps are present. Could use previous
    regexp parsing heuristics to handle most cases */
+/* THE BRACKET STACK IS UNBOUNDED. It used to be `char state[256]`, and overflowing it did not report anything
+   — it `goto done`d and returned whatever token had been reached, so the CALLER decided from a wrong answer.
+   `var {a:{a:…}} = …` nested past ~255 is valid source that this rejected with "variable name expected", and
+   the flat C stack at that failure is what proves it was never a recursion limit: a fixed array is a BOUND,
+   and a bound that answers wrongly instead of failing is the worst kind. It grows on demand instead, from a
+   stack buffer that covers ordinary source with no allocation at all; the heap copy is freed at the single
+   exit. This function never descends and never yields, so the buffer is a plain local with no owner to
+   register — putting it on JSParseState would have created a free obligation at every site one dies, and
+   JSON's step machine embeds a JSParseState BY VALUE. */
 static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_terminator)
 {
-    char state[256];
+    char inline_state[256];
+    char *state = inline_state;
+    size_t state_size = sizeof(inline_state);
     size_t level = 0;
     JSParsePos pos;
     int last_tok, tok = TOK_EOF;
@@ -44605,8 +44602,22 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
         case '(':
         case '[':
         case '{':
-            if (level >= sizeof(state))
-                goto done;
+            if (level >= state_size) {
+                size_t nsize = state_size * 2;
+                char *nstate;
+                if (state == inline_state) {
+                    nstate = js_malloc(s->ctx, nsize);
+                    if (nstate)
+                        memcpy(nstate, state, state_size);
+                } else {
+                    nstate = js_realloc(s->ctx, state, nsize);
+                }
+                /* A dropped allocation here would silently truncate the scan and hand the caller a wrong
+                   token — the very defect this replaced. There is no correct smaller answer, so it is fatal. */
+                CHECK(nstate != NULL, "out of memory growing the parser's bracket stack");
+                state = nstate;
+                state_size = nsize;
+            }
             state[level++] = s->token.val;
             break;
         case ')':
@@ -44697,6 +44708,8 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
         }
     }
  done:
+    if (state != inline_state)
+        js_free(s->ctx, state);
     if (pbits) {
         *pbits = bits;
     }
@@ -45689,15 +45702,12 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_BIN:       goto bin_entry;
     case PDS_BIN_PRIV:  goto bin_priv_done;
     case PDS_BIN_HEAD:  goto bin_head_done;
-    case PDS_BIN_LOOP:  goto bin_loop;
     case PDS_BIN_RHS:   goto bin_rhs_done;
     case PDS_LAO:       goto lao_entry;
     case PDS_LAO_HEAD:  goto lao_head_done;
-    case PDS_LAO_LOOP:  goto lao_loop;
     case PDS_LAO_RHS:   goto lao_rhs_done;
     case PDS_COA:       goto coa_entry;
     case PDS_COA_HEAD:  goto coa_head_done;
-    case PDS_COA_LOOP:  goto coa_loop;
     case PDS_COA_RHS:   goto coa_rhs_done;
     case PDS_CND:       goto cnd_entry;
     case PDS_CND_HEAD:  goto cnd_head_done;
@@ -45779,6 +45789,14 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_SE_FUNC:         goto se_func_done;
     case PDS_EXP_FUNC:        goto exp_func_done;
     case PDS_EXP_DEFFUNC:     goto exp_deffunc_done;
+    case PDS_CLS_KEY:         goto cls_key_done;
+    case PDS_DE_KEY:          goto de_key_done;
+    case PDS_PFX_CLASS:       goto pfx_class_done;
+    case PDS_SOD_CATCHPAT:    goto sod_catchpat_done;
+    case PDS_SOD_CLASS:       goto sod_class_done;
+    case PDS_FIO_PAT1:        goto fio_pat1_done;
+    case PDS_FIO_PAT2:        goto fio_pat2_done;
+    case PDS_SE_EXPORT:       goto se_export_done;
     case PDS_EXP_01:          goto exp_01;
     case PDS_EXP_02:          goto exp_02;
     case PDS_EXP_03:          goto exp_03;
@@ -46728,7 +46746,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             PD_RET(-1);
         break;
     case TOK_CLASS:
-        if (js_parse_descent(s, PDS_CLASS, true, 0, JS_PARSE_EXPORT_NONE))
+        PD_CALL(PDS_CLASS, true, 0, JS_PARSE_EXPORT_NONE, PDS_PFX_CLASS);
+ pfx_class_done:
+        if (pd_ret)
             PD_RET(-1);
         break;
     case TOK_NULL:
@@ -47442,8 +47462,8 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 /* ---- ObjectLiteral. Its property values are AssignmentExpressions, so like ArrayLiteral this CLOSES
    `{a:{a:{…}}}` rather than shortening it. `name` is an OWNED atom live across the value descent, so it lives
    in the frame's atom slot and the OOM unwind releases it — the PD_RET DCHECK is what makes a missed release
-   crash instead of leak. js_parse_property_name stays a C call: it takes a JSAtom out-parameter the descent's
-   signature cannot carry, and for a plain key it descends nowhere. ---- */
+   crash instead of leak. The key is a PD_CALL like every other descent: PDS_PROPNAME returns its atom on the
+   out-channel, which the resume CONSUMES — the producer's DCHECK asserts exactly that. ---- */
  obj_entry:
     if (next_token(s))
         PD_RET(-1);
@@ -48635,7 +48655,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
                         if (s->token.val == '[' || s->token.val == '{') {
                             /* XXX: TOK_LET is not completely correct */
-                            if (js_parse_descent(s, PDS_DESTR, 0, DE_PACK(false, true, true, false, -1), TOK_LET) < 0)
+                            PD_CALL(PDS_DESTR, 0, DE_PACK(false, true, true, false, -1), TOK_LET, PDS_SOD_CATCHPAT);
+ sod_catchpat_done:
+                            if (pd_ret < 0)
                                 goto sod_fail;
                         } else {
                             js_parse_error(s, "identifier expected");
@@ -48858,7 +48880,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             js_parse_error(s, "class declarations can't appear in single-statement context");
             goto sod_fail;
         }
-        if (js_parse_descent(s, PDS_CLASS, false, 0, JS_PARSE_EXPORT_NONE))
+        PD_CALL(PDS_CLASS, false, 0, JS_PARSE_EXPORT_NONE, PDS_SOD_CLASS);
+ sod_class_done:
+        if (pd_ret)
             goto sod_fail;
         break;
 
@@ -49034,7 +49058,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
         if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
             if (s->token.val == '[' || s->token.val == '{') {
-                if (js_parse_descent(s, PDS_DESTR, 0, DE_PACK(false, true, false, false, -1), f->st_tok) < 0)
+                PD_CALL(PDS_DESTR, 0, DE_PACK(false, true, false, false, -1), f->st_tok, PDS_FIO_PAT1);
+ fio_pat1_done:
+                if (pd_ret < 0)
                     goto fio_fail;
                 f->st_b2 = true;
             } else {
@@ -49103,7 +49129,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         int skip_bits;
         if ((s->token.val == '[' || s->token.val == '{')
         &&  ((f->st_bits = js_parse_skip_parens_token(s, &skip_bits, false)) == TOK_IN || f->st_bits == TOK_OF)) {
-            if (js_parse_descent(s, PDS_DESTR, 0, DE_PACK(false, true, true, false, skip_bits & SKIP_HAS_ELLIPSIS), 0) < 0)
+            PD_CALL(PDS_DESTR, 0, DE_PACK(false, true, true, false, skip_bits & SKIP_HAS_ELLIPSIS), 0, PDS_FIO_PAT2);
+ fio_pat2_done:
+            if (pd_ret < 0)
                 goto fio_fail;
         } else {
             int lvalue_label;
@@ -49435,7 +49463,11 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 emit_u8(s, 0 | ((f->depth_lvalue + 1) << 2) | ((f->depth_lvalue + 2) << 5));
                 goto set_val;
             }
-            prop_type = js_parse_property_name(s, &f->atom, false, true, false);
+            PD_CALL(PDS_PROPNAME, 0, PN_ALLOW_VAR, 0, PDS_DE_KEY);
+ de_key_done:
+            f->atom = out_name;
+            out_name = JS_ATOM_NULL;
+            prop_type = pd_ret;
             if (prop_type < 0)
                 goto de_fail;
             f->atom2 = JS_ATOM_NULL;
@@ -49846,7 +49878,6 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     f->st_mask = 0;   /* class_flags — its declaration carried this initialiser */
     JSAtom class_name1;
     int i;
-    const uint8_t *start_ptr;
     f->st_class_start = s->token.ptr;
 /* class_fields, ctor_fd and class_start_ptr span the whole member list — see JSParseFrame.st_class_fields.
    They are spelled through the frame so a class nested in a class METHOD cannot overwrite the outer class's. */
@@ -50004,9 +50035,15 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         }
         if (f->st_b1)
             emit_op(s, OP_swap);
-        start_ptr = s->token.ptr;
+        /* start_ptr is the member's first token, live across BOTH the property-name descent below and the
+           body descent later, so it is frame state: a computed key may contain a class of its own. */
+        f->start_ptr = s->token.ptr;
         if (f->prop_type < 0) {
-            f->prop_type = js_parse_property_name(s, &f->atom, true, false, true);
+            PD_CALL(PDS_PROPNAME, 0, PN_ALLOW_METHOD | PN_ALLOW_PRIVATE, 0, PDS_CLS_KEY);
+ cls_key_done:
+            f->atom = out_name;
+            out_name = JS_ATOM_NULL;
+            f->prop_type = pd_ret;
             if (f->prop_type < 0)
                 goto cls_fail;
         }
@@ -50050,7 +50087,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             }
 
             PD_CALL_P(PDS_FDECL, JS_PARSE_FUNC_GETTER + (f->prop_type - PROP_TYPE_GET), PF_IN_ACCEPTED,
-                      JS_FUNC_NORMAL, start_ptr, &f->st_fd, s->token.line_num,
+                      JS_FUNC_NORMAL, f->start_ptr, &f->st_fd, s->token.line_num,
                       s->token.col_num, JS_PARSE_EXPORT_NONE, PDS_CLS_ACCESSOR);
  cls_accessor_done:
             if (pd_ret)
@@ -50211,7 +50248,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                 class_fields[f->st_b1].need_brand = true;
             }
             PD_CALL_P(PDS_FDECL, f->st_tok, PF_IN_ACCEPTED, func_kind,
-                      start_ptr, &f->st_fd, s->token.line_num, s->token.col_num,
+                      f->start_ptr, &f->st_fd, s->token.line_num, s->token.col_num,
                       JS_PARSE_EXPORT_NONE, PDS_CLS_METHOD);
  cls_method_done:
             if (pd_ret)
@@ -50420,7 +50457,9 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         if (pd_ret)
             PD_RET(-1);
     } else if (s->token.val == TOK_EXPORT && s->cur_func->module) {
-        if (js_parse_descent(s, PDS_EXPORT, 0, 0, 0))
+        PD_CALL(PDS_EXPORT, 0, 0, 0, PDS_SE_EXPORT);
+ se_export_done:
+        if (pd_ret)
             PD_RET(-1);
     } else if (s->token.val == TOK_IMPORT && s->cur_func->module &&
                ((f->st_tok = peek_token(s, false)) != '(' && f->st_tok != '.'))  {
