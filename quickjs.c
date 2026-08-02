@@ -44375,6 +44375,8 @@ enum {
     PDS_VAR, PDS_VAR_LV, PDS_VAR_INIT,
     PDS_SOD, PDS_BLOCK, PDS_BLK_STMT, PDS_IFC, PDS_IFC_DONE, PDS_SOD_30,
     PDS_FIO, PDS_FIO_01, PDS_FIO_02, PDS_FIO_03, PDS_FIO_04, PDS_FIO_05,
+    PDS_DESTR, PDS_DE_01, PDS_DE_02, PDS_DE_03, PDS_DE_04, PDS_DE_05,
+    PDS_DE_06, PDS_DE_07, PDS_DE_08, PDS_DE_09, PDS_DE_10,
     PDS_SOD_01, PDS_SOD_02, PDS_SOD_03, PDS_SOD_04, PDS_SOD_05, PDS_SOD_06, PDS_SOD_07, PDS_SOD_08, PDS_SOD_09, PDS_SOD_10, PDS_SOD_11, PDS_SOD_12, PDS_SOD_13, PDS_SOD_14, PDS_SOD_15, PDS_SOD_16, PDS_SOD_17, PDS_SOD_18, PDS_SOD_19, PDS_SOD_20, PDS_SOD_21, PDS_SOD_22, PDS_SOD_23, PDS_SOD_24, PDS_SOD_25, PDS_SOD_26, PDS_SOD_27, PDS_SOD_28, PDS_SOD_29,
 };
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
@@ -44408,6 +44410,19 @@ static void emit_async_iterator_close(JSParseState *s);
 #define PN_ALLOW_METHOD  (1 << 0)
 #define PN_ALLOW_VAR     (1 << 1)
 #define PN_ALLOW_PRIVATE (1 << 2)
+/* BindingPattern / AssignmentPattern reads `parse_flags` as ITS OWN bit set: the recursive function took six
+   parameters and the driver carries four, so the four booleans pack here and `tok` rides in `op`.
+   has_ellipsis is NOT packed — the pre-parse WRITES it, and a packed accessor is not assignable — so it is
+   seeded into st_idx at entry. */
+#define DE_IS_ARG        (1 << 0)
+#define DE_HASVAL        (1 << 1)
+#define DE_ALLOW_INIT    (1 << 2)
+#define DE_EXPORT        (1 << 3)
+#define DE_ELLIPSIS(fl)  ((int)(((fl) >> 4) & 3) - 1)
+#define DE_PACK(is_arg_, hasval_, allow_init_, export_, ellipsis_)              \
+    (((is_arg_) ? DE_IS_ARG : 0) | ((hasval_) ? DE_HASVAL : 0) |                \
+     ((allow_init_) ? DE_ALLOW_INIT : 0) | ((export_) ? DE_EXPORT : 0) |        \
+     ((((ellipsis_) + 1) & 3) << 4))
 
 static __exception int js_parse_function_decl(JSParseState *s,
                                               JSParseFunctionEnum func_type,
@@ -44482,7 +44497,7 @@ static bool token_starts_property_name(int tok)
 
 /* if the property is an expression, name = JS_ATOM_NULL */
 /* The C-signature adapter for the call sites the descent does not own yet (js_parse_class,
-   js_parse_destructuring_element). There is ONE implementation — PDS_PROPNAME in js_parse_descent — and this
+   the destructuring pattern). There is ONE implementation — PDS_PROPNAME in js_parse_descent — and this
    only reshapes the out-channel into the JSAtom* those sites pass. It CONSUMES the channel, which is what the
    producer's DCHECK asserts. */
 static int __exception js_parse_property_name(JSParseState *s,
@@ -45908,470 +45923,6 @@ fail:
 
 /* Return -1 if error, 0 if no initializer, 1 if an initializer is
    present at the top level. */
-static int js_parse_destructuring_element(JSParseState *s, int tok,
-                                          bool is_arg, bool hasval,
-                                          int has_ellipsis, // tri-state
-                                          bool allow_initializer,
-                                          bool export_flag)
-{
-    int label_parse, label_assign, label_done, label_lvalue, depth_lvalue;
-    int start_addr, assign_addr;
-    JSAtom prop_name, var_name;
-    int opcode, scope, tok1, skip_bits;
-    bool has_initializer;
-
-    label_lvalue = -1;
-
-    if (has_ellipsis < 0) {
-        /* pre-parse destructuration target for spread detection */
-        js_parse_skip_parens_token(s, &skip_bits, false);
-        has_ellipsis = skip_bits & SKIP_HAS_ELLIPSIS;
-    }
-
-    label_parse = new_label(s);
-    label_assign = new_label(s);
-
-    start_addr = s->cur_func->byte_code.size;
-    if (hasval) {
-        /* consume value from the stack */
-        emit_op(s, OP_dup);
-        emit_op(s, OP_undefined);
-        emit_op(s, OP_strict_eq);
-        emit_goto(s, OP_if_true, label_parse);
-        emit_label(s, label_assign);
-    } else {
-        emit_goto(s, OP_goto, label_parse);
-        emit_label(s, label_assign);
-        /* leave value on the stack */
-        emit_op(s, OP_dup);
-    }
-    assign_addr = s->cur_func->byte_code.size;
-    if (s->token.val == '{') {
-        if (next_token(s))
-            return -1;
-        /* throw an exception if the value cannot be converted to an object */
-        emit_op(s, OP_to_object);
-        if (has_ellipsis) {
-            /* add excludeList on stack just below src object */
-            emit_op(s, OP_object);
-            emit_op(s, OP_swap);
-        }
-        while (s->token.val != '}') {
-            int prop_type;
-            if (s->token.val == TOK_ELLIPSIS) {
-                if (!has_ellipsis) {
-                    JS_ThrowInternalError(s->ctx, "unexpected ellipsis token");
-                    return -1;
-                }
-                if (next_token(s))
-                    return -1;
-                if (tok) {
-                    var_name = js_parse_destructuring_var(s, tok, is_arg);
-                    if (var_name == JS_ATOM_NULL)
-                        return -1;
-                    opcode = OP_scope_get_var;
-                    scope = s->cur_func->scope_level;
-                    label_lvalue = -1;
-                    depth_lvalue = 0;
-                } else {
-                    if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
-                        return -1;
-
-                    if (get_lvalue(s, &opcode, &scope, &var_name,
-                                   &label_lvalue, &depth_lvalue, false, '{'))
-                        return -1;
-                }
-                if (s->token.val != '}') {
-                    js_parse_error(s, "assignment rest property must be last");
-                    goto var_error;
-                }
-                emit_op(s, OP_object);  /* target */
-                emit_op(s, OP_copy_data_properties);
-                emit_u8(s, 0 | ((depth_lvalue + 1) << 2) | ((depth_lvalue + 2) << 5));
-                goto set_val;
-            }
-            prop_type = js_parse_property_name(s, &prop_name, false, true, false);
-            if (prop_type < 0)
-                return -1;
-            var_name = JS_ATOM_NULL;
-            opcode = OP_scope_get_var;
-            scope = s->cur_func->scope_level;
-            label_lvalue = -1;
-            depth_lvalue = 0;
-            if (prop_type == PROP_TYPE_IDENT) {
-                /* BindingProperty : PropertyName `:` BindingElement. The SHORTHAND is PROP_TYPE_VAR, and only a
-                   non-reserved IdentifierReference ever becomes one — a string, a number, a computed name or a
-                   reserved word therefore OWES a colon here. Skipping the next token without asking what it was
-                   made `var {'', q} = {q: 0}` mean `var {'': q}` and `function f({q, 'bad', c}){}` legal, while
-                   the same names alone were rejected a token later for a different reason. */
-                if (js_parse_expect(s, ':'))
-                    goto prop_error;
-                if ((s->token.val == '[' || s->token.val == '{')
-                    &&  ((tok1 = js_parse_skip_parens_token(s, &skip_bits, false)) == ',' ||
-                         tok1 == '=' || tok1 == '}')) {
-                    if (prop_name == JS_ATOM_NULL) {
-                        /* computed property name on stack */
-                        if (has_ellipsis) {
-                            /* define the property in excludeList (the key is already a property key —
-                               ComputedPropertyName evaluation coerced it) */
-                            emit_op(s, OP_perm3); /* TOS: src excludeList prop */
-                            emit_op(s, OP_null); /* TOS: src excludeList prop null */
-                            emit_op(s, OP_define_array_el); /* TOS: src excludeList prop */
-                            emit_op(s, OP_perm3); /* TOS: excludeList src prop */
-                        }
-                        /* get the computed property from the source object */
-                        emit_op(s, OP_get_array_el2);
-                    } else {
-                        /* named property */
-                        if (has_ellipsis) {
-                            /* define the property in excludeList */
-                            emit_op(s, OP_swap); /* TOS: src excludeList */
-                            emit_op(s, OP_null); /* TOS: src excludeList null */
-                            emit_op(s, OP_define_field); /* TOS: src excludeList */
-                            emit_atom(s, prop_name);
-                            emit_op(s, OP_swap); /* TOS: excludeList src */
-                        }
-                        /* get the named property from the source object */
-                        emit_op(s, OP_get_field2);
-                        emit_u32(s, prop_name);
-                    }
-                    if (js_parse_destructuring_element(s, tok, is_arg, true, -1, true, export_flag) < 0)
-                        return -1;
-                    if (s->token.val == '}')
-                        break;
-                    /* accept a trailing comma before the '}' */
-                    if (js_parse_expect(s, ','))
-                        return -1;
-                    continue;
-                }
-                if (prop_name == JS_ATOM_NULL) {
-                    /* the key is already a property key — ComputedPropertyName evaluation coerced it */
-                    if (has_ellipsis) {
-                        /* define the property in excludeList */
-                        emit_op(s, OP_perm3);
-                        emit_op(s, OP_null);
-                        emit_op(s, OP_define_array_el);
-                        emit_op(s, OP_perm3);
-                    }
-                    /* source prop -- source source prop */
-                    emit_op(s, OP_dup1);
-                } else {
-                    if (has_ellipsis) {
-                        /* define the property in excludeList */
-                        emit_op(s, OP_swap);
-                        emit_op(s, OP_null);
-                        emit_op(s, OP_define_field);
-                        emit_atom(s, prop_name);
-                        emit_op(s, OP_swap);
-                    }
-                    /* source -- source source */
-                    emit_op(s, OP_dup);
-                }
-                if (tok) {
-                    var_name = js_parse_destructuring_var(s, tok, is_arg);
-                    if (var_name == JS_ATOM_NULL)
-                        goto prop_error;
-                    if (tok == TOK_VAR && has_with_scope(s->cur_func, s->cur_func->scope_level)) {
-                        /* 14.3.3.3 KeyedBindingInitialization: step 2 ResolveBinding precedes step 3 GetV, and a
-                           `var` target inside a `with` resolves through the object Environment Record — an
-                           OBSERVABLE HasBinding. Materialise the Reference BEFORE the source read, the same way
-                           the shorthand `{p}` form below and an assignment target already do; a plain
-                           OP_scope_put_var after the read would resolve too late. Lexical targets cannot be
-                           intercepted by a `with` (resolve_scope_var finds them locally) and keep their
-                           TDZ-honouring OP_scope_put_var_init. */
-                        emit_op(s, OP_scope_get_var);
-                        emit_atom(s, var_name);
-                        emit_u16(s, s->cur_func->scope_level);
-                        JS_FreeAtom(s->ctx, var_name);   /* get_lvalue re-reads it from the bytecode, owned */
-                        var_name = JS_ATOM_NULL;
-                        goto lvalue;
-                    }
-                } else {
-                    if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
-                        goto prop_error;
-                lvalue:
-                    if (get_lvalue(s, &opcode, &scope, &var_name,
-                                   &label_lvalue, &depth_lvalue, false, '{'))
-                        goto prop_error;
-                    /* swap ref and lvalue object if any */
-                    if (prop_name == JS_ATOM_NULL) {
-                        switch(depth_lvalue) {
-                        case 0:
-                            break;
-                        case 1:
-                            /* source prop x -> x source prop */
-                            emit_op(s, OP_rot3r);
-                            break;
-                        case 2:
-                            /* source prop x y -> x y source prop */
-                            emit_op(s, OP_swap2);   /* t p2 s p1 */
-                            break;
-                        case 3:
-                            /* source prop x y z -> x y z source prop */
-                            emit_op(s, OP_rot5l);
-                            emit_op(s, OP_rot5l);
-                            break;
-                        default:
-                            abort();
-                        }
-                    } else {
-                        switch(depth_lvalue) {
-                        case 0:
-                            break;
-                        case 1:
-                            /* source x -> x source */
-                            emit_op(s, OP_swap);
-                            break;
-                        case 2:
-                            /* source x y -> x y source */
-                            emit_op(s, OP_rot3l);
-                            break;
-                        case 3:
-                            /* source x y z -> x y z source */
-                            emit_op(s, OP_rot4l);
-                            break;
-                        default:
-                            abort();
-                        }
-                    }
-                }
-                if (prop_name == JS_ATOM_NULL) {
-                    /* computed property name on stack */
-                    /* XXX: should have OP_get_array_el2x with depth */
-                    /* source prop -- val */
-                    emit_op(s, OP_get_array_el);
-                } else {
-                    /* named property */
-                    /* XXX: should have OP_get_field2x with depth */
-                    /* source -- val */
-                    emit_op(s, OP_get_field);
-                    emit_u32(s, prop_name);
-                }
-            } else {
-                /* prop_type = PROP_TYPE_VAR, cannot be a computed property */
-                if (is_arg && js_parse_check_duplicate_parameter(s, prop_name))
-                    goto prop_error;
-                if (s->cur_func->is_strict_mode &&
-                    (prop_name == JS_ATOM_eval || prop_name == JS_ATOM_arguments)) {
-                    js_parse_error(s, "invalid destructuring target");
-                    goto prop_error;
-                }
-                if (has_ellipsis) {
-                    /* define the property in excludeList */
-                    emit_op(s, OP_swap);
-                    emit_op(s, OP_null);
-                    emit_op(s, OP_define_field);
-                    emit_atom(s, prop_name);
-                    emit_op(s, OP_swap);
-                }
-                if (!tok || tok == TOK_VAR) {
-                    /* generate reference */
-                    /* source -- source source */
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_scope_get_var);
-                    emit_atom(s, prop_name);
-                    emit_u16(s, s->cur_func->scope_level);
-                    goto lvalue;
-                }
-                var_name = JS_DupAtom(s->ctx, prop_name);
-                /* source -- source val */
-                emit_op(s, OP_get_field2);
-                emit_u32(s, prop_name);
-            }
-        set_val:
-            if (tok) {
-                if (js_define_var(s, var_name, tok))
-                    goto var_error;
-                if (export_flag) {
-                    if (!add_export_entry(s, s->cur_func->module, var_name, var_name,
-                                          JS_EXPORT_TYPE_LOCAL))
-                        goto var_error;
-                }
-                scope = s->cur_func->scope_level;
-            }
-            if (s->token.val == '=') {  /* handle optional default value */
-                int label_hasval;
-                emit_op(s, OP_dup);
-                emit_op(s, OP_undefined);
-                emit_op(s, OP_strict_eq);
-                label_hasval = emit_goto(s, OP_if_false, -1);
-                if (next_token(s))
-                    goto var_error;
-                emit_op(s, OP_drop);
-                if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                    goto var_error;
-                if (opcode == OP_scope_get_var || opcode == OP_get_ref_value)
-                    set_object_name(s, var_name);
-                emit_label(s, label_hasval);
-            }
-            /* store value into lvalue object */
-            put_lvalue(s, opcode, scope, var_name, label_lvalue,
-                       PUT_LVALUE_NOKEEP_DEPTH,
-                       (tok == TOK_CONST || tok == TOK_LET));
-            if (s->token.val == '}')
-                break;
-            /* accept a trailing comma before the '}' */
-            if (js_parse_expect(s, ','))
-                return -1;
-        }
-        /* drop the source object */
-        emit_op(s, OP_drop);
-        if (has_ellipsis) {
-            emit_op(s, OP_drop); /* pop excludeList */
-        }
-        if (next_token(s))
-            return -1;
-    } else if (s->token.val == '[') {
-        bool has_spread;
-        int enum_depth;
-        int source_line_num, source_col_num;
-        BlockEnv block_env;
-
-        source_line_num = s->token.line_num;
-        source_col_num = s->token.col_num;
-        if (next_token(s))
-            return -1;
-        /* the block environment is only needed in generators in case
-           'yield' triggers a 'return' */
-        push_break_entry(s->cur_func, &block_env,
-                         JS_ATOM_NULL, -1, -1, 2);
-        block_env.has_iterator = true;
-        emit_op(s, OP_for_of_start);
-        has_spread = false;
-        while (s->token.val != ']') {
-            /* get the next value */
-            if (s->token.val == TOK_ELLIPSIS) {
-                if (next_token(s))
-                    return -1;
-                if (s->token.val == ',' || s->token.val == ']')
-                    return js_parse_error(s, "missing binding pattern...");
-                has_spread = true;
-            }
-            if (s->token.val == ',') {
-                /* do nothing, skip the value, has_spread is false */
-                emit_op(s, OP_for_of_next);
-                emit_u8(s, 0);
-                emit_op(s, OP_drop);
-                emit_op(s, OP_drop);
-            } else if ((s->token.val == '[' || s->token.val == '{')
-                   &&  ((tok1 = js_parse_skip_parens_token(s, &skip_bits, false)) == ',' ||
-                        tok1 == '=' || tok1 == ']')) {
-                if (has_spread) {
-                    if (tok1 == '=')
-                        return js_parse_error(s, "rest element cannot have a default value");
-                    js_emit_spread_code(s, 0);
-                } else {
-                    emit_op(s, OP_for_of_next);
-                    emit_u8(s, 0);
-                    emit_op(s, OP_drop);
-                }
-                if (js_parse_destructuring_element(s, tok, is_arg, true, skip_bits & SKIP_HAS_ELLIPSIS, true, export_flag) < 0)
-                    return -1;
-            } else {
-                var_name = JS_ATOM_NULL;
-                enum_depth = 0;
-                if (tok) {
-                    var_name = js_parse_destructuring_var(s, tok, is_arg);
-                    if (var_name == JS_ATOM_NULL)
-                        goto var_error;
-                    if (js_define_var(s, var_name, tok))
-                        goto var_error;
-                    if (export_flag) {
-                        if (!add_export_entry(s, s->cur_func->module, var_name, var_name,
-                                              JS_EXPORT_TYPE_LOCAL))
-                            goto var_error;
-                    }
-                    opcode = OP_scope_get_var;
-                    scope = s->cur_func->scope_level;
-                } else {
-                    if (js_parse_descent(s, PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0))
-                        return -1;
-                    if (get_lvalue(s, &opcode, &scope, &var_name,
-                                   &label_lvalue, &enum_depth, false, '[')) {
-                        return -1;
-                    }
-                }
-                if (has_spread) {
-                    js_emit_spread_code(s, enum_depth);
-                } else {
-                    emit_op(s, OP_for_of_next);
-                    emit_u8(s, enum_depth);
-                    emit_op(s, OP_drop);
-                }
-                if (s->token.val == '=' && !has_spread) {
-                    /* handle optional default value */
-                    int label_hasval;
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_undefined);
-                    emit_op(s, OP_strict_eq);
-                    label_hasval = emit_goto(s, OP_if_false, -1);
-                    if (next_token(s))
-                        goto var_error;
-                    emit_op(s, OP_drop);
-                    if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-                        goto var_error;
-                    if (opcode == OP_scope_get_var || opcode == OP_get_ref_value)
-                        set_object_name(s, var_name);
-                    emit_label(s, label_hasval);
-                }
-                /* store value into lvalue object */
-                put_lvalue(s, opcode, scope, var_name,
-                           label_lvalue, PUT_LVALUE_NOKEEP_DEPTH,
-                           (tok == TOK_CONST || tok == TOK_LET));
-            }
-            if (s->token.val == ']')
-                break;
-            if (has_spread)
-                return js_parse_error(s, "rest element must be the last one");
-            /* accept a trailing comma before the ']' */
-            if (js_parse_expect(s, ','))
-                return -1;
-        }
-        /* close iterator object:
-           if completed, enum_obj has been replaced by undefined */
-        emit_source_loc_at(s, source_line_num, source_col_num);
-        emit_op(s, OP_iterator_close);
-        pop_break_entry(s->cur_func);
-        if (next_token(s))
-            return -1;
-    } else {
-        return js_parse_error(s, "invalid assignment syntax");
-    }
-    if (s->token.val == '=' && allow_initializer) {
-        label_done = emit_goto(s, OP_goto, -1);
-        if (next_token(s))
-            return -1;
-        emit_label(s, label_parse);
-        if (hasval)
-            emit_op(s, OP_drop);
-        if (js_parse_descent(s, PDS_ASGN, 0, PF_IN_ACCEPTED, 0))
-            return -1;
-        emit_goto(s, OP_goto, label_assign);
-        emit_label(s, label_done);
-        has_initializer = true;
-    } else {
-        /* normally hasval is true except if
-           js_parse_skip_parens_token() was wrong in the parsing */
-        //        assert(hasval);
-        if (!hasval) {
-            js_parse_error(s, "too complicated destructuring expression");
-            return -1;
-        }
-        /* remove test and decrement label ref count */
-        memset(s->cur_func->byte_code.buf + start_addr, OP_nop,
-               assign_addr - start_addr);
-        s->cur_func->label_slots[label_parse].ref_count--;
-        has_initializer = false;
-    }
-    return has_initializer;
-
- prop_error:
-    JS_FreeAtom(s->ctx, prop_name);
- var_error:
-    JS_FreeAtom(s->ctx, var_name);
-    return -1;
-}
-
 typedef enum FuncCallType {
     FUNC_CALL_NORMAL,
     FUNC_CALL_NEW,
@@ -46696,6 +46247,17 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
     case PDS_FIO_03:          goto fio_03;
     case PDS_FIO_04:          goto fio_04;
     case PDS_FIO_05:          goto fio_05;
+    case PDS_DESTR:           goto de_entry;
+    case PDS_DE_01:           goto de_01;
+    case PDS_DE_02:           goto de_02;
+    case PDS_DE_03:           goto de_03;
+    case PDS_DE_04:           goto de_04;
+    case PDS_DE_05:           goto de_05;
+    case PDS_DE_06:           goto de_06;
+    case PDS_DE_07:           goto de_07;
+    case PDS_DE_08:           goto de_08;
+    case PDS_DE_09:           goto de_09;
+    case PDS_DE_10:           goto de_10;
     case PDS_SOD_01:         goto sod_01;
     case PDS_SOD_02:         goto sod_02;
     case PDS_SOD_03:         goto sod_03;
@@ -47280,8 +46842,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                accepted the `=` at any operand position, e.g. `#f in {} = 0`, where the grammar allows only a
                ShiftExpression. */
             /* it returns has_initializer (1) on success, not 0 */
-            if (js_parse_destructuring_element(s, 0, false, false,
-                                               skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
+            PD_CALL(PDS_DESTR, 0,
+                    DE_PACK(false, false, true, false, skip_bits & SKIP_HAS_ELLIPSIS), 0, PDS_DE_09);
+ de_09:
+            if (pd_ret < 0)
                 PD_RET(-1);
             PD_RET(0);
         }
@@ -48804,8 +48368,10 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
             if (f->op == TOK_USING)
                 PD_RET_ERR(s, "binding patterns are not allowed in using declarations");
             emit_op(s, OP_undefined);
-            if (js_parse_destructuring_element(s, f->op, false, true,
-                                               skip_bits & SKIP_HAS_ELLIPSIS, true, f->level) < 0)
+            PD_CALL(PDS_DESTR, 0,
+                    DE_PACK(false, true, true, f->level, skip_bits & SKIP_HAS_ELLIPSIS), f->op, PDS_DE_10);
+ de_10:
+            if (pd_ret < 0)
                 PD_RET(-1);
         } else {
             PD_RET_ERR(s, "variable name expected");
@@ -49519,7 +49085,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                     if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
                         if (s->token.val == '[' || s->token.val == '{') {
                             /* XXX: TOK_LET is not completely correct */
-                            if (js_parse_destructuring_element(s, TOK_LET, false, true, -1, true, false) < 0)
+                            if (js_parse_descent(s, PDS_DESTR, 0, DE_PACK(false, true, true, false, -1), TOK_LET) < 0)
                                 goto sod_fail;
                         } else {
                             js_parse_error(s, "identifier expected");
@@ -49918,7 +49484,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
 
         if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
             if (s->token.val == '[' || s->token.val == '{') {
-                if (js_parse_destructuring_element(s, f->st_tok, false, true, -1, false, false) < 0)
+                if (js_parse_descent(s, PDS_DESTR, 0, DE_PACK(false, true, false, false, -1), f->st_tok) < 0)
                     goto fio_fail;
                 f->st_b2 = true;
             } else {
@@ -49987,7 +49553,7 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
         int skip_bits;
         if ((s->token.val == '[' || s->token.val == '{')
         &&  ((f->st_bits = js_parse_skip_parens_token(s, &skip_bits, false)) == TOK_IN || f->st_bits == TOK_OF)) {
-            if (js_parse_destructuring_element(s, 0, false, true, skip_bits & SKIP_HAS_ELLIPSIS, true, false) < 0)
+            if (js_parse_descent(s, PDS_DESTR, 0, DE_PACK(false, true, true, false, skip_bits & SKIP_HAS_ELLIPSIS), 0) < 0)
                 goto fio_fail;
         } else {
             int lvalue_label;
@@ -50239,6 +49805,492 @@ static __exception int js_parse_descent(JSParseState *s, int entry, int level,
  fio_fail:
     JS_FreeAtom(ctx, f->atom);
     f->atom = JS_ATOM_NULL;
+    PD_RET(-1);
+
+/* ---- BindingPattern / AssignmentPattern. Returns a TRI-STATE — 1 if the pattern carried an initializer,
+   0 if not, negative on error — so callers test `< 0`. Two owned atoms: the property key (atom) and the
+   binding name (atom2); de_fail owns their release. ---- */
+ de_entry:
+    f->st_idx = DE_ELLIPSIS(f->flags);   /* tri-state; the pre-parse below may overwrite it */
+
+    f->st_lbl_d = -1;
+
+    if (f->st_idx < 0) {
+        /* pre-parse destructuration target for spread detection */
+        js_parse_skip_parens_token(s, &f->st_bits, false);
+        f->st_idx = f->st_bits & SKIP_HAS_ELLIPSIS;
+    }
+
+    f->st_lbl_a = new_label(s);
+    f->st_lbl_b = new_label(s);
+
+    f->st_pos_a = s->cur_func->byte_code.size;
+    if ((f->flags & DE_HASVAL)) {
+        /* consume value from the stack */
+        emit_op(s, OP_dup);
+        emit_op(s, OP_undefined);
+        emit_op(s, OP_strict_eq);
+        emit_goto(s, OP_if_true, f->st_lbl_a);
+        emit_label(s, f->st_lbl_b);
+    } else {
+        emit_goto(s, OP_goto, f->st_lbl_a);
+        emit_label(s, f->st_lbl_b);
+        /* leave value on the stack */
+        emit_op(s, OP_dup);
+    }
+    f->st_pos_b = s->cur_func->byte_code.size;
+    if (s->token.val == '{') {
+        if (next_token(s))
+            goto de_fail;
+        /* throw an exception if the value cannot be converted to an object */
+        emit_op(s, OP_to_object);
+        if (f->st_idx) {
+            /* add excludeList on stack just below src object */
+            emit_op(s, OP_object);
+            emit_op(s, OP_swap);
+        }
+        while (s->token.val != '}') {
+            int prop_type;
+            if (s->token.val == TOK_ELLIPSIS) {
+                if (!f->st_idx) {
+                    JS_ThrowInternalError(s->ctx, "unexpected ellipsis token");
+                    goto de_fail;
+                }
+                if (next_token(s))
+                    goto de_fail;
+                if (f->op) {
+                    f->atom2 = js_parse_destructuring_var(s, f->op, (f->flags & DE_IS_ARG));
+                    if (f->atom2 == JS_ATOM_NULL)
+                        goto de_fail;
+                    f->opcode = OP_scope_get_var;
+                    f->scope = s->cur_func->scope_level;
+                    f->st_lbl_d = -1;
+                    f->depth_lvalue = 0;
+                } else {
+                    PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_DE_01);
+ de_01:
+                    if (pd_ret)
+                        goto de_fail;
+
+                    if (get_lvalue(s, &f->opcode, &f->scope, &f->atom2,
+                                   &f->st_lbl_d, &f->depth_lvalue, false, '{'))
+                        goto de_fail;
+                }
+                if (s->token.val != '}') {
+                    js_parse_error(s, "assignment rest property must be last");
+                    goto de_var_error;
+                }
+                emit_op(s, OP_object);  /* target */
+                emit_op(s, OP_copy_data_properties);
+                emit_u8(s, 0 | ((f->depth_lvalue + 1) << 2) | ((f->depth_lvalue + 2) << 5));
+                goto set_val;
+            }
+            prop_type = js_parse_property_name(s, &f->atom, false, true, false);
+            if (prop_type < 0)
+                goto de_fail;
+            f->atom2 = JS_ATOM_NULL;
+            f->opcode = OP_scope_get_var;
+            f->scope = s->cur_func->scope_level;
+            f->st_lbl_d = -1;
+            f->depth_lvalue = 0;
+            if (prop_type == PROP_TYPE_IDENT) {
+                /* BindingProperty : PropertyName `:` BindingElement. The SHORTHAND is PROP_TYPE_VAR, and only a
+                   non-reserved IdentifierReference ever becomes one — a string, a number, a computed name or a
+                   reserved word therefore OWES a colon here. Skipping the next token without asking what it was
+                   made `var {'', q} = {q: 0}` mean `var {'': q}` and `function f({q, 'bad', c}){}` legal, while
+                   the same names alone were rejected a token later for a different reason. */
+                if (js_parse_expect(s, ':'))
+                    goto de_prop_error;
+                if ((s->token.val == '[' || s->token.val == '{')
+                    &&  ((f->st_tok = js_parse_skip_parens_token(s, &f->st_bits, false)) == ',' ||
+                         f->st_tok == '=' || f->st_tok == '}')) {
+                    if (f->atom == JS_ATOM_NULL) {
+                        /* computed property name on stack */
+                        if (f->st_idx) {
+                            /* define the property in excludeList (the key is already a property key —
+                               ComputedPropertyName evaluation coerced it) */
+                            emit_op(s, OP_perm3); /* TOS: src excludeList prop */
+                            emit_op(s, OP_null); /* TOS: src excludeList prop null */
+                            emit_op(s, OP_define_array_el); /* TOS: src excludeList prop */
+                            emit_op(s, OP_perm3); /* TOS: excludeList src prop */
+                        }
+                        /* get the computed property from the source object */
+                        emit_op(s, OP_get_array_el2);
+                    } else {
+                        /* named property */
+                        if (f->st_idx) {
+                            /* define the property in excludeList */
+                            emit_op(s, OP_swap); /* TOS: src excludeList */
+                            emit_op(s, OP_null); /* TOS: src excludeList null */
+                            emit_op(s, OP_define_field); /* TOS: src excludeList */
+                            emit_atom(s, f->atom);
+                            emit_op(s, OP_swap); /* TOS: excludeList src */
+                        }
+                        /* get the named property from the source object */
+                        emit_op(s, OP_get_field2);
+                        emit_u32(s, f->atom);
+                f->atom = JS_ATOM_NULL;   /* handed to the bytecode */
+                    f->atom = JS_ATOM_NULL;   /* handed to the bytecode */
+                        f->atom = JS_ATOM_NULL;   /* handed to the bytecode */
+                    }
+                    PD_CALL(PDS_DESTR, 0, DE_PACK((f->flags & DE_IS_ARG), true, true, (f->flags & DE_EXPORT), -1), f->op, PDS_DE_04);
+ de_04:
+                    if (pd_ret < 0)
+                        goto de_fail;
+                    if (s->token.val == '}')
+                        break;
+                    /* accept a trailing comma before the '}' */
+                    if (js_parse_expect(s, ','))
+                        goto de_fail;
+                    continue;
+                }
+                if (f->atom == JS_ATOM_NULL) {
+                    /* the key is already a property key — ComputedPropertyName evaluation coerced it */
+                    if (f->st_idx) {
+                        /* define the property in excludeList */
+                        emit_op(s, OP_perm3);
+                        emit_op(s, OP_null);
+                        emit_op(s, OP_define_array_el);
+                        emit_op(s, OP_perm3);
+                    }
+                    /* source prop -- source source prop */
+                    emit_op(s, OP_dup1);
+                } else {
+                    if (f->st_idx) {
+                        /* define the property in excludeList */
+                        emit_op(s, OP_swap);
+                        emit_op(s, OP_null);
+                        emit_op(s, OP_define_field);
+                        emit_atom(s, f->atom);
+                        emit_op(s, OP_swap);
+                    }
+                    /* source -- source source */
+                    emit_op(s, OP_dup);
+                }
+                if (f->op) {
+                    f->atom2 = js_parse_destructuring_var(s, f->op, (f->flags & DE_IS_ARG));
+                    if (f->atom2 == JS_ATOM_NULL)
+                        goto de_prop_error;
+                    if (f->op == TOK_VAR && has_with_scope(s->cur_func, s->cur_func->scope_level)) {
+                        /* 14.3.3.3 KeyedBindingInitialization: step 2 ResolveBinding precedes step 3 GetV, and a
+                           `var` target inside a `with` resolves through the object Environment Record — an
+                           OBSERVABLE HasBinding. Materialise the Reference BEFORE the source read, the same way
+                           the shorthand `{p}` form below and an assignment target already do; a plain
+                           OP_scope_put_var after the read would resolve too late. Lexical targets cannot be
+                           intercepted by a `with` (resolve_scope_var finds them locally) and keep their
+                           TDZ-honouring OP_scope_put_var_init. */
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, f->atom2);
+                        emit_u16(s, s->cur_func->scope_level);
+                        JS_FreeAtom(s->ctx, f->atom2);   /* get_lvalue re-reads it from the bytecode, owned */
+                        f->atom2 = JS_ATOM_NULL;
+                        goto lvalue;
+                    }
+                } else {
+                    PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_DE_05);
+ de_05:
+                    if (pd_ret < 0)
+                        goto de_prop_error;
+                lvalue:
+                    if (get_lvalue(s, &f->opcode, &f->scope, &f->atom2,
+                                   &f->st_lbl_d, &f->depth_lvalue, false, '{'))
+                        goto de_prop_error;
+                    /* swap ref and lvalue object if any */
+                    if (f->atom == JS_ATOM_NULL) {
+                        switch(f->depth_lvalue) {
+                        case 0:
+                            break;
+                        case 1:
+                            /* source prop x -> x source prop */
+                            emit_op(s, OP_rot3r);
+                            break;
+                        case 2:
+                            /* source prop x y -> x y source prop */
+                            emit_op(s, OP_swap2);   /* t p2 s p1 */
+                            break;
+                        case 3:
+                            /* source prop x y z -> x y z source prop */
+                            emit_op(s, OP_rot5l);
+                            emit_op(s, OP_rot5l);
+                            break;
+                        default:
+                            abort();
+                        }
+                    } else {
+                        switch(f->depth_lvalue) {
+                        case 0:
+                            break;
+                        case 1:
+                            /* source x -> x source */
+                            emit_op(s, OP_swap);
+                            break;
+                        case 2:
+                            /* source x y -> x y source */
+                            emit_op(s, OP_rot3l);
+                            break;
+                        case 3:
+                            /* source x y z -> x y z source */
+                            emit_op(s, OP_rot4l);
+                            break;
+                        default:
+                            abort();
+                        }
+                    }
+                }
+                if (f->atom == JS_ATOM_NULL) {
+                    /* computed property name on stack */
+                    /* XXX: should have OP_get_array_el2x with depth */
+                    /* source prop -- val */
+                    emit_op(s, OP_get_array_el);
+                } else {
+                    /* named property */
+                    /* XXX: should have OP_get_field2x with depth */
+                    /* source -- val */
+                    emit_op(s, OP_get_field);
+                    emit_u32(s, f->atom);
+                f->atom = JS_ATOM_NULL;   /* handed to the bytecode */
+                    f->atom = JS_ATOM_NULL;   /* handed to the bytecode */
+                }
+            } else {
+                /* prop_type = PROP_TYPE_VAR, cannot be a computed property */
+                if ((f->flags & DE_IS_ARG) && js_parse_check_duplicate_parameter(s, f->atom))
+                    goto de_prop_error;
+                if (s->cur_func->is_strict_mode &&
+                    (f->atom == JS_ATOM_eval || f->atom == JS_ATOM_arguments)) {
+                    js_parse_error(s, "invalid destructuring target");
+                    goto de_prop_error;
+                }
+                if (f->st_idx) {
+                    /* define the property in excludeList */
+                    emit_op(s, OP_swap);
+                    emit_op(s, OP_null);
+                    emit_op(s, OP_define_field);
+                    emit_atom(s, f->atom);
+                    emit_op(s, OP_swap);
+                }
+                if (!f->op || f->op == TOK_VAR) {
+                    /* generate reference */
+                    /* source -- source source */
+                    emit_op(s, OP_dup);
+                    emit_op(s, OP_scope_get_var);
+                    emit_atom(s, f->atom);
+                    emit_u16(s, s->cur_func->scope_level);
+                    goto lvalue;
+                }
+                f->atom2 = JS_DupAtom(s->ctx, f->atom);
+                /* source -- source val */
+                emit_op(s, OP_get_field2);
+                emit_u32(s, f->atom);
+                f->atom = JS_ATOM_NULL;   /* handed to the bytecode */
+            }
+        set_val:
+            if (f->op) {
+                if (js_define_var(s, f->atom2, f->op))
+                    goto de_var_error;
+                if ((f->flags & DE_EXPORT)) {
+                    if (!add_export_entry(s, s->cur_func->module, f->atom2, f->atom2,
+                                          JS_EXPORT_TYPE_LOCAL))
+                        goto de_var_error;
+                }
+                f->scope = s->cur_func->scope_level;
+            }
+            if (s->token.val == '=') {  /* handle optional default value */
+                int label_hasval;
+                emit_op(s, OP_dup);
+                emit_op(s, OP_undefined);
+                emit_op(s, OP_strict_eq);
+                label_hasval = emit_goto(s, OP_if_false, -1);
+                if (next_token(s))
+                    goto de_var_error;
+                emit_op(s, OP_drop);
+                PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_DE_06);
+ de_06:
+                if (pd_ret < 0)
+                    goto de_var_error;
+                if (f->opcode == OP_scope_get_var || f->opcode == OP_get_ref_value)
+                    set_object_name(s, f->atom2);
+                emit_label(s, label_hasval);
+            }
+            /* store value into lvalue object */
+            put_lvalue(s, f->opcode, f->scope, f->atom2, f->st_lbl_d,
+                       PUT_LVALUE_NOKEEP_DEPTH,
+                       (f->op == TOK_CONST || f->op == TOK_LET));
+            f->atom2 = JS_ATOM_NULL;   /* put_lvalue consumed it */
+            if (s->token.val == '}')
+                break;
+            /* accept a trailing comma before the '}' */
+            if (js_parse_expect(s, ','))
+                goto de_fail;
+        }
+        /* drop the source object */
+        emit_op(s, OP_drop);
+        if (f->st_idx) {
+            emit_op(s, OP_drop); /* pop excludeList */
+        }
+        if (next_token(s))
+            goto de_fail;
+    } else if (s->token.val == '[') {
+        bool has_spread;
+        int enum_depth;
+        int source_line_num, source_col_num;
+        BlockEnv block_env;
+
+        source_line_num = s->token.line_num;
+        source_col_num = s->token.col_num;
+        if (next_token(s))
+            goto de_fail;
+        /* the block environment is only needed in generators in case
+           'yield' triggers a 'return' */
+        push_break_entry(s->cur_func, &block_env,
+                         JS_ATOM_NULL, -1, -1, 2);
+        block_env.has_iterator = true;
+        emit_op(s, OP_for_of_start);
+        has_spread = false;
+        while (s->token.val != ']') {
+            /* get the next value */
+            if (s->token.val == TOK_ELLIPSIS) {
+                if (next_token(s))
+                    goto de_fail;
+                if (s->token.val == ',' || s->token.val == ']')
+                    PD_RET_ERR(s, "missing binding pattern...");
+                has_spread = true;
+            }
+            if (s->token.val == ',') {
+                /* do nothing, skip the value, has_spread is false */
+                emit_op(s, OP_for_of_next);
+                emit_u8(s, 0);
+                emit_op(s, OP_drop);
+                emit_op(s, OP_drop);
+            } else if ((s->token.val == '[' || s->token.val == '{')
+                   &&  ((f->st_tok = js_parse_skip_parens_token(s, &f->st_bits, false)) == ',' ||
+                        f->st_tok == '=' || f->st_tok == ']')) {
+                if (has_spread) {
+                    if (f->st_tok == '=')
+                        PD_RET_ERR(s, "rest element cannot have a default value");
+                    js_emit_spread_code(s, 0);
+                } else {
+                    emit_op(s, OP_for_of_next);
+                    emit_u8(s, 0);
+                    emit_op(s, OP_drop);
+                }
+                PD_CALL(PDS_DESTR, 0, DE_PACK((f->flags & DE_IS_ARG), true, true, (f->flags & DE_EXPORT), f->st_bits & SKIP_HAS_ELLIPSIS), f->op, PDS_DE_07);
+ de_07:
+                if (pd_ret < 0)
+                    goto de_fail;
+            } else {
+                f->atom2 = JS_ATOM_NULL;
+                enum_depth = 0;
+                if (f->op) {
+                    f->atom2 = js_parse_destructuring_var(s, f->op, (f->flags & DE_IS_ARG));
+                    if (f->atom2 == JS_ATOM_NULL)
+                        goto de_var_error;
+                    if (js_define_var(s, f->atom2, f->op))
+                        goto de_var_error;
+                    if ((f->flags & DE_EXPORT)) {
+                        if (!add_export_entry(s, s->cur_func->module, f->atom2, f->atom2,
+                                              JS_EXPORT_TYPE_LOCAL))
+                            goto de_var_error;
+                    }
+                    f->opcode = OP_scope_get_var;
+                    f->scope = s->cur_func->scope_level;
+                } else {
+                    PD_CALL(PDS_POSTFIX, 0, PF_POSTFIX_CALL, 0, PDS_DE_02);
+ de_02:
+                    if (pd_ret)
+                        goto de_fail;
+                    if (get_lvalue(s, &f->opcode, &f->scope, &f->atom2,
+                                   &f->st_lbl_d, &enum_depth, false, '[')) {
+                        goto de_fail;
+                    }
+                }
+                if (has_spread) {
+                    js_emit_spread_code(s, enum_depth);
+                } else {
+                    emit_op(s, OP_for_of_next);
+                    emit_u8(s, enum_depth);
+                    emit_op(s, OP_drop);
+                }
+                if (s->token.val == '=' && !has_spread) {
+                    /* handle optional default value */
+                    int label_hasval;
+                    emit_op(s, OP_dup);
+                    emit_op(s, OP_undefined);
+                    emit_op(s, OP_strict_eq);
+                    label_hasval = emit_goto(s, OP_if_false, -1);
+                    if (next_token(s))
+                        goto de_var_error;
+                    emit_op(s, OP_drop);
+                    PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_DE_08);
+ de_08:
+                    if (pd_ret < 0)
+                        goto de_var_error;
+                    if (f->opcode == OP_scope_get_var || f->opcode == OP_get_ref_value)
+                        set_object_name(s, f->atom2);
+                    emit_label(s, label_hasval);
+                }
+                /* store value into lvalue object */
+                put_lvalue(s, f->opcode, f->scope, f->atom2,
+                           f->st_lbl_d, PUT_LVALUE_NOKEEP_DEPTH,
+                           (f->op == TOK_CONST || f->op == TOK_LET));
+                f->atom2 = JS_ATOM_NULL;   /* consumed by put_lvalue */
+            }
+            if (s->token.val == ']')
+                break;
+            if (has_spread)
+                PD_RET_ERR(s, "rest element must be the last one");
+            /* accept a trailing comma before the ']' */
+            if (js_parse_expect(s, ','))
+                goto de_fail;
+        }
+        /* close iterator object:
+           if completed, enum_obj has been replaced by undefined */
+        emit_source_loc_at(s, source_line_num, source_col_num);
+        emit_op(s, OP_iterator_close);
+        pop_break_entry(s->cur_func);
+        if (next_token(s))
+            goto de_fail;
+    } else {
+        PD_RET_ERR(s, "invalid assignment syntax");
+    }
+    if (s->token.val == '=' && (f->flags & DE_ALLOW_INIT)) {
+        f->st_lbl_c = emit_goto(s, OP_goto, -1);
+        if (next_token(s))
+            goto de_fail;
+        emit_label(s, f->st_lbl_a);
+        if ((f->flags & DE_HASVAL))
+            emit_op(s, OP_drop);
+        PD_CALL(PDS_ASGN, 0, PF_IN_ACCEPTED, 0, PDS_DE_03);
+ de_03:
+        if (pd_ret)
+            goto de_fail;
+        emit_goto(s, OP_goto, f->st_lbl_b);
+        emit_label(s, f->st_lbl_c);
+        f->st_flag = true;
+    } else {
+        /* normally (f->flags & DE_HASVAL) is true except if
+           js_parse_skip_parens_token() was wrong in the parsing */
+        //        assert((f->flags & DE_HASVAL));
+        if (!(f->flags & DE_HASVAL)) {
+            js_parse_error(s, "too complicated destructuring expression");
+            goto de_fail;
+        }
+        /* remove test and decrement label ref count */
+        memset(s->cur_func->byte_code.buf + f->st_pos_a, OP_nop,
+               f->st_pos_b - f->st_pos_a);
+        s->cur_func->label_slots[f->st_lbl_a].ref_count--;
+        f->st_flag = false;
+    }
+    PD_RET(f->st_flag);
+
+ de_done:
+    PD_RET(f->st_flag);
+ de_prop_error:
+ de_var_error:
+ de_fail:
+    JS_FreeAtom(ctx, f->atom);
+    JS_FreeAtom(ctx, f->atom2);
+    f->atom = JS_ATOM_NULL;
+    f->atom2 = JS_ATOM_NULL;
     PD_RET(-1);
 
  done:
@@ -58738,7 +58790,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     emit_op(s, OP_get_arg);
                     emit_u16(s, idx);
                 }
-                has_initializer = js_parse_destructuring_element(s, fd->has_parameter_expressions ? TOK_LET : TOK_VAR, true, true, -1, true, false);
+                has_initializer = js_parse_descent(s, PDS_DESTR, 0, DE_PACK(true, true, true, false, -1), fd->has_parameter_expressions ? TOK_LET : TOK_VAR);
                 if (has_initializer < 0)
                     goto fail;
                 if (has_initializer)
