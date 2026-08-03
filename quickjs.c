@@ -19292,6 +19292,47 @@ int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, i
     return JS_ToInt64SatFree(ctx, pres, in);
 }
 
+/* A CALL AS A REQUEST — the operation a browser component needs most, and the last one that was missing.
+   Every host machine so far COERCED its arguments and then computed; dispatchEvent has to RUN the page's
+   listeners, in order, and report whether one of them cancelled — which §2.9 makes SYNCHRONOUS. Calling them
+   from C is the drive-to-completion the engine aborts on, and enqueueing them as jobs answers before any of
+   them has run, so `dispatchEvent` would always report "not cancelled". This parks the machine on the call and
+   answers at the SAME call site when it is re-entered, exactly like the coercion sub-sequences above.
+
+   It takes the machine's OWN phase byte and its OWN buffer rather than borrowing the header's, because a host
+   machine can hold a call across several of its stages while a coercion is a within-stage sub-sequence — and
+   because the buffer must be declared in the machine's `visit` for a fork to copy it. `cb` is 2 + argc slots:
+   [this, func, args...], the shape the dispatch reads. The machine OWNS what it puts there; this dups on the
+   way in and releases on the way out, so a machine never has to remember either half.
+     0 = *pout is the result, 3 = the caller must return that step code, and a throw ABANDONS the machine — a
+   listener's uncaught exception is the page's, and the engine does not swallow it. */
+int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, JSValueConst func, JSValueConst this_val,
+                  int argc, JSValueConst *argv, JSValue in, JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    int i;
+
+    if (*phase == 0) {
+        JS_FreeValue(ctx, in);
+        cb[0] = js_dup(this_val);
+        cb[1] = js_dup(func);
+        for (i = 0; i < argc; i++)
+            cb[2 + i] = js_dup(argv[i]);
+        *out_cb = cb;
+        *out_argc = argc;
+        *phase = 1;
+        return 3;
+    }
+    DCHECK(*phase == 1, "a host call request resumed in a phase it never parked in");
+    *phase = 0;
+    for (i = 0; i < 2 + argc; i++) {
+        JS_FreeValue(ctx, cb[i]);
+        cb[i] = JS_UNDEFINED;
+    }
+    *pout = in;
+    return 0;
+}
+
+
 /* the same sub-sequence delivering 7.1.20 ToLength, which is ToIntegerOrInfinity CLAMPED to [0, 2**53-1]. A
    saturating ToInt64 cannot stand in for it — a negative index must become 0, not stay negative — so it gets its
    own tail like the others rather than being approximated from one. */

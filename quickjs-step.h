@@ -253,6 +253,7 @@ JS_EXTERN int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def);
 #define JS_STEP_DONE     0   /* the machine is finished; fini yields its result */
 #define JS_STEP_ABRUPT (-1)  /* it threw; the completion value is live in the context */
 #define JS_STEP_REQUEST  6   /* it parked on a sub-sequence's request and will be re-entered with the answer */
+#define JS_STEP_CALL     3   /* it parked on a CALL of the page's code (step_call_run); same re-entry contract */
 
 /* The machine's own arguments, borrowed. Out-of-range reads undefined, which is what the IDL's optional
    arguments mean at this level. */
@@ -277,6 +278,16 @@ JS_EXTERN int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, J
    like any other. Returns JS_STEP_REQUEST (the caller returns it), 0 once *pres is set, or -1. */
 JS_EXTERN int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int64_t *pres,
                                JSValue **out_cb, int *out_argc);
+
+/* A CALL AS A REQUEST — see the definition in quickjs.c. A browser component that must RUN the page's code and
+   then continue (dispatchEvent walking a listener list, §2.9's synchronous dispatch) cannot JS_Call from C:
+   that is the drive-to-completion the engine aborts on. `phase` and `cb` are the MACHINE's own — a host machine
+   holds a call across several of its stages, and the buffer must be in its `visit` for a fork to copy it.
+   `cb` is 2 + argc slots, [this, func, args...]; this dups in and releases out, so the machine owns nothing it
+   has to remember. Returns 3 (the caller returns it), or 0 once *pout is the call's result. */
+JS_EXTERN int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, JSValueConst func,
+                            JSValueConst this_val, int argc, JSValueConst *argv, JSValue in, JSValue *pout,
+                            JSValue **out_cb, int *out_argc);
 
 /* ToString AS A REQUEST — the coercion nearly every Web IDL argument actually is. `DOMString type`,
    `DOMString name`, `DOMString selector`: each is ToString on whatever the page passed, so
