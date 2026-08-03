@@ -52733,6 +52733,38 @@ typedef enum JSResolveResultEnum {
     JS_RESOLVE_RES_AMBIGUOUS,
 } JSResolveResultEnum;
 
+/* One ResolveExport activation. `star_i` IS the resume point: < 0 means the frame has not run its head yet,
+   >= 0 means it is partway through its star-export walk and the registers below carry what the child returned. */
+typedef struct JSResolveFrame {
+    JSModuleDef *m;
+    JSAtom export_name;     /* borrowed: `s` owns the dup that guards the cycle */
+    int star_i;
+    JSModuleDef *acc_module; /* the resolution accumulated so far by this frame's star walk */
+    JSExportEntry *acc_me;
+} JSResolveFrame;
+
+static int js_resolve_frame_push(JSContext *ctx, JSResolveFrame **pstack,
+                                 int *psize, int *psp,
+                                 JSModuleDef *m, JSAtom export_name)
+{
+    JSResolveFrame *f;
+    if (js_resize_array(ctx, (void **)pstack, sizeof(JSResolveFrame), psize, *psp + 1))
+        return -1;
+    f = &(*pstack)[(*psp)++];
+    f->m = m;
+    f->export_name = export_name;
+    f->star_i = -1;
+    f->acc_module = NULL;
+    f->acc_me = NULL;
+    return 0;
+}
+
+/* THE STAR-EXPORT WALK IS THE PAGE'S GRAPH. ResolveExport recurses twice over data the page writes: an
+   INDIRECT re-export forwards the whole resolution (`export { v } from "m"`), and a STAR export fans out over
+   every `export * from`. Both were C frames, so a chain of N re-exports was N frames deep and 40000 of them
+   segfaulted. The indirect case is a tail forward and becomes an assignment; the star case is a real branching
+   search with an accumulator, so it becomes an explicit frame stack driven by one loop. `s` still carries the
+   visited set, so the cycle guard is untouched, and `star_i` is the frame's resume point. */
 static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
                                               JSModuleDef **pmodule,
                                               JSExportEntry **pme,
@@ -52740,93 +52772,127 @@ static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
                                               JSAtom export_name,
                                               JSResolveState *s)
 {
-    JSExportEntry *me;
+    JSResolveFrame *stack = NULL;
+    int stack_size = 0, sp = 0;
+    /* the return registers of the frame that just finished — read only at the resume point */
+    JSResolveResultEnum ret = JS_RESOLVE_RES_NOT_FOUND;
+    JSModuleDef *res_m = NULL;
+    JSExportEntry *res_me = NULL;
 
- again:
-    *pmodule = NULL;
-    *pme = NULL;
-    if (find_resolve_entry(s, m, export_name) >= 0)
-        return JS_RESOLVE_RES_CIRCULAR;
-    if (add_resolve_entry(ctx, s, m, export_name) < 0)
+    if (js_resolve_frame_push(ctx, &stack, &stack_size, &sp, m, export_name) < 0) {
+        *pmodule = NULL;
+        *pme = NULL;
         return JS_RESOLVE_RES_EXCEPTION;
-    me = find_export_entry(ctx, m, export_name);
-    if (me) {
-        if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
-            /* local export */
-            *pmodule = m;
-            *pme = me;
-            return JS_RESOLVE_RES_FOUND;
-        } else {
-            /* indirect export */
-            JSModuleDef *m1;
-            m1 = m->req_module_entries[me->u.req_module_idx].module;
-            if (me->is_namespace) {
-                /* export ns from */
-                *pmodule = m;
-                *pme = me;
-                return JS_RESOLVE_RES_FOUND;
-            } else {
-                /* An INDIRECT export forwards the whole resolution to another module — `export { v } from "m"` —
-                   and it did so with a TAIL call, so a chain of N re-exports was N C frames. A re-export chain is
-                   the page's data; its length is not the C stack's business, and 40000 of them segfaulted. The
-                   star-export case below is a real branching walk and stays recursive; this one is a loop.
-                   The resolve state `s` already carries the visited set, so the cycle guard is unaffected. */
-                m = m1;
-                export_name = me->local_name;
-                goto again;
+    }
+
+    for(;;) {
+        JSResolveFrame *f = &stack[sp - 1];
+
+        if (f->star_i < 0) {
+            /* head: resolve within this module, following indirect re-exports without a frame */
+            for(;;) {
+                JSExportEntry *me;
+                if (find_resolve_entry(s, f->m, f->export_name) >= 0) {
+                    ret = JS_RESOLVE_RES_CIRCULAR;
+                    goto frame_done;
+                }
+                if (add_resolve_entry(ctx, s, f->m, f->export_name) < 0) {
+                    ret = JS_RESOLVE_RES_EXCEPTION;
+                    goto frame_done;
+                }
+                me = find_export_entry(ctx, f->m, f->export_name);
+                if (!me)
+                    break;
+                if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
+                    /* local export */
+                    res_m = f->m;
+                    res_me = me;
+                    ret = JS_RESOLVE_RES_FOUND;
+                    goto frame_done;
+                }
+                /* indirect export */
+                if (me->is_namespace) {
+                    /* export ns from */
+                    res_m = f->m;
+                    res_me = me;
+                    ret = JS_RESOLVE_RES_FOUND;
+                    goto frame_done;
+                }
+                f->m = f->m->req_module_entries[me->u.req_module_idx].module;
+                f->export_name = me->local_name;
             }
-        }
-    } else {
-        if (export_name != JS_ATOM_default) {
             /* not found in direct or indirect exports: try star exports */
-            int i;
-
-            for(i = 0; i < m->star_export_entries_count; i++) {
-                JSStarExportEntry *se = &m->star_export_entries[i];
-                JSModuleDef *m1, *res_m;
-                JSExportEntry *res_me;
-                JSResolveResultEnum ret;
-
-                m1 = m->req_module_entries[se->req_module_idx].module;
-                ret = js_resolve_export1(ctx, &res_m, &res_me, m1,
-                                         export_name, s);
-                if (ret == JS_RESOLVE_RES_AMBIGUOUS ||
-                    ret == JS_RESOLVE_RES_EXCEPTION) {
-                    return ret;
-                } else if (ret == JS_RESOLVE_RES_FOUND) {
-                    if (*pme != NULL) {
-                        /* 16.2.1.6.3 ResolveExport step 10.d.ii compares the ResolvedBinding's [[Module]] and
-                           [[BindingName]]. For an `all` indirect entry (`export * as ns from "m"`, and an
-                           `export { ns }` of a namespace import) the ResolvedBinding is
-                           { Module: the IMPORTED module, BindingName: namespace } — NOT the re-exporting module
-                           and its local name, which is what this compared, making two star-exports of the same
-                           namespace look ambiguous. */
-                        JSModuleDef *a_mod = res_m, *b_mod = *pmodule;
-                        bool a_ns = (res_me->export_type == JS_EXPORT_TYPE_INDIRECT &&
-                                     res_me->is_namespace);
-                        bool b_ns = ((*pme)->export_type == JS_EXPORT_TYPE_INDIRECT &&
-                                     (*pme)->is_namespace);
-                        if (a_ns)
-                            a_mod = res_m->req_module_entries[res_me->u.req_module_idx].module;
-                        if (b_ns)
-                            b_mod = (*pmodule)->req_module_entries[(*pme)->u.req_module_idx].module;
-                        if (a_ns != b_ns || a_mod != b_mod ||
-                            (!a_ns && res_me->local_name != (*pme)->local_name)) {
-                            *pmodule = NULL;
-                            *pme = NULL;
-                            return JS_RESOLVE_RES_AMBIGUOUS;
-                        }
-                    } else {
-                        *pmodule = res_m;
-                        *pme = res_me;
+            if (f->export_name == JS_ATOM_default) {
+                ret = JS_RESOLVE_RES_NOT_FOUND;
+                goto frame_done;
+            }
+            f->star_i = 0;
+        } else {
+            /* resume: the star-export child at f->star_i returned into (ret, res_m, res_me) */
+            if (ret == JS_RESOLVE_RES_AMBIGUOUS || ret == JS_RESOLVE_RES_EXCEPTION)
+                goto frame_done;
+            if (ret == JS_RESOLVE_RES_FOUND) {
+                if (f->acc_me != NULL) {
+                    /* 16.2.1.6.3 ResolveExport step 10.d.ii compares the ResolvedBinding's [[Module]] and
+                       [[BindingName]]. For an `all` indirect entry (`export * as ns from "m"`, and an
+                       `export { ns }` of a namespace import) the ResolvedBinding is
+                       { Module: the IMPORTED module, BindingName: namespace } — NOT the re-exporting module
+                       and its local name, which is what this compared, making two star-exports of the same
+                       namespace look ambiguous. */
+                    JSModuleDef *a_mod = res_m, *b_mod = f->acc_module;
+                    bool a_ns = (res_me->export_type == JS_EXPORT_TYPE_INDIRECT &&
+                                 res_me->is_namespace);
+                    bool b_ns = (f->acc_me->export_type == JS_EXPORT_TYPE_INDIRECT &&
+                                 f->acc_me->is_namespace);
+                    if (a_ns)
+                        a_mod = res_m->req_module_entries[res_me->u.req_module_idx].module;
+                    if (b_ns)
+                        b_mod = f->acc_module->req_module_entries[f->acc_me->u.req_module_idx].module;
+                    if (a_ns != b_ns || a_mod != b_mod ||
+                        (!a_ns && res_me->local_name != f->acc_me->local_name)) {
+                        ret = JS_RESOLVE_RES_AMBIGUOUS;
+                        goto frame_done;
                     }
+                } else {
+                    f->acc_module = res_m;
+                    f->acc_me = res_me;
                 }
             }
-            if (*pme != NULL)
-                return JS_RESOLVE_RES_FOUND;
+            f->star_i++;
         }
-        return JS_RESOLVE_RES_NOT_FOUND;
+
+        if (f->star_i < f->m->star_export_entries_count) {
+            JSStarExportEntry *se = &f->m->star_export_entries[f->star_i];
+            JSModuleDef *m1 = f->m->req_module_entries[se->req_module_idx].module;
+            if (js_resolve_frame_push(ctx, &stack, &stack_size, &sp, m1, f->export_name) < 0) {
+                ret = JS_RESOLVE_RES_EXCEPTION;
+                goto frame_done;
+            }
+            continue;
+        }
+        if (f->acc_me != NULL) {
+            res_m = f->acc_module;
+            res_me = f->acc_me;
+            ret = JS_RESOLVE_RES_FOUND;
+        } else {
+            ret = JS_RESOLVE_RES_NOT_FOUND;
+        }
+    frame_done:
+        /* the caller frame resumes with (ret, res_m, res_me); an AMBIGUOUS or EXCEPTION result is re-read
+           at its resume point and pops it in turn, which is how the original's early `return` unwound. */
+        if (--sp == 0)
+            break;
     }
+
+    js_free(ctx, stack);
+    if (ret == JS_RESOLVE_RES_FOUND) {
+        *pmodule = res_m;
+        *pme = res_me;
+    } else {
+        *pmodule = NULL;
+        *pme = NULL;
+    }
+    return ret;
 }
 
 /* If the return value is JS_RESOLVE_RES_FOUND, return the module
