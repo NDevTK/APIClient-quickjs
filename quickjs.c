@@ -22170,6 +22170,11 @@ typedef struct {
                                           it had to give. */
 #define NATIVE_PROMISE_EXEC       53   /* new Promise(executor) — CONT_PROMISE_EXEC */
 #define NATIVE_PROMISE_ALL_BASE   56   /* + PROMISE_MAGIC_*: all / allSettled / any / race, one walk, four rules */
+#define NATIVE_PROMISE_KEYED_BASE 60   /* + PROMISE_MAGIC_all|allSettled: allKeyed / allSettledKeyed. The SAME
+                                          machine with the SAME settlement rules and a different element SOURCE,
+                                          which is why the id says "keyed" and the magic still says which rule —
+                                          a fifth and sixth PROMISE_MAGIC would have collided with the `| 4`
+                                          the allSettled reject closure already spends. */
 #define ITERCONS_ITERTERM_BASE 16
 #define ITERCONS_TA_FROM 10 /* %TypedArray%.from(source, mapfn?, thisArg?) — do_ta_consume_tramp's `from` shape */
 #define ITERCONS_TA_OF   11 /* %TypedArray%.of(...items) — the same create+set phases with the argument LIST as
@@ -22413,12 +22418,33 @@ typedef struct JSPromiseAll {
     /* mirrors JSIterConsume's: an .apply / spread CALL's arguments live in a heap list, and the iterable is
        borrowed out of it until the acquire has an iterator. */
     JSValue *args_own; int args_own_n;
+    /* THE ELEMENT SOURCE IS THE VARIABLE (proposal-await-dictionary). allKeyed / allSettledKeyed differ from
+       all / allSettled in exactly ONE dimension — where the elements come from — so the SETTLEMENT rule stays
+       in `magic` and the SOURCE is this flag. Everything downstream is shared unchanged: C.resolve per element,
+       the `then` attach and its two element closures, remainingElementsCount, the finalize drive, the error
+       path. Only the walk that produces values differs (PerformPromiseAllKeyed's [[OwnPropertyKeys]] +
+       per-key [[GetOwnProperty]] + Get, instead of the iterator protocol) and the shape of the result
+       (CreateKeyedPromiseCombinatorResultObject instead of the values array).
+       A second machine would have had to re-derive all of that, and every rule it re-derived would be one
+       that could drift. */
+    uint8_t keyed;
+    JSValue src_obj;      /* the entries object the walk reads (owned) */
+    JSValue key_list;     /* its [[OwnPropertyKeys]] answer, in order (owned) */
+    JSValue cur_key;      /* the key under examination, held ACROSS its [[GetOwnProperty]] and its Get — both are
+                             the page's code on a Proxy, so it cannot live in an interpreter local (owned) */
+    JSAtom cur_atom;      /* the same key as an atom: a request BORROWS gp_atom, so the owner is the state */
+    JSValue keys;         /* the keys that reached the result, parallel to `values` by element index (owned) */
+    uint32_t key_i, key_n;
+    uint8_t key_ph;       /* KEY_PH_* — which half of the per-key pair is in flight */
 } JSPromiseAll;
+/* The keyed walk's phases. START is "nothing asked yet"; the three _SENT phases each name the request whose
+   answer the next entry is consuming, which is what makes the walk resumable at any point in it. */
+enum { KEY_PH_START = 0, KEY_PH_OWNKEYS_SENT, KEY_PH_WALK, KEY_PH_DESC_SENT, KEY_PH_GET_SENT };
 static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue res);
 static int js_promise_all_attach_args(JSContext *ctx, struct JSPromiseAll *s, int index,
                                       JSValue *out_re, JSValue *out_rj);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
-static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter);   /* the machine is DECLARED; this asks about the receiver and the argument */
+static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, int *out_keyed, JSValue *out_getiter);   /* the machine is DECLARED; this asks about the receiver and the argument */
 
 /* A COROUTINE CREATE (generator or async generator) that fails BEFORE its frame exists must abandon the machine
    that asked for the coroutine: that machine can never be re-entered, and nothing else holds it — the create took
@@ -24957,6 +24983,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t iterterm_kind = 0;                          /* Iterator.prototype terminal recognition: ITERTERM_* (consumed by do_iterterm_tramp) */
     int ta_from = 0;                                    /* 1 = TypedArray.from(gen) (OP_call_method): new_target is this_val at call_argv[-2], not call_argv[-1] */
     int pa_magic = 0;                                   /* Promise.all/allSettled(gen) recognition: the PROMISE_MAGIC (read at OP_call_method, consumed by do_promise_all_consume_tramp) */
+    int pa_keyed = 0;                                   /* …and which SOURCE: the iterator protocol, or allKeyed's own-key walk */
     JSAsyncFunctionState *gen_state = NULL;   /* the generator/async base state IF this activation is preemptible */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -27060,7 +27087,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_iter_consume_tramp;
                     }
                 }
-                if (promise_all_ready(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &pa_magic, &tramp_iter_getiter))
+                if (promise_all_ready(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &pa_magic, &pa_keyed, &tramp_iter_getiter))
                     goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
                 if (tramp_native_machine_of(call_argv[-1]) == NATIVE_PROMISE_TRY)
                     goto do_promise_try_tramp;                  /* Promise.try(fn, ...args) */
@@ -31192,6 +31219,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 s->values = JS_UNDEFINED; s->resolve_element_env = JS_UNDEFINED; s->elem_promises = JS_UNDEFINED;
                 s->index = 0;
                 s->magic = pa_magic;
+                s->keyed = pa_keyed;
+                s->src_obj = JS_UNDEFINED; s->key_list = JS_UNDEFINED;
+                s->cur_key = JS_UNDEFINED; s->keys = JS_UNDEFINED;
+                s->cur_atom = JS_ATOM_NULL;
+                s->key_ph = KEY_PH_START;
                 /* the BRIEF-WINDOW values, stated rather than left to js_mallocz: the teardown frees them now (a
                    state torn down mid-request still holds one), and "a zeroed JSValue happens to be an int" is not
                    a contract this file should depend on. */
@@ -31254,6 +31286,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cont_st = s;
                     goto do_promise_all_settle;
                 }
+                if (s->keyed) {
+                    /* Promise.allKeyed step 5: "If promises is not an Object", reject with a TypeError — and it
+                       is checked HERE, after the capability and after GetPromiseResolve, because that is where
+                       the proposal puts it. There is no iterator to acquire; the walk is the step machine's. */
+                    s->keys = JS_NewArray(ctx);
+                    if (JS_IsException(s->keys)) { cont_st = s; goto do_promise_all_settle; }
+                    if (!JS_IsObject(s->acq_iterable)) {
+                        JS_ThrowTypeError(ctx, "Promise.allKeyed requires an object");
+                        cont_st = s;
+                        goto do_promise_all_settle;
+                    }
+                    s->src_obj = js_dup(s->acq_iterable);
+                    cont_st = s;
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_promise_all_step;
+                }
                 tramp_consume_iterable = s->acq_iterable;   /* borrowed from the STATE, which outlives the acquire */
                 tramp_consume_state = s; tramp_consume_kind = CONT_PROMISE_ALL;
                 goto do_consume_acquire_iterator;   /* GetIterator + its throw-rejects-the-aggregate live in the shared deliver */
@@ -31268,6 +31316,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSPromiseAll *pa = (JSPromiseAll *)cont_st;
                 JSValue pre, prj;
                 cont_st = NULL;
+                /* 7.3.19 Invoke is GetV then ? Call, and Call's step 1 is "If IsCallable(F) is false, throw a
+                   TypeError" — which for a combinator is an abrupt completion that REJECTS the aggregate. It was
+                   never raised: the operands went to the convergence point, which is the right place to resolve a
+                   callee KIND but not the place that knows this call's failure belongs to a promise. The whole
+                   corpus missed it because the only tests for a non-callable `then` are the new keyed pair's;
+                   `Promise.resolve = () => ({}); Promise.all([1])` hangs the same way on the iterable side. */
+                if (unlikely(!JS_IsFunction(ctx, ret_val))) {
+                    JS_FreeValue(ctx, ret_val);
+                    ret_val = JS_UNINITIALIZED;
+                    JS_ThrowTypeError(ctx, "then is not a function");
+                    cont_st = pa;
+                    goto do_promise_all_err_entry;
+                }
                 if (unlikely(js_promise_all_attach_args(ctx, pa, pa->att_index, &pre, &prj) < 0)) {
                     JS_FreeValue(ctx, ret_val);
                     ret_val = JS_UNINITIALIZED;
@@ -31351,7 +31412,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        ON THE CHAIN, like the other two sites: the `return` method is the page's code. The
                        rejection is already parked in fin_arg, so the close carries NO saved exception and its own
                        throw is discarded — which is 7.4.9 under an abrupt completion. */
-                    if (!s->driving_next && !s->iter_done) {
+                    /* !keyed: a keyed source has no iterator, so IfAbruptCloseIterator does not apply to it at
+                       all — there is nothing whose `return` the spec would call. */
+                    if (!s->keyed && !s->driving_next && !s->iter_done) {
                         JSIterClose *ce = js_malloc(ctx, sizeof(*ce));
                         if (likely(ce != NULL)) {
                             ce->iter = js_dup(s->iter);
@@ -31365,6 +31428,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, JS_GetException(ctx));   /* the OOM; the rejection still stands */
                     }
                     st = 2;   /* fall through to the FINALIZE drive below, then DONE */
+                }
+                if (st == 1 && s->keyed) {
+                    /* ADVANCE. For an iterator source that is a .next() drive; for the keyed source the next
+                       element is the next key, which the step itself walks — so re-enter it with nothing to
+                       consume, exactly as the re-attach cursor does. */
+                    ret_val = JS_UNINITIALIZED;
+                    goto do_promise_all_step;
+                }
+                if (st == 8) {
+                    /* PerformPromiseAllKeyed step 1: promises.[[OwnPropertyKeys]](). On a Proxy that is the
+                       `ownKeys` trap, so it is the one keyed entry's request like every other internal method. */
+                    gp_outer = s; gp_outer_kind = CONT_PROMISE_ALL_GET;
+                    gp_obj = s->src_obj; gp_atom = JS_ATOM_NULL;
+                    gp_op = GP_OWNKEYS; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
+                }
+                if (st == 9 || st == 10) {
+                    /* step 6.a's [[GetOwnProperty]] and step 6.b.i's Get, on the key the state holds. Both are
+                       page code — a trap, or an accessor — and the atom is BORROWED by the request, which is why
+                       the state owns it. */
+                    gp_outer = s; gp_outer_kind = CONT_PROMISE_ALL_GET;
+                    gp_obj = s->src_obj; gp_atom = s->cur_atom;
+                    gp_op = (st == 9) ? GP_GETOWNPROP : GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
                 }
                 if (st == 7) {
                     /* the .next() RESULT's IteratorComplete / IteratorValue. */
@@ -40060,11 +40147,20 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->res_obj = js_dup(os->res_obj);         /* in flight when a fork lands mid-unpack */
                 ns->acq_method = js_dup(os->acq_method);       /* both in flight when a fork lands mid-capability */
                 ns->acq_iterable = js_dup(os->acq_iterable);
+                /* the keyed source's own fields. `keys` is FRESH like `values` and takes a copy of the elements
+                   already walked, because the sibling builds its own result object out of the pair. */
+                ns->src_obj = js_dup(os->src_obj);
+                ns->key_list = js_dup(os->key_list);
+                ns->cur_key = js_dup(os->cur_key);
+                ns->cur_atom = JS_DupAtom(ctx, os->cur_atom);
+                ns->keys = JS_UNDEFINED;
                 ns->result_promise = js_new_promise_capability(ctx, ns->resolving_funcs, os->this_val);   /* fresh aggregate + [resolve,reject] */
                 ns->values = JS_NewArray(ctx);
                 ns->resolve_element_env = JS_NewArray(ctx);
                 ns->elem_promises = JS_NewArray(ctx);
-                if (JS_IsException(ns->result_promise) || JS_IsException(ns->values)
+                if (os->keyed) ns->keys = JS_NewArray(ctx);
+                if (JS_IsException(ns->keys)
+                    || JS_IsException(ns->result_promise) || JS_IsException(ns->values)
                     || JS_IsException(ns->resolve_element_env) || JS_IsException(ns->elem_promises)
                     || JS_DefinePropertyValueUint32(ctx, ns->resolve_element_env, 0, js_int32(1),
                                                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0) {
@@ -40077,6 +40173,14 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                       if (JS_IsException(ep)
                           || JS_DefinePropertyValueInt64(ctx, ns->elem_promises, ei, ep, JS_PROP_C_W_E) < 0) {
                           fail = 1; break; }   /* JS_DefinePropertyValueInt64 consumes ep */
+                  }
+                  if (!fail && os->keyed) {
+                      for (int ei = 0; ei < os->index; ei++) {
+                          JSValue kk = JS_GetPropertyInt64(ctx, os->keys, ei);
+                          if (JS_IsException(kk)
+                              || JS_DefinePropertyValueInt64(ctx, ns->keys, ei, kk, JS_PROP_C_W_E) < 0) {
+                              fail = 1; break; }
+                      }
                   }
                   if (fail) { js_promise_all_end(ctx, ns); js_free(ctx, ns); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
                 }
@@ -89724,6 +89828,8 @@ static __exception int remainingElementsCount_add(JSContext *ctx,
    element was the LAST — in which case the aggregate settle must run (out_fire=1, out_resolve/out_arg owned). ONE
    logic feeding BOTH dispatch entries of the reaction: the job-queue C body (which JS_Calls the settle) and the
    tramp STEP MACHINE (which drives the settle on the chain so a user settle's loop parks). */
+static JSValue js_keyed_result_object(JSContext *ctx, JSValueConst keys, JSValueConst values, uint32_t n);
+
 static int promise_resolve_elem_prep(JSContext *ctx, int magic, JSValueConst *func_data,
                                      int argc, JSValueConst *argv,
                                      JSValue *out_resolve, JSValue *out_arg, int *out_fire)
@@ -89733,6 +89839,12 @@ static int promise_resolve_elem_prep(JSContext *ctx, int magic, JSValueConst *fu
     JSValueConst values = func_data[2];
     JSValueConst resolve = func_data[3];
     JSValueConst resolve_element_env = func_data[4];
+    /* THE SETTLE CAN HAPPEN HERE, not only at the end of the walk: an element whose promise is already settled
+       runs this closure after the walk has finished, so the LAST element to settle is what resolves the
+       aggregate. That is why the keyed result has to be buildable from the closure too — the aggregate's shape
+       is a property of the combinator, not of which half of it happens to reach zero first. UNDEFINED for the
+       iterable combinators, which resolve with the values list. */
+    JSValueConst keys = func_data[5];
     JSValue obj;
     int is_zero, index;
     /* A resolving function takes ONE parameter, and a page can call it with none — `f()` on a resolve-element
@@ -89743,9 +89855,23 @@ static int promise_resolve_elem_prep(JSContext *ctx, int magic, JSValueConst *fu
     *out_resolve = JS_UNDEFINED; *out_arg = JS_UNDEFINED; *out_fire = 0;
     if (JS_ToInt32(ctx, &index, func_data[1]))
         return -1;
-    if (JS_ToBool(ctx, func_data[0]))   /* alreadyCalled: a resolving function fires at most once */
-        return 0;
-    func_data[0] = JS_TRUE;
+    /* [[AlreadyCalled]] IS A RECORD IN THE SPEC BECAUSE IT IS SHARED. allSettled builds two element closures
+       per element — onFulfilled and onRejected — and they hold the SAME record, so an element that fulfils makes
+       its own rejection handler a no-op. Each closure had its own boolean, which is a separate record by
+       construction: `then(f, r) { f("first"); r(err); f("second") }` recorded the fulfilment AND then the
+       rejection over it. Shared through a one-slot holder, exactly as remainingElementsCount already is, since
+       that one is a Record for the same reason. */
+    {
+        JSValue ac = JS_GetPropertyUint32(ctx, func_data[0], 0);
+        int already;
+        if (JS_IsException(ac))
+            return -1;
+        already = JS_ToBoolFree(ctx, ac);
+        if (already)
+            return 0;
+        if (JS_SetPropertyUint32(ctx, func_data[0], 0, JS_TRUE) < 0)
+            return -1;
+    }
 
     if (resolve_type == PROMISE_MAGIC_allSettled) {
         JSValue str;
@@ -89769,6 +89895,11 @@ static int promise_resolve_elem_prep(JSContext *ctx, int magic, JSValueConst *fu
             JSValue error = js_aggregate_error_constructor(ctx, values);
             if (JS_IsException(error)) return -1;
             *out_arg = error;
+        } else if (!JS_IsUndefined(keys)) {
+            uint32_t n;
+            if (js_get_length32(ctx, &n, keys)) return -1;
+            *out_arg = js_keyed_result_object(ctx, keys, values, n);
+            if (JS_IsException(*out_arg)) return -1;
         } else {
             *out_arg = js_dup(values);
         }
@@ -89906,11 +90037,44 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
 /* The two ELEMENT CLOSURES the attach passes to `then`, built once the method is in hand. Everything here is C:
    the closures are engine-made and the arrays they capture are the aggregate's own. `race` passes the aggregate's
    resolve/reject directly — the FIRST element to settle wins, so there is no per-element closure at all. */
+/* CreateKeyedPromiseCombinatorResultObject ( entries ): OrdinaryObjectCreate(null), then
+   CreateDataPropertyOrThrow per entry. The prototype is NULL by the proposal's own step 1 — the result is a
+   dictionary, and a page reading `result.constructor` off %Object.prototype% would be reading something the
+   combinator never put there. Nothing here runs the page's code: the object is fresh, so every define is an
+   own-slot add on a shape nobody else holds. */
+static JSValue js_keyed_result_object(JSContext *ctx, JSValueConst keys, JSValueConst values, uint32_t n)
+{
+    JSValue obj = JS_NewObjectProto(ctx, JS_NULL);
+    uint32_t i;
+
+    if (JS_IsException(obj))
+        return obj;
+    for (i = 0; i < n; i++) {
+        JSValue k = JS_GetPropertyUint32(ctx, keys, i);
+        JSValue v;
+        JSAtom a;
+        if (JS_IsException(k))
+            goto fail;
+        a = JS_ValueToAtom(ctx, k);   /* already a property key: the ownKeys answer holds strings and symbols */
+        JS_FreeValue(ctx, k);
+        if (a == JS_ATOM_NULL)
+            goto fail;
+        v = JS_GetPropertyUint32(ctx, values, i);
+        if (JS_IsException(v)) { JS_FreeAtom(ctx, a); goto fail; }
+        if (JS_DefinePropertyValue(ctx, obj, a, v, JS_PROP_C_W_E) < 0) { JS_FreeAtom(ctx, a); goto fail; }
+        JS_FreeAtom(ctx, a);
+    }
+    return obj;
+ fail:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
 static int js_promise_all_attach_args(JSContext *ctx, JSPromiseAll *s, int index,
                                       JSValue *out_re, JSValue *out_rj)
 {
-    JSValue resolve_element, reject_element;
-    JSValueConst resolve_element_data[5];
+    JSValue resolve_element, reject_element, already_called;
+    JSValueConst resolve_element_data[6];
 
     *out_re = JS_UNDEFINED; *out_rj = JS_UNDEFINED;
     if (s->magic == PROMISE_MAGIC_race) {
@@ -89918,32 +90082,42 @@ static int js_promise_all_attach_args(JSContext *ctx, JSPromiseAll *s, int index
         *out_rj = js_dup(s->resolving_funcs[1]);
         return 0;
     }
-    resolve_element_data[0] = JS_FALSE;
+    /* the shared [[AlreadyCalled]] holder — one per ELEMENT, handed to both of that element's closures */
+    already_called = JS_NewArray(ctx);
+    if (JS_IsException(already_called)) return -1;
+    if (JS_DefinePropertyValueUint32(ctx, already_called, 0, JS_FALSE, JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(ctx, already_called); return -1;
+    }
+    resolve_element_data[0] = already_called;
     resolve_element_data[1] = js_int32(index);
     resolve_element_data[2] = s->values;
     resolve_element_data[3] = s->resolving_funcs[s->magic == PROMISE_MAGIC_any ? 1 : 0];   /* any: the aggregate REJECT (called when all reject); all/allSettled: resolve */
     resolve_element_data[4] = s->resolve_element_env;
+    resolve_element_data[5] = s->keyed ? (JSValueConst)s->keys : JS_UNDEFINED;
     resolve_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
-                                          s->magic, 5, resolve_element_data);
-    if (JS_IsException(resolve_element)) return -1;
+                                          s->magic, 6, resolve_element_data);
+    /* the closures DUP what they capture, so the holder's own reference is this function's to release — on
+       every exit below, which is why it is released here rather than at four returns. */
+    if (JS_IsException(resolve_element)) { JS_FreeValue(ctx, already_called); return -1; }
     promise_reaction_set_step(resolve_element);
     if (s->magic == PROMISE_MAGIC_allSettled) {
         /* allSettled: a rejection is ALSO recorded (as {status:'rejected', reason}) — a second element closure. */
         reject_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
-                                             s->magic | 4, 5, resolve_element_data);
-        if (JS_IsException(reject_element)) { JS_FreeValue(ctx, resolve_element); return -1; }
+                                             s->magic | 4, 6, resolve_element_data);
+        if (JS_IsException(reject_element)) { JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, already_called); return -1; }
         promise_reaction_set_step(reject_element);
     } else if (s->magic == PROMISE_MAGIC_any) {
         /* any: the element CLOSURE is the REJECT handler (records the error at index); a FULFILLMENT resolves the
            aggregate directly. Pre-fill values[index] so a later rejection has a slot. */
         if (JS_DefinePropertyValueUint32(ctx, s->values, index, JS_UNDEFINED, JS_PROP_C_W_E) < 0) {
-            JS_FreeValue(ctx, resolve_element); return -1;
+            JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, already_called); return -1;
         }
         reject_element = resolve_element;
         resolve_element = js_dup(s->resolving_funcs[0]);
     } else {
         reject_element = js_dup(s->resolving_funcs[1]);   /* `all`: reject the aggregate on first rejection */
     }
+    JS_FreeValue(ctx, already_called);
     if (remainingElementsCount_add(ctx, s->resolve_element_env, 1) < 0) {
         JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, reject_element); return -1;
     }
@@ -89988,6 +90162,68 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
         s->index++;
         return 1;   /* drive the next .next() */
     }
+    if (s->keyed) {
+        /* PerformPromiseAllKeyed's element walk. Three of its steps are the page's code on a Proxy —
+           [[OwnPropertyKeys]] once, then [[GetOwnProperty]] and Get per key — so each is a REQUEST and the
+           cursor lives on the state. From `have_value` on, this is the same machine the iterator walk feeds. */
+        switch (s->key_ph) {
+        case KEY_PH_START:
+            JS_FreeValue(ctx, res);
+            s->key_ph = KEY_PH_OWNKEYS_SENT;
+            return 8;                         /* step 1: allKeys = ? promises.[[OwnPropertyKeys]]() */
+        case KEY_PH_WALK:
+            /* re-entered with nothing to consume: the previous element's attach completed and the cursor has
+               already been advanced past it. */
+            JS_FreeValue(ctx, res);
+            break;
+        case KEY_PH_OWNKEYS_SENT:
+            s->key_list = res;
+            if (js_get_length32(ctx, &s->key_n, s->key_list)) return -1;
+            s->key_i = 0;
+            s->key_ph = KEY_PH_WALK;
+            break;
+        case KEY_PH_DESC_SENT: {
+            /* step 6.b: "desc is not undefined and desc.[[Enumerable]] is true". The answer is the descriptor
+               OBJECT FromPropertyDescriptor built — engine-made and ordinary, so reading its field is C. */
+            int enumerable = 0;
+            if (JS_IsObject(res)) {
+                JSValue e = JS_GetProperty(ctx, res, JS_ATOM_enumerable);
+                if (JS_IsException(e)) { JS_FreeValue(ctx, res); return -1; }
+                enumerable = JS_ToBoolFree(ctx, e);
+            }
+            JS_FreeValue(ctx, res);
+            s->key_ph = KEY_PH_WALK;
+            if (!enumerable) { s->key_i++; break; }
+            s->key_ph = KEY_PH_GET_SENT;
+            return 10;                        /* step 6.b.i: propertyValue = ? Get(promises, key) */
+        }
+        case KEY_PH_GET_SENT:
+            /* step 6.b.ii-iii: the key and a values slot are appended TOGETHER, so keys[index] and
+               values[index] name the same element for the result object. */
+            if (JS_DefinePropertyValueInt64(ctx, s->keys, s->index, js_dup(s->cur_key), JS_PROP_C_W_E) < 0) {
+                JS_FreeValue(ctx, res); return -1;
+            }
+            s->key_i++;
+            s->key_ph = KEY_PH_WALK;
+            value = res;
+            goto have_value;
+        default:
+            DFAIL("the keyed combinator walk resumed in an unknown phase");
+            JS_FreeValue(ctx, res);
+            return -1;
+        }
+        /* KEY_PH_WALK: advance to the next key, or the source is exhausted (step 7). */
+        if (s->key_i >= s->key_n)
+            goto source_done;
+        JS_FreeValue(ctx, s->cur_key);
+        s->cur_key = JS_GetPropertyUint32(ctx, s->key_list, s->key_i);
+        if (JS_IsException(s->cur_key)) { s->cur_key = JS_UNDEFINED; return -1; }
+        JS_FreeAtom(ctx, s->cur_atom);
+        s->cur_atom = JS_ValueToAtom(ctx, s->cur_key);   /* already a property key; runs nothing */
+        if (s->cur_atom == JS_ATOM_NULL) return -1;
+        s->key_ph = KEY_PH_DESC_SENT;
+        return 9;                             /* step 6.a: desc = ? promises.[[GetOwnProperty]](key) */
+    }
     if (JS_VALUE_GET_TAG(res) == JS_TAG_UNINITIALIZED)
         return 1;   /* first step: nothing to process, drive .next() */
     if (!s->res_ph && !JS_IsObject(res)) {
@@ -90018,8 +90254,21 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
         goto have_value;
     }
     if (done) {
-        int is_zero;
         JS_FreeValue(ctx, res);
+        goto source_done;
+    }
+have_value:
+    s->driving_next = 0;   /* the iterator has fully stepped; from here an error closes it (fail_reject1) */
+    s->elem_value = value;
+    s->resolving_elem = 1;
+    return 4;   /* RESOLVE-ELEMENT: drive C.resolve(value) on the tramp, then re-enter with its promise */
+
+source_done:
+    /* THE SOURCE IS EXHAUSTED — step 7's remainingElementsCount decrement and step 8's settle, reached from the
+       iterator walk's {done:true} and from the keyed walk running out of keys. It is one place because it is one
+       step of the spec: which walk produced the elements is not a fact this half needs. */
+    {
+        int is_zero;
         s->iter_done = 1;   /* exhausted: a finalize-stage error must not close it */
         if (s->magic == PROMISE_MAGIC_race)
             return 0;   /* race: no aggregation/finalize — the aggregate already settled (or stays pending if empty) */
@@ -90034,6 +90283,11 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
                 JSValue err = js_aggregate_error_constructor(ctx, s->values);
                 if (JS_IsException(err)) return -1;
                 s->fin_arg = err; s->fin_is_reject = 1;
+            } else if (s->keyed) {
+                /* step 8.a: the result is the dictionary, not the values list. */
+                JSValue r = js_keyed_result_object(ctx, s->keys, s->values, (uint32_t)s->index);
+                if (JS_IsException(r)) return -1;
+                s->fin_arg = r; s->fin_is_reject = 0;
             } else {
                 s->fin_arg = js_dup(s->values); s->fin_is_reject = 0;
             }
@@ -90042,11 +90296,6 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
         }
         return 0;   /* count not zero: another element still pending — DONE for this drive */
     }
-have_value:
-    s->driving_next = 0;   /* the iterator has fully stepped; from here an error closes it (fail_reject1) */
-    s->elem_value = value;
-    s->resolving_elem = 1;
-    return 4;   /* RESOLVE-ELEMENT: drive C.resolve(value) on the tramp, then re-enter with its promise */
 }
 
 /* Free a for-await async-from-sync state's owned fields (promise dup'd out by the caller before this). */
@@ -90078,11 +90327,16 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
     JS_FreeValue(ctx, s->acq_method);    /* both held across the capability request */
     JS_FreeValue(ctx, s->acq_iterable);
     if (s->args_own) { free_arg_list(ctx, s->args_own, s->args_own_n); s->args_own = NULL; s->args_own_n = 0; }
+    JS_FreeValue(ctx, s->src_obj);    /* the keyed source's four, each NULL/UNDEFINED for an iterator walk */
+    JS_FreeValue(ctx, s->key_list);
+    JS_FreeValue(ctx, s->cur_key);
+    JS_FreeValue(ctx, s->keys);
+    JS_FreeAtom(ctx, s->cur_atom);
 }
 
 /* Route Promise.all / allSettled / any over a GENERATOR-BACKED iterable (its .next() must run on the tramp); `race`
    and every other shape stay on the normal C path, which drives them correctly. */
-static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, JSValue *out_getiter)
+static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, int *out_keyed, JSValue *out_getiter)
 {
     JSObject *fp;
     int magic;
@@ -90095,7 +90349,15 @@ static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst re
        (do_promise_all_step branches on s->magic == PROMISE_MAGIC_race), so it belongs here, not in a second
        recognizer with its own generator-only narrowing. */
     magic = tramp_native_machine_of(func) - NATIVE_PROMISE_ALL_BASE;
-    if (magic < 0 || magic > PROMISE_MAGIC_race) return false;
+    if (magic < 0 || magic > PROMISE_MAGIC_race) {
+        /* the KEYED pair: the same machine, so the same recognizer — what differs is the source, which the
+           caller reads out of *out_keyed and nothing else here has to know about. */
+        magic = tramp_native_machine_of(func) - NATIVE_PROMISE_KEYED_BASE;
+        if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled) return false;
+        *out_keyed = 1;
+    } else {
+        *out_keyed = 0;
+    }
     /* the receiver (the constructor `this`) must be an Object — NewPromiseCapability(C) requires it. A non-object
        (Promise.all.call(5, x)) is rejected here so the C entry throws TypeErrorNotAnObject in spec order, BEFORE
        any iteration; a side-effect-free tag check, so probing it changes nothing. The RESOLVED receiver is
@@ -90112,7 +90374,10 @@ static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst re
     /* ANY ARGUMENT COUNT. These take exactly one parameter, so extra arguments are ignored and a missing one is
        undefined — neither is a fact about the CALLEE, and requiring exactly 1 sent `Promise.all(iter, "extra")`
        and `Promise.all()` to the C body, whose .next() loop cannot suspend. */
-    iter_data_at_iterator(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED, out_getiter);   /* JS_UNDEFINED when absent/uncallable => acquire throws */
+    /* the @@iterator PROBE belongs to the iterator source alone: the keyed walk never acquires one, and probing
+       for it would strand the method the probe leaves behind. */
+    if (!*out_keyed)
+        iter_data_at_iterator(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED, out_getiter);   /* JS_UNDEFINED when absent/uncallable => acquire throws */
     *out_magic = magic;
     return true;
 }
@@ -90569,6 +90834,10 @@ static const JSCFunctionListEntry js_promise_funcs[] = {
     JS_CFUNC_MAGIC_DEF("all", 1, js_promise_all, PROMISE_MAGIC_all ),
     JS_CFUNC_MAGIC_DEF("allSettled", 1, js_promise_all, PROMISE_MAGIC_allSettled ),
     JS_CFUNC_MAGIC_DEF("any", 1, js_promise_all, PROMISE_MAGIC_any ),
+    /* proposal-await-dictionary. Same C residue as their iterable twins: the body is a DFAIL, because the call
+       is routed to the machine before it can reach one. */
+    JS_CFUNC_MAGIC_DEF("allKeyed", 1, js_promise_all, PROMISE_MAGIC_all ),
+    JS_CFUNC_MAGIC_DEF("allSettledKeyed", 1, js_promise_all, PROMISE_MAGIC_allSettled ),
     JS_CFUNC_DEF("try", 1, js_promise_try ),   /* declared a machine in JS_AddIntrinsicPromise */
     JS_CFUNC_DEF("race", 1, js_promise_race ),
     JS_CFUNC_STEP_DEF("withResolvers", 0, STEPDEF_PROMISE_WITHRESOLVERS ),
@@ -90977,6 +91246,8 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
             { "allSettled", NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_allSettled },
             { "any",        NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_any },
             { "race",       NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_race },
+            { "allKeyed",        NATIVE_PROMISE_KEYED_BASE + PROMISE_MAGIC_all },
+            { "allSettledKeyed", NATIVE_PROMISE_KEYED_BASE + PROMISE_MAGIC_allSettled },
         };
         size_t mi;
         for (mi = 0; mi < countof(promise_machines); mi++) {
