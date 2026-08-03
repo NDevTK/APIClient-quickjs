@@ -3676,8 +3676,12 @@ static uint32_t hash_string(JSString *str, uint32_t h)
     return h;
 }
 
+/* ONE SLOT MORE THAN THE CAP, because the rebalance walks the one rope that exceeds it: js_new_string_rope
+   rebalances exactly when the new node's depth reaches JS_STRING_ROPE_MAX_DEPTH + 1, so the tree handed to the
+   walk is that deep. The stack holds at most one entry per level of the left spine, so depth slots is the
+   requirement and the DCHECK below is that invariant, not a bound on the input. */
 typedef struct {
-    JSValueConst stack[JS_STRING_ROPE_MAX_DEPTH];
+    JSValueConst stack[JS_STRING_ROPE_MAX_DEPTH + 1];
     int stack_len;
 } JSStringRopeIter;
 
@@ -3700,7 +3704,8 @@ static JSString *string_rope_iter_next(JSStringRopeIter *s)
         if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
             return JS_VALUE_GET_STRING(val);
         r = JS_VALUE_GET_STRING_ROPE(val);
-        DCHECK(s->stack_len < JS_STRING_ROPE_MAX_DEPTH, "s->stack_len < JS_STRING_ROPE_MAX_DEPTH");
+        DCHECK(s->stack_len < JS_STRING_ROPE_MAX_DEPTH + 1,
+               "a rope deeper than js_new_string_rope's rebalance point reached the leaf walk");
         s->stack[s->stack_len++] = r->right;
         val = r->left;
     }
@@ -5792,17 +5797,32 @@ static const uint32_t rope_bucket_len[ROPE_N_BUCKETS] = {
   267914296,  433494437,  701408733, 1134903170, /* > JS_STRING_LEN_MAX */
 };
 
-static int js_rebalance_string_rope_rec(JSContext *ctx, JSValue *buckets,
-                                        JSValueConst val)
+/* THE LEAF WALK, AND ITS DEPTH IS THE PAGE'S: `s = s + x` in a loop builds a rope one level deeper per
+   iteration, and this was one C frame per level — a recursion over a structure the page sizes, which is the
+   one thing this fork may not spend. The order it needs is left-to-right over the LEAVES, which is exactly
+   what string_rope_iter_next yields; the flat walker already existed for hash_string_rope, so — as with
+   string_buffer_concat_str_rope — the fix was to notice the traversal was written and not to write a third.
+   A plain string is a one-leaf rope to the iterator, so it needs no case of its own.
+   The bucket insertion (Boehm/Atkinson/Plass) is unchanged and stays inline rather than becoming a second
+   function: splitting it added a name to the recursion audit's count and bought nothing, since the cycle that
+   remains is js_new_string_rope <-> js_rebalance_string_rope either way — the leaf step builds bucket
+   concatenations, and building a rope is what can ask for a rebalance. That one is bounded by construction:
+   the ropes it builds out of buckets are balanced, so the depth never reaches the rebalance point again. */
+static int js_rebalance_string_rope_walk(JSContext *ctx, JSValue *buckets, JSValueConst val)
 {
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
-        JSString *p = JS_VALUE_GET_STRING(val);
+    JSStringRopeIter it;
+    JSString *p;
+
+    string_rope_iter_init(&it, val);
+    while ((p = string_rope_iter_next(&it)) != NULL) {
         uint32_t len, i;
         JSValue a, b;
 
+        JSValueConst leaf = JS_MKPTR(JS_TAG_STRING, p);
+
         len = p->len;
         if (len == 0)
-            return 0; /* nothing to do */
+            continue;   /* an empty leaf contributes nothing — and the walk has more leaves to visit */
         /* find the bucket i so that rope_bucket_len[i] <= len <
            rope_bucket_len[i + 1] and concatenate the ropes in the
            buckets before */
@@ -5823,11 +5843,11 @@ static int js_rebalance_string_rope_rec(JSContext *ctx, JSValue *buckets,
             i++;
         }
         if (!JS_IsNull(a)) {
-            a = js_new_string_rope(ctx, a, js_dup(val));
+            a = js_new_string_rope(ctx, a, js_dup(leaf));
             if (JS_IsException(a))
                 return -1;
         } else {
-            a = js_dup(val);
+            a = js_dup(leaf);
         }
         while (!JS_IsNull(buckets[i])) {
             a = js_new_string_rope(ctx, buckets[i], a);
@@ -5837,12 +5857,6 @@ static int js_rebalance_string_rope_rec(JSContext *ctx, JSValue *buckets,
             i++;
         }
         buckets[i] = a;
-    } else {
-        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
-        if (js_rebalance_string_rope_rec(ctx, buckets, r->left))
-            return -1;
-        if (js_rebalance_string_rope_rec(ctx, buckets, r->right))
-            return -1;
     }
     return 0;
 }
@@ -5857,7 +5871,7 @@ static JSValue js_rebalance_string_rope(JSContext *ctx, JSValueConst rope)
 
     for(i = 0; i < ROPE_N_BUCKETS; i++)
         buckets[i] = JS_NULL;
-    if (js_rebalance_string_rope_rec(ctx, buckets, rope))
+    if (js_rebalance_string_rope_walk(ctx, buckets, rope))
         goto fail;
     a = JS_NULL;
     for(i = 0; i < ROPE_N_BUCKETS; i++) {
