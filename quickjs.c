@@ -5070,36 +5070,54 @@ static int string_buffer_concat(StringBuffer *s, JSString *p,
         return string_buffer_write8(s, str8(p) + from, to - from);
 }
 
+/* Append a value that IS a string or a rope, walking a rope's children. Nothing here coerces, and that is what
+   a LINEARIZATION needs: a rope's children are strings and ropes by construction, so reaching JS_ToString from
+   js_linearize_string_rope was a general operation answering a fixed question — and it put string building
+   into a cycle with ToString, which linearizes. */
+static int string_buffer_concat_str_rope(StringBuffer *s, JSValueConst v)
+{
+    JSStringRopeIter it;
+    JSString *p;
+
+    if (s->error_status) {
+        /* prevent exception overload */
+        return -1;
+    }
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING) {
+        p = JS_VALUE_GET_STRING(v);
+        return string_buffer_concat(s, p, 0, p->len);
+    }
+    DCHECK(JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE,
+           "string_buffer_concat_str_rope over something that is neither — use string_buffer_concat_value");
+    /* The rope ITERATOR that already exists, not a second walker: it yields the leaves left to right, which is
+       the order the recursion visited them in, and its stack is the one the tree needs. Same argument as
+       hash_string_rope — the recursion was a duplicate traversal of a structure that already had a flat one. */
+    string_rope_iter_init(&it, v);
+    while ((p = string_rope_iter_next(&it)) != NULL) {
+        if (string_buffer_concat(s, p, 0, p->len))
+            return -1;
+    }
+    return 0;
+}
+
 static int string_buffer_concat_value(StringBuffer *s, JSValueConst v)
 {
-    JSString *p;
     JSValue v1;
-    int res;
-    int tag;
+    int res, tag;
 
     if (s->error_status) {
         /* prevent exception overload */
         return -1;
     }
     tag = JS_VALUE_GET_TAG(v);
-    if (tag == JS_TAG_STRING_ROPE) {
-        /* recursively concatenate rope children */
-        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(v);
-        if (string_buffer_concat_value(s, r->left))
-            return -1;
-        return string_buffer_concat_value(s, r->right);
-    }
-    if (unlikely(tag != JS_TAG_STRING)) {
-        v1 = JS_ToString(s->ctx, v);
-        if (JS_IsException(v1))
-            return string_buffer_set_error(s);
-        p = JS_VALUE_GET_STRING(v1);
-        res = string_buffer_concat(s, p, 0, p->len);
-        JS_FreeValue(s->ctx, v1);
-        return res;
-    }
-    p = JS_VALUE_GET_STRING(v);
-    return string_buffer_concat(s, p, 0, p->len);
+    if (likely(tag == JS_TAG_STRING || tag == JS_TAG_STRING_ROPE))
+        return string_buffer_concat_str_rope(s, v);
+    v1 = JS_ToString(s->ctx, v);
+    if (JS_IsException(v1))
+        return string_buffer_set_error(s);
+    res = string_buffer_concat_str_rope(s, v1);
+    JS_FreeValue(s->ctx, v1);
+    return res;
 }
 
 static int string_buffer_concat_value_free(StringBuffer *s, JSValue v)
@@ -5664,6 +5682,7 @@ static int js_string_rope_compare(JSValueConst op1,
 
 /* forward declaration */
 static int string_buffer_concat_value(StringBuffer *s, JSValueConst v);
+static int string_buffer_concat_str_rope(StringBuffer *s, JSValueConst v);
 static JSValue js_rebalance_string_rope(JSContext *ctx, JSValueConst rope);
 
 /* op1 and op2 must be strings or string ropes */
@@ -5859,7 +5878,7 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValueConst rope)
     }
     if (string_buffer_init2(ctx, b, r->len, r->is_wide_char))
         goto fail;
-    if (string_buffer_concat_value(b, rope))
+    if (string_buffer_concat_str_rope(b, rope))
         goto fail;
     ret = string_buffer_end(b);
     if (JS_REF_COUNT(r) > 1) {
@@ -14661,7 +14680,18 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
             const char *p;
             size_t len;
 
-            str = JS_ToCStringLen(ctx, &len, val);
+            /* THE OPERAND IS A STRING, so this is the ENCODER, not ToString. JS_ToCStringLen begins with
+               js_force_tostring, which for anything else reads a `message` property, and that call reached
+               [[Get]] — so ToNumber of a string statically reached the whole property machinery, which reaches
+               ToNumber. A rope is linearized first because the encoder wants a flat string and says so. */
+            if (tag == JS_TAG_STRING_ROPE) {
+                JSValue flat = js_linearize_string_rope(ctx, val);
+                JS_FreeValue(ctx, val);
+                if (JS_IsException(flat))
+                    return JS_EXCEPTION;
+                val = flat;
+            }
+            str = js_cstring_from_string(ctx, &len, val, false);
             JS_FreeValue(ctx, val);
             if (!str)
                 return JS_EXCEPTION;
