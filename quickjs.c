@@ -52925,41 +52925,51 @@ static JSVarRef *js_get_local_export_var_ref1(JSContext *ctx, JSModuleDef *m,
                                               JSExportEntry *me,
                                               JSResolveState *s)
 {
-    JSVarRef *var_ref = me->u.local.var_ref;
-    int i;
+    /* FOLLOWING THE ALIAS IS A WALK ALONG THE PAGE'S RE-EXPORT CHAIN, and it was a tail call, so the chain's
+       length was C-stack depth. It carries nothing across the hop — the next module and export entry are the
+       whole state — so it is an assignment. `s` still guards the cycle. */
+    for(;;) {
+        JSVarRef *var_ref = me->u.local.var_ref;
+        bool followed = false;
+        int i;
 
-    if (!var_ref) {
-        JSObject *p = JS_VALUE_GET_OBJ(m->func_obj);
-        var_ref = p->u.func.var_refs[me->u.local.var_idx];
-    }
-    if (var_ref)
-        return var_ref;
-    /* the slot is a re-exported import whose source is not linked yet: follow
-       the import alias, guarding against re-export cycles like js_resolve_export1 */
-    for(i = 0; i < m->import_entries_count; i++) {
-        JSImportEntry *mi = &m->import_entries[i];
-        JSModuleDef *m1, *res_m;
-        JSExportEntry *res_me;
+        if (!var_ref) {
+            JSObject *p = JS_VALUE_GET_OBJ(m->func_obj);
+            var_ref = p->u.func.var_refs[me->u.local.var_idx];
+        }
+        if (var_ref)
+            return var_ref;
+        /* the slot is a re-exported import whose source is not linked yet: follow
+           the import alias, guarding against re-export cycles like js_resolve_export1 */
+        for(i = 0; i < m->import_entries_count; i++) {
+            JSImportEntry *mi = &m->import_entries[i];
+            JSModuleDef *m1, *res_m;
+            JSExportEntry *res_me;
 
-        if (mi->var_idx != me->u.local.var_idx)
-            continue;
-        /* a namespace import's slot holds the namespace OBJECT — there is no exported binding behind it to
-           follow, and its import_name is the `*` the user wrote, which would otherwise be looked up as a
-           real export name. */
-        if (mi->is_namespace)
+            if (mi->var_idx != me->u.local.var_idx)
+                continue;
+            /* a namespace import's slot holds the namespace OBJECT — there is no exported binding behind it to
+               follow, and its import_name is the `*` the user wrote, which would otherwise be looked up as a
+               real export name. */
+            if (mi->is_namespace)
+                return NULL;
+            if (find_resolve_entry(s, m, mi->import_name) >= 0)
+                return NULL;
+            if (add_resolve_entry(ctx, s, m, mi->import_name) < 0)
+                return NULL;
+            m1 = m->req_module_entries[mi->req_module_idx].module;
+            if (js_resolve_export1(ctx, &res_m, &res_me, m1, mi->import_name, s) ==
+                    JS_RESOLVE_RES_FOUND &&
+                !res_me->is_namespace) {
+                m = res_m;
+                me = res_me;
+                followed = true;
+            }
+            break;
+        }
+        if (!followed)
             return NULL;
-        if (find_resolve_entry(s, m, mi->import_name) >= 0)
-            return NULL;
-        if (add_resolve_entry(ctx, s, m, mi->import_name) < 0)
-            return NULL;
-        m1 = m->req_module_entries[mi->req_module_idx].module;
-        if (js_resolve_export1(ctx, &res_m, &res_me, m1, mi->import_name, s) ==
-                JS_RESOLVE_RES_FOUND &&
-            !res_me->is_namespace)
-            return js_get_local_export_var_ref1(ctx, res_m, res_me, s);
-        break;
     }
-    return NULL;
 }
 
 /* var_ref of a local export. For a re-exported import the slot is NULL until
