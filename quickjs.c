@@ -10736,10 +10736,17 @@ int JS_IsExtensible(JSContext *ctx, JSValueConst obj)
     if (unlikely(JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT))
         return false;
     p = JS_VALUE_GET_OBJ(obj);
-    if (unlikely(p->class_id == JS_CLASS_PROXY))
+    if (unlikely(p->class_id == JS_CLASS_PROXY)) {
+        /* ONE assert for all seven C-side call sites, placed where the trap actually starts rather than at each
+           caller: js_proxy_isExtensible runs the page's `isExtensible` handler, so reaching it from C is the
+           page's code with no flow base. The routed answer is a GP_ISEXT request; a caller that lands here is
+           one that still has to route, and it says which one instead of hanging. */
+        DCHECK(0, "a C-side IsExtensible reached a Proxy — its isExtensible trap would run with no flow base; "
+                  "route that caller onto the GP_ISEXT request");
         return js_proxy_isExtensible(ctx, obj);
-    else
+    } else {
         return p->extensible;
+    }
 }
 
 /* return -1 if exception (Proxy object only) or true/false */
@@ -10795,6 +10802,13 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
                 return ret;
             }
         }
+        /* ASSERTED, not claimed. This is a C-side [[GetOwnProperty]] on every level of the chain, so a Proxy
+           anywhere on it runs the page's getOwnPropertyDescriptor trap with no flow base. The routed
+           [[HasProperty]] is a GP_HAS request; a caller reaching HERE with a proxied receiver is one that
+           still has to route, and this is where it says so rather than hanging. */
+        DCHECK(p->class_id != JS_CLASS_PROXY,
+               "JS_HasProperty walked onto a Proxy from C — route that caller onto the GP_HAS request before "
+               "its trap runs with no flow base");
         /* JS_GetOwnPropertyInternal can free the prototype */
         js_dup(JS_MKPTR(JS_TAG_OBJECT, p));
         ret = JS_GetOwnPropertyInternal(ctx, NULL, p, prop);
@@ -23799,6 +23813,13 @@ static int for_in_fast(JSContext *ctx, JSValueConst obj, JSForInIterator *it, JS
             return 1;
         }
     }
+    /* The SIBLING walk above tests for_in_is_ordinary before asking; this one is reached only after the same
+       question was settled for `p`, and saying so as an assert is what retires it from the C-side list rather
+       than leaving it to be re-derived. An enumerability walk on a Proxy is its ownKeys trap plus a
+       getOwnPropertyDescriptor per key — all of it the page's code, none of it with a flow base here. */
+    DCHECK(for_in_is_ordinary(ctx, p),
+           "a for-in enumeration walked a non-ordinary object from C — a Proxy's ownKeys and per-key "
+           "getOwnPropertyDescriptor would run with no flow base; route it onto the request path");
     if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count, p,
                                        JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
         return -1;
@@ -29742,6 +29763,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ret_val = js_bool(hres);
                             goto do_has_answered;
                         }
+                        DCHECK(hp->class_id != JS_CLASS_PROXY,
+                               "the routed [[HasProperty]] answered a Proxy in place — the proxy arm is above "
+                               "this and must have taken it");
                         hres = JS_GetOwnPropertyInternal(ctx, &hd, hp, gp_atom);
                         if (unlikely(hres < 0)) goto getprop_throw;
                         if (hres) {
@@ -29853,6 +29877,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* a trapless proxy's forward is spelled out, exactly as js_proxy_get_own_property does:
                            re-entering the proxy's own hook would look the handler up a SECOND time, which
                            property-traps-order-with-proxied-array counts. */
+                        DCHECK(JS_VALUE_GET_OBJ(fwd ? gp_fwd : gp_obj)->class_id != JS_CLASS_PROXY,
+                               "the routed [[GetOwnProperty]] answered a Proxy in place — a trapless forward "
+                               "names the TARGET, so a proxy here means the arm above did not take it");
                         int gres = JS_GetOwnPropertyInternal(ctx, &gd,
                                                              JS_VALUE_GET_OBJ(fwd ? gp_fwd : gp_obj), gp_atom);
                         if (unlikely(gres < 0)) goto getprop_throw;
@@ -86283,6 +86310,12 @@ static int js_proxy_facts_from_c(JSContext *ctx, JSValueConst target, JSAtom ato
     JSPropertyDescriptor d;
     int res;
     js_desc_facts_init(f);
+    /* The target of a proxy MAY ITSELF BE A PROXY, and then this reads the inner trap from C. The routed path
+       performs the same facts as requests (JSGopdDesc's GD_TARGET), so reaching here with a proxied target
+       means the unrouted C hook is still live for that consumer — the thing to find, not to tolerate. */
+    DCHECK(JS_VALUE_GET_OBJ(target)->class_id != JS_CLASS_PROXY,
+           "a proxy invariant read its TARGET from C and the target is itself a Proxy — the inner trap would "
+           "run with no flow base; route that consumer onto the request path");
     res = JS_GetOwnPropertyInternal(ctx, &d, JS_VALUE_GET_OBJ(target), atom);
     if (res < 0)
         return -1;
