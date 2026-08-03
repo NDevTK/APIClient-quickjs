@@ -59549,14 +59549,13 @@ static int add_module_variables(JSContext *ctx, JSFunctionDef *fd)
 /* create a function object from a function definition. The function
    definition is freed. All the child functions are also created. It
    must be done this way to resolve all the variables. */
-static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+/* THE PROLOGUE, which must run BEFORE this definition's children are generated: a child resolves a closure
+   variable by walking UP to this level, so the scope relinking, the eval-call closure ordering and the module
+   globals all have to be in place first. That ordering is the whole reason the tree walk below is two-phase and
+   not a reverse traversal. Returns 0 / -1; on failure the caller owns every definition, including this one. */
+static int js_create_function_pre(JSContext *ctx, JSFunctionDef *fd)
 {
-    JSValue func_obj;
-    JSFunctionBytecode *b;
-    struct list_head *el, *el1;
-    int stack_size, scope, idx;
-    int function_size, byte_code_offset, cpool_offset;
-    int closure_var_offset, vardefs_offset;
+    int scope, idx;
 
     /* recompute scope linkage */
     for (scope = 0; scope < fd->scope_count; scope++) {
@@ -59599,20 +59598,22 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
             goto fail;
     }
 
-    /* first create all the child functions */
-    list_for_each_safe(el, el1, &fd->child_list) {
-        JSFunctionDef *fd1;
-        int cpool_idx;
+    return 0;
+ fail:
+    return -1;
+}
 
-        fd1 = list_entry(el, JSFunctionDef, link);
-        cpool_idx = fd1->parent_cpool_idx;
-        func_obj = js_create_function(ctx, fd1);
-        if (JS_IsException(func_obj))
-            goto fail;
-        /* save it in the constant pool */
-        DCHECK(cpool_idx >= 0, "cpool_idx >= 0");
-        fd->cpool[cpool_idx] = func_obj;
-    }
+/* Everything AFTER the children exist: this definition's own code generation, which reads fd->cpool — the slots
+   its children's results were written into. Frees `fd` on both paths, exactly as the recursive version did. */
+static JSValue js_create_function_post(JSContext *ctx, JSFunctionDef *fd)
+{
+    JSValue func_obj;
+    JSFunctionBytecode *b;
+    struct list_head *el, *el1;
+    int stack_size, idx;
+    int function_size, byte_code_offset, cpool_offset;
+    int closure_var_offset, vardefs_offset;
+    (void)el; (void)el1;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_PASS1
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_PASS1)) {
@@ -59766,6 +59767,83 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
  fail:
     js_free_function_def(ctx, fd);
     return JS_EXCEPTION;
+}
+
+/* THE DEFINITION TREE, ITERATIVELY. Generating a function generated each child by recursing, so compiling cost
+   one C frame per level of the page's own function nesting — the depth the PARSER was flattened to reach, which
+   had simply moved here. `"function f(){".repeat(n)` passes at 20 000 and died at 60 000.
+   IT IS TWO PHASES AND NOT A REVERSE WALK, because the interleaving matters in both directions: a node's
+   PROLOGUE must run before its children exist (they resolve closure variables by walking up to it), and its
+   BODY must run after all of them (it reads the cpool slots their results were written into). So the tree is
+   visited top-down for the prologues — breadth-first, which puts every parent before its children — and then in
+   reverse for the bodies, which is children-before-parents. A sibling's body landing later than in the
+   recursion changes nothing: nothing a prologue reads belongs to a sibling.
+   The root is never linked into the worklist, so its own link stays whatever its parent left; every descendant
+   is self-linked before release for the reason js_free_function_def's walk is — the one-node teardown unlinks
+   from its parent itself. */
+static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+{
+    struct list_head order, *el, *el1, *cursor;
+    JSFunctionDef *cur;
+    bool failed = false;
+
+    init_list_head(&order);
+    cur = fd;
+    cursor = &order;
+    for (;;) {
+        list_for_each_safe(el, el1, &cur->child_list) {
+            JSFunctionDef *kid = list_entry(el, JSFunctionDef, link);
+            list_del(&kid->link);
+            list_add_tail(&kid->link, &order);
+        }
+        cursor = cursor->next;
+        if (cursor == &order)
+            break;
+        cur = list_entry(cursor, JSFunctionDef, link);
+    }
+
+    /* prologues, parents first */
+    if (js_create_function_pre(ctx, fd) < 0)
+        failed = true;
+    if (!failed) {
+        list_for_each(el, &order) {
+            if (js_create_function_pre(ctx, list_entry(el, JSFunctionDef, link)) < 0) {
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    /* bodies, children first; each result goes into the slot its parent reserved for it */
+    while (!list_empty(&order)) {
+        JSFunctionDef *par;
+        JSValue f;
+        int slot;
+
+        cur = list_entry(order.prev, JSFunctionDef, link);
+        list_del(&cur->link);
+        init_list_head(&cur->link);
+        par = cur->parent;
+        slot = cur->parent_cpool_idx;
+        if (failed) {
+            js_free_function_def_one(ctx, cur);
+            continue;
+        }
+        f = js_create_function_post(ctx, cur);   /* frees `cur` either way */
+        if (JS_IsException(f)) {
+            failed = true;
+            continue;
+        }
+        DCHECK(par != NULL && slot >= 0,
+               "a non-root function definition reached code generation with no parent slot to be stored in");
+        par->cpool[slot] = f;
+    }
+
+    if (failed) {
+        js_free_function_def(ctx, fd);   /* its children are gone; this releases the root itself */
+        return JS_EXCEPTION;
+    }
+    return js_create_function_post(ctx, fd);
 }
 
 #endif // QJS_DISABLE_PARSER
