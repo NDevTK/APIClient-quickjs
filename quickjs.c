@@ -56118,24 +56118,51 @@ static int get_closure_var(JSContext *ctx, JSFunctionDef *s,
                            bool is_const, bool is_lexical,
                            JSVarKindEnum var_kind)
 {
-    int i;
+    /* THE DEPTH IS THE SOURCE'S NESTING. This walked from `s` UP to the level whose parent is `fd`, then added
+       a closure variable at each level on the way back down — a head recursion one C frame deep per scope
+       between the use and the definition, which `function a(){let x; function b(){ … x … }}` nests as far as it
+       likes. Collected into an explicit chain and processed OUTERMOST FIRST, which is the order the unwind had.
+       The inline array covers ordinary code; deeper nesting grows onto the heap rather than meeting a cap. */
+    JSFunctionDef *inline_chain[32];
+    JSFunctionDef **chain = inline_chain;
+    int cap = countof(inline_chain), n = 0, i, k, r = -1;
+    JSFunctionDef *cur;
+    JSClosureTypeEnum inner_type;
 
-    if (fd != s->parent) {
-        var_idx = get_closure_var(ctx, s->parent, fd, closure_type,
-                                  var_idx, var_name,
-                                  is_const, is_lexical, var_kind);
-        if (var_idx < 0)
-            return -1;
-        if (closure_type != JS_CLOSURE_GLOBAL_REF)
-            closure_type = JS_CLOSURE_REF;
+    for (cur = s; ; cur = cur->parent) {
+        if (n == cap) {
+            int ncap = cap * 2;
+            JSFunctionDef **nc = js_realloc(ctx, chain == inline_chain ? NULL : chain,
+                                            sizeof(*nc) * ncap);
+            CHECK(nc != NULL, "out of memory growing the closure-variable scope chain");
+            if (chain == inline_chain)
+                memcpy(nc, inline_chain, sizeof(*nc) * cap);
+            chain = nc; cap = ncap;
+        }
+        chain[n++] = cur;
+        if (cur->parent == fd)
+            break;
     }
-    for(i = 0; i < s->closure_var_count; i++) {
-        JSClosureVar *cv = &s->closure_var[i];
-        if (cv->var_idx == var_idx && cv->closure_type == closure_type)
-            return i;
+    /* The OUTERMOST level keeps the caller's closure_type — that is the recursion's base case. Every level
+       below it saw the type already rewritten on the unwind, which is constant for all of them. */
+    inner_type = (closure_type != JS_CLOSURE_GLOBAL_REF) ? JS_CLOSURE_REF : closure_type;
+    for (k = n - 1; k >= 0; k--) {
+        JSFunctionDef *lv = chain[k];
+        JSClosureTypeEnum ct = (k == n - 1) ? closure_type : inner_type;
+        r = -1;
+        for (i = 0; i < lv->closure_var_count; i++) {
+            JSClosureVar *cv = &lv->closure_var[i];
+            if (cv->var_idx == var_idx && cv->closure_type == ct) { r = i; break; }
+        }
+        if (r < 0)
+            r = add_closure_var(ctx, lv, ct, var_idx, var_name, is_const, is_lexical, var_kind);
+        if (r < 0)
+            break;
+        var_idx = r;
     }
-    return add_closure_var(ctx, s, closure_type, var_idx, var_name,
-                           is_const, is_lexical, var_kind);
+    if (chain != inline_chain)
+        js_free(ctx, chain);
+    return r;
 }
 
 /* The scope opcode is mapped onto its `with` twin by SUBTRACTION, so the two runs must stay parallel and
