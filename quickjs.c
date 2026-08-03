@@ -52986,9 +52986,14 @@ static __exception int get_exported_names(JSContext *ctx,
                                           JSModuleDef *m, bool from_star)
 {
     ExportedNameEntry *en;
-    int i, j;
+    int i, j, cursor, start;
 
-    /* check circular reference */
+    /* THE `export * from` CHAIN IS THE PAGE'S GRAPH, and this walked it by recursing into each star target —
+       one C frame per link of a re-export chain the page writes. It needs no separate worklist: `s->modules`
+       IS one. It is already the circular-reference set, appended in exactly the order modules are first
+       reached, so walking it with a cursor visits the same modules in the same order with no frames.
+       `from_star` follows from the position: the module this call was given keeps the caller's value, and every
+       module appended after it got there through a star export, which is what from_star means. */
     for(i = 0; i < s->modules_count; i++) {
         if (s->modules[i] == m)
             return 0;
@@ -52996,36 +53001,51 @@ static __exception int get_exported_names(JSContext *ctx,
     if (js_resize_array(ctx, (void **)&s->modules, sizeof(s->modules[0]),
                         &s->modules_size, s->modules_count + 1))
         return -1;
+    start = s->modules_count;
     s->modules[s->modules_count++] = m;
 
-    for(i = 0; i < m->export_entries_count; i++) {
-        JSExportEntry *me = &m->export_entries[i];
-        if (from_star && me->export_name == JS_ATOM_default)
-            continue;
-        j = find_exported_name(s, me->export_name);
-        if (j < 0) {
-            if (js_resize_array(ctx, (void **)&s->exported_names, sizeof(s->exported_names[0]),
-                                &s->exported_names_size,
-                                s->exported_names_count + 1))
-                return -1;
-            en = &s->exported_names[s->exported_names_count++];
-            en->export_name = me->export_name;
-            /* avoid a second lookup for simple module exports */
-            if (from_star || me->export_type != JS_EXPORT_TYPE_LOCAL)
+    for(cursor = start; cursor < s->modules_count; cursor++) {
+        JSModuleDef *cm = s->modules[cursor];
+        bool cstar = (cursor == start) ? from_star : true;
+
+        for(i = 0; i < cm->export_entries_count; i++) {
+            JSExportEntry *me = &cm->export_entries[i];
+            if (cstar && me->export_name == JS_ATOM_default)
+                continue;
+            j = find_exported_name(s, me->export_name);
+            if (j < 0) {
+                if (js_resize_array(ctx, (void **)&s->exported_names,
+                                    sizeof(s->exported_names[0]),
+                                    &s->exported_names_size,
+                                    s->exported_names_count + 1))
+                    return -1;
+                en = &s->exported_names[s->exported_names_count++];
+                en->export_name = me->export_name;
+                /* avoid a second lookup for simple module exports */
+                if (cstar || me->export_type != JS_EXPORT_TYPE_LOCAL)
+                    en->u.me = NULL;
+                else
+                    en->u.me = me;
+            } else {
+                en = &s->exported_names[j];
                 en->u.me = NULL;
-            else
-                en->u.me = me;
-        } else {
-            en = &s->exported_names[j];
-            en->u.me = NULL;
+            }
         }
-    }
-    for(i = 0; i < m->star_export_entries_count; i++) {
-        JSStarExportEntry *se = &m->star_export_entries[i];
-        JSModuleDef *m1;
-        m1 = m->req_module_entries[se->req_module_idx].module;
-        if (get_exported_names(ctx, s, m1, true))
-            return -1;
+        for(i = 0; i < cm->star_export_entries_count; i++) {
+            JSStarExportEntry *se = &cm->star_export_entries[i];
+            JSModuleDef *m1 = cm->req_module_entries[se->req_module_idx].module;
+            int k;
+            for(k = 0; k < s->modules_count; k++) {
+                if (s->modules[k] == m1)
+                    break;
+            }
+            if (k < s->modules_count)
+                continue;   /* already reached: the circular-reference check, unchanged */
+            if (js_resize_array(ctx, (void **)&s->modules, sizeof(s->modules[0]),
+                                &s->modules_size, s->modules_count + 1))
+                return -1;
+            s->modules[s->modules_count++] = m1;   /* the queue this loop walks */
+        }
     }
     return 0;
 }
