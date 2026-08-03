@@ -24196,6 +24196,7 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val, int argc
                                  int *pdone, int magic);
 static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s);
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor, int class_id);
+static JSValue js_create_from_intrinsic(JSContext *ctx, int class_id);
 /* A generator FUNCTION call (g()) runs its params to OP_initial_yield on the caller's tramp chain
    (do_generator_create_tramp) so a PARAM-DEFAULT loop preempts the base flow; at initial_yield the generator
    object is created and returned. */
@@ -38954,52 +38955,63 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
 
 /* warning: the refcount of the context is not incremented. Return
    NULL in case of exception (case of revoked proxy only) */
+/* 10.5.14 GetFunctionRealm. THE DEPTH IS THE PAGE'S: steps 3 and 4 hand the question to a Proxy's target and a
+   bound function's target, and `new Proxy(new Proxy(…))` or `f.bind().bind()…` nests either as far as the page
+   likes. Both of those steps are TAIL positions in the spec's own text, so the recursion was never structure —
+   it was a C frame per link, and the one this fork may not spend. A loop over the current object is the same
+   algorithm with the same answer at every step.
+   It was invisible while it sat inside the interpreter's cycle, and then inside the error/property one; it
+   surfaced as its own recursion the moment js_create_from_ctor stopped dragging JS_GetProperty along, which is
+   the whole point of measuring cycles rather than counting call sites. */
 static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
 {
-    JSObject *p;
-    JSContext *realm;
+    JSValueConst cur = func_obj;
 
-    if (JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)
-        return ctx;
-    p = JS_VALUE_GET_OBJ(func_obj);
-    switch(p->class_id) {
-    case JS_CLASS_C_FUNCTION:
-        realm = p->u.cfunc.realm;
-        break;
-    case JS_CLASS_BYTECODE_FUNCTION:
-    case JS_CLASS_GENERATOR_FUNCTION:
-    case JS_CLASS_ASYNC_FUNCTION:
-    case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
-        {
-            JSFunctionBytecode *b;
-            b = p->u.func.function_bytecode;
-            realm = b->realm;
-        }
-        break;
-    case JS_CLASS_PROXY:
-        {
-            JSProxyData *s = p->u.opaque;
-            if (!s)
-                return ctx;
-            if (s->is_revoked) {
-                JS_ThrowTypeErrorRevokedProxy(ctx);
-                return NULL;
-            } else {
-                realm = JS_GetFunctionRealm(ctx, s->target);
+    for (;;) {
+        JSObject *p;
+        if (JS_VALUE_GET_TAG(cur) != JS_TAG_OBJECT)
+            return ctx;
+        p = JS_VALUE_GET_OBJ(cur);
+        switch(p->class_id) {
+        case JS_CLASS_C_FUNCTION:
+            return p->u.cfunc.realm;
+        case JS_CLASS_BYTECODE_FUNCTION:
+        case JS_CLASS_GENERATOR_FUNCTION:
+        case JS_CLASS_ASYNC_FUNCTION:
+        case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
+            return p->u.func.function_bytecode->realm;
+        case JS_CLASS_PROXY:
+            {
+                JSProxyData *s = p->u.opaque;
+                if (!s)
+                    return ctx;
+                if (s->is_revoked) {
+                    JS_ThrowTypeErrorRevokedProxy(ctx);
+                    return NULL;
+                }
+                cur = s->target;          /* step 3, in tail position */
             }
+            break;
+        case JS_CLASS_BOUND_FUNCTION:
+            cur = p->u.bound_function->func_obj;   /* step 4, in tail position */
+            break;
+        default:
+            return ctx;
         }
-        break;
-    case JS_CLASS_BOUND_FUNCTION:
-        {
-            JSBoundFunction *bf = p->u.bound_function;
-            realm = JS_GetFunctionRealm(ctx, bf->func_obj);
-        }
-        break;
-    default:
-        realm = ctx;
-        break;
     }
-    return realm;
+}
+
+/* THE REALM'S OWN PROTOTYPE, for an object no new.target names. OrdinaryCreateFromConstructor's whole body is
+   GetPrototypeFromConstructor, and that is only an operation when there IS a constructor to read `prototype`
+   off; with none, 10.1.13 step 2 says "use the intrinsic", which is a field read. Seven call sites passed a
+   literal JS_UNDEFINED and went through the general entry to reach it, and that is not free: the general entry
+   calls JS_GetProperty, so a Date, a DOMException and — inside error construction — a CallSite all appeared to
+   run page code, which is what kept build_backtrace inside the error/property cycle.
+   Same argument as js_error_add_own: asking a general operation a question whose answer is fixed does not just
+   cost a branch, it inherits every path the general operation can take. */
+static JSValue js_create_from_intrinsic(JSContext *ctx, int class_id)
+{
+    return JS_NewObjectProtoClass(ctx, ctx->class_proto[class_id], class_id);
 }
 
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
@@ -39008,9 +39020,14 @@ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
     JSValue proto, obj;
     JSContext *realm;
 
-    if (JS_IsUndefined(ctor)) {
-        proto = js_dup(ctx->class_proto[class_id]);
-    } else {
+    /* A ctor that is undefined at RUNTIME is a real case — several callers forward a new.target that a plain
+       call left undefined — so this branch stays and delegates. What is gone is the seven call sites that
+       passed a LITERAL JS_UNDEFINED: those reached JS_GetProperty in the reachability graph without ever
+       being able to reach it in a run, which is what put a CallSite's creation, and through it error
+       construction, inside the property cycle. */
+    if (JS_IsUndefined(ctor))
+        return js_create_from_intrinsic(ctx, class_id);
+    {
         proto = JS_GetProperty(ctx, ctor, JS_ATOM_prototype);
         if (JS_IsException(proto))
             return proto;
@@ -67218,7 +67235,7 @@ static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
     DCHECK(JS_IsUndefined(new_target),
            "the Array constructor reached its C entry with a real new.target — its `prototype` read is the page's "
            "code and belongs on the tramp; route that call site onto the STEPDEF_ARRAY_CTOR machine");
-    obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_ARRAY);
+    obj = js_create_from_intrinsic(ctx, JS_CLASS_ARRAY);
     if (JS_IsException(obj))
         return obj;
     return js_array_ctor_body(ctx, obj, argc, argv);
@@ -92240,7 +92257,7 @@ static const JSCFunctionListEntry js_date_proto_funcs[] = {
 
 JSValue JS_NewDate(JSContext *ctx, double epoch_ms)
 {
-    JSValue obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_DATE);
+    JSValue obj = js_create_from_intrinsic(ctx, JS_CLASS_DATE);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
     JS_SetObjectData(ctx, obj, js_float64(time_clip(epoch_ms)));
@@ -93058,7 +93075,7 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
                                             JSFreeArrayBufferDataFunc *free_func,
                                             void *opaque, bool alloc_flag)
 {
-    JSValue obj = js_create_from_ctor(ctx, JS_UNDEFINED, class_id);
+    JSValue obj = js_create_from_intrinsic(ctx, class_id);
     if (JS_IsException(obj))
         return obj;
     return js_array_buffer_init(ctx, obj, len, max_len, class_id, buf, free_func, opaque, alloc_flag);
@@ -93967,7 +93984,7 @@ static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, 
     size_log2 = typed_array_size_log2(p->class_id);
 
     /* create new typed array with original length (zero-initialized) */
-    arr = js_create_from_ctor(ctx, JS_UNDEFINED, p->class_id);
+    arr = js_create_from_intrinsic(ctx, p->class_id);
     if (JS_IsException(arr)) {
         JS_FreeValue(ctx, val);
         return JS_EXCEPTION;
@@ -96252,7 +96269,7 @@ static JSValue js_new_uint8array(JSContext *ctx, JSValue buffer)
 {
     if (JS_IsException(buffer))
         return JS_EXCEPTION;
-    JSValue obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_UINT8_ARRAY);
+    JSValue obj = js_create_from_intrinsic(ctx, JS_CLASS_UINT8_ARRAY);
     if (JS_IsException(obj)) {
         JS_FreeValue(ctx, buffer);
         return JS_EXCEPTION;
@@ -97841,7 +97858,7 @@ static void js_callsite_mark(JSRuntime *rt, JSValueConst val,
 }
 
 static JSValue js_new_callsite(JSContext *ctx, JSCallSiteData *csd) {
-    JSValue obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_CALL_SITE);
+    JSValue obj = js_create_from_intrinsic(ctx, JS_CLASS_CALL_SITE);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
 
@@ -98228,7 +98245,7 @@ static JSValue js_domexception_constructor0(JSContext *ctx, JSValueConst new_tar
     DCHECK(JS_IsUndefined(new_target),
            "the DOMException constructor reached its C entry with a real new.target — route that call site onto "
            "the STEPDEF_DOMEXCEPTION_CTOR machine");
-    obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_DOM_EXCEPTION);
+    obj = js_create_from_intrinsic(ctx, JS_CLASS_DOM_EXCEPTION);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
     return js_domexception_ctor_body(ctx, obj, argc, argv, backtrace_flags);
