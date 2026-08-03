@@ -5178,7 +5178,12 @@ static JSValue string_buffer_end(StringBuffer *s)
 }
 
 /* create a string from a UTF-8 buffer */
-JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
+/* JS_NewStringLen WITHOUT the length RangeError: JS_NULL for a buffer no JS string can hold, JS_EXCEPTION only
+   for allocation failure — and that throws the context's pre-allocated out-of-memory error, constructing
+   nothing. A CAPTURE needs exactly this shape: build_backtrace runs with an exception already in flight and
+   has nowhere to throw to, and JS_NewStringLen's RangeError was the last thing that let building a stack build
+   an error, which captures a stack. */
+static JSValue js_new_string_len_or_null(JSContext *ctx, const char *buf, size_t buf_len)
 {
     JSString *str;
     size_t len;
@@ -5190,7 +5195,7 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
     /* Compute string kind and length: 7-bit, 8-bit, 16-bit, 16-bit UTF-16 */
     kind = utf8_scan(buf, buf_len, &len);
     if (unlikely(len > JS_STRING_LEN_MAX))
-        return JS_ThrowRangeError(ctx, "invalid string length");
+        return JS_NULL;
 
     switch (kind) {
     case UTF8_PLAIN_ASCII:
@@ -5218,6 +5223,14 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
         break;
     }
     return JS_MKPTR(JS_TAG_STRING, str);
+}
+
+JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
+{
+    JSValue r = js_new_string_len_or_null(ctx, buf, buf_len);
+    if (unlikely(JS_IsNull(r)))
+        return JS_ThrowRangeError(ctx, "invalid string length");
+    return r;
 }
 
 JSValue JS_NewStringUTF16(JSContext *ctx, const uint16_t *buf, size_t len)
@@ -5308,17 +5321,42 @@ static JSValue js_force_tostring(JSContext *ctx, JSValueConst val1)
 /* return (NULL, 0) if exception. */
 /* return pointer into a JSString with a live ref_count */
 /* cesu8 determines if non-BMP1 codepoints are encoded as 1 or 2 utf-8 sequences */
+static const char *js_cstring_encode(JSContext *ctx, size_t *plen, JSValue val, bool cesu8);
+
+/* THE ENCODER, on a value that IS ALREADY A FLAT STRING. JS_ToCStringLen2 is ToString followed by this, and
+   ToString is the page's code: a caller that has already established a JS_TAG_STRING gets nothing from the
+   first half but its reachability, which is how reading a function's `name` — a property get_func_name has
+   just checked is a string — appeared to run a toString and, through it, every throw in the engine.
+   The DCHECK is the whole contract: a rope is not a flat string and must be linearized by the ToString path,
+   so `JS_VALUE_GET_STRING` on one would read a JSStringRope as a JSString. */
+static const char *js_cstring_from_string(JSContext *ctx, size_t *plen, JSValueConst val1, bool cesu8)
+{
+    DCHECK(JS_VALUE_GET_TAG(val1) == JS_TAG_STRING,
+           "js_cstring_from_string on something that is not a flat string — use JS_ToCStringLen2");
+    return js_cstring_encode(ctx, plen, js_dup(val1), cesu8);
+}
+
 const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
                              bool cesu8)
 {
     JSValue val;
+
+    val = js_force_tostring(ctx, val1);
+    if (JS_IsException(val)) {
+        if (plen)
+            *plen = 0;
+        return NULL;
+    }
+    return js_cstring_encode(ctx, plen, val, cesu8);
+}
+
+/* `val` is OWNED: a flat string this consumes whether it succeeds or fails. */
+static const char *js_cstring_encode(JSContext *ctx, size_t *plen, JSValue val, bool cesu8)
+{
     JSString *str, *str_new;
     int pos, len, c, c1;
     uint8_t *q;
 
-    val = js_force_tostring(ctx, val1);
-    if (JS_IsException(val))
-        goto fail;
     str = JS_VALUE_GET_STRING(val);
     len = str->len;
     if (!str->is_wide_char) {
@@ -5395,6 +5433,8 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
         *plen = str_new->len;
     return (const char *)str8(str_new);
 fail:
+    /* the only way here is a failed js_alloc_string, and `val` is this function's — it was dropped before */
+    JS_FreeValue(ctx, val);
     if (plen)
         *plen = 0;
     return NULL;
@@ -8596,6 +8636,8 @@ static JSValue js_callsite_method_name(JSContext *ctx, const JSCallSiteData *csd
    what builtin it is inside. Defined with the frame chain it is bracketed alongside. */
 static _Thread_local struct JSStepHdr *g_step_running;
 static const char *get_func_name(JSContext *ctx, JSValueConst func);
+static JSValue get_func_name_value(JSContext *ctx, JSValueConst func);
+static JSValue js_new_string_len_or_null(JSContext *ctx, const char *buf, size_t buf_len);
 /* Fill `csd` from the step machine currently executing, and say whether there was one. It lives beside that
    machine's declaration rather than here because JSStepHdr's shape belongs down there; what belongs up here
    is the question. */
@@ -8607,17 +8649,11 @@ static bool js_callsite_running_step(JSContext *ctx, JSCallSiteData *csd);
 static void js_new_callsite_data_step(JSContext *ctx, JSCallSiteData *csd, JSValueConst func,
                                       JSValueConst this_val)
 {
-    const char *name;
-
     csd->constructor = false;
     csd->strict = true;    /* a builtin hands out neither its receiver nor itself */
     csd->this_val = js_dup(this_val);
     csd->func = js_dup(func);
-    name = get_func_name(ctx, func);
-    csd->func_name = (name && name[0]) ? JS_NewString(ctx, name) : JS_NULL;
-    JS_FreeCString(ctx, name);
-    if (JS_IsException(csd->func_name))
-        csd->func_name = JS_NULL;
+    csd->func_name = get_func_name_value(ctx, func);
     csd->native = true;
     csd->is_eval = false;
     csd->eval_origin = JS_NULL;
@@ -8663,11 +8699,9 @@ static JSValue js_callsite_type_name(JSContext *ctx, const JSCallSiteData *csd)
         prs = find_own_property(&pr, proto, JS_ATOM_constructor);
         if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
             continue;
-        name = get_func_name(ctx, pr->u.value);
-        if (!name)
+        r = get_func_name_value(ctx, pr->u.value);
+        if (JS_IsNull(r))
             continue;
-        r = JS_NewString(ctx, name);
-        JS_FreeCString(ctx, name);
         return r;
     }
     /* no constructor to name: the object's own class, which is what [[Class]] gives V8 in the same case */
@@ -8943,23 +8977,46 @@ fail:
 /* in order to avoid executing arbitrary code during the stack trace
    generation, we only look at simple 'name' properties containing a
    string. */
-static const char *get_func_name(JSContext *ctx, JSValueConst func)
+/* A function's own `name`, as the STRING it already is, WITHOUT running a line of the page's code: an own
+   normal data property whose value is a flat string, or nothing. An accessor, an inherited name, a rope or a
+   non-string all answer "no name", because reading them would mean a [[Get]] or a ToString, and this is called
+   while an exception is in flight.
+   JS_NULL rather than JS_UNDEFINED: that is what a JSCallSiteData records for an absent field. */
+static JSValue get_func_name_value(JSContext *ctx, JSValueConst func)
 {
     JSProperty *pr;
     JSShapeProperty *prs;
     JSValue val;
 
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
-        return NULL;
+        return JS_NULL;
     prs = find_own_property(&pr, JS_VALUE_GET_OBJ(func), JS_ATOM_name);
     if (!prs)
-        return NULL;
+        return JS_NULL;
     if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
-        return NULL;
+        return JS_NULL;
     val = pr->u.value;
     if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
+        return JS_NULL;
+    return js_dup(val);
+}
+
+/* The same name ENCODED, for a caller that prints it. Nothing here re-creates a JS string: a name that came
+   out of one is already within JS_STRING_LEN_MAX, and round-tripping it through JS_NewString re-scanned the
+   UTF-8 and could report an "invalid string length" RangeError — a throw, inside a capture, that built an
+   error, that captured a stack. That was the last edge of the error/property cycle. */
+static const char *get_func_name(JSContext *ctx, JSValueConst func)
+{
+    JSValue val = get_func_name_value(ctx, func);
+    const char *r;
+
+    if (JS_IsNull(val))
         return NULL;
-    return JS_ToCString(ctx, val);
+    /* Established as a flat string by the reader above, so this is the ENCODER and not ToString — see
+       js_cstring_from_string. */
+    r = js_cstring_from_string(ctx, NULL, val, false);
+    JS_FreeValue(ctx, val);
+    return r;
 }
 
 /* "eval at f (file:12:3)" — V8's rendering of WHERE an eval was called, for CallSite#getEvalOrigin. The
@@ -9092,7 +9149,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     JSValue stack, prepare, saved_exception, error_obj;
     JSObject *p;
     JSFunctionBytecode *b;
-    bool backtrace_barrier, has_prepare, has_filter_func;
+    bool backtrace_barrier, has_filter_func;
     JSRuntime *rt;
     JSCallSiteData csd[64];
     uint32_t i;
@@ -9129,14 +9186,13 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
     stack_trace_limit = min_int(stack_trace_limit, countof(csd));
     stack_trace_limit = max_int(stack_trace_limit, 0);
-    has_prepare = false;
     has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
     i = 0;
 
-    if (!JS_IsNull(ctx->error_ctor)) {
+    /* Whatever Error.prepareStackTrace holds RIGHT NOW, function or not: the accessor tests it when it renders,
+       and a non-function means the default rendering, which is the same answer this used to compute here. */
+    if (!JS_IsNull(ctx->error_ctor))
         prepare = js_dup(ctx->error_prepare_stack);
-        has_prepare = JS_IsFunction(ctx, prepare);
-    }
 
     /* ONE capture, whether or not a hook is installed. The two used to be different walks — one filling
        JSCallSiteData records for Error.prepareStackTrace, one printing straight into a DynBuf — and the second
@@ -9213,23 +9269,29 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             break;
     }
  done:
-    if (has_prepare) {
-        int j = 0, k;
-        stack = JS_NewArray(ctx);
-        if (JS_IsException(stack)) {
-            stack = JS_NULL;
-        } else {
-            for (; j < i; j++) {
-                JSValue v = js_new_callsite(ctx, &csd[j]);
-                if (JS_IsException(v))
-                    break;
-                if (JS_DefinePropertyValueUint32(ctx, stack, j, v, JS_PROP_C_W_E) < 0) {
-                    JS_FreeValue(ctx, v);
-                    break;
-                }
-            }
+    /* THE CAPTURE PARKS FRAMES; IT DOES NOT FORMAT THEM. This branched on whether Error.prepareStackTrace held
+       a function — the hook path parked a pending [prepare, callsites] pair for the `.stack` accessor to run,
+       the default path RENDERED the string here — and that second half is why building any error reached the
+       string builder, JS_NewStringLen's length RangeError and, through the property definition its array
+       append used, every throw in the engine. Error construction then reached error construction: exactly the
+       cycle `in_build_stack_trace` exists to suppress at runtime.
+       V8 formats lazily in BOTH cases and for the same reason it runs the hook lazily, so there is one path
+       now: park the frames, and let the accessor decide between the hook and the default rendering. `prepare`
+       is still captured HERE, so which hook a read runs is the one installed when the error was created.
+       The array is built from a filled vector rather than appended to element by element: a fresh array of
+       known length is JS_NewArrayFrom's job, and JS_DefinePropertyValueUint32 was the general
+       [[DefineOwnProperty]] answering a question that has no descriptor in it. */
+    {
+        JSValue sites[countof(csd)];
+        JSValue arr;
+        uint32_t j, k;
+
+        for (j = 0; j < i; j++) {
+            sites[j] = js_new_callsite(ctx, &csd[j]);   /* ADOPTS the record's references */
+            if (JS_IsException(sites[j]))
+                break;
         }
-        // Clear the csd's we didn't use in case of error.
+        /* Whatever no CallSite adopted is this walk's to release. */
         for (k = j; k < i; k++) {
             JS_FreeValue(ctx, csd[k].filename);
             JS_FreeValue(ctx, csd[k].func);
@@ -9237,31 +9299,16 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, csd[k].this_val);
             JS_FreeValue(ctx, csd[k].eval_origin);
         }
-        /* Error.prepareStackTrace is the PAGE's code, and build_backtrace runs under every internal throw —
-           an activation with no flow base, where a JS_Call drives the hook's body to completion and its first
-           loop back-edge aborts. The call belongs to the `.stack` ACCESSOR, which is a step machine and can
-           suspend, so what is parked here is the PENDING PAIR [prepare, callsites] and nothing runs.
-           V8 formats lazily for the same reason; capturing `prepare` here rather than reading it at access
-           time keeps the hook that was installed when the error was created. */
-        JSValue pending[2] = { prepare, stack };   /* both references are HANDED OVER to the array */
-        stack = JS_NewArrayFrom(ctx, 2, pending);
-        if (JS_IsException(stack))
+        arr = JS_NewArrayFrom(ctx, j, sites);          /* takes the CallSites */
+        if (JS_IsException(arr)) {
+            JS_FreeValue(ctx, prepare);
             stack = JS_NULL;
-    } else {
-        uint32_t k;
-        stack = js_callsite_data_render(ctx, csd, i);
-        /* Nothing adopted the records on this path, so this walk owns them. The hook path hands each one to a
-           CallSite object instead, which is why only one of the two frees. */
-        for (k = 0; k < i; k++) {
-            JS_FreeValue(ctx, csd[k].filename);
-            JS_FreeValue(ctx, csd[k].func);
-            JS_FreeValue(ctx, csd[k].func_name);
-            JS_FreeValue(ctx, csd[k].this_val);
-            JS_FreeValue(ctx, csd[k].eval_origin);
+        } else {
+            JSValue pending[2] = { prepare, arr };     /* both references are HANDED OVER to the array */
+            stack = JS_NewArrayFrom(ctx, 2, pending);
+            if (JS_IsException(stack))
+                stack = JS_NULL;
         }
-        /* `prepare` is whatever Error.prepareStackTrace held; a non-function value was read and never released
-           before, which leaked one reference per throw for a page that assigned an object to it. */
-        JS_FreeValue(ctx, prepare);
     }
     JS_Throw(ctx, saved_exception);
 
@@ -9309,10 +9356,14 @@ static JSValue JS_MakeError2(JSContext *ctx, JSErrorEnum error_num,
     }
     if (JS_IsException(obj))
         return JS_EXCEPTION;
-    msg = JS_NewString(ctx, message);
-    if (JS_IsException(msg))
-        msg = JS_NewString(ctx, "Invalid error message");
-    if (!JS_IsException(msg)) {
+    /* THE NON-THROWING CONSTRUCTOR, and this is the last edge of the cycle rather than a defensive choice:
+       JS_NewStringLen's length RangeError is itself an error to construct, whose message is a string to build.
+       The retry with "Invalid error message" was that recursion's brake — it made the second attempt one that
+       could not fail — and it is unnecessary once nothing here can throw. A message no JS string can hold
+       leaves the error without a `message`, which is the same thing the retry could not have produced either.
+       (In practice unreachable: JS_MakeError formats into a 256-byte buffer.) */
+    msg = js_new_string_len_or_null(ctx, message, strlen(message));
+    if (!JS_IsException(msg) && !JS_IsNull(msg)) {
         js_error_add_own(ctx, obj, JS_ATOM_message, msg,
                          JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
@@ -66942,17 +66993,6 @@ static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
             s->result = js_dup(d);
             return 0;
         }
-        if (js_error_stack_formatting()) {
-            /* Inside the hook: the default rendering, and NOT memoized — the pending pair stays, so a later
-               read from outside the hook still runs it. That is V8's behaviour and it is what makes the
-               `return error.stack` idiom terminate. */
-            JSValue sites = JS_GetPropertyUint32(ctx, d, 1);
-            if (JS_IsException(sites))
-                return -1;
-            s->result = js_callsite_array_render(ctx, sites);
-            JS_FreeValue(ctx, sites);
-            return JS_IsException(s->result) ? -1 : 0;
-        }
         /* [prepare, callsites] -> prepare.call(Error, error, callsites). The pair's own elements are taken
            into the request buffer so the memoizing write below cannot free them out from under the call. */
         s->cb[0] = js_dup(ctx->error_ctor);           /* `this` */
@@ -66961,6 +67001,28 @@ static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
         s->cb[3] = JS_GetPropertyUint32(ctx, d, 1);
         if (JS_IsException(s->cb[1]) || JS_IsException(s->cb[3]))
             return -1;
+        /* THE DEFAULT RENDERING IS THE OTHER HALF OF THIS ONE OPERATION, not a case the CAPTURE decided.
+           build_backtrace used to render it, which is what made building an error reach the string builder and
+           through it every throw; it parks the frames now and the choice is made here, where it is a read of
+           the value the capture recorded. Two ways to reach it, and they differ:
+           `prepare` is not callable — nobody installed a hook, or installed something that is not a function —
+           so 20.5's own formatting applies, and it MEMOIZES like the hook's answer because nothing about it
+           can change.
+           Or a hook IS installed and is already running on this flow: V8 returns the default while
+           Isolate::formatting_stack_trace is set, the documented contract mjsunit's own formatter is built on
+           (it ends with `catch (e) {}; return error.stack;`). That one does NOT memoize — the pending pair
+           stays, so a later read from outside the hook still runs the hook. */
+        if (!JS_IsFunction(ctx, s->cb[1]) || js_error_stack_formatting()) {
+            bool memoize = !JS_IsFunction(ctx, s->cb[1]);
+            s->result = js_callsite_array_render(ctx, s->cb[3]);
+            if (JS_IsException(s->result))
+                return -1;
+            if (memoize) {
+                JS_FreeValue(ctx, p->u.object_data);
+                p->u.object_data = js_dup(s->result);
+            }
+            return 0;
+        }
         *out_cb = s->cb; *out_argc = 2;
         return 3;
     }
@@ -97907,31 +97969,26 @@ static JSValue js_frame_this_binding(JSContext *ctx, JSStackFrame *sf)
     }
     if (JS_IsUndefined(sf->this_val) || JS_IsNull(sf->this_val))
         return js_dup(ctx->global_obj);
-    if (JS_VALUE_GET_TAG(sf->this_val) == JS_TAG_OBJECT)
-        return js_dup(sf->this_val);
-    return JS_ToObject(ctx, sf->this_val);
+    /* A PRIMITIVE RECEIVER IS RECORDED UNBOXED. 10.2.1.2 step 5 does box it for a sloppy function, and that is
+       what getThis has to answer — but boxing ALLOCATES a wrapper and DEFINES its properties, which is a throw
+       inside a capture that runs with an exception already in flight, and it is what put JS_ToObject, and
+       through it the whole of property definition, into error construction's cycle. It is also work no reader
+       may ever ask for. So the frame-dependent half happens here, where the frame still exists (the `this`
+       vardef, the global substitution), and the box happens in getThis, which has a caller to throw to.
+       The default rendering never needed it either: js_callsite_type_name names a primitive receiver from its
+       tag precisely so it does not have to allocate a wrapper to read the class back off. */
+    return js_dup(sf->this_val);
 }
 
 static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFrame *sf)
 {
-    const char *func_name_str;
     JSObject *p;
 
     csd->constructor = sf->is_constructor;
     csd->strict = sf->is_strict_mode;
     csd->this_val = js_frame_this_binding(ctx, sf);
-    if (JS_IsException(csd->this_val)) {
-        csd->this_val = JS_UNDEFINED;
-        JS_FreeValue(ctx, JS_GetException(ctx));   /* an OOM in the conversion, like the filename read below */
-    }
     csd->func = js_dup(sf->cur_func);
-    /* func_name_str is UTF-8 encoded if needed */
-    func_name_str = get_func_name(ctx, sf->cur_func);
-    if (!func_name_str || func_name_str[0] == '\0')
-        csd->func_name = JS_NULL;
-    else
-        csd->func_name = JS_NewString(ctx, func_name_str);
-    JS_FreeCString(ctx, func_name_str);
+    csd->func_name = get_func_name_value(ctx, sf->cur_func);
     if (JS_IsException(csd->func_name))
         csd->func_name = JS_NULL;
 
@@ -97989,11 +98046,14 @@ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const cha
     csd->strict = false;
     csd->line_num = line_num;
     csd->col_num = col_num;
-    /* filename is UTF-8 encoded if needed (original argument to __JS_EvalInternal()) */
-    csd->filename = JS_NewString(ctx, filename);
+    /* filename is UTF-8 encoded if needed (original argument to __JS_EvalInternal()).
+       THE NON-THROWING CONSTRUCTOR, because a capture has nowhere to throw: a name too long for a JS string
+       answers JS_NULL, which is what a record holds for an absent field anyway. Catching-and-clearing did the
+       same thing at runtime but left the call able to build an error, which is a capture, which is this. */
+    csd->filename = js_new_string_len_or_null(ctx, filename, strlen(filename));
     if (JS_IsException(csd->filename)) {
         csd->filename = JS_NULL;
-        JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+        JS_FreeValue(ctx, JS_GetException(ctx));   /* allocation failure; the pre-allocated OOM error */
     }
 }
 
@@ -98046,6 +98106,12 @@ static JSValue js_callsite_getthis(JSContext *ctx, JSValueConst this_val, int ar
         return JS_EXCEPTION;
     if (csd->strict || csd->native)
         return JS_UNDEFINED;
+    /* 10.2.1.2 step 5's ToObject, deferred from the capture to here — see js_frame_this_binding. A sloppy
+       function observes the WRAPPER, so that is what getThis reports; the difference is only that the wrapper
+       is built where a throw has somewhere to go. */
+    if (JS_VALUE_GET_TAG(csd->this_val) != JS_TAG_OBJECT &&
+        !JS_IsUndefined(csd->this_val) && !JS_IsNull(csd->this_val))
+        return JS_ToObject(ctx, csd->this_val);
     return js_dup(csd->this_val);
 }
 
