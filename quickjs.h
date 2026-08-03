@@ -1141,6 +1141,15 @@ typedef enum JSPromiseStateEnum {
 } JSPromiseStateEnum;
 
 JS_EXTERN JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
+/* Atomics.waitAsync timeouts are the HOST's to wait for — 25.4.3.14 enqueues a host timeout job. Ask how long
+   until the earliest deadline (-1 = none), wait for it wherever the host already waits, then settle what is
+   due. The engine never blocks on this itself. */
+/* Atomics.waitAsync's timeout is a HOST job (25.4.3.14). JS_AtomicsExpireAsync settles every waiter this
+   runtime owns that is due — notified or past its deadline — and reports how many; call it from the event loop
+   alongside the job pump. JS_AtomicsAsyncWaitForWork blocks until there is one, returning false when the
+   runtime owns no outstanding waiter and the loop may treat its queue as drained. */
+JS_EXTERN int JS_AtomicsExpireAsync(JSRuntime *rt);
+JS_EXTERN bool JS_AtomicsAsyncWaitForWork(JSRuntime *rt);
 JS_EXTERN JSPromiseStateEnum JS_PromiseState(JSContext *ctx,
                                              JSValueConst promise);
 JS_EXTERN JSValue JS_PromiseResult(JSContext *ctx, JSValueConst promise);

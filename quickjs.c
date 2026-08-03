@@ -1662,7 +1662,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_DATE_SETTIME, STEPDEF_DATE_SETYEAR,
     STEPDEF_ATOMICS_ADD, STEPDEF_ATOMICS_AND, STEPDEF_ATOMICS_OR, STEPDEF_ATOMICS_SUB,
     STEPDEF_ATOMICS_XOR, STEPDEF_ATOMICS_EXCHANGE, STEPDEF_ATOMICS_CMPXCHG, STEPDEF_ATOMICS_LOAD,
-    STEPDEF_ATOMICS_STORE, STEPDEF_ATOMICS_ISLOCKFREE, STEPDEF_ATOMICS_WAIT, STEPDEF_ATOMICS_NOTIFY,
+    STEPDEF_ATOMICS_STORE, STEPDEF_ATOMICS_ISLOCKFREE, STEPDEF_ATOMICS_WAIT, STEPDEF_ATOMICS_WAITASYNC, STEPDEF_ATOMICS_NOTIFY,
     STEPDEF_PROMISE_THEN, STEPDEF_PROMISE_WITHRESOLVERS,
     STEPDEF_GET_DISPOSE_SYNC, STEPDEF_GET_DISPOSE_ASYNC, STEPDEF_DISPOSABLE_USE, STEPDEF_ASYNC_DISPOSABLE_USE,
     STEPDEF_U8_TOBASE64, STEPDEF_U8_FROMBASE64, STEPDEF_U8_SETFROMBASE64,
@@ -2861,6 +2861,10 @@ JSContext *JS_GetPendingJobContext(JSRuntime *rt)
 
 /* return < 0 if exception, 0 if no job pending, 1 if a job was
    executed successfully. the context of the job is stored in '*pctx' */
+#ifdef CONFIG_ATOMICS
+static void js_atomics_free_async_waiters(JSRuntime *rt);
+#endif
+
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
 {
     JSContext *ctx;
@@ -2981,6 +2985,14 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     rt->in_free = true;
+#ifdef CONFIG_ATOMICS
+    /* AN UNSETTLED waitAsync AT TEARDOWN OWNS ITS RESOLVING PAIR. The async waiter list is a plain global, not a
+       GC root, so refcounting is the only thing keeping those functions alive — and a promise nobody notified
+       still holds them when the runtime goes. Dropping the list here is what makes the object walk below
+       truthful; without it every un-notified waitAsync is reported as a leak, which is exactly what the
+       gc_obj_list DCHECK said the first time these tests ran. */
+    js_atomics_free_async_waiters(rt);
+#endif
     /* A PARKED FLOW AT TEARDOWN IS A DROPPED FLOW. The slot is not a GC root: it holds a raw callback plus a
        reference the park took (the suspended async activation, or the async generator whose body is mid-run), and
        tearing the runtime down without resuming it leaks that whole graph silently — the runtime's own object walk
@@ -71937,6 +71949,7 @@ static JSValue js_atomics_op(JSContext *ctx, JSValueConst this_obj, int argc, JS
 static JSValue js_atomics_store(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
 static JSValue js_atomics_isLockFree(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
 static JSValue js_atomics_wait(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
+static JSValue js_atomics_wait_async(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
 static JSValue js_atomics_notify(JSContext *ctx, JSValueConst this_obj, int argc, JSValueConst *argv);
 static int js_atomics_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_atomics_fini(JSContext *ctx, void *st, bool take_result);
@@ -71979,6 +71992,12 @@ static const JSTrampStepDef js_atomics_load_def  = ATOMICS_DEF(0x2, 2, 0, 0, gen
 /* wait and notify are the WAITABLE forms — Int32Array or BigInt64Array only, and wait additionally requires a
    SharedArrayBuffer. Both read rather than write. */
 static const JSTrampStepDef js_atomics_wait_def  = ATOMICS_DEF(0xE, 4, 2, 0, generic, js_atomics_wait, 0);
+/* 25.4.3.14 waitAsync coerces the same three arguments as wait and validates the same way — waitable=2, so a
+   non-shared buffer is rejected for BOTH modes. DoWait's shared check is not sync-only; what IS sync-only is
+   step 9's AgentCanSuspend, which is why waitAsync's body has no can_block test. Declaring it is what keeps its
+   own body free of user code; coercing those arguments in C is what the ToPrimitive DCHECK caught the moment
+   these tests were un-skipped. */
+static const JSTrampStepDef js_atomics_waitasync_def = ATOMICS_DEF(0xE, 4, 2, 0, generic, js_atomics_wait_async, 0);
 static const JSTrampStepDef js_atomics_notify_def = ATOMICS_DEF(0x6, 3, 1, 0, generic, js_atomics_notify, 0);
 /* 25.4.9 isLockFree takes a plain number and no typed array, so it is the ordinary one-argument declaration. */
 static const JSTrampStepDef js_atomics_islockfree_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic,
@@ -73637,7 +73656,8 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ATOMICS_XOR]   = &js_atomics_xor_def,   [STEPDEF_ATOMICS_EXCHANGE] = &js_atomics_xchg_def,
     [STEPDEF_ATOMICS_CMPXCHG] = &js_atomics_cmpxchg_def, [STEPDEF_ATOMICS_LOAD] = &js_atomics_load_def,
     [STEPDEF_ATOMICS_STORE] = &js_atomics_store_def, [STEPDEF_ATOMICS_ISLOCKFREE] = &js_atomics_islockfree_def,
-    [STEPDEF_ATOMICS_WAIT]  = &js_atomics_wait_def,  [STEPDEF_ATOMICS_NOTIFY] = &js_atomics_notify_def,
+    [STEPDEF_ATOMICS_WAIT]  = &js_atomics_wait_def,
+    [STEPDEF_ATOMICS_WAITASYNC] = &js_atomics_waitasync_def,  [STEPDEF_ATOMICS_NOTIFY] = &js_atomics_notify_def,
 #endif
     [STEPDEF_STR_CHARAT]      = &js_str_charAt_def,
     [STEPDEF_STR_CHARCODEAT]  = &js_str_charCodeAt_def,
@@ -96715,10 +96735,56 @@ typedef struct JSAtomicsWaiter {
     int32_t *ptr;
 } JSAtomicsWaiter;
 
+/* 25.4.3.14 Atomics.waitAsync's waiter. The synchronous Atomics.wait parks the whole THREAD on a condition
+   variable, which is the one thing this engine cannot do to a flow; waitAsync is the shape that fits, because
+   its answer is a PROMISE and the flow carries on. So the async waiter holds a resolving pair instead of a
+   cond, and Atomics.notify claims it with "ok" exactly where it signals a sync waiter.
+   The resolving functions are DUP'd and held by this list, which is what keeps them alive: the list is not
+   reachable from the GC roots, so refcounting is the only thing that owns them, and they are released either
+   when the owning agent settles them or when the runtime tears the list down.
+
+   CLAIM AND SETTLE ARE DIFFERENT THREADS, which is the spec's own structure and not an optimisation: 25.4.3.15
+   does not resolve the promise where it notifies, it performs EnqueueResolveInAgentJob — the job runs in the
+   WAITING agent. Atomics.notify can be executing on any agent's thread, and the resolving pair belongs to
+   w->ctx's runtime, so calling it from the notifier would be a cross-runtime JS_Call on a heap another thread
+   owns. Notify therefore only sets `result` and flips `claimed` under the atomics mutex; the owning agent's
+   pump (JS_AtomicsExpireAsync) is the only place a resolving function is ever invoked or freed. */
+typedef struct JSAtomicsAsyncWaiter {
+    struct list_head link;
+    bool linked;
+    bool claimed;          /* a notify or an expiry has decided this waiter; `result` says which */
+    JSAtom result;         /* JS_ATOM_ok or JS_ATOM_timed_out; meaningful only once claimed */
+    void *ptr;
+    JSContext *ctx;
+    int64_t deadline;      /* monotonic ms; INT64_MAX = no timeout, so it waits for a notify forever */
+    JSValue resolving_funcs[2];
+} JSAtomicsAsyncWaiter;
+
+static struct list_head js_atomics_async_waiter_list =
+    LIST_HEAD_INIT(js_atomics_async_waiter_list);
+/* broadcast whenever a waiter becomes settle-able, so an agent parked in JS_AtomicsAsyncWaitForWork on a
+   notify-only waiter wakes on the notifying agent's thread rather than on a clock it does not have */
+static js_cond_t js_atomics_async_cond;
+
 static js_once_t js_atomics_once = JS_ONCE_INIT;
 static js_mutex_t js_atomics_mutex;
 static struct list_head js_atomics_waiter_list =
     LIST_HEAD_INIT(js_atomics_waiter_list);
+
+static void js__atomics_init(void) {
+    js_mutex_init(&js_atomics_mutex);
+    js_cond_init(&js_atomics_async_cond);
+}
+
+/* THE LOCK MUST COVER EVERY PATH THAT TOUCHES THE LISTS, and the async list is reached by RUNTIME-scoped entry
+   points (teardown, the host's deadline query) that can run for a runtime which never created a context — so
+   tying the mutex's construction to JS_AddIntrinsicAtomics, as upstream does, leaves those paths locking an
+   uninitialised mutex. Acquire through this and the once is discharged wherever the first toucher happens to be. */
+static void js_atomics_lock(void)
+{
+    js_once(&js_atomics_once, js__atomics_init);
+    js_mutex_lock(&js_atomics_mutex);
+}
 
 // no-op: Atomics.pause() is not allowed to block or yield to another
 // thread, only to hint the CPU that it should back off for a bit;
@@ -96791,7 +96857,7 @@ static JSValue js_atomics_wait(JSContext *ctx,
 
     /* XXX: inefficient if large number of waiters, should hash on
        'ptr' value */
-    js_mutex_lock(&js_atomics_mutex);
+    js_atomics_lock();
     if (size_log2 == 3) {
         res = *(int64_t *)ptr != v;
     } else {
@@ -96823,6 +96889,252 @@ static JSValue js_atomics_wait(JSContext *ctx,
     } else {
         return JS_AtomToString(ctx, JS_ATOM_ok);
     }
+}
+
+/* Drop every async waiter belonging to `rt`, releasing the resolving pair it owns. Called from JS_FreeRuntime;
+   a waiter whose promise nobody settled would otherwise keep those functions alive past the runtime. */
+static void js_atomics_free_async_waiters(JSRuntime *rt)
+{
+    struct list_head *el, *el1;
+    JSAtomicsAsyncWaiter *w;
+
+    js_atomics_lock();
+    list_for_each_safe(el, el1, &js_atomics_async_waiter_list) {
+        w = list_entry(el, JSAtomicsAsyncWaiter, link);
+        if (w->ctx->rt != rt)
+            continue;
+        list_del(&w->link);
+        w->linked = false;
+        JS_FreeValueRT(rt, w->resolving_funcs[0]);
+        JS_FreeValueRT(rt, w->resolving_funcs[1]);
+        js_free_rt(rt, w);
+    }
+    js_mutex_unlock(&js_atomics_mutex);
+}
+
+/* THE TIMEOUT IS THE HOST'S, which is what 25.4.3.14 says: the waiter is registered and the timeout becomes a
+   host-enqueued job. So the embedder gets exactly two entry points — SETTLE what is due, and WAIT until
+   something is. Neither one is the job pump: an earlier version of this put a sleep inside
+   JS_ExecutePendingJob, which is the one thing this engine may not do, because the pump is the flow
+   scheduler's and a pump that blocks is an unparkable area by construction. The pump reports "no jobs"
+   truthfully and the embedder decides what it is waiting for, next to whatever else its event loop waits on.
+
+   Block until this runtime has an async waiter to settle, and report whether it does. A waiter with a deadline
+   is a clock the loop can sleep to; a waiter WITHOUT one can be settled only by another agent's notify, which
+   is an event, so it is waited for on a condition variable that notify broadcasts — the async mirror of the
+   per-waiter cond the synchronous Atomics.wait parks its whole thread on. Returns false when this runtime owns
+   no outstanding waiter, which is the only truthful "the queue really is drained". */
+bool JS_AtomicsAsyncWaitForWork(JSRuntime *rt)
+{
+    struct list_head *el;
+    JSAtomicsAsyncWaiter *w;
+
+    js_atomics_lock();
+    for (;;) {
+        int64_t soonest = INT64_MAX, now = (int64_t)(js__hrtime_ns() / 1000000);
+        int outstanding = 0;
+
+        list_for_each(el, &js_atomics_async_waiter_list) {
+            w = list_entry(el, JSAtomicsAsyncWaiter, link);
+            if (w->ctx->rt != rt)
+                continue;
+            outstanding++;
+            if (w->claimed || w->deadline <= now) {
+                js_mutex_unlock(&js_atomics_mutex);
+                return true;             /* due now — the caller settles it */
+            }
+            if (w->deadline < soonest)
+                soonest = w->deadline;
+        }
+        if (outstanding == 0) {
+            js_mutex_unlock(&js_atomics_mutex);
+            return false;
+        }
+        if (soonest == INT64_MAX)
+            js_cond_wait(&js_atomics_async_cond, &js_atomics_mutex);
+        else
+            js_cond_timedwait(&js_atomics_async_cond, &js_atomics_mutex,
+                              (soonest - now) * 1000000 /* ms to ns */);
+    }
+}
+
+/* SETTLE the waiters this runtime owns that are due — claimed by a notify, or past their deadline — and report
+   how many. This is EnqueueResolveInAgentJob's landing site: it runs on the owning agent's thread, so it is the
+   only place a resolving function may be called or freed.
+   The due set is unlinked onto a private list UNDER the lock and settled after releasing it. Settling calls back
+   into JS (a .then reaction can waitAsync again), so holding the lock across it would deadlock; and walking the
+   shared list with the lock dropped mid-iteration would follow a cursor another agent's notify may have freed. */
+int JS_AtomicsExpireAsync(JSRuntime *rt)
+{
+    struct list_head *el, *el1, due;
+    JSAtomicsAsyncWaiter *w;
+    int64_t now = (int64_t)(js__hrtime_ns() / 1000000);
+    int n = 0;
+
+    init_list_head(&due);
+    js_atomics_lock();
+    list_for_each_safe(el, el1, &js_atomics_async_waiter_list) {
+        w = list_entry(el, JSAtomicsAsyncWaiter, link);
+        if (w->ctx->rt != rt)
+            continue;
+        if (!w->claimed) {
+            if (now < w->deadline)
+                continue;
+            w->claimed = true;
+            w->result = JS_ATOM_timed_out;
+        }
+        list_del(&w->link);
+        w->linked = false;
+        list_add_tail(&w->link, &due);
+    }
+    js_mutex_unlock(&js_atomics_mutex);
+
+    list_for_each_safe(el, el1, &due) {
+        JSValue arg, r;
+        w = list_entry(el, JSAtomicsAsyncWaiter, link);
+        list_del(&w->link);
+        DCHECK(w->result == JS_ATOM_ok || w->result == JS_ATOM_timed_out,
+               "an async waiter reached settlement without a spec result");
+        arg = JS_AtomToString(w->ctx, w->result);
+        r = JS_Call(w->ctx, w->resolving_funcs[0], JS_UNDEFINED, 1, vc(&arg));
+        JS_FreeValue(w->ctx, arg);
+        JS_FreeValue(w->ctx, r);
+        JS_FreeValueRT(rt, w->resolving_funcs[0]);
+        JS_FreeValueRT(rt, w->resolving_funcs[1]);
+        js_free_rt(rt, w);
+        n++;
+    }
+    return n;
+}
+
+/* 25.4.3.14 Atomics.waitAsync — DoWait with mode=async. The differences from the sync twin are all in the
+   spec, not in convenience: a NON-shared buffer is allowed (step 3 only rejects it for sync), AgentCanSuspend
+   is not consulted (step 9 is sync-only), and the answer is an object { async, value } rather than a string.
+   Steps 15-17: an unequal value answers not-equal WITHOUT waiting, a zero timeout answers timed-out without
+   waiting, and only a real wait produces the promise. */
+static JSValue js_atomics_wait_async(JSContext *ctx, JSValueConst this_obj,
+                                     int argc, JSValueConst *argv)
+{
+    JSAtomicsAsyncWaiter *waiter;
+    JSValue res, promise, resolving_funcs[2];
+    int64_t v, timeout;
+    int32_t v32;
+    void *ptr;
+    uint64_t idx;
+    JSObject *p;
+    int size_log2, cmp;
+    double d;
+
+    /* is_waitable = 2, the same validation as the sync twin: an Int32Array or BigInt64Array over a
+       SharedArrayBuffer. The machine already ran it before any coercion; this reaches the buffer. */
+    p = js_atomics_get_buf(ctx, argv[0], argv[1], NULL, &idx, 2);
+    if (!p)
+        return JS_EXCEPTION;
+    size_log2 = typed_array_size_log2(p->class_id);
+    if (size_log2 == 3) {
+        if (JS_ToBigInt64(ctx, &v, argv[2]))
+            return JS_EXCEPTION;
+    } else {
+        if (JS_ToInt32(ctx, &v32, argv[2]))
+            return JS_EXCEPTION;
+        v = v32;
+    }
+    if (JS_ToFloat64(ctx, &d, argv[3]))
+        return JS_EXCEPTION;
+    if (isnan(d) || d >= 0x1p63)
+        timeout = INT64_MAX;
+    else if (d < 0)
+        timeout = 0;
+    else
+        timeout = (int64_t)d;
+
+    /* the value's own valueOf may have detached or resized the buffer between the validation and here */
+    if (idx >= p->u.array.count)
+        return JS_ThrowRangeError(ctx, "out-of-bound access");
+
+    res = JS_NewObject(ctx);
+    if (JS_IsException(res))
+        return JS_EXCEPTION;
+
+    ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
+    js_atomics_lock();
+    if (size_log2 == 3)
+        cmp = *(int64_t *)ptr != v;
+    else
+        cmp = *(int32_t *)ptr != v;
+    js_mutex_unlock(&js_atomics_mutex);
+
+    if (cmp) {
+        if (JS_DefinePropertyValue(ctx, res, JS_ATOM_async, js_bool(false), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValue(ctx, res, JS_ATOM_value,
+                                   JS_AtomToString(ctx, JS_ATOM_not_equal), JS_PROP_C_W_E) < 0)
+            goto fail;
+        return res;
+    }
+    if (timeout == 0) {
+        if (JS_DefinePropertyValue(ctx, res, JS_ATOM_async, js_bool(false), JS_PROP_C_W_E) < 0 ||
+            JS_DefinePropertyValue(ctx, res, JS_ATOM_value,
+                                   JS_AtomToString(ctx, JS_ATOM_timed_out), JS_PROP_C_W_E) < 0)
+            goto fail;
+        return res;
+    }
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        goto fail;
+    waiter = js_malloc(ctx, sizeof(*waiter));
+    if (!waiter) {
+        JS_FreeValue(ctx, promise);
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
+        goto fail;
+    }
+    waiter->ptr = ptr;
+    waiter->ctx = ctx;
+    waiter->linked = true;
+    waiter->claimed = false;
+    waiter->result = JS_ATOM_NULL;
+    waiter->deadline = (timeout == INT64_MAX) ? INT64_MAX
+                                              : (int64_t)(js__hrtime_ns() / 1000000) + timeout;
+    waiter->resolving_funcs[0] = resolving_funcs[0];
+    waiter->resolving_funcs[1] = resolving_funcs[1];
+    js_atomics_lock();
+    list_add_tail(&waiter->link, &js_atomics_async_waiter_list);
+    js_mutex_unlock(&js_atomics_mutex);
+
+    if (JS_DefinePropertyValue(ctx, res, JS_ATOM_async, js_bool(true), JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValue(ctx, res, JS_ATOM_value, promise, JS_PROP_C_W_E) < 0)
+        goto fail;
+    return res;
+ fail:
+    JS_FreeValue(ctx, res);
+    return JS_EXCEPTION;
+}
+
+/* CLAIM up to `count` async waiters parked on `ptr` with "ok" and report how many. Called from Atomics.notify
+   at the same point it signals the sync waiters, because 25.4.3.15 counts both kinds and RemoveWaiters takes
+   them in one pass. It claims only — see the JSAtomicsAsyncWaiter comment: the resolving pair belongs to the
+   waiting agent and is invoked by that agent's JS_AtomicsExpireAsync, never here. Must hold the atomics mutex:
+   `ptr` is shared memory and the waiter may belong to another thread's runtime. */
+static int js_atomics_notify_async(void *ptr, int count)
+{
+    struct list_head *el;
+    JSAtomicsAsyncWaiter *w;
+    int n = 0;
+
+    list_for_each(el, &js_atomics_async_waiter_list) {
+        if (n >= count)
+            break;
+        w = list_entry(el, JSAtomicsAsyncWaiter, link);
+        if (w->ptr != ptr || w->claimed)
+            continue;
+        w->claimed = true;
+        w->result = JS_ATOM_ok;
+        n++;
+    }
+    if (n > 0)
+        js_cond_broadcast(&js_atomics_async_cond);
+    return n;
 }
 
 static JSValue js_atomics_notify(JSContext *ctx,
@@ -96864,7 +97176,7 @@ static JSValue js_atomics_notify(JSContext *ctx,
     if (abuf->shared && count > 0) {
         ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
 
-        js_mutex_lock(&js_atomics_mutex);
+        js_atomics_lock();
         init_list_head(&waiter_list);
         list_for_each_safe(el, el1, &js_atomics_waiter_list) {
             waiter = list_entry(el, JSAtomicsWaiter, link);
@@ -96881,6 +97193,9 @@ static JSValue js_atomics_notify(JSContext *ctx,
             waiter = list_entry(el, JSAtomicsWaiter, link);
             js_cond_signal(&waiter->cond);
         }
+        /* 25.4.3.15 counts the async waiters too — they are the same waiter list to the spec, removed in the
+           same critical section so a concurrent notify cannot hand the same waiter to both calls. */
+        n += js_atomics_notify_async(ptr, count - n);
         js_mutex_unlock(&js_atomics_mutex);
     }
     return js_int32(n);
@@ -96899,6 +97214,7 @@ static const JSCFunctionListEntry js_atomics_funcs[] = {
     JS_CFUNC_STEP_DEF("isLockFree", 1, STEPDEF_ATOMICS_ISLOCKFREE ),
     JS_CFUNC_DEF("pause", 0, js_atomics_pause ),
     JS_CFUNC_STEP_DEF("wait", 4, STEPDEF_ATOMICS_WAIT ),
+    JS_CFUNC_STEP_DEF("waitAsync", 4, STEPDEF_ATOMICS_WAITASYNC ),
     JS_CFUNC_STEP_DEF("notify", 3, STEPDEF_ATOMICS_NOTIFY ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Atomics", JS_PROP_CONFIGURABLE ),
 };
@@ -96906,10 +97222,6 @@ static const JSCFunctionListEntry js_atomics_funcs[] = {
 static const JSCFunctionListEntry js_atomics_obj[] = {
     JS_OBJECT_DEF("Atomics", js_atomics_funcs, countof(js_atomics_funcs), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
 };
-
-static void js__atomics_init(void) {
-    js_mutex_init(&js_atomics_mutex);
-}
 
 /* TODO(saghul) make this public and not dependent on typed arrays? */
 static int JS_AddIntrinsicAtomics(JSContext *ctx)

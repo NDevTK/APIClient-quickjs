@@ -49,6 +49,21 @@
 
 #define CMD_NAME "run-test262"
 
+/* Atomics.waitAsync's TIMEOUT IS A HOST JOB — 25.4.3.14 registers the waiter and hands the timeout to the
+   embedder, which is why the engine only settles and never sleeps inside the pump. THIS is the embedder's
+   event loop, so the waiting is here.
+   `may_wait` is the difference between the two places this is called from. On EVERY iteration the loop settles
+   what has come due without waiting: atomicsHelper.js implements $262.agent.setTimeout by chaining promise
+   reactions, so a test with a pending timer never empties the job queue, and a deadline that is only checked
+   when the queue drains is a deadline that never fires. Only when the pump reports empty does the loop have
+   nothing better to do than wait for the next one. */
+static bool host_pump_atomics_async(JSRuntime *rt, bool may_wait)
+{
+    if (JS_AtomicsExpireAsync(rt) > 0)
+        return true;
+    return may_wait && JS_AtomicsAsyncWaitForWork(rt);
+}
+
 // not quite correct because in theory someone could compile quickjs.c
 // with a different compiler but in practice no one does that, right?
 #ifdef __TINYC__
@@ -702,11 +717,14 @@ static void agent_start(void *arg)
 
     for(;;) {
         JSContext *ctx1;
+        host_pump_atomics_async(JS_GetRuntime(ctx), false);
         ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
         if (ret < 0) {
             js_std_dump_error(ctx);
             break;
         } else if (ret == 0) {
+            if (host_pump_atomics_async(JS_GetRuntime(ctx), true))
+                continue;
             if (JS_IsUndefined(agent->broadcast_func)) {
                 break;
             } else {
@@ -1514,11 +1532,14 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                the scheduler decides when nothing else is runnable. */
             while (JS_ResumeParkedFlow(JS_GetRuntime(ctx)))
                 ;
+            host_pump_atomics_async(JS_GetRuntime(ctx), false);
             ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
             if (ret < 0) {
                 res_val = JS_EXCEPTION;
                 break;
             } else if (ret == 0) {
+                if (host_pump_atomics_async(JS_GetRuntime(ctx), true))
+                    continue;
                 if (is_async) {
                     /* test if the test called $DONE() once */
                     if (tls->async_done != 1) {
@@ -2204,11 +2225,14 @@ int run_test262_harness_test(ThreadLocalStorage *tls, const char *filename,
                the scheduler decides when nothing else is runnable. */
             while (JS_ResumeParkedFlow(JS_GetRuntime(ctx)))
                 ;
+            host_pump_atomics_async(JS_GetRuntime(ctx), false);
             ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
             if (ret < 0) {
                 js_std_dump_error(ctx1);
                 ret_code = 1;
             } else if (ret == 0) {
+                if (host_pump_atomics_async(JS_GetRuntime(ctx), true))
+                    continue;
                 break;
             }
          }
