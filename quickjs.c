@@ -1474,10 +1474,6 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
                                           JSValueConst new_target,
                                           int argc, JSValueConst *argv, int flags);
-static JSValue JS_CallFree(JSContext *ctx, JSValue func_obj, JSValueConst this_obj,
-                           int argc, JSValueConst *argv);
-static JSValue JS_InvokeFree(JSContext *ctx, JSValue this_val, JSAtom atom,
-                             int argc, JSValueConst *argv);
 static __exception int JS_ToArrayLengthFree(JSContext *ctx, uint32_t *plen,
                                             JSValue val, bool is_array_ctor);
 static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
@@ -15252,13 +15248,6 @@ static JSValue JS_ToStringFree(JSContext *ctx, JSValue val)
     JSValue ret = JS_ToString(ctx, val);
     JS_FreeValue(ctx, val);
     return ret;
-}
-
-static JSValue JS_ToLocaleStringFree(JSContext *ctx, JSValue val)
-{
-    if (JS_IsUndefined(val) || JS_IsNull(val))
-        return JS_ToStringFree(ctx, val);
-    return JS_InvokeFree(ctx, val, JS_ATOM_toLocaleString, 0, NULL);
 }
 
 static JSValue JS_ToPropertyKeyInternal(JSContext *ctx, JSValueConst val,
@@ -38917,15 +38906,6 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                            argc, argv, JS_CALL_FLAG_COPY_ARGV);
 }
 
-static JSValue JS_CallFree(JSContext *ctx, JSValue func_obj, JSValueConst this_obj,
-                           int argc, JSValueConst *argv)
-{
-    JSValue res = JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
-                                  argc, argv, JS_CALL_FLAG_COPY_ARGV);
-    JS_FreeValue(ctx, func_obj);
-    return res;
-}
-
 /* warning: the refcount of the context is not incremented. Return
    NULL in case of exception (case of revoked proxy only) */
 static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
@@ -39156,22 +39136,18 @@ JSValue JS_CallConstructor(JSContext *ctx, JSValueConst func_obj,
                                       JS_CALL_FLAG_COPY_ARGV);
 }
 
+/* READ-THEN-CALL FROM C, which is two pieces of page code in one line: the [[Get]] can be an accessor or a
+   Proxy trap, and the method it produces is a body with loops in it. Every internal user of this became a step
+   machine — the promise resolve/then reads, @@toPrimitive, @@species, the iterator protocol — and the last one
+   left, JS_ToLocaleStringFree, had no callers at all. The JS_CallFree it ended in is gone with the rest, which
+   is what takes JS_CallInternal's own cycle apart.
+   It stays EXPORTED because it is quickjs.h's API and an embedder's call is not this fork's to silently
+   redefine; what it can no longer do is run that call on the C stack, so it names the routing to build. */
 JSValue JS_Invoke(JSContext *ctx, JSValueConst this_val, JSAtom atom,
                   int argc, JSValueConst *argv)
 {
-    JSValue func_obj;
-    func_obj = JS_GetProperty(ctx, this_val, atom);
-    if (JS_IsException(func_obj))
-        return func_obj;
-    return JS_CallFree(ctx, func_obj, this_val, argc, argv);
-}
-
-static JSValue JS_InvokeFree(JSContext *ctx, JSValue this_val, JSAtom atom,
-                             int argc, JSValueConst *argv)
-{
-    JSValue res = JS_Invoke(ctx, this_val, atom, argc, argv);
-    JS_FreeValue(ctx, this_val);
-    return res;
+    DFAIL("JS_Invoke ran a method from C — route this call onto the tramp chain");
+    return JS_ThrowTypeError(ctx, "invoke");
 }
 
 /* JSAsyncFunctionState (used by generator and async functions) */
@@ -59680,8 +59656,18 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
 
     tag = JS_VALUE_GET_TAG(fun_obj);
     if (tag == JS_TAG_FUNCTION_BYTECODE) {
-        fun_obj = js_closure(ctx, fun_obj, var_refs, sf);
-        ret_val = JS_CallFree(ctx, fun_obj, this_obj, 0, NULL);
+        /* A PROGRAM BODY IS PAGE CODE, and running it from here gives it a C activation with no flow base — a
+           loop at the eval'd program's top level would drive to completion. Every entry routes it instead:
+           JS_EVAL_FLAG_TRAMP_CLOSURE hands a direct eval's closure back to the opcode that trampolines it,
+           JS_FlowNew wraps a program in an async frame the scheduler drives, and the embedder starts a program
+           the same way. The JS_CallFree that used to be here was measured over the whole corpus behind a
+           DCHECK; the last caller reaching it was the test262 harness's AGENT thread, which is now on the flow
+           machinery, and nothing reaches it since.
+           The module arm below is a different algorithm, not a fallback: a module is a graph to link and
+           evaluate, and its bodies are async functions on the flow's own seam. */
+        JS_FreeValue(ctx, fun_obj);
+        DFAIL("JS_EvalFunctionInternal ran a program body from C — route it onto the tramp chain");
+        return JS_ThrowTypeError(ctx, "eval");
     } else if (tag == JS_TAG_MODULE) {
         JSModuleDef *m;
         m = JS_VALUE_GET_PTR(fun_obj);

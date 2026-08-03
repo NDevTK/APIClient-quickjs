@@ -605,9 +605,10 @@ static JSValue js_detachArrayBuffer(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-static int fork_preempt_enabled(void);
 static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len,
                                  const char *filename, int eval_flags);
+static JSValue fork_preempt_run_program(JSContext *ctx, const char *buf, size_t buf_len,
+                                        const char *filename, int eval_flags);
 
 static JSValue js_evalScript_262(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
@@ -625,9 +626,7 @@ static JSValue js_evalScript_262(JSContext *ctx, JSValueConst this_val,
        activation with no flow base and the whole annexB tree aborted. It is a NESTED flow: the outer flow is
        suspended in this C frame while the host pumps the inner one to its completion, which is the host
        boundary a synchronous eval API requires, not a second scheduler inside the engine. */
-    ret = fork_preempt_enabled()
-        ? fork_preempt_eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL)
-        : JS_Eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL);
+    ret = fork_preempt_eval(ctx, str, len, "<evalScript>", JS_EVAL_TYPE_GLOBAL);
     JS_FreeCString(ctx, str);
     return ret;
 }
@@ -707,8 +706,14 @@ static void agent_start(void *arg)
     JS_SetCanBlock(rt, true);
 
     add_helpers(ctx);
-    ret_val = JS_Eval(ctx, agent->script, strlen(agent->script),
-                      "<evalScript>", JS_EVAL_TYPE_GLOBAL);
+    /* THE AGENT'S SCRIPT IS TEST CODE and runs on the flow machinery like every other program. It ran through
+       plain JS_Eval, so an agent body executed in a C activation with no flow base — a loop in it drove to
+       completion, and its top level reached JS_EvalFunctionInternal's C call into the interpreter, which is the
+       last thing holding JS_CallFree on the interpreter's own cycle.
+       The hooks are NOT armed here: agent_start is only ever reached from $262.agent.start inside a running
+       test, so the main thread has already armed them, and JSFlowControlHooks is one global. */
+    ret_val = fork_preempt_run_program(ctx, agent->script, strlen(agent->script),
+                                       "<evalScript>", JS_EVAL_TYPE_GLOBAL);
     free(agent->script);
     agent->script = NULL;
     if (JS_IsException(ret_val))
@@ -1443,11 +1448,6 @@ int longest_match(const char *str, const char *find, int pos, int *ppos, int lin
    NOT "does QuickJS run JS" (known), but "does our time-travel preserve JS across thousands of suspend/resumes".
    Modules + async ($DONE) fall back to JS_Eval for now (JS_FlowNew is a global program; that surface is next). */
 static int fork_preempt_always(void) { return 1; }
-static int fork_preempt_enabled(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("FORK_PREEMPT") ? 1 : 0;
-    return v;
-}
 /* JSFlowControlHooks is {branch, fork, preempt} — THREE fields. A fourth initializer silently left `preempt` NULL,
    so the forced back-edge preemption never armed and the engagement metric read a vacuous 0/0. Designated
    initializers so the field can never drift again. */
@@ -1461,8 +1461,20 @@ static const JSFlowControlHooks fork_hooks_OFF = { .branch = NULL, .fork = NULL,
    is a fake-green the metric exists to prevent, so the hooks are released only after the jobs are drained
    (fork_preempt_hooks_off, called at the end of eval_buf). */
 static void fork_preempt_hooks_off(void) {
-    if (fork_preempt_enabled())
-        JS_SetFlowControlHooks(&fork_hooks_OFF);
+    JS_SetFlowControlHooks(&fork_hooks_OFF);
+}
+
+/* Run a global PROGRAM as a flow: park and rebuild the whole frame chain at every back-edge. It does NOT touch
+   the flow hooks, because the ARMING belongs to whoever owns the run — an agent thread inherits hooks the main
+   thread already armed, and JSFlowControlHooks is one global that a second thread has no business writing. */
+static JSValue fork_preempt_run_program(JSContext *ctx, const char *buf, size_t buf_len,
+                                        const char *filename, int eval_flags) {
+    JSValue *flow = JS_FlowNew(ctx, buf, buf_len, filename, eval_flags);   /* STRICTNESS and the real script NAME */
+    JSValue res = JS_UNDEFINED;
+    if (!flow) return JS_EXCEPTION;   /* compile error: exception already pending */
+    while (JS_FlowResume(ctx, flow, &res)) { }   /* park + rebuild the whole frame chain on every back-edge */
+    JS_FlowFree(ctx, flow);
+    return res;   /* the program's COMPLETION VALUE — what an eval API evaluates to (JS_EXCEPTION on a throw) */
 }
 
 static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len,
@@ -1475,13 +1487,8 @@ static JSValue fork_preempt_eval(JSContext *ctx, const char *buf, size_t buf_len
         JS_SetFlowControlHooks(&fork_hooks_ON);
         return JS_FlowEvalModule(ctx, buf, buf_len, filename, eval_flags);
     }
-    JSValue *flow = JS_FlowNew(ctx, buf, buf_len, filename, eval_flags);   /* STRICTNESS and the real script NAME */
-    JSValue res = JS_UNDEFINED;
-    if (!flow) return JS_EXCEPTION;   /* compile error: exception already pending */
     JS_SetFlowControlHooks(&fork_hooks_ON);
-    while (JS_FlowResume(ctx, flow, &res)) { }   /* park + rebuild the whole frame chain on every back-edge */
-    JS_FlowFree(ctx, flow);
-    return res;   /* the program's COMPLETION VALUE — what an eval API evaluates to (JS_EXCEPTION on a throw) */
+    return fork_preempt_run_program(ctx, buf, buf_len, filename, eval_flags);
 }
 
 static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
@@ -1508,15 +1515,17 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
     tls->async_fail[0] = '\0';   /* per TEST, beside the counter it explains — a stale one would mislabel the next */
 
     start = get_clock_ms();
-    if (fork_preempt_enabled())
-        /* FORK-FEATURE run: EVERY test goes through the time-travel machinery — NO fallback. No async carve-out,
-           NO module carve-out: the project is never run without its features, so a fallback to plain JS_Eval tests
-           something that never runs and hides feature gaps. A construct the feature does not yet support (module
-           top-level, async interleaving) must FAIL LOUD here (an honest gap to build at the root: module support
-           in JS_FlowNew), never be papered over by JS_Eval. */
-        res_val = fork_preempt_eval(ctx, buf, buf_len, filename, eval_flags);
-    else
-        res_val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);   /* only when the feature is OFF entirely */
+    /* FORK-FEATURE run: EVERY test goes through the time-travel machinery — NO fallback. No async carve-out, NO
+       module carve-out: the project is never run without its features, so a fallback to plain JS_Eval tests
+       something that never runs and hides feature gaps. A construct the feature does not yet support must FAIL
+       LOUD here (an honest gap to build at the root), never be papered over by JS_Eval.
+       THE ENV SWITCH THAT USED TO GUARD THIS IS GONE. FORK_PREEMPT was read once and branched on in four
+       places, and the OFF arm was exactly the banned fallback — dead in practice (engine/test262.mjs always
+       sets it) and load-bearing in the worst way: the agent thread's own script eval was written against the
+       OFF shape and stayed on plain JS_Eval, which is how a whole thread of test code ran off the flow
+       machinery unnoticed. A mode that is never selected is not a safety net, it is a place for the second
+       implementation to hide. */
+    res_val = fork_preempt_eval(ctx, buf, buf_len, filename, eval_flags);
 
     if ((is_async || ret_promise) && !JS_IsException(res_val)) {
         JSValue promise = JS_UNDEFINED;
@@ -2545,7 +2554,7 @@ int main(int argc, char **argv)
            test's logic. requested = back-edge preempt points reached; fired = actually parked+rebuilt. They diverge
            EXACTLY where the feature is gated (nested async/generator activations), so <100% engagement means the
            run passed tests the feature silently skipped — a fake green the harness must flag, for ALL categories. */
-        if (fork_preempt_enabled()) {
+        {
             uint64_t req = 0, fired = 0;
             JS_FlowPreemptStats(&req, &fired);
             /* ZERO back-edges is NOT 100% engaged — it PROVES NOTHING: no suspend/resume happened at all (an
