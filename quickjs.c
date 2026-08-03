@@ -15196,66 +15196,76 @@ static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val)
     return 0;
 }
 
+/* ArrayLength over an ALREADY-NUMERIC value: 1 = converted, 0 = `val` is not numeric so the caller must coerce
+   first, -1 = out of range. It has no coercion of its own, which is why the two call sites below cannot loop.
+   JS_ToArrayLengthFree used to re-enter ITSELF for this with a comment saying it could not recurse; naming the
+   numeric half makes that a property of the call graph rather than a claim in a comment. */
+static int js_array_length_numeric(uint32_t *plen, JSValueConst val)
+{
+    uint32_t tag = JS_VALUE_GET_TAG(val);
+
+    if (tag == JS_TAG_INT || tag == JS_TAG_BOOL || tag == JS_TAG_NULL) {
+        int v = JS_VALUE_GET_INT(val);
+        if (v < 0)
+            return -1;
+        *plen = v;
+        return 1;
+    }
+    if (JS_TAG_IS_FLOAT64(tag)) {
+        double d = JS_VALUE_GET_FLOAT64(val);
+        if (!(d >= 0 && d <= UINT32_MAX))
+            return -1;
+        *plen = (uint32_t)d;
+        if (*plen != d)
+            return -1;
+        return 1;
+    }
+    return 0;
+}
+
 static __exception int JS_ToArrayLengthFree(JSContext *ctx, uint32_t *plen,
                                             JSValue val, bool is_array_ctor)
 {
-    uint32_t tag, len;
+    uint32_t len, len1;
+    int r;
 
-    tag = JS_VALUE_GET_TAG(val);
-    switch(tag) {
-    case JS_TAG_INT:
-    case JS_TAG_BOOL:
-    case JS_TAG_NULL:
-        {
-            int v;
-            v = JS_VALUE_GET_INT(val);
-            if (v < 0)
-                goto fail;
-            len = v;
-        }
-        break;
-    default:
-        if (JS_TAG_IS_FLOAT64(tag)) {
-            double d;
-            d = JS_VALUE_GET_FLOAT64(val);
-            if (!(d >= 0 && d <= UINT32_MAX))
-                goto fail;
-            len = (uint32_t)d;
-            if (len != d)
-                goto fail;
-        } else {
-            uint32_t len1;
-
-            if (is_array_ctor) {
-                val = JS_ToNumberFree(ctx, val);
-                if (JS_IsException(val))
-                    return -1;
-                /* cannot recurse because val is a number */
-                if (JS_ToArrayLengthFree(ctx, &len, val, true))
-                    return -1;
-            } else {
-                /* legacy behavior: must do the conversion twice and compare */
-                if (JS_ToUint32(ctx, &len, val)) {
-                    JS_FreeValue(ctx, val);
-                    return -1;
-                }
-                val = JS_ToNumberFree(ctx, val);
-                if (JS_IsException(val))
-                    return -1;
-                /* cannot recurse because val is a number */
-                if (JS_ToArrayLengthFree(ctx, &len1, val, false))
-                    return -1;
-                if (len1 != len) {
-                fail:
-                    JS_ThrowRangeError(ctx, "invalid array length");
-                    return -1;
-                }
-            }
-        }
-        break;
+    r = js_array_length_numeric(&len, val);
+    if (r > 0) {
+        *plen = len;
+        return 0;
     }
+    if (r < 0)
+        goto fail;
+
+    /* not numeric: coerce, then convert. ToNumber's result is a Number, so the conversion below needs no
+       further coercion — the whole reason the original could call itself here. */
+    if (is_array_ctor) {
+        val = JS_ToNumberFree(ctx, val);
+        if (JS_IsException(val))
+            return -1;
+        r = js_array_length_numeric(&len, val);
+    } else {
+        /* legacy behavior: must do the conversion twice and compare */
+        if (JS_ToUint32(ctx, &len1, val)) {
+            JS_FreeValue(ctx, val);
+            return -1;
+        }
+        val = JS_ToNumberFree(ctx, val);
+        if (JS_IsException(val))
+            return -1;
+        r = js_array_length_numeric(&len, val);
+        if (r > 0 && len != len1)
+            r = -1;
+    }
+    DCHECK(r != 0, "ToNumber handed ArrayLength a value that is not a Number — the second conversion has "
+                   "nothing to convert, and the recursive form this replaced would have coerced forever");
+    if (r <= 0)
+        goto fail;
     *plen = len;
     return 0;
+ fail:
+    JS_ThrowRangeError(ctx, "invalid array length");
+    return -1;
 }
 
 #define MAX_SAFE_INTEGER (((int64_t)1 << 53) - 1)
@@ -15366,68 +15376,97 @@ static JSValue js_dtoa2(JSContext *ctx,
 static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                                    int flags)
 {
+    /* the ToPrimitive result, when the object case took its one hop; owned by this frame */
+    JSValue owned = JS_UNDEFINED, ret;
     uint32_t tag;
     char buf[32];
     size_t len;
 
+    for(;;) {
     tag = JS_VALUE_GET_NORM_TAG(val);
     switch(tag) {
     case JS_TAG_STRING:
-        return js_dup(val);
+        ret = js_dup(val);
+        goto done;
     case JS_TAG_STRING_ROPE:
-        return js_linearize_string_rope(ctx, val);
+        ret = js_linearize_string_rope(ctx, val);
+        goto done;
     case JS_TAG_INT:
         len = i32toa(buf, JS_VALUE_GET_INT(val));
-        return js_new_string8_len(ctx, buf, len);
+        ret = js_new_string8_len(ctx, buf, len);
+        goto done;
     case JS_TAG_BOOL:
-        return JS_AtomToString(ctx, JS_VALUE_GET_BOOL(val) ?
-                          JS_ATOM_true : JS_ATOM_false);
+        ret = JS_AtomToString(ctx, JS_VALUE_GET_BOOL(val) ?
+                              JS_ATOM_true : JS_ATOM_false);
+        goto done;
     case JS_TAG_NULL:
-        return JS_AtomToString(ctx, JS_ATOM_null);
+        ret = JS_AtomToString(ctx, JS_ATOM_null);
+        goto done;
     case JS_TAG_UNDEFINED:
-        return JS_AtomToString(ctx, JS_ATOM_undefined);
+        ret = JS_AtomToString(ctx, JS_ATOM_undefined);
+        goto done;
     case JS_TAG_EXCEPTION:
-        return JS_EXCEPTION;
+        ret = JS_EXCEPTION;
+        goto done;
     case JS_TAG_OBJECT:
         if (flags & JS_TO_STRING_NO_SIDE_EFFECTS) {
-            return js_new_string8(ctx, "{}");
+            ret = js_new_string8(ctx, "{}");
+            goto done;
         } else {
-            JSValue val1, ret;
+            JSValue val1;
             /* The ToNumber boundary's twin — see the contract stated there. A concolic must not arrive: the
                operator owed it a concolic result, and this function owes C a real string. */
             if (unlikely(g_concolic.is && g_concolic.is(val))) {
                 DCHECK(0, "ToString over a CONCOLIC operand — stringifying unknown external input has no "
                           "concolic semantics yet. Build it in the operator (a derived concolic), never by "
                           "converting here: this boundary owes C a real string.");
-                return JS_ThrowTypeError(ctx, "stringifying unknown external input is not modelled yet");
+                ret = JS_ThrowTypeError(ctx, "stringifying unknown external input is not modelled yet");
+                goto done;
             }
             val1 = JS_ToPrimitive(ctx, val, HINT_STRING);
-            if (JS_IsException(val1))
-                return val1;
-            ret = JS_ToStringInternal(ctx, val1, flags);
-            JS_FreeValue(ctx, val1);
-            return ret;
+            if (JS_IsException(val1)) {
+                ret = val1;
+                goto done;
+            }
+            /* 7.1.1 ToPrimitive returns a PRIMITIVE or throws, so the next pass can never re-enter this case.
+               That is the whole reason this hop was safe as a recursive call — so state it as an invariant and
+               take the hop as an assignment instead of a frame. */
+            DCHECK(JS_VALUE_GET_NORM_TAG(val1) != JS_TAG_OBJECT,
+                   "ToPrimitive returned an object — OrdinaryToPrimitive's \"could not convert to primitive\" "
+                   "TypeError is missing, and ToString would have recursed on it");
+            JS_FreeValue(ctx, owned);
+            owned = val1;
+            val = owned;
+            continue;
         }
-        break;
     case JS_TAG_FUNCTION_BYTECODE:
-        return js_new_string8(ctx, "[function bytecode]");
+        ret = js_new_string8(ctx, "[function bytecode]");
+        goto done;
     case JS_TAG_SYMBOL:
-        if (flags & JS_TO_STRING_IS_PROPERTY_KEY) {
-            return js_dup(val);
-        } else {
-            return JS_ThrowTypeError(ctx, "cannot convert symbol to string");
-        }
+        if (flags & JS_TO_STRING_IS_PROPERTY_KEY)
+            ret = js_dup(val);
+        else
+            ret = JS_ThrowTypeError(ctx, "cannot convert symbol to string");
+        goto done;
     case JS_TAG_FLOAT64:
-        return js_dtoa2(ctx, JS_VALUE_GET_FLOAT64(val), 10, 0,
-                        JS_DTOA_FORMAT_FREE);
+        ret = js_dtoa2(ctx, JS_VALUE_GET_FLOAT64(val), 10, 0,
+                       JS_DTOA_FORMAT_FREE);
+        goto done;
     case JS_TAG_SHORT_BIG_INT:
     case JS_TAG_BIG_INT:
-        return js_bigint_to_string(ctx, val);
+        ret = js_bigint_to_string(ctx, val);
+        goto done;
     case JS_TAG_UNINITIALIZED:
-        return js_new_string8(ctx, "[uninitialized]");
+        ret = js_new_string8(ctx, "[uninitialized]");
+        goto done;
     default:
-        return js_new_string8(ctx, "[unsupported type]");
+        ret = js_new_string8(ctx, "[unsupported type]");
+        goto done;
     }
+    }
+ done:
+    JS_FreeValue(ctx, owned);
+    return ret;
 }
 
 JSValue JS_ToString(JSContext *ctx, JSValueConst val)
@@ -89353,41 +89392,45 @@ static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s)
     reaction_flow_free(ctx, rf);
 }
 
-/* One slice of the handler flow: resume it as its own base; a preempt parks it back into the job pump. */
-static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf);
+/* One slice of the handler flow: resume it as its own base; a preempt parks it back into the job pump.
+   PHASE 1 (the settle) runs on the SAME flow, and it used to get there by calling this function again — a tail
+   call, so `rf` is the whole state and the hop is a `continue`. */
 static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
 {
-    JSAsyncFunctionState *prev_base = g_flow_base_gen;
-    JSValue res, jv;
+    for(;;) {
+        JSAsyncFunctionState *prev_base = g_flow_base_gen;
+        JSValue res, jv;
 
-    rf->fs.throw_flag = false;   /* a preempt-resume is a continuation, never a re-throw */
-    g_flow_base_gen = &rf->fs;
-    res = async_func_resume(ctx, &rf->fs);
-    g_flow_base_gen = prev_base;
-    /* SUSPENDED (a NORMAL handler has no yield/await, so this is a forced preempt) — detect by the FRAME, never
-       the value: a handler returning the integer 3 would collide with js_int32(FUNC_RET_PREEMPT). */
-    if (rf->fs.frame.cur_sp != NULL || rf->fs.tramp_top != NULL) {
-        JS_FreeValue(ctx, res);
-        jv = JS_MKPTR(JS_TAG_INT, rf);
-        if (JS_EnqueueJob(ctx, js_reaction_resume_job, 1, (JSValueConst *)&jv) < 0)
-            return JS_EXCEPTION;
-        return JS_UNDEFINED;   /* PARKED: the pump resumes it; the promise settles when it completes */
-    }
-    /* COMPLETED via `done:` — that path frees the stack/vars inline but not the frame buffer + cur_func/this */
-    js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
-    JS_FreeValue(ctx, rf->fs.frame.cur_func);
-    JS_FreeValue(ctx, rf->fs.this_val);
-    if (rf->phase == 0) {
-        int st = reaction_flow_settle_start(ctx, rf, res);
-        if (st == 0) return reaction_flow_step(ctx, rf);   /* PHASE 1 on the same flow */
+        rf->fs.throw_flag = false;   /* a preempt-resume is a continuation, never a re-throw */
+        g_flow_base_gen = &rf->fs;
+        res = async_func_resume(ctx, &rf->fs);
+        g_flow_base_gen = prev_base;
+        /* SUSPENDED (a NORMAL handler has no yield/await, so this is a forced preempt) — detect by the FRAME,
+           never the value: a handler returning the integer 3 would collide with js_int32(FUNC_RET_PREEMPT). */
+        if (rf->fs.frame.cur_sp != NULL || rf->fs.tramp_top != NULL) {
+            JS_FreeValue(ctx, res);
+            jv = JS_MKPTR(JS_TAG_INT, rf);
+            if (JS_EnqueueJob(ctx, js_reaction_resume_job, 1, (JSValueConst *)&jv) < 0)
+                return JS_EXCEPTION;
+            return JS_UNDEFINED;   /* PARKED: the pump resumes it; the promise settles when it completes */
+        }
+        /* COMPLETED via `done:` — that path frees the stack/vars inline but not the frame buffer + cur_func/this */
+        js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
+        JS_FreeValue(ctx, rf->fs.frame.cur_func);
+        JS_FreeValue(ctx, rf->fs.this_val);
+        if (rf->phase == 0) {
+            int st = reaction_flow_settle_start(ctx, rf, res);
+            if (st == 0)
+                continue;   /* PHASE 1 on the same flow: settle_start has rebuilt rf->fs for it */
+            reaction_flow_free(ctx, rf);
+            return st < 0 && JS_IsException(ctx->rt->current_exception) ? JS_EXCEPTION : JS_UNDEFINED;
+        }
+        /* phase 1: the resolving function's own result is discarded; only its throw matters. */
         reaction_flow_free(ctx, rf);
-        return st < 0 && JS_IsException(ctx->rt->current_exception) ? JS_EXCEPTION : JS_UNDEFINED;
+        if (JS_IsException(res)) return JS_EXCEPTION;
+        JS_FreeValue(ctx, res);
+        return JS_UNDEFINED;
     }
-    /* phase 1: the resolving function's own result is discarded; only its throw matters. */
-    reaction_flow_free(ctx, rf);
-    if (JS_IsException(res)) return JS_EXCEPTION;
-    JS_FreeValue(ctx, res);
-    return JS_UNDEFINED;
 }
 
 static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv)
