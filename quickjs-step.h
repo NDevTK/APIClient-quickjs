@@ -278,4 +278,13 @@ JS_EXTERN int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, J
 JS_EXTERN int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int64_t *pres,
                                JSValue **out_cb, int *out_argc);
 
+/* ToString AS A REQUEST — the coercion nearly every Web IDL argument actually is. `DOMString type`,
+   `DOMString name`, `DOMString selector`: each is ToString on whatever the page passed, so
+   `el.addEventListener({toString(){ for(;;){} }}, f)` is the page's loop. Without this a component's only
+   honest move was JS_ToCString from C, which in this engine does not quietly misbehave — it reaches
+   JS_ToPrimitiveFree's DFAIL and aborts, naming the site — but aborting is where a capability is missing, not
+   where it is built. Returns JS_STEP_REQUEST (the caller returns it), 0 once *pout is set, or -1. */
+JS_EXTERN int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, JSValue *pout,
+                                JSValue **out_cb, int *out_argc);
+
 #endif

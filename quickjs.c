@@ -19110,7 +19110,7 @@ static int step_ta_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst exempl
    that step code and will be re-entered here, -1 = threw. */
 enum { STR_PH_START = 0, STR_PH_PRIM };
 
-static int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, JSValue *pout,
+int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, JSValue *pout,
                              JSValue **out_cb, int *out_argc)
 {
     if (h->str_phase == STR_PH_START) {
