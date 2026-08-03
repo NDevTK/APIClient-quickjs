@@ -269,4 +269,13 @@ static inline JSValueConst step_arg(const JSStepHdr *h, int i)
 JS_EXTERN int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
                                JSValue *pout, JSValue **out_cb, int *out_argc);
 
+/* A NUMERIC COERCION AS A REQUEST — the other half of what a browser component needs, and the half that was
+   missing. Web IDL's integer types (`[EnforceRange] unsigned long long milliseconds`, `long`, `unsigned long`)
+   are ToNumber on whatever the page passed, so `AbortSignal.timeout({valueOf(){ for(;;){} }})` is the page's
+   code and cannot be a JS_ToInt64Sat from C. With only the property read exported, a component's only honest
+   options were to abort on an object argument or to run the coercion off the chain; this makes it a request
+   like any other. Returns JS_STEP_REQUEST (the caller returns it), 0 once *pres is set, or -1. */
+JS_EXTERN int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int64_t *pres,
+                               JSValue **out_cb, int *out_argc);
+
 #endif

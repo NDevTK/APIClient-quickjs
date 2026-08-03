@@ -19256,8 +19256,8 @@ static int step_toprim_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, int hin
     return 0;
 }
 
-static int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int64_t *pres,
-                            JSValue **out_cb, int *out_argc)
+int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int64_t *pres,
+                     JSValue **out_cb, int *out_argc)
 {
     if (h->num_phase == NUM_PH_START) {
         JS_FreeValue(ctx, in);
