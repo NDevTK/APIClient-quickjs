@@ -100043,6 +100043,18 @@ JSValue JS_PRINTF_FORMAT_ATTR(3, 4) JS_ThrowDOMException(JSContext *ctx, const c
     return JS_Throw(ctx, obj);
 }
 
+/* PER CONTEXT, AND IDEMPOTENT — which it was not, and the difference was the whole realm.
+   The CLASS registration is runtime-wide and was already guarded. The PROTOTYPE and the CONSTRUCTOR are this
+   context's, and were not: a second call rebuilt them and assigned over
+   ctx->class_proto[JS_CLASS_DOM_EXCEPTION], dropping the previous prototype's only reference. That prototype is
+   reachable from the constructor, which is reachable from the global, so the leak took 333 GC objects with it —
+   including the JSContext itself, which is why JS_FreeContext's teardown body then never ran at all and the
+   final GC could not collect the cycle.
+   Reaching a second call needed no unusual host: JS_NewContext calls JS_AddIntrinsicAToB, which installed this
+   whenever the CLASS was unregistered, so `JS_NewContext` followed by an explicit JS_AddIntrinsicDOMException —
+   exactly what a host that wants the interface writes, and what engine/host/main.c writes — leaked every time.
+   Guarding on the prototype rather than the class is what makes the two questions the right ones: is the class
+   registered in this RUNTIME, and does this CONTEXT already have its prototype. */
 int JS_AddIntrinsicDOMException(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
@@ -100050,6 +100062,8 @@ int JS_AddIntrinsicDOMException(JSContext *ctx)
     JSAtom name;
     JSValue ctor, proto;
 
+    if (JS_IsObject(ctx->class_proto[JS_CLASS_DOM_EXCEPTION]))
+        return 0;   /* this context already has it */
     if (!JS_IsRegisteredClass(rt, JS_CLASS_DOM_EXCEPTION)) {
         if (init_class_range(rt, js_domexception_class_def, JS_CLASS_DOM_EXCEPTION,
                              countof(js_domexception_class_def)))
@@ -100072,6 +100086,9 @@ int JS_AddIntrinsicDOMException(JSContext *ctx)
     }
     JS_DefinePropertyValue(ctx, ctx->global_obj, JS_ATOM_DOMException, ctor,
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    DCHECK(!JS_IsObject(ctx->class_proto[JS_CLASS_DOM_EXCEPTION]),
+           "assigning over a class_proto slot that already holds a prototype — the old one's only reference is "
+           "this slot, so the assignment leaks it and everything reachable from it");
     ctx->class_proto[JS_CLASS_DOM_EXCEPTION] = proto;
     return 0;
 }
@@ -100985,10 +101002,12 @@ static int js_uint8array_funcs_init(JSContext *ctx)
 
 int JS_AddIntrinsicAToB(JSContext *ctx)
 {
-    if (!JS_IsRegisteredClass(ctx->rt, JS_CLASS_DOM_EXCEPTION)) {
-        if (JS_AddIntrinsicDOMException(ctx))
-            return -1;
-    }
+    /* atob throws an InvalidCharacterError, so it needs THIS context's DOMException prototype. The test used to
+       be JS_IsRegisteredClass, which is runtime-wide: with more than one context the second got atob and no
+       prototype at all, and its InvalidCharacterError had nothing to build on. The intrinsic is idempotent per
+       context now, so asking it unconditionally is both correct and cheaper than asking the wrong question. */
+    if (JS_AddIntrinsicDOMException(ctx))
+        return -1;
     JS_SetPropertyFunctionList(ctx, ctx->global_obj,
                                js_base64_funcs, countof(js_base64_funcs));
     return 0;
