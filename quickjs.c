@@ -12740,115 +12740,34 @@ void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id)
     return p->u.opaque;
 }
 
-/* THE LAST C-DRIVES-JS PATH IN ToPrimitive, and what is left of it is ONE site.
-   This function runs user code — @@toPrimitive, valueOf, toString — through JS_CallFree, the single edge that
-   holds 417 of the interpreter cycle's 433 functions (engine/check_recursion.mjs --why-blob). The trampolined
-   form already exists (JSToPrim, operand and machine mode) and the operator dispatch, the key coercions and
-   every PRIMARGS builtin use it.
-   WHICH CALLERS STILL REACH IT WAS MEASURED, not read: a DCHECK on the path below, run over the whole corpus,
-   names them one at a time. Round one was BigInt.prototype.toString coercing its radix from C — fixed by
-   declaring it PRIMARGS, the mechanism that already existed. Round two is ONE test:
+/* THE C-DRIVES-JS PATH IN ToPrimitive IS GONE — the body that ran @@toPrimitive / valueOf / toString through
+   JS_CallFree has been DELETED, not left behind an assert. It was the last of the three functions whose mutual
+   reachability manufactures the interpreter cycle (engine/check_recursion.mjs --why-blob), and a superseded
+   system kept as a fallback is what lets an unrouted site stay unrouted: the DCHECK that used to sit here was
+   silent over the whole corpus precisely because the real work had moved, and the only honest end to that
+   sequence is removal.
+   The trampolined form is JSToPrim (operand and machine mode); the operator dispatch, the key coercions and
+   every PRIMARGS builtin route through it. Two rounds of that conversion are in the git history and both are
+   worth knowing when a new site turns up: round one was BigInt.prototype.toString coercing its radix from C,
+   fixed by declaring it PRIMARGS; round two was Reflect.set onto a typed array, fixed in
+   ta_atom_write_needs_toprim's receiver test rather than by adding a coercion path.
 
-     built-ins/TypedArrayConstructors/internals/Set/BigInt/key-is-valid-index-reflect-set.js
-     JS_CallInternal -> JS_SetPropertyInternal2 -> JS_DefineProperty -> JS_SetPropertyValue
-       -> JS_ToBigInt64Free -> JS_ToBigIntFree -> JS_ToPrimitiveFree
-
-   TWO WRONG DESCRIPTIONS OF THIS PRECEDED THE RIGHT ONE, and both are in the git history, so: it is NOT a
-   missing route at OP_put_array_el, and it is NOT the prototype-chain [[Set]] test. Both of those were read
-   off a -vv listing whose last line is the last SUCCESS, not the failure. Confirm a site with -f on the single
-   file before believing it.
-   The write REACHES the interpreter's own guarded site (the ta_atom_write_needs_toprim arm two thousand lines
-   below, which already routes typed-array element coercion including a write whose site is on the prototype
-   chain). That predicate DECLINES this shape and the write falls through to JS_SetPropertyInternal2, which
-   coerces from C. So the fix is in the predicate's receiver test, not a new coercion path: work out which of
-   Reflect.set's receiver shapes it is rejecting and why, keeping 10.4.5.5 step ii — where the receiver is NOT
-   the typed array the value is genuinely not coerced at all — intact.
-   THE DCHECK BELOW STAYS. I removed it once to keep the suite green and called that judgement; it was not.
-   A DCHECK is dev-only and ships with no production effect, an unrouted site is a capability that does not
-   exist yet, and a directory going red over one is the work queue rather than a reason to soften the check.
-   Deleting it is how the last unrouted path stays unrouted. */
+   WHAT REMAINS IS NOT A COERCION AT ALL. Both arms are the cases 7.1.1 answers without running anything:
+   a value that is ALREADY primitive is its own result, and a concolic stands for unknown EXTERNAL INPUT —
+   primitive in the page, wearing an object only because the solver needs a carrier with an exotic [[Get]], so
+   reading @@toPrimitive off it would get a DERIVED concolic back and call it, throwing "toPrimitive is not a
+   function" inside an expression the page never wrote.
+   A real object reaching here is a call site that runs user code from C with no flow base under it, which is a
+   capability that does not exist rather than a case to handle: route it to the trampoline. */
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
 {
-    int i;
-    bool force_ordinary;
-
-    JSAtom method_name;
-    JSValue method, ret;
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
         return val;
-    /* 7.1.1 OVER A CONCOLIC: it IS what ToPrimitive produces. A concolic stands for unknown EXTERNAL INPUT — a
-       string off location.hash, a field of a reply — which is PRIMITIVE in the page and wears an object only
-       because the solver needs a carrier with an exotic [[Get]]. Reading @@toPrimitive off it instead gets a
-       DERIVED concolic back from that [[Get]] and calls it, which throws "toPrimitive is not a function" inside
-       an expression the page never wrote. Safe to hand back precisely because the conversion boundary above
-       asserts a concolic never reaches it — this cannot become an infinite coercion. */
     if (g_concolic.is && g_concolic.is(val))
         return val;
-    DCHECK(false, "JS_ToPrimitiveFree reached with a real object — route this site to the ToPrimitive "
-                  "trampoline instead of running valueOf/toString from C");
-    force_ordinary = hint & HINT_FORCE_ORDINARY;
-    hint &= ~HINT_FORCE_ORDINARY;
-    if (!force_ordinary) {
-        method = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toPrimitive);
-        if (JS_IsException(method))
-            goto exception;
-        /* ECMA says *If exoticToPrim is not undefined* but tests in
-           test262 use null as a non callable converter */
-        if (!JS_IsUndefined(method) && !JS_IsNull(method)) {
-            JSAtom atom;
-            JSValue arg;
-            switch(hint) {
-            case HINT_STRING:
-                atom = JS_ATOM_string;
-                break;
-            case HINT_NUMBER:
-                atom = JS_ATOM_number;
-                break;
-            default:
-            case HINT_NONE:
-                atom = JS_ATOM_default;
-                break;
-            }
-            arg = JS_AtomToString(ctx, atom);
-            ret = JS_CallFree(ctx, method, val, 1, vc(&arg));
-            JS_FreeValue(ctx, arg);
-            if (JS_IsException(ret))
-                goto exception;
-            JS_FreeValue(ctx, val);
-            if (JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT)
-                return ret;
-            JS_FreeValue(ctx, ret);
-            return JS_ThrowTypeError(ctx, "toPrimitive");
-        }
-    }
-    if (hint != HINT_STRING)
-        hint = HINT_NUMBER;
-    for(i = 0; i < 2; i++) {
-        if ((i ^ hint) == 0) {
-            method_name = JS_ATOM_toString;
-        } else {
-            method_name = JS_ATOM_valueOf;
-        }
-        method = JS_GetProperty(ctx, val, method_name);
-        if (JS_IsException(method))
-            goto exception;
-        if (JS_IsFunction(ctx, method)) {
-            ret = JS_CallFree(ctx, method, val, 0, NULL);
-            if (JS_IsException(ret))
-                goto exception;
-            if (JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT) {
-                JS_FreeValue(ctx, val);
-                return ret;
-            }
-            JS_FreeValue(ctx, ret);
-        } else {
-            JS_FreeValue(ctx, method);
-        }
-    }
-    JS_ThrowTypeError(ctx, "toPrimitive");
-exception:
-    JS_FreeValue(ctx, val);
-    return JS_EXCEPTION;
+    DFAIL("JS_ToPrimitiveFree reached with a real object — route this site to the ToPrimitive trampoline "
+          "instead of running valueOf/toString from C");
+    return JS_ThrowTypeError(ctx, "toPrimitive");
 }
 
 static JSValue JS_ToPrimitive(JSContext *ctx, JSValueConst val, int hint)
