@@ -110,11 +110,6 @@ typedef struct {
     int has_named_captures; /* -1 = don't know, 0 = no, 1 = yes */
     void *opaque;
     DynBuf group_alts;    /* one u32 per capture, in declaration order: the alternative it was declared in */
-    /* `\q{…}` and get_class_atom call each OTHER, which reads as unbounded recursion and is not: the call
-       below passes cr=NULL and inclass=false, and the \q branch needs both, so the depth is two by
-       construction. That is a structural invariant, so it gets an assert rather than a frame stack —
-       flattening a descent that cannot descend would manufacture debt instead of removing it. */
-    bool in_class_string_disjunction;
     DynBuf group_names;
     union {
         char error_msg[TMP_BUF_SIZE];
@@ -1077,8 +1072,13 @@ static int parse_unicode_property(REParseState *s, REStringList *cr,
     return re_parse_out_of_memory(s);
 }
 
-static int get_class_atom(REParseState *s, REStringList *cr,
-                          const uint8_t **pp, bool inclass);
+/* THE ClassAtom GRAMMAR WITHOUT `\q{…}` — everything a ClassStringDisjunction ELEMENT may be. `\q` is the one
+   production whose operand is itself a list of atoms, so it is the only edge that could make this grammar
+   recursive; it lives in the wrapper below instead, and the elements are parsed by THIS function, which has no
+   \q branch to take. The pair used to call each other and be held apart by an assert that the element call
+   passed cr=NULL — true, and an invariant a later edit could break silently. Structure says it instead. */
+static int get_class_atom_1(REParseState *s, REStringList *cr,
+                            const uint8_t **pp, bool inclass);
 
 static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
                                           const uint8_t **pp)
@@ -1087,17 +1087,9 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     DynBuf str;
     int c;
     
-    DCHECK(!s->in_class_string_disjunction,
-           "\\q{…} re-entered itself: the only thing keeping this pair from being unbounded recursion is that "
-           "its get_class_atom call passes cr=NULL, which makes the \\q branch unreachable — someone has just "
-           "changed that, and this now needs a frame stack like the other two class productions");
-    s->in_class_string_disjunction = true;
-
     p = *pp;
-    if (*p != '{') {
-        s->in_class_string_disjunction = false;
+    if (*p != '{')
         return re_parse_error(s, "expecting '{' after \\q");
-    }
 
     dbuf_init2(&str, s->opaque, lre_realloc);
     re_string_list_init(s, cr);
@@ -1106,7 +1098,7 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     for(;;) {
         str.size = 0;
         while (*p != '}' && *p != '|') {
-            c = get_class_atom(s, NULL, &p, false);
+            c = get_class_atom_1(s, NULL, &p, false);
             if (c < 0)
                 goto fail;
             if (dbuf_put_u32(&str, c)) {
@@ -1129,20 +1121,18 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     p++; /* skip the '}' */
     dbuf_free(&str);
     *pp = p;
-    s->in_class_string_disjunction = false;
     return 0;
  fail:
     dbuf_free(&str);
     re_string_list_free(cr);
-    s->in_class_string_disjunction = false;
     return -1;
 }
 
 /* return -1 if error otherwise the character or a class range
    (CLASS_RANGE_BASE) if cr != NULL. In case of class range, 'cr' is
    initialized. Otherwise, it is ignored. */
-static int get_class_atom(REParseState *s, REStringList *cr,
-                          const uint8_t **pp, bool inclass)
+static int get_class_atom_1(REParseState *s, REStringList *cr,
+                            const uint8_t **pp, bool inclass)
 {
     const uint8_t *p;
     uint32_t c;
@@ -1229,12 +1219,8 @@ static int get_class_atom(REParseState *s, REStringList *cr,
             }
             goto default_escape;
         case 'q':
-            if (s->unicode_sets && cr && inclass) {
-                if (parse_class_string_disjunction(s, cr, &p))
-                    return -1;
-                c = CLASS_RANGE_BASE;
-                break;
-            }
+            /* the wrapper answered `\q{…}` before this body ran, so reaching it here means the guard it
+               applies was false and `\q` is an ordinary escape. */
             goto default_escape;
         default:
         default_escape:
@@ -1318,6 +1304,28 @@ static int get_class_atom(REParseState *s, REStringList *cr,
     }
     *pp = p;
     return c;
+}
+
+/* ClassAtom, INCLUDING `\q{…}`. The one production whose operand is a list of atoms is answered HERE and
+   nowhere else, and its elements go to get_class_atom_1 above, which has no `\q` branch — so the grammar's
+   only self-edge is cut by structure. It was previously cut by a state flag plus an assert saying "the element
+   call passes cr=NULL, so the branch is unreachable", which is a true fact about today's code and not an
+   invariant the compiler could keep.
+   Reading p[1] is safe whenever p[0] is a backslash: that means p is inside the buffer, so p[1] is at worst
+   the terminator the body's own `case '\0'` already relies on. */
+static int get_class_atom(REParseState *s, REStringList *cr,
+                          const uint8_t **pp, bool inclass)
+{
+    const uint8_t *p = *pp;
+
+    if (p[0] == '\\' && p[1] == 'q' && s->unicode_sets && cr && inclass) {
+        p += 2;
+        if (parse_class_string_disjunction(s, cr, &p))
+            return -1;
+        *pp = p;
+        return CLASS_RANGE_BASE;
+    }
+    return get_class_atom_1(s, cr, pp, inclass);
 }
 
 static int re_emit_range(REParseState *s, const CharRange *cr)
@@ -3103,7 +3111,6 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
     s->dotall = ((re_flags & LRE_FLAG_DOTALL) != 0);
     s->unicode_sets = ((re_flags & LRE_FLAG_UNICODE_SETS) != 0);
     s->capture_count = 1;
-    s->in_class_string_disjunction = false;
     s->total_capture_count = -1;
     s->has_named_captures = -1;
 
