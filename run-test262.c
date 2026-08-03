@@ -1025,10 +1025,14 @@ static JSValue add_helpers1(JSContext *ctx)
 
     is_html_dda = JS_NewCFunction(ctx, js_IsHTMLDDA, "IsHTMLDDA", 0);
     JS_SetIsHTMLDDA(ctx, is_html_dda);
-#define N 7
+    /* `gc` is INTERPRETING.md's host hook — "wraps the host's garbage collection invocation mechanism, if such
+       a capability exists", and the tests that need it are the ones whose semantics ARE collection: WeakRef,
+       FinalizationRegistry, a WeakMap entry going away. It existed as a bare global and not on $262, so the
+       whole host-gc-required feature was skipped even though the capability was already there. */
+#define N 8
     static const char *props[N] = {
         "detachArrayBuffer", "evalScript", "codePointRange",
-        "agent", "global", "createRealm", "IsHTMLDDA",
+        "agent", "global", "createRealm", "IsHTMLDDA", "gc",
     };
     JSValue values[N] = {
         JS_NewCFunction(ctx, js_detachArrayBuffer, "detachArrayBuffer", 1),
@@ -1038,6 +1042,7 @@ static JSValue add_helpers1(JSContext *ctx)
         JS_DupValue(ctx, global_obj),
         JS_NewCFunction(ctx, js_createRealm, "createRealm", 0),
         is_html_dda,
+        JS_NewCFunction(ctx, js_gc, "gc", 0),
     };
     /* $262 special object used by the tests */
     obj262 = JS_NewObjectFromStr(ctx, N, props, values);
@@ -2332,6 +2337,7 @@ void help(void)
            "-e file        load the known errors from 'file'\n"
            "-f file        execute single test from 'file'\n"
            "-x file        exclude tests listed in 'file'\n"
+           "-I dir         re-include a directory the config excludes (file exclusions still apply)\n"
            "--no-can-block set [[CanBlock]] to false (Atomics.wait will throw)\n",
            JS_GetVersion());
     exit(1);
@@ -2377,7 +2383,7 @@ int main(int argc, char **argv)
         if (*arg != '-')
             break;
         optind++;
-        if (strstr("-c -d -e -x -f -E -T -t", arg))
+        if (strstr("-c -d -e -x -I -f -E -T -t", arg))
             optind++;
         if (strstr("-d -f", arg))
             ignore = "testdir"; // run only the tests from -d or -f
@@ -2415,6 +2421,21 @@ int main(int argc, char **argv)
             error_filename = strdup(get_opt_arg(arg, argv[optind++]));
         } else if (str_equal(arg, "-x")) {
             namelist_load(&exclude_list, get_opt_arg(arg, argv[optind++]));
+        } else if (str_equal(arg, "-I")) {
+            /* RE-INCLUDE a directory the config excludes, for a run that names it on purpose. The exclude list
+               already understands a leading `!` and resolves overlaps by longest prefix, so this needs no new
+               matching rule — it writes the entry the config could have written. FILE-level exclusions are
+               untouched: those are matched by equality in include_exclude_or_skip, not by prefix here, so a
+               single file the config rules out for a stated reason stays out. */
+            {
+                const char *p = get_opt_arg(arg, argv[optind++]);
+                char *bang = malloc(strlen(p) + 3);
+                if (!bang)
+                    fatal(1, "out of memory");
+                snprintf(bang, strlen(p) + 3, "!%s%s", p, js__has_suffix(p, "/") ? "" : "/");
+                namelist_add(&exclude_list, NULL, bang);
+                free(bang);
+            }
         } else if (str_equal(arg, "-f")) {
             is_dir_list = false;
         } else if (str_equal(arg, "-E")) {
