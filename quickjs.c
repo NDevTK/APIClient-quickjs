@@ -197,6 +197,8 @@ enum {
     JS_CLASS_DOM_EXCEPTION,
     JS_CLASS_CALL_SITE,
     JS_CLASS_RAWJSON,
+    JS_CLASS_SHADOW_REALM,      /* u.shadow_realm_data */
+    JS_CLASS_WRAPPED_FUNCTION,  /* u.wrapped_function_data */
 
     JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
 };
@@ -1318,6 +1320,17 @@ struct JSShape {
     uint32_t hash_table[]; /* prop_hash_mask + 1 elements, then prop[prop_size] */
 };
 
+/* The two ShadowRealm slot carriers, up here because JS_GetFunctionRealm reads a wrapped function's
+   [[Realm]] and the object union names both. Their operations live with the rest of the membrane. */
+typedef struct JSShadowRealmData {
+    JSContext *realm;   /* [[ShadowRealm]] */
+} JSShadowRealmData;
+
+typedef struct JSWrappedFunctionData {
+    JSValue target;     /* [[WrappedTargetFunction]] */
+    JSContext *realm;   /* [[Realm]] — the realm this wrapper belongs to; its caller's */
+} JSWrappedFunctionData;
+
 struct JSObject {
     /* ref_count/gc_obj_type/mark live in the allocator block header; the object
        body keeps only the GC list link plus the object's own flags. */
@@ -1363,6 +1376,8 @@ struct JSObject {
         struct JSIteratorHelperData *iterator_helper_data; /* JS_CLASS_ITERATOR_HELPER */
         struct JSIteratorWrapData *iterator_wrap_data; /* JS_CLASS_ITERATOR_WRAP */
         struct JSProxyData *proxy_data; /* JS_CLASS_PROXY */
+        struct JSShadowRealmData *shadow_realm_data; /* JS_CLASS_SHADOW_REALM */
+        struct JSWrappedFunctionData *wrapped_function_data; /* JS_CLASS_WRAPPED_FUNCTION */
         struct JSPromiseData *promise_data; /* JS_CLASS_PROMISE */
         struct JSPromiseFunctionData *promise_function_data; /* JS_CLASS_PROMISE_RESOLVE_FUNCTION, JS_CLASS_PROMISE_REJECT_FUNCTION */
         struct JSAsyncFunctionData *async_function_data; /* JS_CLASS_ASYNC_FUNCTION_RESOLVE, JS_CLASS_ASYNC_FUNCTION_REJECT */
@@ -1700,6 +1715,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     /* thirteen contiguous ids, one per CreateHTML tag: JS_CFUNC_STEP_DEF spends the builtin's magic
        on the step id, so the tag has to come from the id. */
     STEPDEF_STR_HTML_BASE, STEPDEF_STR_HTML_LAST = STEPDEF_STR_HTML_BASE + 12,
+    STEPDEF_SHADOWREALM_CTOR, STEPDEF_SHADOWREALM_EVALUATE, STEPDEF_SHADOWREALM_IMPORTVALUE,
     STEPDEF_COUNT
 };
 #define HINT_NONE    2
@@ -3313,6 +3329,7 @@ JSContext *JS_NewContext(JSRuntime *rt)
         JS_AddIntrinsicTypedArrays(ctx) ||
         JS_AddIntrinsicPromise(ctx) ||
         JS_AddIntrinsicWeakRef(ctx) ||
+        JS_AddIntrinsicShadowRealm(ctx) ||
         JS_AddIntrinsicAToB(ctx) ||
         JS_AddPerformance(ctx)) {
         JS_FreeContext(ctx);
@@ -6836,6 +6853,12 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     case JS_CLASS_DATE:
     case JS_CLASS_BIG_INT:
         p->u.object_data = JS_UNDEFINED;
+        goto set_exotic;
+    case JS_CLASS_SHADOW_REALM:
+    case JS_CLASS_WRAPPED_FUNCTION:
+        /* NULL for the reason RegExp's two slots are: the object exists before its data does, so a throw or an
+           abandon between OrdinaryCreateFromConstructor and the attach reaches the finalizer with neither. */
+        p->u.opaque = NULL;
         goto set_exotic;
     case JS_CLASS_REGEXP:
         p->u.regexp.pattern = NULL;
@@ -19138,13 +19161,16 @@ enum { PROG_PH_START = 0, PROG_PH_RAN };
 
 static inline bool tramp_body_is_plain(JSValueConst func);
 
-/* `origin_flags` is JS_EVAL_FLAG_FUNCTION_CTOR for the Function constructor and 0 for the indirect eval. The
+/* `realm` is the realm the program BELONGS to — its own for eval and the Function constructor, the eval realm
+   for ShadowRealm.prototype.evaluate, whose 3.2.1 is this same compile-then-call in another global environment.
+   It is a parameter rather than `ctx` because the machine performing it runs in the CALLER's realm.
+   `origin_flags` is JS_EVAL_FLAG_FUNCTION_CTOR for the Function constructor and 0 for the indirect eval. The
    two share this body because their algorithm IS the same program evaluation — and they are not the same
    ORIGIN: `new Function` produces code with no eval origin and CallSite#isEval must say so. Passing the flag
    in rather than hardcoding it here is the difference between one implementation and one implementation that
    quietly asserts both callers are the same thing; hardcoded, indirect eval reported itself as not an eval. */
-static int step_program_run(JSContext *ctx, JSStepHdr *h, JSValueConst src, JSValue in, JSValue *pout,
-                            JSValue **out_cb, int *out_argc, int origin_flags)
+static int step_program_run(JSContext *ctx, JSStepHdr *h, JSContext *realm, JSValueConst src, JSValue in,
+                            JSValue *pout, JSValue **out_cb, int *out_argc, int origin_flags)
 {
     if (h->prog_phase == PROG_PH_START) {
         JSValue clo;
@@ -19158,7 +19184,7 @@ static int step_program_run(JSContext *ctx, JSStepHdr *h, JSValueConst src, JSVa
         str = JS_ToCStringLen(ctx, &len, src);
         if (!str)
             return -1;
-        clo = JS_EvalInternal(ctx, ctx->global_obj, str, len, "<input>", 1,
+        clo = JS_EvalInternal(realm, realm->global_obj, str, len, "<input>", 1,
                               JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE | origin_flags, -1);
         JS_FreeCString(ctx, str);
         if (JS_IsException(clo))
@@ -19167,7 +19193,7 @@ static int step_program_run(JSContext *ctx, JSStepHdr *h, JSValueConst src, JSVa
         DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                "a coercion is already in flight on this machine's header");
         h->coerce = clo;                     /* owned across the call */
-        h->cb_coerce[0] = ctx->global_obj;   /* borrowed: the context holds the global object */
+        h->cb_coerce[0] = realm->global_obj; /* borrowed: the realm holds its global object */
         h->cb_coerce[1] = h->coerce;         /* borrowed view */
         *out_cb = h->cb_coerce; *out_argc = 0;
         h->prog_phase = PROG_PH_RAN;
@@ -39333,6 +39359,10 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
         case JS_CLASS_BOUND_FUNCTION:
             cur = p->u.bound_function->func_obj;   /* step 4, in tail position */
             break;
+        case JS_CLASS_WRAPPED_FUNCTION:
+            /* step 2: an ordinary object with a [[Realm]] answers with it. A wrapped function has one — that
+               is the realm its arguments are wrapped INTO when it is called. */
+            return p->u.wrapped_function_data->realm;
         default:
             return ctx;
         }
@@ -63661,12 +63691,14 @@ static JSValue JS_NewGlobalCConstructor(JSContext *ctx, const char *name,
 /* A global constructor whose implementation is a STEP MACHINE. Same two lines as the two above; only the
    cproto differs, and `magic` names the machine rather than a mode. It exists because a constructor that
    performs 10.1.14's `? Get(newTarget, "prototype")` from C runs the page's getter below the live flow. */
-static JSValue JS_NewGlobalCConstructorStep(JSContext *ctx, const char *name, int length,
-                                            JSValueConst proto, int stepid)
+/* VOID, because JS_NewGlobalCConstructor2 CONSUMES func_obj — the value this used to return had already been
+   freed, so a caller that treated it as its own (the obvious reading of a JSValue return) double-freed the
+   constructor and the next GC walked a zero-refcount object. Every caller ignored it; now none can. */
+static void JS_NewGlobalCConstructorStep(JSContext *ctx, const char *name, int length,
+                                         JSValueConst proto, int stepid)
 {
     JSValue func_obj = JS_NewCFunctionMagic(ctx, NULL, name, length, JS_CFUNC_step_ctor, stepid);
     JS_NewGlobalCConstructor2(ctx, func_obj, name, proto);
-    return func_obj;
 }
 
 static JSValue JS_NewGlobalCConstructorMagic(JSContext *ctx, const char *name,
@@ -63790,7 +63822,7 @@ typedef struct JSProgEval {
 static int js_global_eval_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSProgEval *s = st;
-    int r = step_program_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->result, out_cb, out_argc, 0);
+    int r = step_program_run(ctx, &s->hdr, ctx, step_arg(&s->hdr, 0), cb_result, &s->result, out_cb, out_argc, 0);
     return r ? (r < 0 ? -1 : r) : 0;
 }
 
@@ -66111,13 +66143,13 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         if (JS_IsException(src))
             return -1;
         s->hdr.stage = 2;
-        r = step_program_run(ctx, &s->hdr, src, JS_UNDEFINED, &s->func, out_cb, out_argc,
+        r = step_program_run(ctx, &s->hdr, ctx, src, JS_UNDEFINED, &s->func, out_cb, out_argc,
                              JS_EVAL_FLAG_FUNCTION_CTOR);
         JS_FreeValue(ctx, src);
         if (r) return r < 0 ? -1 : r;
         created = true;
     } else if (s->hdr.stage == 2) {
-        r = step_program_run(ctx, &s->hdr, JS_UNDEFINED, cb_result, &s->func, out_cb, out_argc,
+        r = step_program_run(ctx, &s->hdr, ctx, JS_UNDEFINED, cb_result, &s->func, out_cb, out_argc,
                              JS_EVAL_FLAG_FUNCTION_CTOR);
         if (r) return r < 0 ? -1 : r;
         created = true;
@@ -74042,6 +74074,11 @@ static const JSTrampStepDef js_weakmap_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS
 static const JSTrampStepDef js_promise_resolvefn_def;
 static const JSTrampStepDef js_proxy_call_def;
 static const JSTrampStepDef js_proxy_construct_def;
+/* likewise: the ShadowRealm machines are defined with the realm code they belong to. */
+static const JSTrampStepDef js_wrapped_function_call_def;
+static const JSTrampStepDef js_shadow_realm_ctor_def;
+static const JSTrampStepDef js_shadow_realm_evaluate_def;
+static const JSTrampStepDef js_shadow_realm_importvalue_def;
 
 /* DisposeResources' state. It lives here rather than beside its step functions because the table below names
    the definition, and the definition names this size — the resource list is reached through a forward tag so the
@@ -74189,6 +74226,9 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_DISPOSABLE_CTOR] = &js_disposable_ctor_def,
     [STEPDEF_STR_TOLOWER] = &js_str_toLower_def,
     [STEPDEF_STR_TOUPPER] = &js_str_toUpper_def,
+    [STEPDEF_SHADOWREALM_CTOR]        = &js_shadow_realm_ctor_def,
+    [STEPDEF_SHADOWREALM_EVALUATE]    = &js_shadow_realm_evaluate_def,
+    [STEPDEF_SHADOWREALM_IMPORTVALUE] = &js_shadow_realm_importvalue_def,
     [STEPDEF_STR_HTML_BASE + 0] = &js_str_html_defs[0],
     [STEPDEF_STR_HTML_BASE + 1] = &js_str_html_defs[1],
     [STEPDEF_STR_HTML_BASE + 2] = &js_str_html_defs[2],
@@ -74530,6 +74570,12 @@ static const JSTrampStepDef *tramp_step_def_of(JSValueConst func)
            the resolving functions below give, for the same reason — the algorithm has user-code steps, so it
            belongs on the tramp rather than in a class hook that reads with JS_GetProperty from C. */
         return &js_proxy_call_def;
+    }
+    if (fp->class_id == JS_CLASS_WRAPPED_FUNCTION) {
+        /* a ShadowRealm wrapped function IS a step machine: its [[Call]] wraps every argument (each wrap is
+           CopyNameAndLength's three property reads on the target, so an accessor or a Proxy trap), calls the
+           target, and wraps the RESULT — a continuation held across a call. */
+        return &js_wrapped_function_call_def;
     }
     if (fp->class_id == JS_CLASS_PROMISE_RESOLVE_FUNCTION
         || fp->class_id == JS_CLASS_PROMISE_REJECT_FUNCTION) {
@@ -91757,6 +91803,782 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
     JS_NewGlobalCConstructorStep(ctx, "AsyncDisposableStack", 0,
                                  ctx->class_proto[JS_CLASS_ASYNC_DISPOSABLE_STACK],
                                  STEPDEF_ASYNC_DISPOSABLE_CTOR);
+    return 0;
+}
+
+
+/* ---- ShadowRealm ---------------------------------------------------------------------------------------
+
+   A ShadowRealm is a second global environment in the SAME agent, which is exactly what a JSContext already
+   is — so the object holds one, and CreateRealm + SetRealmGlobalObject + SetDefaultGlobalBindings are
+   JS_NewContext. What the proposal actually adds is the MEMBRANE: nothing but primitives and WRAPPED
+   FUNCTIONS crosses between the two realms.
+
+   Both halves of that membrane run the page's code, so neither can be a C loop. WrappedFunctionCreate
+   performs CopyNameAndLength, whose HasOwnProperty and two Gets land on an accessor or a Proxy trap; and a
+   wrapped function's [[Call]] wraps every argument, calls the target, and wraps the RESULT — a continuation
+   held across a call. Both are step machines, and the wrap is a resumable sub-sequence a machine drives, so
+   wrapping ONE argument can suspend inside a `get` trap while the rest of the list is still to come. */
+
+static void js_shadow_realm_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSShadowRealmData *sd = p->u.shadow_realm_data;
+    if (sd) {
+        if (sd->realm)
+            JS_FreeContext(sd->realm);
+        js_free_rt(rt, sd);
+    }
+}
+
+static void js_shadow_realm_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSShadowRealmData *sd = p->u.shadow_realm_data;
+    if (sd && sd->realm)
+        mark_func(rt, &sd->realm->header);
+}
+
+static void js_wrapped_function_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSWrappedFunctionData *wd = p->u.wrapped_function_data;
+    if (wd) {
+        JS_FreeValueRT(rt, wd->target);
+        if (wd->realm)
+            JS_FreeContext(wd->realm);
+        js_free_rt(rt, wd);
+    }
+}
+
+static void js_wrapped_function_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSWrappedFunctionData *wd = p->u.wrapped_function_data;
+    if (wd) {
+        JS_MarkValue(rt, wd->target, mark_func);
+        if (wd->realm)
+            mark_func(rt, &wd->realm->header);
+    }
+}
+
+/* A wrapped function's [[Call]] is the step machine below and nothing else. This entry exists so
+   JS_IsFunction answers true for the class (it reads `call != NULL`), and so a C-side [[Call]] that has not
+   been routed FAILS VISIBLY instead of running the membrane with no flow base — the same contract
+   js_proxy_call carries. */
+static JSValue js_wrapped_function_call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
+                                        int argc, JSValueConst *argv, int flags)
+{
+    DFAIL("a C-side [[Call]] reached a ShadowRealm wrapped function — its argument and result wraps run the "
+          "page's code and have no flow base here; route that caller onto the call convergence point");
+    (void)func_obj; (void)this_obj; (void)argc; (void)argv; (void)flags;
+    JS_ThrowInternalError(ctx, "[[Call]] on a wrapped function is only implemented on the interpreter's chain");
+    return JS_EXCEPTION;
+}
+
+/* 3.2.3 GetWrappedValue + 3.2.4 WrappedFunctionCreate + 3.2.5 CopyNameAndLength, as ONE resumable
+   sub-sequence. It is one and not three because CopyNameAndLength is the only part that suspends and it is
+   reached from nowhere else; splitting it would give three cursors where the algorithm has one. */
+typedef struct JSWrapSeq {
+    uint8_t phase;
+    JSValue wrapper;   /* the wrapped function under construction (owned) */
+    JSValue value;     /* the target being wrapped (owned) — the receiver of the three reads */
+} JSWrapSeq;
+enum { WRAP_PH_START = 0, WRAP_PH_LEN_OWN, WRAP_PH_LEN, WRAP_PH_NAME };
+
+static void js_wrap_seq_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSWrapSeq *w = st;
+    v->val(ctx, &w->wrapper);
+    v->val(ctx, &w->value);
+}
+
+/* WrappedFunctionCreate steps 1-6: the object, its caller-realm %Function.prototype%, and the two slots.
+   Steps 7-8 (CopyNameAndLength) are the requests the sequence below makes. */
+static JSValue js_new_wrapped_function(JSContext *ctx, JSContext *realm, JSValueConst target)
+{
+    JSWrappedFunctionData *wd;
+    JSValue obj;
+
+    obj = JS_NewObjectProtoClass(ctx, realm->function_proto, JS_CLASS_WRAPPED_FUNCTION);
+    if (JS_IsException(obj))
+        return obj;
+    wd = js_malloc(ctx, sizeof(*wd));
+    if (!wd) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    wd->target = js_dup(target);
+    wd->realm = JS_DupContext(realm);
+    JS_VALUE_GET_OBJ(obj)->u.wrapped_function_data = wd;
+    return obj;
+}
+
+/* 3.2.5 steps 4.b and 5: SetFunctionLength(F, L) from whatever `length` the target answered with. CONSUMES
+   len_val. A non-Number contributes nothing, which is what leaves L at its step-2 value of 0. */
+static void js_wrap_set_length(JSContext *ctx, JSWrapSeq *w, JSValue len_val)
+{
+    JSValue out = js_int32(0);
+
+    if (JS_VALUE_GET_TAG(len_val) == JS_TAG_INT) {
+        int n = JS_VALUE_GET_INT(len_val);
+        out = js_int32(n < 0 ? 0 : n);
+    } else if (JS_VALUE_GET_NORM_TAG(len_val) == JS_TAG_FLOAT64) {
+        double d = JS_VALUE_GET_FLOAT64(len_val);
+        if (isnan(d))
+            d = 0.0;                       /* ToIntegerOrInfinity(NaN) is 0 */
+        else if (d == INFINITY)
+            out = js_number(INFINITY);     /* step 4.b.i: L is +INFINITY, and the property says so */
+        else
+            d = trunc(d);
+        if (d != INFINITY)
+            out = js_number(d <= 0 ? 0.0 : d);   /* -INFINITY and every negative land on step 4.b.ii's 0 */
+    }
+    JS_FreeValue(ctx, len_val);
+    JS_DefinePropertyValue(ctx, w->wrapper, JS_ATOM_length, out, JS_PROP_CONFIGURABLE);
+}
+
+/* WrappedFunctionCreate step 8: an abrupt CopyNameAndLength is a TypeError, whatever it actually threw. The
+   pending completion is dropped here rather than propagated, which is the whole of that step. */
+static int js_wrap_abrupt(JSContext *ctx, JSContext *err_realm)
+{
+    JSValue e = JS_GetException(ctx);
+    JS_FreeValue(ctx, e);
+    JS_ThrowTypeError(err_realm, "cannot wrap the value: reading its name or length threw");
+    return -1;
+}
+
+/* GetWrappedValue(realm, value). 0 = done and *pout is owned, 6 = the caller must return that step code,
+   -1 = threw. Re-entered at the SAME call site with the request's answer in `in`, exactly as
+   step_getprop_run is. */
+static int step_wrap_run(JSContext *ctx, JSStepHdr *h, JSWrapSeq *w, JSContext *realm,
+                         JSContext *err_realm, JSValueConst value, JSValue in, JSValue *pout,
+                         JSValue **out_cb, int *out_argc)
+{
+    switch (w->phase) {
+    case WRAP_PH_START:
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT) {
+            *pout = js_dup(value);         /* step 2: a primitive crosses unchanged */
+            return 0;
+        }
+        if (!JS_IsFunction(ctx, value)) {
+            /* step 1.b: a non-callable object cannot cross the membrane at all. */
+            /* the TypeError is the RUNNING realm's, not the one the wrapper would have been created in:
+               10.4.x runs a wrapped function's [[Call]] in its caller's context, and a test that catches this
+               compares constructor identity. */
+            JS_ThrowTypeError(err_realm, "cross-realm value must be callable");
+            return -1;
+        }
+        w->value = js_dup(value);
+        w->wrapper = js_new_wrapped_function(ctx, realm, value);
+        if (JS_IsException(w->wrapper)) {
+            w->wrapper = JS_UNDEFINED;
+            return -1;
+        }
+        /* 3.2.5 step 3: HasOwnProperty(Target, "length"). Only whether it EXISTS is wanted, so the ordinary
+           descriptor-object answer says it — undefined means absent. */
+        w->phase = WRAP_PH_LEN_OWN;
+        h->cb_coerce[0] = w->value;        /* borrowed: the sequence owns it across the request */
+        *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_length;
+        return 12;
+    case WRAP_PH_LEN_OWN: {
+        bool has_len;
+        if (JS_IsException(in))
+            return js_wrap_abrupt(ctx, err_realm);
+        has_len = !JS_IsUndefined(in);
+        JS_FreeValue(ctx, in);
+        if (has_len) {
+            w->phase = WRAP_PH_LEN;        /* step 4.a: Get(Target, "length") */
+            h->cb_coerce[0] = w->value;
+            *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_length;
+            return 6;
+        }
+        js_wrap_set_length(ctx, w, js_int32(0));   /* step 2: L stays 0 when the target has no own length */
+        goto want_name;
+    }
+    case WRAP_PH_LEN:
+        if (JS_IsException(in))
+            return js_wrap_abrupt(ctx, err_realm);
+        js_wrap_set_length(ctx, w, in);    /* consumes it */
+    want_name:
+        w->phase = WRAP_PH_NAME;           /* step 6: Get(Target, "name") */
+        h->cb_coerce[0] = w->value;
+        *out_cb = h->cb_coerce; *out_argc = (int)JS_ATOM_name;
+        return 6;
+    default: {
+        JSValue name;
+        DCHECK(w->phase == WRAP_PH_NAME, "GetWrappedValue's sub-sequence resumed in no phase");
+        if (JS_IsException(in))
+            return js_wrap_abrupt(ctx, err_realm);
+        name = in;
+        if (!JS_IsString(name)) {          /* step 7 */
+            JS_FreeValue(ctx, name);
+            name = js_empty_string(ctx->rt);
+        }
+        JS_DefinePropertyValue(ctx, w->wrapper, JS_ATOM_name, name, JS_PROP_CONFIGURABLE);
+        JS_FreeValue(ctx, w->value);
+        w->value = JS_UNDEFINED;
+        *pout = w->wrapper;
+        w->wrapper = JS_UNDEFINED;
+        w->phase = WRAP_PH_START;
+        return 0;
+    }
+    }
+}
+
+/* 3.4 [[Call]] of a wrapped function. Steps 6 and 7 wrap the arguments and the receiver INTO the target's
+   realm, step 8 calls the target, and step 9 wraps the result back into the caller's — which is why this is
+   a machine and not a class hook: the wrap after the call is a continuation the call is made across, and
+   every wrap before it can itself suspend in a `get` trap. */
+typedef struct JSWrappedCall {
+    JSStepHdr hdr;      /* MUST be first; hdr.func_obj IS the wrapper, hdr.this_val the thisArgument */
+    JSValue result;     /* owned */
+    JSValue *cb;        /* [wrappedThis, target, wrappedArgs…] — its own block */
+    int ncb;
+    int wi;             /* which operand the wrap is on: 0..argc-1 the arguments, argc the receiver */
+    JSValue retval;     /* the target's result, held across the wrap of it (owned) */
+    JSWrapSeq w;
+} JSWrappedCall;
+enum { WC_ST_WRAP = 1, WC_ST_CALLED, WC_ST_RETWRAP };
+
+/* step 10: an abrupt completion of the target's call is a TypeError, whatever it threw. */
+static int js_wrapped_call_abrupt(JSContext *ctx, JSContext *err_realm)
+{
+    JSValue e = JS_GetException(ctx);
+    JS_FreeValue(ctx, e);
+    JS_ThrowTypeError(err_realm, "wrapped function threw");
+    return -1;
+}
+
+static int js_wrapped_function_call_step(JSContext *ctx, void *st, JSValue cb_result,
+                                         JSValue **out_cb, int *out_argc)
+{
+    JSWrappedCall *s = st;
+    JSObject *fp = JS_VALUE_GET_OBJ(s->hdr.func_obj);
+    JSWrappedFunctionData *wd = fp->u.wrapped_function_data;
+    JSContext *target_realm;
+    int n = s->hdr.argc, r;
+
+    DCHECK(fp->class_id == JS_CLASS_WRAPPED_FUNCTION && wd != NULL,
+           "the wrapped-function [[Call]] machine was entered on a callee that is not one");
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(n + 2));
+        if (unlikely(!s->cb))
+            return -1;
+        s->ncb = n + 2;
+        for (r = 0; r < n + 2; r++)
+            s->cb[r] = JS_UNDEFINED;
+        s->cb[1] = js_dup(wd->target);
+        s->retval = JS_UNDEFINED;
+        s->wi = 0;
+        s->hdr.stage = WC_ST_WRAP;
+    }
+
+    if (s->hdr.stage == WC_ST_WRAP) {
+        /* step 4: GetFunctionRealm(target) — a Proxy chain answers it, and a revoked one throws. */
+        target_realm = JS_GetFunctionRealm(ctx, wd->target);
+        if (!target_realm)
+            return -1;
+        /* steps 6 and 7, in the spec's order: every argument, then the receiver. */
+        while (s->wi <= n) {
+            JSValueConst src = (s->wi < n) ? s->hdr.argv[s->wi] : s->hdr.this_val;
+            JSValue wrapped;
+            r = step_wrap_run(ctx, &s->hdr, &s->w, target_realm, wd->realm, src, cb_result, &wrapped,
+                              out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r)
+                return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, s->cb[(s->wi < n) ? s->wi + 2 : 0]);
+            s->cb[(s->wi < n) ? s->wi + 2 : 0] = wrapped;
+            s->wi++;
+        }
+        s->hdr.stage = WC_ST_CALLED;
+        *out_cb = s->cb; *out_argc = n;
+        return 3;   /* step 8: Call(target, wrappedThisArgument, wrappedArgs) */
+    }
+
+    DCHECK(s->hdr.stage == WC_ST_CALLED || s->hdr.stage == WC_ST_RETWRAP,
+           "the wrapped-function [[Call]] machine resumed in no stage");
+    if (s->hdr.stage == WC_ST_CALLED) {
+        if (JS_IsException(cb_result))
+            return js_wrapped_call_abrupt(ctx, wd->realm);
+        /* THE VALUE BEING WRAPPED HAS TO OUTLIVE THE WRAP. step_wrap_run reads it only in its start phase and
+           reads the REQUEST ANSWER in every later one, so a caller that keeps passing the same C local for both
+           hands the answer back as the value and silently skips the reads — CopyNameAndLength then never ran
+           and every wrapper's `length` was 0. */
+        s->retval = cb_result;
+        cb_result = JS_UNDEFINED;
+        s->hdr.stage = WC_ST_RETWRAP;
+    }
+    /* step 9: the result crosses back into the CALLER's realm. It reuses the same sub-sequence, which is
+       free because the wrap loop above left it at its start phase. */
+    r = step_wrap_run(ctx, &s->hdr, &s->w, wd->realm, wd->realm, s->retval, cb_result, &s->result,
+                      out_cb, out_argc);
+    if (r)
+        return r < 0 ? -1 : r;
+    JS_FreeValue(ctx, s->retval);
+    s->retval = JS_UNDEFINED;
+    return 0;
+}
+
+static void js_wrapped_function_call_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSWrappedCall *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->retval);
+    v->array(ctx, (void **)&s->cb, sizeof(JSValue), s->ncb, s->ncb, js_step_visit_value_elem);
+    js_wrap_seq_visit(ctx, &s->w, v);
+}
+
+static JSValue js_wrapped_function_call_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSWrappedCall *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
+    return r;
+}
+
+static const JSTrampStepDef js_wrapped_function_call_def = {
+    sizeof(JSWrappedCall), js_wrapped_function_call_step, js_wrapped_function_call_fini, 0,
+    /* every request this machine makes has an abrupt completion the ALGORITHM converts — step 8's call and
+       WrappedFunctionCreate's three reads all become a TypeError — so the throw comes back as a value. */
+    .catches_abrupt = 1, .visit = js_wrapped_function_call_visit
+};
+
+/* 3.1.1 step 1: `ShadowRealm()` without new is a TypeError, before anything is created. */
+static int js_shadow_realm_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
+{
+    if (JS_IsUndefined(h->this_val)) {
+        JS_ThrowTypeError(ctx, "constructor ShadowRealm requires 'new'");
+        return -1;
+    }
+    return 0;
+}
+
+/* 3.1.1 steps 3-8. CreateRealm + SetRealmGlobalObject + SetDefaultGlobalBindings IS JS_NewContext: a
+   JSContext is a global environment plus its intrinsics, which is exactly the realm record. Nothing here
+   runs the page's code, so it is the machine's plain body. */
+static JSValue js_shadow_realm_ctor_body(JSContext *ctx, JSValueConst obj, int argc, JSValueConst *argv)
+{
+    JSShadowRealmData *sd;
+    JSContext *realm;
+
+    (void)argc; (void)argv;
+    realm = JS_NewContext(ctx->rt);
+    if (!realm) {
+        JS_FreeValue(ctx, obj);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    sd = js_malloc(ctx, sizeof(*sd));
+    if (!sd) {
+        JS_FreeContext(realm);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    sd->realm = realm;
+    JS_VALUE_GET_OBJ(obj)->u.shadow_realm_data = sd;
+    return obj;
+}
+
+static const JSTrampStepDef js_shadow_realm_ctor_def =
+    CREATECTOR_DEF_FULL(JS_CLASS_SHADOW_REALM, 0, generic, js_shadow_realm_ctor_body, 0,
+                        js_shadow_realm_ctor_precheck);
+
+/* 3.3 ValidateShadowRealmObject. */
+static JSShadowRealmData *js_shadow_realm_of(JSContext *ctx, JSValueConst v)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        goto fail;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->class_id != JS_CLASS_SHADOW_REALM || !p->u.shadow_realm_data)
+        goto fail;
+    return p->u.shadow_realm_data;
+ fail:
+    JS_ThrowTypeErrorInvalidClass(ctx, JS_CLASS_SHADOW_REALM);
+    return NULL;
+}
+
+/* 3.2.1 PerformShadowRealmEval. The script is COMPILED in the eval realm and then CALLED, so it runs on the
+   trampoline like any other program and a loop in it parks — which is the only way it can be run at all: the
+   caller is a step machine on the chain, and a JS_EvalInternal-to-completion here would be a bytecode body
+   entered by C recursion under the live flow.
+   The two error shapes are the caller realm's, not the eval realm's: a parse failure is step 8's SyntaxError
+   and everything else is step 17's TypeError, both created here, with what the eval realm threw dropped. */
+typedef struct JSShadowEval {
+    JSStepHdr hdr;      /* MUST be first — argv[0] = sourceText */
+    JSValue result;     /* owned */
+    JSValue retval;     /* the program's completion value, held across the wrap of it (owned) */
+    JSWrapSeq w;
+} JSShadowEval;
+enum { SE_ST_RAN = 1, SE_ST_WRAP };
+
+static int js_shadow_realm_evaluate_step(JSContext *ctx, void *st, JSValue cb_result,
+                                         JSValue **out_cb, int *out_argc)
+{
+    JSShadowEval *s = st;
+    JSShadowRealmData *sd;
+    int r;
+
+    sd = js_shadow_realm_of(ctx, s->hdr.this_val);
+    if (!sd)
+        return -1;
+
+    if (s->hdr.stage == 0) {
+        JSValueConst src = step_arg(&s->hdr, 0);
+        int pr;
+
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->retval = JS_UNDEFINED;
+        if (!JS_IsString(src)) {   /* 3.3.1 step 4 */
+            JS_ThrowTypeError(ctx, "sourceText must be a string");
+            return -1;
+        }
+        s->hdr.stage = SE_ST_RAN;
+        /* steps 7-16 ARE the indirect-eval sub-sequence, performed in the EVAL realm: compile the program,
+           then CALL it, so it runs on the trampoline and a loop in it parks. Running it to completion here
+           instead would be a bytecode body entered by C recursion under the live flow. */
+        pr = step_program_run(ctx, &s->hdr, sd->realm, src, JS_UNDEFINED, &s->retval,
+                              out_cb, out_argc, 0);
+        if (pr > 0)
+            return pr;
+        if (pr < 0) {
+            /* step 8: a PARSE failure is a SyntaxError of the CALLER's realm — the eval realm's error object
+               must not cross the membrane, and a caller catching it compares constructor identity. Everything
+               else (an out-of-memory on the source text) is not the spec's case and propagates unchanged. */
+            JSValue e = JS_GetException(ctx);
+            JSValue proto = JS_GetPrototype(ctx, e);
+            bool syn = js_same_value(ctx, proto, sd->realm->native_error_proto[JS_SYNTAX_ERROR]);
+            JS_FreeValue(ctx, proto);
+            if (!syn) {
+                JS_Throw(ctx, e);
+                return -1;
+            }
+            JS_FreeValue(ctx, e);
+            JS_ThrowSyntaxError(ctx, "ShadowRealm.prototype.evaluate: source text could not be parsed");
+            return -1;
+        }
+        /* a non-string source never reaches here, so the program always ran */
+        s->hdr.stage = SE_ST_WRAP;
+    } else if (s->hdr.stage == SE_ST_RAN) {
+        int pr;
+        if (JS_IsException(cb_result)) {
+            /* step 17 */
+            JSValue e = JS_GetException(ctx);
+            JS_FreeValue(ctx, e);
+            JS_ThrowTypeError(ctx, "ShadowRealm.prototype.evaluate: the evaluation threw");
+            return -1;
+        }
+        pr = step_program_run(ctx, &s->hdr, sd->realm, JS_UNDEFINED, cb_result, &s->retval,
+                              out_cb, out_argc, 0);
+        if (pr)
+            return pr < 0 ? -1 : pr;
+        /* held for the reason the wrapped call's result is: step_wrap_run reads the value only in its start
+           phase and the request ANSWER in every later one. */
+        s->hdr.stage = SE_ST_WRAP;
+        cb_result = JS_UNDEFINED;
+    } else {
+        DCHECK(s->hdr.stage == SE_ST_WRAP, "ShadowRealm.prototype.evaluate resumed in no stage");
+    }
+
+    /* step 18: the completion value crosses into the CALLER's realm. */
+    r = step_wrap_run(ctx, &s->hdr, &s->w, ctx, ctx, s->retval, cb_result, &s->result, out_cb, out_argc);
+    if (r)
+        return r < 0 ? -1 : r;
+    JS_FreeValue(ctx, s->retval);
+    s->retval = JS_UNDEFINED;
+    return 0;
+}
+
+static void js_shadow_realm_evaluate_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSShadowEval *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->retval);
+    js_wrap_seq_visit(ctx, &s->w, v);
+}
+
+static JSValue js_shadow_realm_evaluate_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSShadowEval *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
+    return r;
+}
+
+static const JSTrampStepDef js_shadow_realm_evaluate_def = {
+    sizeof(JSShadowEval), js_shadow_realm_evaluate_step, js_shadow_realm_evaluate_fini, 0,
+    /* steps 17 and 18 both convert an abrupt completion, so a throw comes back to the machine as a value. */
+    .catches_abrupt = 1, .visit = js_shadow_realm_evaluate_visit
+};
+
+/* 3.2.2's ExportGetter, as its own step machine. It is a promise reaction, so it is a closure
+   (JS_CLASS_C_FUNCTION_DATA) that DECLARES a step_def — the same thing Promise.all's resolve-element
+   closures do — because its GetWrappedValue can suspend in the target's `name` getter.
+   data[0] = the export name, data[1] = the ShadowRealm object whose [[Realm]] this getter wraps INTO. */
+typedef struct JSExportGetter {
+    JSStepHdr hdr;      /* MUST be first — argv[0] = the module namespace */
+    JSValue result;     /* owned */
+    JSValue value;      /* the export, held across the wrap of it (owned) */
+    JSAtom name;        /* [[ExportNameString]] as a key, held across both reads (owned) */
+    JSWrapSeq w;
+} JSExportGetter;
+enum { EG_ST_HAS = 1, EG_ST_GET, EG_ST_WRAP };
+
+static int js_export_getter_step(JSContext *ctx, void *st, JSValue cb_result,
+                                 JSValue **out_cb, int *out_argc)
+{
+    JSExportGetter *s = st;
+    JSObject *fp = JS_VALUE_GET_OBJ(s->hdr.func_obj);
+    JSCFunctionDataRecord *cr = fp->u.c_function_data_record;
+    JSContext *realm = cr && cr->realm ? cr->realm : ctx;
+    JSValueConst exports = step_arg(&s->hdr, 0);
+    int r;
+
+    DCHECK(cr != NULL && cr->data_len == 1, "the ExportGetter closure lost its [[ExportNameString]]");
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->value = JS_UNDEFINED;
+        s->name = JS_ValueToAtom(ctx, cr->data[0]);
+        if (s->name == JS_ATOM_NULL)
+            return -1;
+        s->hdr.stage = EG_ST_HAS;
+    }
+    if (s->hdr.stage == EG_ST_HAS) {
+        /* step 4: HasProperty(exports, string). A module NAMESPACE object answers it with no user code, but
+           WHICH exotic this is is the delivery's business and not this machine's — asked as a request, the
+           answer is the same and the question cannot become a C entry when the operand changes. */
+        int has = 0;
+        r = step_hasprop_run(ctx, &s->hdr, exports, s->name, cb_result, &has, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r)
+            return r < 0 ? -1 : r;
+        if (!has) {   /* step 5 */
+            JS_ThrowTypeError(realm, "the module does not export the requested name");
+            return -1;
+        }
+        s->hdr.stage = EG_ST_GET;
+    }
+    if (s->hdr.stage == EG_ST_GET) {
+        r = step_getprop_run(ctx, &s->hdr, exports, s->name, cb_result, &s->value, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r)
+            return r < 0 ? -1 : r;
+        s->hdr.stage = EG_ST_WRAP;
+    }
+    DCHECK(s->hdr.stage == EG_ST_WRAP, "the ExportGetter resumed in no stage");
+    /* step 8: into the realm this closure was created in, which is the caller's. */
+    r = step_wrap_run(ctx, &s->hdr, &s->w, realm, realm, s->value, cb_result, &s->result, out_cb, out_argc);
+    if (r)
+        return r < 0 ? -1 : r;
+    JS_FreeValue(ctx, s->value);
+    s->value = JS_UNDEFINED;
+    return 0;
+}
+
+static void js_export_getter_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSExportGetter *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->value);
+    v->atom(ctx, &s->name);
+    js_wrap_seq_visit(ctx, &s->w, v);
+}
+
+static JSValue js_export_getter_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSExportGetter *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
+    return r;
+}
+
+static const JSTrampStepDef js_export_getter_def = {
+    sizeof(JSExportGetter), js_export_getter_step, js_export_getter_fini, 0,
+    .visit = js_export_getter_visit
+};
+
+/* The C body of the ExportGetter closure. It is NOT a second implementation: a closure's step_def is
+   consulted at the call convergence point, and this entry is what a call that never reaches one would get —
+   so it fails visibly, the way every other unrouted membrane entry does. */
+static JSValue js_export_getter_body(JSContext *ctx, JSValueConst this_val, int argc,
+                                     JSValueConst *argv, int magic, JSValue *func_data)
+{
+    DFAIL("ShadowRealmImportValue's ExportGetter was called off the chain — its GetWrappedValue runs the "
+          "page's code and has no flow base here");
+    (void)this_val; (void)argc; (void)argv; (void)magic; (void)func_data;
+    JS_ThrowInternalError(ctx, "the ShadowRealm export getter only runs on the interpreter's chain");
+    return JS_EXCEPTION;
+}
+
+/* 3.3.2 ShadowRealm.prototype.importValue + 3.2.2 ShadowRealmImportValue. The specifier's ToString is the
+   page's code, so it is a request; everything after it is promise plumbing plus the ExportGetter above. */
+typedef struct JSShadowImport {
+    JSStepHdr hdr;      /* MUST be first — argv[0] = specifier, argv[1] = exportName */
+    JSValue result;     /* the outer capability's promise (owned) */
+    JSValue spec;       /* ToString(specifier) (owned) */
+} JSShadowImport;
+
+static int js_shadow_realm_importvalue_step(JSContext *ctx, void *st, JSValue cb_result,
+                                            JSValue **out_cb, int *out_argc)
+{
+    JSShadowImport *s = st;
+    JSShadowRealmData *sd;
+    JSValue inner, inner_funcs[2], outer, outer_funcs[2], getter, handlers[2];
+    JSValueConst gdata[1];
+    JSValue job_args[5];
+    JSAtom basename;
+    JSValue basename_val;
+    int r;
+
+    sd = js_shadow_realm_of(ctx, s->hdr.this_val);
+    if (!sd)
+        return -1;
+
+    if (s->hdr.stage == 0) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->result = JS_UNDEFINED;
+        s->spec = JS_UNDEFINED;
+        s->hdr.stage = 1;
+        /* step 3: ToString(specifier) — a `toString` method is the page's code. */
+        r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), JS_UNDEFINED, &s->spec,
+                              out_cb, out_argc);
+        if (r)
+            return r < 0 ? -1 : r;
+    } else {
+        DCHECK(s->hdr.stage == 1, "ShadowRealm.prototype.importValue resumed in no stage");
+        r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->spec, out_cb, out_argc);
+        if (r)
+            return r < 0 ? -1 : r;
+    }
+
+    if (!JS_IsString(step_arg(&s->hdr, 1))) {   /* step 4 */
+        JS_ThrowTypeError(ctx, "exportName must be a string");
+        return -1;
+    }
+
+    /* 3.2.2 step 1: the inner capability the host load settles. */
+    inner = JS_NewPromiseCapability(ctx, inner_funcs);
+    if (JS_IsException(inner))
+        return -1;
+    /* step 2: HostLoadImportedModule in the EVAL realm. The load cannot run synchronously — it would recurse
+       into the module evaluation below the live flow — so it is a job on that realm, which is exactly how
+       `import()` reaches the host. The referrer is the CALLER's script, because that is what a relative
+       specifier is relative to. */
+    basename = JS_GetScriptOrModuleName(ctx, 0);
+    basename_val = (basename == JS_ATOM_NULL) ? JS_NULL : JS_AtomToValue(ctx, basename);
+    JS_FreeAtom(ctx, basename);
+    job_args[0] = inner_funcs[0]; job_args[1] = inner_funcs[1];
+    job_args[2] = basename_val;   job_args[3] = s->spec; job_args[4] = JS_UNDEFINED;
+    JS_EnqueueJob(sd->realm, js_dynamic_import_job, 5, vc(job_args));
+    JS_FreeValue(ctx, basename_val);
+
+    /* steps 5-7: the ExportGetter, created in the CALLER's realm — which is what decides the realm its
+       GetWrappedValue wraps into. */
+    gdata[0] = step_arg(&s->hdr, 1);
+    getter = JS_NewCFunctionData(ctx, js_export_getter_body, 1, 0, 1, gdata);
+    if (JS_IsException(getter)) {
+        JS_FreeValue(ctx, inner);
+        JS_FreeValue(ctx, inner_funcs[0]); JS_FreeValue(ctx, inner_funcs[1]);
+        return -1;
+    }
+    promise_closure_set_step(getter, &js_export_getter_def);
+
+    /* steps 8-9: PerformPromiseThen(inner, onFulfilled, %ThrowTypeError%, outer). The rejection handler is
+       the intrinsic %ThrowTypeError%, which is 3.2.2's way of saying a load failure does not leak the eval
+       realm's error object across the membrane. */
+    outer = JS_NewPromiseCapability(ctx, outer_funcs);
+    if (JS_IsException(outer)) {
+        JS_FreeValue(ctx, getter);
+        JS_FreeValue(ctx, inner);
+        JS_FreeValue(ctx, inner_funcs[0]); JS_FreeValue(ctx, inner_funcs[1]);
+        return -1;
+    }
+    handlers[0] = getter;
+    handlers[1] = js_dup(ctx->throw_type_error);
+    r = perform_promise_then(ctx, inner, vc(handlers), vc(outer_funcs));
+    JS_FreeValue(ctx, handlers[0]);
+    JS_FreeValue(ctx, handlers[1]);
+    JS_FreeValue(ctx, inner);
+    JS_FreeValue(ctx, inner_funcs[0]); JS_FreeValue(ctx, inner_funcs[1]);
+    JS_FreeValue(ctx, outer_funcs[0]); JS_FreeValue(ctx, outer_funcs[1]);
+    if (r) {
+        JS_FreeValue(ctx, outer);
+        return -1;
+    }
+    s->result = outer;
+    return 0;
+}
+
+static void js_shadow_realm_importvalue_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSShadowImport *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->spec);
+}
+
+static JSValue js_shadow_realm_importvalue_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSShadowImport *s = st;
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
+    js_free(ctx, s);
+    return r;
+}
+
+static const JSTrampStepDef js_shadow_realm_importvalue_def = {
+    sizeof(JSShadowImport), js_shadow_realm_importvalue_step, js_shadow_realm_importvalue_fini, 0,
+    .visit = js_shadow_realm_importvalue_visit
+};
+
+static const JSCFunctionListEntry js_shadow_realm_proto_funcs[] = {
+    JS_CFUNC_STEP_DEF("evaluate", 1, STEPDEF_SHADOWREALM_EVALUATE ),
+    JS_CFUNC_STEP_DEF("importValue", 2, STEPDEF_SHADOWREALM_IMPORTVALUE ),
+    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "ShadowRealm", JS_PROP_CONFIGURABLE ),
+};
+
+static const JSClassShortDef js_shadow_realm_class_def[] = {
+    { JS_ATOM_Object, js_shadow_realm_finalizer, js_shadow_realm_mark },       /* JS_CLASS_SHADOW_REALM */
+    { JS_ATOM_Object, js_wrapped_function_finalizer, js_wrapped_function_mark }, /* JS_CLASS_WRAPPED_FUNCTION */
+};
+
+int JS_AddIntrinsicShadowRealm(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (!JS_IsRegisteredClass(rt, JS_CLASS_SHADOW_REALM)) {
+        if (init_class_range(rt, js_shadow_realm_class_def, JS_CLASS_SHADOW_REALM,
+                             countof(js_shadow_realm_class_def)))
+            return -1;
+        rt->class_array[JS_CLASS_WRAPPED_FUNCTION].call = js_wrapped_function_call;
+    }
+    ctx->class_proto[JS_CLASS_SHADOW_REALM] = JS_NewObject(ctx);
+    if (JS_IsException(ctx->class_proto[JS_CLASS_SHADOW_REALM]))
+        return -1;
+    JS_SetPropertyFunctionList(ctx, ctx->class_proto[JS_CLASS_SHADOW_REALM],
+                               js_shadow_realm_proto_funcs,
+                               countof(js_shadow_realm_proto_funcs));
+    JS_NewGlobalCConstructorStep(ctx, "ShadowRealm", 0,
+                                 ctx->class_proto[JS_CLASS_SHADOW_REALM],
+                                 STEPDEF_SHADOWREALM_CTOR);
     return 0;
 }
 
