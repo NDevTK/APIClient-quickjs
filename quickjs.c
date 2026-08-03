@@ -19637,6 +19637,8 @@ static void js_from_ctor_abandon(JSContext *ctx, void *st);
    before the kind list is declared. The _Static_assert at the list keeps the two from drifting. */
 #define CONT_ITER_CONSUME_FWD 8
 static void js_iter_consume_abandon(JSContext *ctx, void *st);
+static void *js_iter_consume_abandon_upto(JSContext *ctx, void *st, uint8_t *out_kind);
+static void *js_from_ctor_abandon_upto(JSContext *ctx, void *st, uint8_t *out_kind);
 /* CONT_ITER_HELPER's value, forward for the same reason. */
 #define CONT_ITER_HELPER_FWD  11
 static void js_iter_helper_abandon(JSContext *ctx, void *st);
@@ -20956,14 +20958,24 @@ typedef struct JSFromCtor {
 } JSFromCtor;
 struct JSIterConsume;
 static void js_iter_consume_end(JSContext *ctx, struct JSIterConsume *s);
-static void js_from_ctor_abandon(JSContext *ctx, void *st)
+static void *js_iter_consume_end_upto(JSContext *ctx, struct JSIterConsume *s, uint8_t *out_kind);
+static void *js_from_ctor_abandon_upto(JSContext *ctx, void *st, uint8_t *out_kind)
 {
     JSFromCtor *fc = st;
+    void *o;
     JS_FreeValue(ctx, fc->ctor);
     JS_FreeValue(ctx, fc->method);
-    js_iter_consume_end(ctx, (struct JSIterConsume *)fc->consumer);
+    o = js_iter_consume_end_upto(ctx, (struct JSIterConsume *)fc->consumer, out_kind);
     js_free_rt(ctx->rt, fc->consumer);
     js_free_rt(ctx->rt, fc);
+    return o;
+}
+
+static void js_from_ctor_abandon(JSContext *ctx, void *st)
+{
+    uint8_t k;
+    void *o = js_from_ctor_abandon_upto(ctx, st, &k);
+    if (o) tramp_step_chain_free(ctx, o);
 }
 
 /* THE ONE teardown of a construct's REQUESTER — the machine waiting for the object. It is reached from every
@@ -21098,10 +21110,15 @@ static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t 
             st = nxt; kind = nk;
             continue;
         }
-        if (kind == CONT_FROM_CTOR)        { js_from_ctor_abandon(ctx, st); return NULL; }
+        if (kind == CONT_FROM_CTOR) {
+            st = js_from_ctor_abandon_upto(ctx, st, &kind);
+            continue;
+        }
         if (kind == CONT_ITER_CONSUME_FWD) {
-            /* the machine was a consume machine's CALLBACK and threw: the source owes IfAbruptCloseIterator. */
-            js_iter_consume_abandon(ctx, st); return NULL;
+            /* the machine was a consume machine's CALLBACK and threw: the source owes IfAbruptCloseIterator.
+               Its requester chain comes back as the next link rather than being walked from inside it. */
+            st = js_iter_consume_abandon_upto(ctx, st, &kind);
+            continue;
         }
         if (kind == CONT_ITER_HELPER_FWD)  { js_iter_helper_abandon(ctx, st); return NULL; }
         *out_kind = kind;
@@ -69149,12 +69166,21 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
    carries out off the state (clearing each) so this frees the remainder. The DONE path used to free its fields by
    hand, which is a second owned-field list: a field missing from it leaked on success only, where no error path
    ever exercises it. */
-static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
+/* Release the machine's own state and REPORT its requester chain instead of walking it. That report is the
+   whole difference: walking it meant this teardown called the chain walk, which reaches the abandon hooks,
+   which call this — one C frame per nested consume, over a depth the page picks (`Array.from(x, f)` where f
+   does another Array.from and throws). The walk continues with what this hands back, in its own loop.
+   The wrapper below keeps the contract every other caller has, so the twenty-two teardown sites are unchanged;
+   what their comment warns against — a list of sites that the next one added forgets — stays impossible,
+   because the chain teardown still lives in exactly one place. */
+static void *js_iter_consume_end_upto(JSContext *ctx, JSIterConsume *s, uint8_t *out_kind)
 {
+    void *o = NULL;
     #define ITERCONS_FREE_ONE(f) JS_FreeValue(ctx, s->f);
     ITERCONS_OWNED(ITERCONS_FREE_ONE)
     #undef ITERCONS_FREE_ONE
     if (s->args_own) { free_arg_list(ctx, s->args_own, s->args_own_n); s->args_own = NULL; s->args_own_n = 0; }
+    *out_kind = CONT_NONE;
     if (s->outer) {
         /* the machine that ASKED for this consume goes with it. This lives HERE, in the one teardown every
            abrupt path already calls, rather than in a list of the eight sites that tear a consume down — a list
@@ -69162,23 +69188,40 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
            whole machine through exactly one of them. The FINISH clears s->outer before calling this, because
            there the requester is being RESUMED, not abandoned. */
         DCHECK(s->outer_kind == CONT_STEP, "consume outer continuation: unknown machine kind");
-        tramp_step_chain_free(ctx, s->outer);
+        o = s->outer; *out_kind = s->outer_kind;
         s->outer = NULL; s->outer_kind = CONT_NONE;
     }
+    return o;
+}
+
+static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
+{
+    uint8_t k;
+    void *o = js_iter_consume_end_upto(ctx, s, &k);
+    if (o) tramp_step_chain_free(ctx, o);
 }
 
 /* A phase this machine asked the interpreter to run (the entry key's ToPrimitive) THREW where there is no way
    back into the step: IfAbruptCloseIterator still has to close the source before the exception propagates (the
    close's own throw is discarded — the original wins), and then the machine is gone. A GENERATOR source's
    .return() is a coroutine, so it is DEFERRED to the exception label's tramp close rather than driven here. */
-static void js_iter_consume_abandon(JSContext *ctx, void *st)
+static void *js_iter_consume_abandon_upto(JSContext *ctx, void *st, uint8_t *out_kind)
 {
     JSIterConsume *s = st;
+    void *o;
     if (!JS_IsUndefined(s->iter) && !s->iter_done) {
         iter_close_defer(ctx, s->iter);
     }
-    js_iter_consume_end(ctx, s);
+    o = js_iter_consume_end_upto(ctx, s, out_kind);
     js_free_rt(ctx->rt, s);
+    return o;
+}
+
+static void js_iter_consume_abandon(JSContext *ctx, void *st)
+{
+    uint8_t k;
+    void *o = js_iter_consume_abandon_upto(ctx, st, &k);
+    if (o) tramp_step_chain_free(ctx, o);
 }
 
 /* Route Array.from ONLY for the direct-generator, single-arg (no mapfn) shape — the case whose C loop drives the
