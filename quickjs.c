@@ -401,6 +401,14 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
+    /* FINALIZATION-REGISTRY ENTRIES WHOSE TARGET HAS DIED, waiting to become cleanup jobs. 9.13's
+       HostEnqueueFinalizationRegistryCleanupJob is the HOST's, "at some future time" — V8 posts it from the GC
+       epilogue — and this list is that seam. Enqueueing it where the target is freed instead put allocation
+       inside object teardown: js_malloc fails, JS_ThrowOutOfMemory throws, the throw frees the previous
+       exception, that free runs a finalizer, the finalizer enqueues, and enqueueing allocates. The entries are
+       MOVED here rather than copied, so recording one allocates nothing and the references they already hold
+       keep the callback and the held value alive exactly as a queued job would. */
+    struct list_head finrec_pending; /* list of JSFinRecEntry.link */
 
     bool module_normalize_has_attr;
     union {
@@ -1742,6 +1750,8 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                              int flags);
 static int js_string_memcmp(JSString *p1, JSString *p2, int len);
 static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref);
+/* `enqueue`: turn each parked entry into a cleanup job (the pump's use); false just releases them (teardown) */
+static void js_finrec_drain(JSRuntime *rt, bool enqueue);
 static bool is_valid_weakref_target(JSValueConst val);
 static void insert_weakref_record(JSValueConst target,
                                   struct JSWeakRefRecord *wr);
@@ -2669,6 +2679,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->string_list);
 #endif
     init_list_head(&rt->job_list);
+    init_list_head(&rt->finrec_pending);
 
     if (JS_InitAtoms(rt))
         goto fail;
@@ -2854,6 +2865,7 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 
 bool JS_IsJobPending(JSRuntime *rt)
 {
+    js_finrec_drain(rt, true);
     return !list_empty(&rt->job_list);
 }
 
@@ -2878,6 +2890,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JSValue res;
     int i, ret;
 
+    js_finrec_drain(rt, true);
     if (list_empty(&rt->job_list)) {
         *pctx = NULL;
         return 0;
@@ -3017,6 +3030,10 @@ void JS_FreeRuntime(JSRuntime *rt)
         js_free_rt(rt, e);
     }
     init_list_head(&rt->job_list);
+
+    /* A parked cleanup entry that never became a job still owns its callback, held value and context, so it is
+       released here rather than reported as a leak by the walk below. */
+    js_finrec_drain(rt, false);
 
     JS_RunGC(rt);
 
@@ -97618,6 +97635,29 @@ static void js_finrec_free(JSRuntime *rt, JSFinRecEntry *fre)
     js_free_rt(rt, fre);
 }
 
+static JSValue js_finrec_job(JSContext *ctx, int argc, JSValueConst *argv);
+
+/* Empty the runtime's parked-cleanup list — see JSRuntime::finrec_pending. With `enqueue`, this is where 9.13's
+   HostEnqueueFinalizationRegistryCleanupJob happens: outside any teardown, where allocating is ordinary, driven
+   by the two functions that ask what work is pending, so a target that died since the last question is answered
+   by the next one. Without it, the entries are simply released, which is all a runtime teardown can do. */
+static void js_finrec_drain(JSRuntime *rt, bool enqueue)
+{
+    struct list_head *el, *el1;
+
+    list_for_each_safe(el, el1, &rt->finrec_pending) {
+        JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
+        list_del(&fre->link);
+        if (enqueue) {
+            JSValueConst args[2];
+            args[0] = fre->cb;
+            args[1] = fre->held_val;
+            JS_EnqueueJob(fre->ctx, js_finrec_job, 2, args);
+        }
+        js_finrec_free(rt, fre);
+    }
+}
+
 static void js_finrec_finalizer(JSRuntime *rt, JSValueConst val)
 {
     JSFinalizationRegistryData *frd = JS_GetOpaque(val, JS_CLASS_FINALIZATION_REGISTRY);
@@ -97876,12 +97916,13 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
                     enqueue = false;
             }
             if (enqueue) {
-                JSValueConst args[2];
-                args[0] = fre->cb;
-                args[1] = fre->held_val;
-                JS_EnqueueJob(fre->ctx, js_finrec_job, 2, args);
+                /* PARKED, not enqueued — see JSRuntime::finrec_pending. The entry moves onto the runtime's
+                   list with the references it already holds, so a dying target allocates nothing; the pump
+                   turns it into a cleanup job where allocating is ordinary. */
+                list_add_tail(&fre->link, &rt->finrec_pending);
+            } else {
+                js_finrec_free(rt, fre);
             }
-            js_finrec_free(rt, fre);
             break;
         }
         default:
