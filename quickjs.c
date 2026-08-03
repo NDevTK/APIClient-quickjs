@@ -19349,8 +19349,24 @@ static void tramp_step_hdr_release(JSContext *ctx, JSStepHdr *h)
     JS_FreeValue(ctx, h->cap_promise);   h->cap_promise = JS_UNDEFINED;
     JS_FreeValue(ctx, h->cap_funcs[0]);  h->cap_funcs[0] = JS_UNDEFINED;
     JS_FreeValue(ctx, h->cap_funcs[1]);  h->cap_funcs[1] = JS_UNDEFINED;
-    /* an inner machine built but never handed over (the outer threw between the two) is this state's to free. */
-    if (h->delegate) { tramp_step_state_free(ctx, h->delegate, false); h->delegate = NULL; }
+    /* An inner machine built but never handed over (the outer threw between the two) is this state's to free —
+       and a delegate can itself hold one, so this is a CHAIN whose length is the nesting of builtins that build
+       inner machines. Freeing it by calling the state teardown, which calls back into here, cost one C frame per
+       link. DETACHED FIRST, then freed one at a time: each link's own release then finds no delegate, so the
+       mutual pair bottoms out at one level instead of recursing down the chain.
+       The pair still reads as a cycle to engine/check_recursion.mjs, which cannot see that the detach empties
+       the field before the callee looks at it — the same shape as free_zero_refcount's phase flag. What the
+       detach removes is the DEPTH, which is the part that was not a static artifact. */
+    {
+        JSStepHdr *d = h->delegate;
+        h->delegate = NULL;
+        while (d) {
+            JSStepHdr *nx = d->delegate;
+            d->delegate = NULL;
+            tramp_step_state_free(ctx, d, false);
+            d = nx;
+        }
+    }
     JS_FreeAtom(ctx, h->get_atom);  /* set only while a property read is in flight */
     h->get_atom = JS_ATOM_NULL;
     for (i = 0; i < h->argc; i++)
