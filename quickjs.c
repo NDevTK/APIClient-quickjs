@@ -90669,6 +90669,12 @@ _Static_assert(offsetof(JSPromiseThen, hdr) == 0, "JSStepHdr must be first in JS
 static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPromiseThen *s = st;
+    /* THE STAGE DISPATCH IS A LOOP, not a recursion. Two stages finish by deciding the NEXT stage should run
+       immediately — SpeciesConstructor's default when `constructor` is undefined, and again when @@species is —
+       and they said so by tail-calling this function with a fresh UNDEFINED. Depth two, so nothing was at risk;
+       what it cost was a self-edge in engine/check_recursion.sh's graph for a control-flow decision that has a
+       `continue`. */
+    for (;;) {
     if (s->hdr.stage == 0) {
         JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
         s->ctor = JS_UNDEFINED; s->result = JS_UNDEFINED; s->cb_args[0] = JS_UNDEFINED;
@@ -90683,7 +90689,7 @@ static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     if (s->hdr.stage == 1) {
         /* cb_result = O.constructor. Steps 3-4: undefined is the default; a non-object is a TypeError. */
         JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
-        if (JS_IsUndefined(cb_result)) { s->hdr.stage = 3; return js_promise_then_step(ctx, st, JS_UNDEFINED, out_cb, out_argc); }
+        if (JS_IsUndefined(cb_result)) { s->hdr.stage = 3; cb_result = JS_UNDEFINED; continue; }
         if (!JS_IsObject(cb_result)) { JS_FreeValue(ctx, cb_result); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
         s->hdr.stage = 2;
         s->cb_args[0] = cb_result;   /* the constructor, held for the @@species read (owned) */
@@ -90700,7 +90706,8 @@ static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSV
             return -1;
         } else s->ctor = cb_result;
         s->hdr.stage = 3;
-        return js_promise_then_step(ctx, st, JS_UNDEFINED, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        continue;
     }
     if (s->hdr.stage == 3) {
         /* step 5: NewPromiseCapability(C). The PromiseHook's parent is this promise, and it rides the request
@@ -90730,6 +90737,7 @@ static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         s->result = s->hdr.cap_promise; s->hdr.cap_promise = JS_UNDEFINED;
     }
     return 0;
+    }
 }
 
 /* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). @@species is the page's, so the result promise's constructor is a request. */
@@ -90902,6 +90910,12 @@ _Static_assert(offsetof(JSPromiseFinally, hdr) == 0, "JSStepHdr must be first in
 static int js_promise_finally_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPromiseFinally *s = st;
+    /* THE STAGE DISPATCH IS A LOOP, not a recursion. Two stages finish by deciding the NEXT stage should run
+       immediately — SpeciesConstructor's default when `constructor` is undefined, and again when @@species is —
+       and they said so by tail-calling this function with a fresh UNDEFINED. Depth two, so nothing was at risk;
+       what it cost was a self-edge in engine/check_recursion.sh's graph for a control-flow decision that has a
+       `continue`. */
+    for (;;) {
     if (s->hdr.stage == 0) {
         JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
         if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
@@ -90913,7 +90927,7 @@ static int js_promise_finally_step(JSContext *ctx, void *st, JSValue cb_result, 
     if (s->hdr.stage == 1) {
         /* cb_result = O.constructor. Steps 3-4: undefined is the default; a non-object is a TypeError. */
         JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
-        if (JS_IsUndefined(cb_result)) { s->ctor = JS_UNDEFINED; s->hdr.stage = 3; return js_promise_finally_step(ctx, st, JS_UNDEFINED, out_cb, out_argc); }
+        if (JS_IsUndefined(cb_result)) { s->ctor = JS_UNDEFINED; s->hdr.stage = 3; cb_result = JS_UNDEFINED; continue; }
         if (!JS_IsObject(cb_result)) { JS_FreeValue(ctx, cb_result); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
         s->hdr.stage = 2;
         s->cb_args[0] = cb_result;   /* the constructor, held for the @@species read (owned) */
@@ -90930,7 +90944,8 @@ static int js_promise_finally_step(JSContext *ctx, void *st, JSValue cb_result, 
             return -1;
         } else s->ctor = cb_result;
         s->hdr.stage = 3;
-        return js_promise_finally_step(ctx, st, JS_UNDEFINED, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        continue;
     }
     if (s->hdr.stage == 3) {
         /* the species constructor is in hand: build the two reaction closures, then read `then`. */
@@ -90962,6 +90977,7 @@ static int js_promise_finally_step(JSContext *ctx, void *st, JSValue cb_result, 
     }
     s->result = cb_result;
     return 0;
+    }
 }
 
 /* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The species constructor captured into the two wrappers, and
