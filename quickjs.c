@@ -19408,14 +19408,24 @@ static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVal
     return step_getlen_run(ctx, h, obj, JS_ATOM_length, in, plen, out_cb, out_argc);
 }
 
-/* Release everything the HEADER owns, leaving the machine-private half alone. Split out because the CLONE's
-   failure path needs exactly this and nothing else: the byte-copy's private fields are still unowned second
-   references at that point, so running fini over them would free the ORIGINAL machine's values. One
-   implementation, so the two cannot drift as the header grows. */
-static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result);
-static void tramp_step_hdr_release(JSContext *ctx, JSStepHdr *h)
+/* FREE ONE MACHINE, whose delegate chain the caller has already taken — which is what makes this unable to
+   reach another machine at all. It used to be two functions, a header release that walked the delegate chain by
+   calling the state teardown, which called back into the release; the walk's DEPTH was already gone (the chain
+   is detached before it is freed, so each link's release found nothing), but the pair still read as a cycle
+   because nothing in the call graph says the detach empties the field first. Taking the chain in the wrapper
+   below says it. The header release was also split out for a second consumer — the clone's failure path — that
+   no longer exists, so it is inlined here rather than kept as a one-caller function. */
+static JSValue tramp_step_state_free_1(JSContext *ctx, void *st, bool take_result)
 {
+    JSStepHdr *h = st;
     int i;
+
+    DCHECK(h->delegate == NULL,
+           "a machine reached the one-machine teardown still owning a delegate — the chain is taken by "
+           "tramp_step_state_free, and an inner machine freed from here would leak its own");
+    if (!take_result && h->coercing && h->def->onerror)
+        h->def->onerror(ctx, h->this_val, h->def->body_magic);   /* BEFORE the receiver is released */
+
     JS_FreeValue(ctx, h->this_val);
     JS_FreeValue(ctx, h->func_obj);
     JS_FreeValue(ctx, h->coerce);   /* set only while a prologue coercion is in flight */
@@ -19427,24 +19437,6 @@ static void tramp_step_hdr_release(JSContext *ctx, JSStepHdr *h)
     JS_FreeValue(ctx, h->cap_promise);   h->cap_promise = JS_UNDEFINED;
     JS_FreeValue(ctx, h->cap_funcs[0]);  h->cap_funcs[0] = JS_UNDEFINED;
     JS_FreeValue(ctx, h->cap_funcs[1]);  h->cap_funcs[1] = JS_UNDEFINED;
-    /* An inner machine built but never handed over (the outer threw between the two) is this state's to free —
-       and a delegate can itself hold one, so this is a CHAIN whose length is the nesting of builtins that build
-       inner machines. Freeing it by calling the state teardown, which calls back into here, cost one C frame per
-       link. DETACHED FIRST, then freed one at a time: each link's own release then finds no delegate, so the
-       mutual pair bottoms out at one level instead of recursing down the chain.
-       The pair still reads as a cycle to engine/check_recursion.mjs, which cannot see that the detach empties
-       the field before the callee looks at it — the same shape as free_zero_refcount's phase flag. What the
-       detach removes is the DEPTH, which is the part that was not a static artifact. */
-    {
-        JSStepHdr *d = h->delegate;
-        h->delegate = NULL;
-        while (d) {
-            JSStepHdr *nx = d->delegate;
-            d->delegate = NULL;
-            tramp_step_state_free(ctx, d, false);
-            d = nx;
-        }
-    }
     JS_FreeAtom(ctx, h->get_atom);  /* set only while a property read is in flight */
     h->get_atom = JS_ATOM_NULL;
     for (i = 0; i < h->argc; i++)
@@ -19452,15 +19444,25 @@ static void tramp_step_hdr_release(JSContext *ctx, JSStepHdr *h)
     h->argc = 0;                     /* fini frees the block; nothing may read the captures after this */
     h->this_val = JS_UNDEFINED;
     h->func_obj = JS_UNDEFINED;
+    return h->def->fini(ctx, st, take_result);
 }
 
+/* An inner machine built but never handed over (the outer threw between the two) is this state's to free — and
+   a delegate can itself hold one, so this is a CHAIN whose length is the nesting of builtins that build inner
+   machines. It is DETACHED FIRST and then freed one link at a time, so no link's teardown can reach another. */
 static JSValue tramp_step_state_free(JSContext *ctx, void *st, bool take_result)
 {
     JSStepHdr *h = st;
-    if (!take_result && h->coercing && h->def->onerror)
-        h->def->onerror(ctx, h->this_val, h->def->body_magic);   /* BEFORE the receiver is released */
-    tramp_step_hdr_release(ctx, h);
-    return h->def->fini(ctx, st, take_result);
+    JSStepHdr *d = h->delegate;
+
+    h->delegate = NULL;
+    while (d) {
+        JSStepHdr *nx = d->delegate;
+        d->delegate = NULL;
+        tramp_step_state_free_1(ctx, d, false);
+        d = nx;
+    }
+    return tramp_step_state_free_1(ctx, st, take_result);
 }
 
 /* A machine may hold a pointer to ANOTHER machine on the same flow's continuation chain — the join's enclosing
