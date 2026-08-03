@@ -9809,10 +9809,15 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     if (unlikely(!pr->u.getset.getter)) {
                         return JS_UNDEFINED;
                     } else {
-                        JSValue func = JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter);
-                        /* Note: the field could be removed in the getter */
-                        func = js_dup(func);
-                        return JS_CallFree(ctx, func, this_obj, 0, NULL);
+                        /* THE GETTER RUNS PAGE CODE, and running it from here would run it in a C activation
+                           with no flow base — a loop in the body drives to completion instead of parking. The
+                           read OPCODES route it instead: tramp_accessor_getter finds the same getter this walk
+                           finds, for ANY callable, and calls it on the tramp chain as a 0-arg method call.
+                           The JS_CallFree that used to be here was measured over the whole corpus behind a
+                           DCHECK and never reached, so it is deleted rather than left as a fallback. */
+                        DFAIL("JS_GetPropertyInternal reached a getter — route this read onto the tramp chain "
+                              "instead of running the getter from C");
+                        return JS_ThrowTypeError(ctx, "getter");
                     }
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
                     JSValue val = *pr->u.var_ref->pvalue;
@@ -9877,7 +9882,14 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         if (ret) {
                             if (desc.flags & JS_PROP_GETSET) {
                                 JS_FreeValue(ctx, desc.setter);
-                                return JS_CallFree(ctx, desc.getter, this_obj, 0, NULL);
+                                JS_FreeValue(ctx, desc.getter);
+                                /* Measured unreachable over the whole corpus behind a DCHECK: the read opcodes
+                                   route every callable getter, and tramp_walk_continues asserts that the only
+                                   class defining this hook past the Proxy is the String index lookup, which
+                                   has no accessors at all. */
+                                DFAIL("an exotic [[GetOwnProperty]] accessor reached the C read — route it "
+                                      "onto the tramp chain");
+                                return JS_ThrowTypeError(ctx, "getter");
                             } else {
                                 return desc.value;
                             }
@@ -10984,17 +10996,18 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
 static int call_setter(JSContext *ctx, JSObject *setter,
                        JSValueConst this_obj, JSValue val, int flags)
 {
-    JSValue ret, func;
     if (likely(setter)) {
-        func = JS_MKPTR(JS_TAG_OBJECT, setter);
-        /* Note: the field could be removed in the setter */
-        func = js_dup(func);
-        ret = JS_CallFree(ctx, func, this_obj, 1, vc(&val));
+        /* THE SETTER RUNS PAGE CODE. Running it from here gives it a C activation with no flow base, so a loop
+           in the setter body drives to completion; the write OPCODES route it onto the tramp chain as a 1-arg
+           method call, the same way the read opcodes route a getter. The JS_CallFree that used to be here was
+           measured over the whole corpus behind a DCHECK and never reached, so it is deleted rather than kept
+           as a fallback for whatever the routing misses.
+           The no-setter arm below is not a fallback at all — it is 10.1.9.2 step 4.e's TypeError, which runs no
+           user code and belongs exactly here. */
         JS_FreeValue(ctx, val);
-        if (JS_IsException(ret))
-            return -1;
-        JS_FreeValue(ctx, ret);
-        return true;
+        DFAIL("call_setter ran a setter from C — route this write onto the tramp chain");
+        JS_ThrowTypeError(ctx, "setter");
+        return -1;
     } else {
         JS_FreeValue(ctx, val);
         if ((flags & JS_PROP_THROW) ||
@@ -17510,7 +17523,7 @@ static JSAtom js_for_in_candidate(JSObject *p, JSForInIterator *it)
 static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
                             bool is_exception_pending)
 {
-    JSValue method, ret, ex_obj;
+    JSValue method, ex_obj;
     int res;
 
     if (is_exception_pending) {
@@ -17529,16 +17542,14 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
     if (JS_IsUndefined(method) || JS_IsNull(method)) {
         goto done;
     }
-    ret = JS_CallFree(ctx, method, enum_obj, 0, NULL);
-    if (!is_exception_pending) {
-        if (JS_IsException(ret)) {
-            res = -1;
-        } else if (!JS_IsObject(ret)) {
-            JS_ThrowTypeErrorNotAnObject(ctx);
-            res = -1;
-        }
-    }
-    JS_FreeValue(ctx, ret);
+    /* 7.4.9 IteratorClose calls the iterator's own `return`, which is page code — from here it would run in a C
+       activation with no flow base. The interpreter's close path routes it onto the tramp chain, and this
+       JS_CallFree was measured unreachable over the whole corpus behind a DCHECK.
+       The undefined/null arm above IS the spec's step 4 and stays: it runs nothing. */
+    JS_FreeValue(ctx, method);
+    DFAIL("JS_IteratorClose ran the iterator's `return` from C — route it onto the tramp chain");
+    JS_ThrowTypeError(ctx, "iterator return");
+    res = -1;
  done:
     if (is_exception_pending) {
         JS_Throw(ctx, ex_obj);
