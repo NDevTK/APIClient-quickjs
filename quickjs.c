@@ -7730,11 +7730,21 @@ static void free_gc_object(JSRuntime *rt, JSGCObjectHeader *gp)
     }
 }
 
+/* THE REFCOUNT CASCADE IS ALREADY FLAT — this is the worklist, and the phase is what keeps it the only one.
+   A dying object's properties are released while gc_phase is DECREF, so js_free_value_rt only APPENDS to
+   gc_zero_ref_count_list and this loop drains it; `for (;;) a = {next: a}` then dropped is one iteration per
+   link and no C frames at all. The DCHECK is that invariant stated where it is relied on, because the whole
+   argument rests on this function never being re-entered: engine/check_recursion.mjs still reports the cycle
+   (free_object -> free_property -> JS_FreeValueRT -> here -> free_gc_object -> free_object) since a static
+   walk cannot see a phase flag, and the assert is what makes that a MEASURED claim rather than a read one. */
 static void free_zero_refcount(JSRuntime *rt)
 {
     struct list_head *el;
     JSGCObjectHeader *p;
 
+    DCHECK(rt->gc_phase == JS_GC_PHASE_NONE,
+           "free_zero_refcount re-entered — the refcount cascade is a worklist, and a nested drain means "
+           "something released a value at a phase where the outer loop was supposed to own it");
     rt->gc_phase = JS_GC_PHASE_DECREF;
     for(;;) {
         el = rt->gc_zero_ref_count_list.next;
