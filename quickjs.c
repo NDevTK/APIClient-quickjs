@@ -1850,6 +1850,7 @@ static __exception int js_set_length64(JSContext *ctx, JSValueConst obj,
                                        int64_t len);
 static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len);
 static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab);
+static bool js_get_fast_array_element(JSContext *ctx, JSObject *p, uint32_t idx, JSValue *pval);
 static bool js_get_fast_array(JSContext *ctx, JSValue obj,
                               JSValue **arrpp, uint32_t *countp);
 static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len);
@@ -10006,8 +10007,20 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 if (__JS_AtomIsTaggedInt(prop)) {
                     uint32_t idx = __JS_AtomToUInt32(prop);
                     if (idx < p->u.array.count) {
-                        /* we avoid duplicating the code */
-                        return JS_GetPropertyUint32(ctx, JS_MKPTR(JS_TAG_OBJECT, p), idx);
+                        /* THE ELEMENT READ ITSELF, not the general indexed entry that finds its way to it.
+                           JS_GetPropertyUint32 -> JS_GetPropertyInt64 tries js_get_fast_array_element and falls
+                           back to JS_GetProperty, which is this function — so the ordinary read was in a cycle
+                           with itself to answer a case already resolved two lines up: p is a fast array and idx
+                           is in range, so the element read succeeds and that fallback is unreachable from here.
+                           Same defect as the other "general operation, fixed answer" sites, and the DCHECK is
+                           the claim: every class that sets fast_array is one js_get_fast_array_element
+                           switches on. */
+                        JSValue el;
+                        if (js_get_fast_array_element(ctx, p, idx, &el))
+                            return el;
+                        DFAIL("a fast_array class in range did not answer its own element read — add it to "
+                              "js_get_fast_array_element rather than routing the read back through [[Get]]");
+                        return JS_UNDEFINED;
                     } else if (is_typed_array(p->class_id)) {
                         return JS_UNDEFINED;
                     }
