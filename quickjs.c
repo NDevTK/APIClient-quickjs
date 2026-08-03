@@ -59570,6 +59570,15 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     fd->closure_var = NULL;
     /* consumed by the OP_dispose_scope expansion in resolve_variables; nothing in the bytecode refers to it */
     js_free(ctx, fd->using_decls);
+    /* THE SUCCESS PATH OWES THIS TOO. js_free_function_def released the Annex B provisional-store table and
+       this one did not, so every compile that RECORDED one — any sloppy-mode block-level function declaration —
+       leaked the table. It was the largest single contributor to the raw-allocation ratchet: 342 of the 606
+       came from annexB/language/eval-code alone, and `{ function f() {} }` at top level leaks the same 40 bytes
+       with no eval in sight.
+       `using_decls` sits one line above and was added with both sites done; this is the same obligation missed
+       once, which is the argument for the two teardowns eventually being one list rather than two. The atoms
+       belong to the byte code, which is why only the array is released. */
+    js_free(ctx, fd->annexb_vars);
     fd->using_decls = NULL;
     fd->using_decl_count = fd->using_decl_size = 0;
 
