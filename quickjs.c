@@ -55465,17 +55465,12 @@ static void free_bytecode_atoms(JSRuntime *rt,
 
 #ifndef QJS_DISABLE_PARSER
 
-static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
+/* Release ONE function definition's own storage, its children already gone. Split from the tree walk below for
+   the reason the walk had to stop being a recursion: the depth is the SOURCE's function nesting, and
+   `"function f(){".repeat(n)` makes n whatever it likes. */
+static void js_free_function_def_one(JSContext *ctx, JSFunctionDef *fd)
 {
     int i;
-    struct list_head *el, *el1;
-
-    /* free the child functions */
-    list_for_each_safe(el, el1, &fd->child_list) {
-        JSFunctionDef *fd1;
-        fd1 = list_entry(el, JSFunctionDef, link);
-        js_free_function_def(ctx, fd1);
-    }
 
     free_bytecode_atoms(ctx->rt, fd->byte_code.buf, fd->byte_code.size,
                         fd->use_short_opcodes);
@@ -55528,6 +55523,46 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
         list_del(&fd->link);
     }
     js_free(ctx, fd);
+}
+
+/* THE TREE, ITERATIVELY. A definition owns its children, so freeing one meant recursing into each — one C frame
+   per level of the page's own function nesting, which the parser was flattened precisely so it could reach.
+   ORDER IS PART OF THE CONTRACT: the recursion released every child before its parent, and a first attempt that
+   released parents first segfaulted immediately. So the tree is COLLECTED breadth-first — a node's children are
+   appended as it is visited, which puts every child after its parent — and then released in REVERSE, which is
+   children-before-parents again with no frames. The root goes last and its own link is never touched: it may
+   still sit in its parent's child_list, and the recursion did not unlink it either. */
+static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
+{
+    struct list_head order, *el, *el1, *cursor;
+    JSFunctionDef *cur;
+
+    init_list_head(&order);
+    cur = fd;
+    cursor = &order;
+    for (;;) {
+        list_for_each_safe(el, el1, &cur->child_list) {
+            JSFunctionDef *kid = list_entry(el, JSFunctionDef, link);
+            list_del(&kid->link);
+            list_add_tail(&kid->link, &order);
+        }
+        cursor = cursor->next;
+        if (cursor == &order)
+            break;
+        cur = list_entry(cursor, JSFunctionDef, link);
+    }
+    while (!list_empty(&order)) {
+        cur = list_entry(order.prev, JSFunctionDef, link);
+        list_del(&cur->link);
+        /* THE ONE-NODE RELEASE UNLINKS FROM THE PARENT ITSELF (`if (fd->parent) list_del(&fd->link)`), and the
+           walk above has already moved this link twice. Left as it was, that second unlink writes through the
+           worklist's freed neighbours — which is exactly the segfault this produced. Self-linking makes it the
+           no-op it now is, and leaves the ROOT's path unchanged: its link is never touched here, so it is still
+           the release that takes it out of its parent's list. */
+        init_list_head(&cur->link);
+        js_free_function_def_one(ctx, cur);
+    }
+    js_free_function_def_one(ctx, fd);
 }
 
 #endif // QJS_DISABLE_PARSER
