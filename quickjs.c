@@ -19598,6 +19598,19 @@ static void *tramp_step_state_clone(JSContext *ctx, const void *src)
 
 struct JSToPrim;
 static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp);
+static void js_toprim_free(JSContext *ctx, struct JSToPrim *tp);
+/* the two terminal owners the TOPRIM arm hands its remainder to, forward for the same reason the abandon hooks
+   above are: the shared walk runs before either record is declared. */
+typedef struct JSArgList JSArgList;
+static void js_arg_list_free(JSContext *ctx, JSArgList *al);
+/* CONT_ARG_LIST's and CONT_ARRAY_LEN's values, forward for the reason CONT_FROM_CTOR and CONT_ITER_CONSUME_FWD
+   already are: this walk runs before the kind list is declared. The _Static_asserts at the list keep them from
+   drifting. */
+#define CONT_ARG_LIST_FWD   68
+#define CONT_ARRAY_LEN_FWD  64
+/* The ARRAY_LEN link is handed to its own hook rather than unwound here, because unwinding it reads fields of a
+   record declared two thousand lines below — the same reason every other terminal owner has a hook. */
+static void js_array_len_abandon(JSContext *ctx, void *st);
 /* The chain is not homogeneous: a machine's outer is another machine, EXCEPT that a machine invoked as a
    coercion method (`{valueOf: [].sort}`) is waited on by a ToPrimitive sequence. The kind on each link says which,
    so the walk asks rather than assuming — assuming would free a JSToPrim through JSStepHdr's teardown. */
@@ -19615,35 +19628,11 @@ static void js_iter_helper_abandon(JSContext *ctx, void *st);
    one whose abrupt handling belongs to the interpreter (a combinator rejects its aggregate; a consumer owes
    IfAbruptCloseIterator and then yields). Reporting rather than freeing is the whole point: a JSPromiseAll freed
    through JSStepHdr's teardown reads its `def` out of the middle of the struct. */
+/* The shared abandon walk; DEFINED past JSToPrim, whose links it reads. */
+static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t *out_kind);
 static void *tramp_step_chain_free_upto(JSContext *ctx, void *st, uint8_t *out_kind)
 {
-    *out_kind = 0;   /* CONT_NONE, declared below with the rest of the namespace */
-    while (st) {
-        JSStepHdr *h = st;
-        void *nxt = h->outer;
-        uint8_t nk = h->outer_kind;
-        tramp_step_state_free(ctx, h, false);
-        if (nxt && nk == CONT_TOPRIM) {
-            js_toprim_abandon(ctx, nxt);   /* which walks whatever waits on IT */
-            return NULL;
-        }
-        if (nxt && nk == CONT_FROM_CTOR) {
-            js_from_ctor_abandon(ctx, nxt);
-            return NULL;
-        }
-        if (nxt && nk == CONT_ITER_CONSUME_FWD) {
-            /* the machine was a consume machine's CALLBACK and threw: the source owes IfAbruptCloseIterator. */
-            js_iter_consume_abandon(ctx, nxt);
-            return NULL;
-        }
-        if (nxt && nk == CONT_ITER_HELPER_FWD) {
-            js_iter_helper_abandon(ctx, nxt);
-            return NULL;
-        }
-        if (nxt && nk != CONT_STEP) { *out_kind = nk; return nxt; }
-        st = nxt;
-    }
-    return NULL;
+    return tramp_chain_unwind(ctx, st, CONT_STEP, out_kind);
 }
 /* The common case: nothing is left for the interpreter to answer for. A requester this walk does not own reaching
    here would be one whose abrupt handling was silently skipped, so it CRASHES rather than leaking the answer. */
@@ -20273,6 +20262,7 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
+_Static_assert(CONT_ARG_LIST_FWD == 68, "the forward-declared CONT_ARG_LIST drifted");
 #define CONT_ARG_LIST      68  /* gp_outer AND tp_outer = JSArgList: 19.2.3.1 CreateListFromArrayLike, which
                                   `f.apply(t, arrayLike)`, `Reflect.apply` and the `f(...arr)` spread all reach.
                                   Step 3 is `? LengthOfArrayLike(obj)` and step 5 is `? Get(obj, index)` PER
@@ -20372,6 +20362,7 @@ typedef struct JSCtorProto {
 enum { CTOR_RESUME_CONSTRUCT = 0, CTOR_RESUME_PROMISE_EXEC };
 static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp);
 
+_Static_assert(CONT_ARRAY_LEN_FWD == 64, "the forward-declared CONT_ARRAY_LEN drifted");
 #define CONT_ARRAY_LEN     64  /* tp_outer = JSArrayLen: 10.4.2.4 ArraySetLength steps 3-5, whose TWO coercions
                                   are the page's code — ToUint32(V) then ToNumber(V), both on the ORIGINAL V, so
                                   a substituted primitive cannot stand for them and the coerce-then-resume
@@ -20399,11 +20390,28 @@ typedef struct JSArrayLen {
     JSValue getter, setter;
     int dflags;
 } JSArrayLen;
+
 /* AL_UINT32/AL_NUMBER/AL_COMPARE are 10.4.2.4's two coercions of V and their comparison. AL_TA_PRIM/AL_TA_WRITE
    are 10.4.5.16 TypedArraySetElement step 1's SINGLE coercion — a different algorithm in the same carrier,
    because what the carrier IS is "a keyed write parked across a coercion of V, finished here". */
 enum { AL_UINT32 = 0, AL_NUMBER, AL_COMPARE, AL_TA_PRIM, AL_TA_WRITE };
 static void js_array_len_free(JSContext *ctx, JSArrayLen *al);
+
+/* 10.4.2.4's coercion was abandoned. The WRITE can never finish, so the throw unwinds one level — and everything
+   waiting on the write goes with it, which is the KEYED chain and not a step chain (walking a JSArrayLen as one
+   would call through `obj` as a step-def pointer). That chain's teardown is getprop_throw, a label, so the link
+   is parked for the exception label. Freeing only the sequence leaked its waiter — the write's JSOpKeyed for
+   `[].length = {valueOf(){throw}}`. */
+static void js_array_len_abandon(JSContext *ctx, void *st)
+{
+    JSArrayLen *al = st;
+    DCHECK(ctx->pending_gp_unwind == NULL,
+           "pending_gp_unwind already set — a nested keyed-operation unwind needs a queue");
+    ctx->pending_gp_unwind = al->outer;
+    ctx->pending_gp_unwind_kind = al->outer_kind;
+    js_array_len_free(ctx, al);
+}
+
 
 #define CONT_DEFINE_CLASS  63  /* gp_outer = JSOpClass: 15.7.14 ClassDefinitionEvaluation step 8.d.i's
                                   `Get(superclass, "prototype")`. js_op_define_class read it with JS_GetProperty
@@ -21023,6 +21031,69 @@ static void js_toprim_free(JSContext *ctx, struct JSToPrim *tp)
     js_free_rt(ctx->rt, tp);
 }
 
+/* ONE LOOP OVER THE WHOLE CHAIN, and the reason is depth. A machine's outer is another machine EXCEPT where a
+   coercion sequence waits in between, so the chain alternates STEP and TOPRIM links — and the page chooses how
+   many: `[{valueOf(){ return [{valueOf(){…}}].sort() }}].sort()` adds a pair per nesting level. The walk used to
+   hand a TOPRIM link to js_toprim_abandon, which walked its own outer by calling back into here, so unwinding
+   cost one C frame per level of somebody else's object graph.
+   `kind` is what made two functions one: the loop already knew a link's kind, and the only thing the recursion
+   bought was a place to write the TOPRIM link's own outer-kind cases. Those are terminal — each hands the
+   remainder to a different owner and stops — so they end the loop rather than nesting it.
+   `*out_kind`/return report the first requester this walk does NOT own — one whose abrupt handling belongs to
+   the interpreter (a combinator rejects its aggregate; a consumer owes IfAbruptCloseIterator and then yields).
+   Reporting rather than freeing is the whole point: a JSPromiseAll freed through JSStepHdr's teardown reads its
+   `def` out of the middle of the struct. */
+static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t *out_kind)
+{
+    *out_kind = 0;   /* CONT_NONE, declared below with the rest of the namespace */
+    while (st) {
+        if (kind == CONT_STEP) {
+            JSStepHdr *h = st;
+            void *nxt = h->outer;
+            uint8_t nk = h->outer_kind;
+            tramp_step_state_free(ctx, h, false);
+            st = nxt; kind = nk;
+            continue;
+        }
+        if (kind == CONT_TOPRIM) {
+            struct JSToPrim *tp = st;
+            void *nxt = tp->outer;
+            uint8_t nk = tp->outer_kind;
+            js_toprim_free(ctx, tp);
+            if (nxt && nk == CONT_IMPORT) {
+                /* the specifier's coercion threw. There is nothing to unwind INTO: the capability it was created
+                   for is the opcode's result, and rejecting it is what the spec does with this abrupt completion.
+                   Park it for the exception label, which is where the frame and the operand stack are the
+                   opcode's again. */
+                DCHECK(ctx->pending_import_cap == NULL, "pending_import_cap already set — nested import coercion");
+                ctx->pending_import_cap = nxt;
+                return NULL;
+            }
+            if (nxt && nk == CONT_ARG_LIST_FWD) {
+                /* 19.2.3.1's length coercion was abandoned: the list can never be completed, and it owns nothing
+                   the interpreter has to answer for — its operands are the caller's. */
+                js_arg_list_free(ctx, (JSArgList *)nxt);
+                return NULL;
+            }
+            if (nxt && nk == CONT_ARRAY_LEN_FWD) {
+                js_array_len_abandon(ctx, nxt);
+                return NULL;
+            }
+            st = nxt; kind = nk;
+            continue;
+        }
+        if (kind == CONT_FROM_CTOR)        { js_from_ctor_abandon(ctx, st); return NULL; }
+        if (kind == CONT_ITER_CONSUME_FWD) {
+            /* the machine was a consume machine's CALLBACK and threw: the source owes IfAbruptCloseIterator. */
+            js_iter_consume_abandon(ctx, st); return NULL;
+        }
+        if (kind == CONT_ITER_HELPER_FWD)  { js_iter_helper_abandon(ctx, st); return NULL; }
+        *out_kind = kind;
+        return st;
+    }
+    return NULL;
+}
+
 /* 7.1.1 propagates an abrupt completion — there is no next-method fallback — so the sequence dies, and with it
    the machine that asked for the primitive and whoever was waiting on that. */
 static void js_import_cap_free(JSContext *ctx, JSImportCap *ic)
@@ -21033,61 +21104,21 @@ static void js_import_cap_free(JSContext *ctx, JSImportCap *ic)
     js_free(ctx, ic);
 }
 
+/* Entry into the shared walk at a TOPRIM link. The leftover is PARKED rather than returned because this
+   function is not a label and cannot goto — every caller reaches the exception label, and that slot is exactly
+   what it is for. */
 static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
 {
-    void *touter = tp->outer;
-    uint8_t tk = tp->outer_kind;
-    js_toprim_free(ctx, tp);
-    if (touter && tk == CONT_IMPORT) {
-        /* the specifier's coercion threw. There is nothing to unwind INTO: the capability it was created for is
-           the opcode's result, and rejecting it is what the spec does with this abrupt completion. Park it for
-           the exception label, which is where the frame and the operand stack are the opcode's again. */
-        DCHECK(ctx->pending_import_cap == NULL, "pending_import_cap already set — nested import coercion");
-        ctx->pending_import_cap = touter;
-        return;
-    }
-    if (touter && tk == CONT_ITER_CONSUME_FWD) {
-        js_iter_consume_abandon(ctx, touter);   /* IfAbruptCloseIterator, then the machine is gone */
-        return;
-    }
-    if (touter && tk == CONT_ARG_LIST) {
-        /* 19.2.3.1's length coercion was abandoned: the list can never be completed, and it owns nothing the
-           interpreter has to answer for — its operands are the caller's. */
-        js_arg_list_free(ctx, touter);
-        return;
-    }
-    if (touter && tk == CONT_ARRAY_LEN) {
-        /* 10.4.2.4's coercion was abandoned. The WRITE can never finish, so the throw unwinds one level — and
-           everything waiting on the write goes with it, which is the KEYED chain and not a step chain (walking a
-           JSArrayLen as one would call through `obj` as a step-def pointer). That chain's teardown is
-           getprop_throw, a label, so the link is parked for the exception label every caller of this function
-           reaches. Freeing only the sequence here leaked its waiter — the write's JSOpKeyed for
-           `[].length = {valueOf(){throw}}`. */
-        JSArrayLen *al = touter;
+    uint8_t left = 0;
+    void *rest = tramp_chain_unwind(ctx, tp, CONT_TOPRIM, &left);
+    if (rest) {
         DCHECK(ctx->pending_gp_unwind == NULL,
                "pending_gp_unwind already set — a nested keyed-operation unwind needs a queue");
-        ctx->pending_gp_unwind = al->outer;
-        ctx->pending_gp_unwind_kind = al->outer_kind;
-        js_array_len_free(ctx, al);
-        return;
-    }
-    DCHECK(!touter || tk == CONT_STEP,
-           "ToPrimitive outer continuation: unknown machine kind");
-    {
-        /* The chain this walk frees can END in a requester only the interpreter can unwind — a step machine whose
-           own outer is a consumer's @@iterator acquire, which is what String.prototype[@@iterator] became. This
-           function is not a label and cannot goto, so the leftover is PARKED for the exception label every caller
-           of this walk reaches; that slot is exactly what it is for. */
-        uint8_t left = 0;
-        void *rest = tramp_step_chain_free_upto(ctx, touter, &left);
-        if (rest) {
-            DCHECK(ctx->pending_gp_unwind == NULL,
-                   "pending_gp_unwind already set — a nested keyed-operation unwind needs a queue");
-            ctx->pending_gp_unwind = rest;
-            ctx->pending_gp_unwind_kind = left;
-        }
+        ctx->pending_gp_unwind = rest;
+        ctx->pending_gp_unwind_kind = left;
     }
 }
+
 
 /* DEFER one IteratorClose to the interpreter's exception label. The reference is OWNED by the queue until the
    drain takes it. PUSH ORDER IS THE REVERSE OF CLOSE ORDER, because 7.4.11 IteratorCloseAll closes in reverse
