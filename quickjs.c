@@ -51040,11 +51040,20 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
         && f->op == JS_FUNC_NORMAL
         &&  (lex_idx < 0 || lex_is_redefinable_func)
         &&  !((f->st_pos_b = find_var(ctx, f->st_fd, f->st_idx)) >= 0 && (f->st_pos_b & ARGUMENT_VAR_OFFSET))
-        /* "F is not an element of parameterNames", and FunctionDeclarationInstantiation step 22.f APPENDS
-           "arguments" to parameterNames whenever the arguments object is needed — so a block-level
-           `function arguments(){}` never reaches the enclosing binding and `arguments` stays the Arguments
-           object. (sm/lexical-environment/block-scoped-functions-annex-b-arguments asserts the opposite; the
-           spec citation and annexB/.../block-decl-func-skip-arguments are the oracle.) */
+        /* `function arguments(){}` in a block does NOT reach the enclosing binding, and the two engines
+           genuinely disagree about that — so this is worth stating precisely rather than by citation.
+           The condition B.3.2.1 ii tests is "parameterNames does not contain F". In the edition V8's test was
+           written against, FunctionDeclarationInstantiation step 22.f appended "arguments" to parameterNames,
+           which settles it directly. The CURRENT text does not: step 20.f builds a separate parameterBindings
+           list and leaves parameterNames alone, so the condition holds, step 2's own "F is not arguments"
+           carve-out skips only the binding CREATION, and step 3's assignment would still overwrite the
+           Arguments object at evaluation.
+           test262 proper still ships the older reading — annexB/language/function-code/block-decl-func-skip-
+           arguments asserts `arguments.toString()` is "[object Arguments]" after the block — and that file is
+           in the gate, so it is the oracle this follows. SpiderMonkey took the newer reading, which is what
+           sm/lexical-environment/block-scoped-functions-annex-b-arguments and sm/regress/regress-602621 assert;
+           both are in a suite this repo excludes for exactly this reason. If test262 proper ever changes side,
+           the change here is to drop this clause and let step 3 run — the surrounding code needs nothing. */
         &&  !(f->st_idx == JS_ATOM_arguments && f->st_fd->has_arguments_binding)) {
             f->st_b3 = true;
         }
