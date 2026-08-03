@@ -1070,6 +1070,13 @@ typedef struct JSRegExp {
        this object — a subclass instance must not be able to write the intrinsic's static slots, which is the
        whole point of the flag: `RegExp.$1` is shared mutable state reachable from any script on the page. */
     bool legacy_features_enabled;
+    /* [[Realm]], which RegExpAlloc gives every instance in the same proposal. It exists for exactly one
+       comparison — RegExp.prototype.compile refuses a receiver from another realm — and that refusal is the
+       same safety argument as the flag: compile REWRITES an existing object's pattern, so a page that could
+       reach across realms with it could turn another realm's legacy-enabled regexp into one of its own.
+       Owned, like a C function's realm, and marked for the same reason: realm -> instance -> realm is a cycle
+       only the GC can break. */
+    JSContext *realm;
 } JSRegExp;
 
 typedef struct JSProxyData {
@@ -1528,6 +1535,7 @@ static void js_for_in_iterator_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_for_in_iterator_mark(JSRuntime *rt, JSValueConst val,
                                 JS_MarkFunc *mark_func);
 static void js_regexp_finalizer(JSRuntime *rt, JSValueConst val);
+static void js_regexp_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_array_buffer_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_typed_array_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_typed_array_mark(JSRuntime *rt, JSValueConst val,
@@ -2568,7 +2576,7 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_Function, js_c_closure_finalizer, js_c_closure_mark },             /* JS_CLASS_C_CLOSURE */
     { JS_ATOM_GeneratorFunction, js_bytecode_function_finalizer, js_bytecode_function_mark },  /* JS_CLASS_GENERATOR_FUNCTION */
     { JS_ATOM_ForInIterator, js_for_in_iterator_finalizer, js_for_in_iterator_mark },      /* JS_CLASS_FOR_IN_ITERATOR */
-    { JS_ATOM_RegExp, js_regexp_finalizer, NULL },                              /* JS_CLASS_REGEXP */
+    { JS_ATOM_RegExp, js_regexp_finalizer, js_regexp_mark },                     /* JS_CLASS_REGEXP */
     { JS_ATOM_ArrayBuffer, js_array_buffer_finalizer, NULL },                   /* JS_CLASS_ARRAY_BUFFER */
     { JS_ATOM_SharedArrayBuffer, js_array_buffer_finalizer, NULL },             /* JS_CLASS_SHARED_ARRAY_BUFFER */
     { JS_ATOM_Uint8ClampedArray, js_typed_array_finalizer, js_typed_array_mark }, /* JS_CLASS_UINT8C_ARRAY */
@@ -6818,6 +6826,11 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
         p->u.regexp.pattern = NULL;
         p->u.regexp.bytecode = NULL;
         p->u.regexp.legacy_features_enabled = false;
+        /* [[Realm]] IS CREATED BY THE ALLOCATION, which is what RegExpAlloc says — the slot is in the list
+           OrdinaryCreateFromConstructor is given. Setting it at the two INITIALISATION sites instead left the
+           second one (a literal, and @@split's internal splitter) without a realm, so every plain `/x/` was
+           rejected by compile's own guard. One place, and a third creation site cannot forget. */
+        p->u.regexp.realm = JS_DupContext(ctx);
         goto set_exotic;
     default:
     set_exotic:
@@ -80699,6 +80712,17 @@ static void js_regexp_finalizer(JSRuntime *rt, JSValueConst val)
        one. The C body assigned both the instant it created the object, which is why this was never hit. */
     if (re->bytecode) JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, re->bytecode));
     if (re->pattern)  JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, re->pattern));
+    if (re->realm)    JS_FreeContext(re->realm);
+}
+
+/* [[Realm]] is a strong reference to a context, and a context reaches its own %RegExp% instances, so the pair
+   is a cycle. Every other holder of a realm is marked (a C function's, a bytecode function's); this class had
+   no mark function at all because it had nothing to mark until now. */
+static void js_regexp_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    if (p->u.regexp.realm)
+        mark_func(rt, &p->u.regexp.realm->header);
 }
 
 /* create a string containing the RegExp bytecode */
@@ -81075,7 +81099,21 @@ static int js_regexp_compile_step(JSContext *ctx, void *st, JSValue cb_result, J
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         m->result = JS_UNDEFINED; m->pattern = JS_UNDEFINED;
         /* every validation the spec performs before either coercion */
-        if (!js_get_regexp(ctx, this_val, true)) return -1;
+        re = js_get_regexp(ctx, this_val, true);
+        if (!re) return -1;
+        /* proposal-regexp-legacy-features rewrites this method's opening. compile REWRITES an existing
+           object's pattern, so both of the proposal's guards protect the same thing the flag does: a page must
+           not be able to take a regexp the intrinsic trusts and make it match something of its own choosing.
+           A subclass instance never had [[LegacyFeaturesEnabled]], and an instance from ANOTHER realm has it
+           relative to that realm's %RegExp%, not this one's — which is why the flag alone is not the test and
+           [[Realm]] exists.
+           "The current Realm Record" is the CALLEE's, not the caller's: `other.RegExp.prototype.compile.call(re)`
+           must throw other.TypeError, and `ctx` inside a builtin is already the function's realm. */
+        if (!re->legacy_features_enabled)
+            return (JS_ThrowTypeError(ctx, "RegExp.prototype.compile requires a regexp %RegExp% itself "
+                                           "constructed"), -1);
+        if (re->realm != ctx)
+            return (JS_ThrowTypeError(ctx, "RegExp.prototype.compile requires a regexp from the same realm"), -1);
         re1 = js_get_regexp(ctx, pattern1, false);
         if (re1) {
             /* step 2: a RegExp source is copied whole, so nothing is coerced at all. */
