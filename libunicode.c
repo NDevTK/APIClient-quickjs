@@ -28,6 +28,7 @@
 #include <assert.h>
 
 #include "cutils.h"
+#include "quickjs-check.h"
 #include "libunicode.h"
 #include "libunicode-table.h"
 
@@ -1002,15 +1003,29 @@ static void sort_cc(int *buf, int len)
     }
 }
 
+/* A decomposition whose parts decompose again was a C frame per level. The chain's length is the UCD's rather
+   than the page's, so this was never a stack-depth hazard — but it is the same walk with no frames, and a walk
+   with none cannot become one when a later Unicode revision lengthens a chain.
+   The ORDER is the recursion's: a character's parts are emitted before the next source character. Pushing the
+   pending code points in reverse and popping LIFO is exactly that pre-order traversal.
+   The pending stack is its OWN DynBuf, and its allocation failure is reported on the OUTPUT buffer, because
+   that is the one the caller already tests (unicode_normalize's dbuf_error) — a truncated normalization must
+   not read as a successful one. */
 static void to_nfd_rec(DynBuf *dbuf,
                        const int *src, int src_len, int is_compat)
 {
     uint32_t c, v;
     int i, l;
     uint32_t res[UNICODE_DECOMP_LEN_MAX];
+    DynBuf stk;
 
-    for(i = 0; i < src_len; i++) {
-        c = src[i];
+    dbuf_init2(&stk, dbuf->opaque, dbuf->realloc_func);
+    for(i = src_len - 1; i >= 0; i--)
+        dbuf_put_u32(&stk, src[i]);
+
+    while (stk.size > 0) {
+        stk.size -= sizeof(uint32_t);
+        memcpy(&c, stk.buf + stk.size, sizeof(uint32_t));
         if (c >= 0xac00 && c < 0xd7a4) {
             /* Hangul decomposition */
             c -= 0xac00;
@@ -1022,12 +1037,16 @@ static void to_nfd_rec(DynBuf *dbuf,
         } else {
             l = unicode_decomp_char(res, c, is_compat);
             if (l) {
-                to_nfd_rec(dbuf, (int *)res, l, is_compat);
+                for(i = l - 1; i >= 0; i--)
+                    dbuf_put_u32(&stk, res[i]);
             } else {
                 dbuf_put_u32(dbuf, c);
             }
         }
     }
+    if (stk.error)
+        dbuf->error = true;
+    dbuf_free(&stk);
 }
 
 /* return 0 if not found */
@@ -1704,12 +1723,18 @@ int unicode_general_category(CharRange *cr, const char *gc_name)
    callback. Returns -2 if the property name is unknown. */
 #define SEQ_MAX_LEN 16
 
-static int unicode_sequence_prop1(int seq_prop_idx, UnicodeSequencePropCB *cb, void *opaque,
-                                  CharRange *cr)
+/* ONE sequence property, and never RGI_Emoji — which is DEFINED as the union of the others, so it is the only
+   operand that would send this body back into itself. It is expanded by the wrapper below instead, which makes
+   the walk's single self-edge a loop rather than a call. */
+static int unicode_sequence_prop_one(int seq_prop_idx, UnicodeSequencePropCB *cb, void *opaque,
+                                     CharRange *cr)
 {
     int i, c, j;
     uint32_t seq[SEQ_MAX_LEN];
-    
+
+    DCHECK(seq_prop_idx != UNICODE_SEQUENCE_PROP_RGI_Emoji,
+           "RGI_Emoji reached the per-property body, which has no case for it and would answer 'no such "
+           "property' — the wrapper is what expands it into the others");
     switch(seq_prop_idx) {
     case UNICODE_SEQUENCE_PROP_Basic_Emoji:
         if (unicode_prop1(cr, UNICODE_PROP_Basic_Emoji1) < 0)
@@ -1881,20 +1906,29 @@ static int unicode_sequence_prop1(int seq_prop_idx, UnicodeSequencePropCB *cb, v
             }
         }
         break;
-    case UNICODE_SEQUENCE_PROP_RGI_Emoji:
-        /* all prevous sequences */
-        for(i = UNICODE_SEQUENCE_PROP_Basic_Emoji; i <= UNICODE_SEQUENCE_PROP_RGI_Emoji_ZWJ_Sequence; i++) {
-            int ret;
-            ret = unicode_sequence_prop1(i, cb, opaque, cr);
-            if (ret < 0)
-                return ret;
-            cr->len = 0;
-        }
-        break;
     default:
         return -2;
     }
     return 0;
+}
+
+/* A sequence property, including RGI_Emoji — "all of the above", which is the one case whose operand is the
+   other cases. Answering it HERE keeps it out of the body and off the call graph. */
+static int unicode_sequence_prop1(int seq_prop_idx, UnicodeSequencePropCB *cb, void *opaque,
+                                  CharRange *cr)
+{
+    int i, ret;
+
+    if (seq_prop_idx == UNICODE_SEQUENCE_PROP_RGI_Emoji) {
+        for(i = UNICODE_SEQUENCE_PROP_Basic_Emoji; i <= UNICODE_SEQUENCE_PROP_RGI_Emoji_ZWJ_Sequence; i++) {
+            ret = unicode_sequence_prop_one(i, cb, opaque, cr);
+            if (ret < 0)
+                return ret;
+            cr->len = 0;
+        }
+        return 0;
+    }
+    return unicode_sequence_prop_one(seq_prop_idx, cb, opaque, cr);
 }
 
 /* build a unicode sequence property */
