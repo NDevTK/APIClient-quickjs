@@ -381,7 +381,6 @@ struct JSRuntime {
 
     JSValue current_exception;
     /* true if inside an out of memory error, to avoid recursing */
-    bool in_out_of_memory;
     /* true if inside build_backtrace, to avoid recursing */
     bool in_build_stack_trace;
     /* true if inside JS_FreeRuntime */
@@ -638,6 +637,17 @@ struct JSContext {
     JSValue promise_ctor;
     JSValue native_error_proto[JS_NATIVE_ERROR_COUNT];
     JSValue error_ctor;
+    /* THE OUT-OF-MEMORY ERROR IS BUILT ONCE, WHILE THERE IS STILL MEMORY. Constructing it at the moment of
+       failure is a recursion with a real trigger: the constructor allocates the object, its message string and
+       its shape, each of those can fail, and each failure calls JS_ThrowOutOfMemory again. Upstream stops that
+       with an `in_out_of_memory` re-entrancy flag, which makes the recursion not happen rather than impossible
+       — and it is also what puts every allocation in the engine into one cycle with error construction and,
+       through it, with property definition and the GC.
+       Pre-allocating is the same thing V8 does with its per-Isolate pre-allocated exceptions, and it costs no
+       fidelity here: an OOM error never carried a backtrace anyway (add_backtrace was suppressed by that same
+       flag), so the only thing the throw site adds is the throw itself. JS_UNDEFINED where the Error intrinsic
+       was never added to this context; the throw then has no object to hand over and says so. */
+    JSValue oom_error;
     JSValue error_back_trace;
     /* import(specifier) whose specifier is an OBJECT: 13.3.10.1 runs ToString INSIDE the promise, so an abrupt
        completion REJECTS rather than throws. The capability is created at the opcode and rides the coercion;
@@ -3239,6 +3249,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->async_from_sync_next = JS_NULL;
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
+    ctx->oom_error = JS_UNDEFINED;
     ctx->error_back_trace = JS_UNDEFINED;
     ctx->module_resolving = false;
     ctx->pending_close_iters = NULL;
@@ -3376,6 +3387,7 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
         JS_MarkValue(rt, ctx->native_error_proto[i], mark_func);
     }
     JS_MarkValue(rt, ctx->error_ctor, mark_func);
+    JS_MarkValue(rt, ctx->oom_error, mark_func);
     JS_MarkValue(rt, ctx->error_back_trace, mark_func);
     JS_MarkValue(rt, ctx->error_prepare_stack, mark_func);
     JS_MarkValue(rt, ctx->error_stack_trace_limit, mark_func);
@@ -3473,6 +3485,7 @@ void JS_FreeContext(JSContext *ctx)
     while (ctx->pending_close_n > 0)   /* normally empty (drained at the exception label); free defensively */
         JS_FreeValue(ctx, ctx->pending_close_iters[--ctx->pending_close_n]);
     js_free_rt(rt, ctx->pending_close_iters);
+    JS_FreeValue(ctx, ctx->oom_error);
     JS_FreeValue(ctx, ctx->error_back_trace);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
     JS_FreeValue(ctx, ctx->error_stack_trace_limit);
@@ -9039,9 +9052,41 @@ static bool can_store_error_stack(JSValueConst obj)
 
 /* if filename != NULL, an additional level is added with the filename
    and line number information (used for parse error). */
+/* 20.5.1.1 step 4's CreateNonEnumerableDataPropertyOrThrow, on an object this engine has just created.
+   THE GENERAL [[DefineOwnProperty]] IS THE WRONG OPERATION HERE, and using it is what put error construction
+   into a 176-function cycle with property definition: a define can throw, a throw builds an error, and every
+   allocation and GC path either of those touches rode along. None of it applies to the calls that were making
+   the edge — a freshly made Error whose only slot is being written for the first time, and a DOMException the
+   caller has already tested for an own `stack`. There is no existing property to validate against, no exotic
+   hook, no prototype involvement, and nothing that can fail except the allocation, which is reported rather
+   than thrown. So it adds the own slot directly, and the DCHECK holds the caller to the "just created" claim
+   the whole argument rests on. */
+static int js_error_add_own(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val, int flags)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    JSProperty *pr;
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && !find_own_property1(p, prop),
+           "error construction wrote a slot that already existed — that is a real [[DefineOwnProperty]]");
+    pr = add_property(ctx, p, prop, flags);
+    if (unlikely(!pr)) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
+    pr->u.value = val;
+    return 0;
+}
+
+/* `pstack`, when non-NULL, takes the rendered stack INSTEAD of installing it, and only Error.captureStackTrace
+   passes it. Installing is not one operation: the two arms below write an object the engine itself made — the
+   [[ErrorData]] slot of an Error, an own slot of a DOMException the arm has already checked has none — and
+   neither can throw or run page code, while captureStackTrace's target is ANY object the page names, so
+   installing there is a real [[DefineOwnProperty]] that can hit a Proxy trap or a non-configurable slot. Both
+   went through one JS_DefinePropertyValue, which is why building ANY error appeared to reach property
+   definition, and through it every throw. The capture and the render are shared; the install is the caller's. */
 static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                             JSValueConst filter_func, const char *filename,
-                            int line_num, int col_num, int backtrace_flags)
+                            int line_num, int col_num, int backtrace_flags,
+                            JSValue *pstack)
 {
     JSStackFrame *sf, *sf_start;
     JSValue stack, prepare, saved_exception, error_obj;
@@ -9055,29 +9100,32 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     int stack_trace_limit;
 
     rt = ctx->rt;
+    if (pstack)
+        *pstack = JS_UNDEFINED;
     if (rt->in_build_stack_trace)
         return;
     rt->in_build_stack_trace = true;
     error_obj = js_dup(error_val);
     prepare = JS_UNDEFINED;   /* read only when there IS an %Error%; the release below is unconditional */
 
-    // Save exception because conversion to double may fail.
-    saved_exception = JS_GetException(ctx);
-
-    // Extract stack trace limit.
-    // Ignore error since it sets d to NAN anyway.
-    // coverity[check_return]
-    JS_ToFloat64(ctx, &d, ctx->error_stack_trace_limit);
+    /* Error.stackTraceLimit IS READ, NOT COERCED. It is V8's API and V8's rule: a value that is not a Number
+       captures no frames at all — there is no ToNumber step, so an object with a valueOf is simply "not a
+       number", not a conversion. Coercing it ran the page's valueOf from inside error construction, which is
+       page code in a C activation with no flow base AND a throw source in the one function that must not throw:
+       building an error's backtrace can then build another error. That is what the save-and-restore of the
+       pending exception around it was for, and both go together. */
+    if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(ctx->error_stack_trace_limit)))
+        d = JS_VALUE_GET_FLOAT64(ctx->error_stack_trace_limit);
+    else if (JS_VALUE_GET_TAG(ctx->error_stack_trace_limit) == JS_TAG_INT)
+        d = JS_VALUE_GET_INT(ctx->error_stack_trace_limit);
+    else
+        d = NAN;
     if (isnan(d) || d < 0.0)
         stack_trace_limit = 0;
     else if (d > INT32_MAX)
         stack_trace_limit = INT32_MAX;
     else
-        stack_trace_limit = fabs(d);
-
-    // Restore current exception.
-    JS_Throw(ctx, saved_exception);
-    saved_exception = JS_UNINITIALIZED;
+        stack_trace_limit = d;
 
     stack_trace_limit = min_int(stack_trace_limit, countof(csd));
     stack_trace_limit = max_int(stack_trace_limit, 0);
@@ -9219,20 +9267,18 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
     if (JS_IsUndefined(ctx->error_back_trace))
         ctx->error_back_trace = js_dup(stack);
-    if (has_filter_func) {
-        /* Error.captureStackTrace(target, ...): install an own data property
-           on the (possibly non-Error) target, shadowing the accessor */
-        JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    if (pstack) {
+        *pstack = stack;                    /* the caller installs it; see this function's header */
     } else if (can_store_error_stack(error_obj)) {
         /* genuine Error instance: store as the [[ErrorData]] stack value */
         p = JS_VALUE_GET_OBJ(error_obj);
         JS_FreeValue(ctx, p->u.object_data);
         p->u.object_data = stack;
     } else if (can_add_backtrace(error_obj)) {
-        /* DOMException and the like keep an own "stack" data property */
-        JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        /* DOMException and the like keep an own "stack" data property. can_add_backtrace has just established
+           there is no own slot, so this is an add, not a define. */
+        js_error_add_own(ctx, error_obj, JS_ATOM_stack, stack,
+                         JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     } else {
         JS_FreeValue(ctx, stack);
     }
@@ -9246,7 +9292,7 @@ JSValue JS_NewError(JSContext *ctx)
     JSValue obj = JS_NewObjectClass(ctx, JS_CLASS_ERROR);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0);
+    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0, NULL);
     return obj;
 }
 
@@ -9267,11 +9313,11 @@ static JSValue JS_MakeError2(JSContext *ctx, JSErrorEnum error_num,
     if (JS_IsException(msg))
         msg = JS_NewString(ctx, "Invalid error message");
     if (!JS_IsException(msg)) {
-        JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, msg,
-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        js_error_add_own(ctx, obj, JS_ATOM_message, msg,
+                         JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
     if (add_backtrace)
-        build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0);
+        build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0, NULL);
     return obj;
 }
 
@@ -9318,7 +9364,7 @@ JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
        innermost activation is not a bytecode frame, and a running machine is that moment as much as a C
        function is. */
     sf = rt->current_stack_frame;
-    add_backtrace = !rt->in_out_of_memory &&
+    add_backtrace =
         (!sf || JS_GetFunctionBytecode(sf->cur_func) == NULL || g_step_running != NULL);
     return JS_ThrowError2(ctx, error_num, add_backtrace, fmt, ap);
 }
@@ -9410,15 +9456,15 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
     }
 }
 
+/* ALLOCATION FAILURE MUST NOT ALLOCATE. Every path in this function is a plain refcount bump on an object the
+   context has held since its Error intrinsic was installed, so there is no constructor to re-enter, no shape to
+   grow, no string to intern, and no second failure to report — the recursion is gone by construction rather
+   than suppressed by a flag, and with it the edge that joined every js_malloc in the engine to error
+   construction. A context without the Error intrinsic has no error to throw and says so with JS_NULL, exactly
+   as JS_ThrowError2 does when construction itself fails. */
 JSValue JS_ThrowOutOfMemory(JSContext *ctx)
 {
-    JSRuntime *rt = ctx->rt;
-    if (!rt->in_out_of_memory) {
-        rt->in_out_of_memory = true;
-        JS_ThrowInternalError(ctx, "out of memory");
-        rt->in_out_of_memory = false;
-    }
-    return JS_EXCEPTION;
+    return JS_Throw(ctx, JS_IsUndefined(ctx->oom_error) ? JS_NULL : js_dup(ctx->oom_error));
 }
 
 static JSValue JS_ThrowStackOverflow(JSContext *ctx)
@@ -38136,7 +38182,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     || JS_IsUndefined(ctx->error_back_trace)) {
         sf->cur_pc = pc;
         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
-                        NULL, 0, 0, 0);
+                        NULL, 0, 0, 0, NULL);
     }
     if (!JS_IsUncatchableError(rt->current_exception)) {
         while (sp > stack_buf) {
@@ -42143,7 +42189,7 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) js_parse_error(JSParseState *s, JS_PRINTF_FORMAT
         err_col_num = (int)(s->token.ptr - line_start) + 1;
     }
     build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, s->filename,
-                    s->token.line_num, err_col_num, backtrace_flags);
+                    s->token.line_num, err_col_num, backtrace_flags, NULL);
     return -1;
 }
 
@@ -46779,7 +46825,7 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
                                 s->filename,
                                 s->token.line_num,
                                 s->token.col_num,
-                                backtrace_flags);
+                                backtrace_flags, NULL);
                 PD_RET(-1);
             }
             emit_r = emit_push_const(s, str, 0);
@@ -66697,7 +66743,7 @@ static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     /* SKIP the Error constructor's own activation: naming Error() as the place the error came from is the one
        thing a stack trace must not do. The skip had to be dropped when a step machine pushed no frame at all —
        it was eating the PAGE's frame instead — and comes back now that the machine has one of its own. */
-    build_backtrace(ctx, s->obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
+    build_backtrace(ctx, s->obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL, NULL);
     return 0;
 }
 
@@ -67008,7 +67054,16 @@ static JSValue js_error_capture_stack_trace(JSContext *ctx, JSValueConst this_va
     JSValueConst v = argv[0];
     if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
         return JS_ThrowTypeErrorNotAnObject(ctx);
-    build_backtrace(ctx, v, argv[1], NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL|JS_BACKTRACE_FLAG_FILTER_FUNC);
+    JSValue stack;
+    build_backtrace(ctx, v, argv[1], NULL, 0, 0,
+                    JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL | JS_BACKTRACE_FLAG_FILTER_FUNC, &stack);
+    if (JS_IsUndefined(stack))
+        return JS_UNDEFINED;               /* a capture was already in progress; there is nothing to install */
+    /* THE TARGET IS THE PAGE'S, so this is the real [[DefineOwnProperty]] — an own data property shadowing the
+       accessor, on an object that may be a Proxy or may already hold a non-configurable `stack`. */
+    if (JS_DefinePropertyValue(ctx, v, JS_ATOM_stack, stack,
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0)
+        return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
 
@@ -87348,7 +87403,7 @@ static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
     /* No skip, for the reason the Error constructor has none: every caller of this reaches it from the
        interpreter or from a step machine, neither of which pushes a frame of its own. The one caller with a
        real builtin frame is the C-data closure below, and it says so at its call. */
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, backtrace_flags);
+    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, backtrace_flags, NULL);
     return obj;
 }
 
@@ -92517,6 +92572,20 @@ static int JS_AddIntrinsicBasicObjects(JSContext *ctx)
                                js_empty_string(ctx->rt),
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
         ctx->native_error_proto[i] = proto;
+    }
+
+    /* The pre-allocated out-of-memory error, made here because this is the first moment its prototype exists.
+       It is an ordinary InternalError with a message and nothing else; JS_ThrowOutOfMemory hands out a
+       reference to THIS object rather than building one under memory pressure. */
+    {
+        JSValue oom = JS_NewObjectProtoClass(ctx, ctx->native_error_proto[JS_INTERNAL_ERROR],
+                                             JS_CLASS_ERROR);
+        if (!JS_IsException(oom)) {
+            JS_DefinePropertyValue(ctx, oom, JS_ATOM_message,
+                                   JS_NewString(ctx, "out of memory"),
+                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+            ctx->oom_error = oom;
+        }
     }
 
     /* the array prototype is an array */
@@ -98128,7 +98197,7 @@ static JSValue js_domexception_ctor_body(JSContext *ctx, JSValueConst obj_,
     s->message = message;
     s->code = -1;
     JS_SetOpaqueInternal(obj, s);
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, backtrace_flags);
+    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, backtrace_flags, NULL);
     return obj;
 fail3:
     JS_FreeValue(ctx, name);
