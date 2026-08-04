@@ -254,6 +254,15 @@ JS_EXTERN int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def);
 #define JS_STEP_ABRUPT (-1)  /* it threw; the completion value is live in the context */
 #define JS_STEP_REQUEST  6   /* it parked on a sub-sequence's request and will be re-entered with the answer */
 #define JS_STEP_CALL     3   /* it parked on a CALL of the page's code (step_call_run); same re-entry contract */
+/* "I HAVE MORE WORK; PREEMPT ME IF YOU WANT." The bytecode half of this is a loop back-edge asking the flow
+   control whether to yield; a machine that walks a structure of the PAGE'S SIZE — a DOM subtree, a token list,
+   a document to serialise, a parse — needs the same, because otherwise it runs to completion inside one opcode
+   however carefully the frames beneath it were flattened. Running no user code is NOT what makes a C body safe
+   to leave un-parkable; being O(1) is, and almost nothing that walks a page is.
+   Return it with no request pending; the machine is re-entered with JS_UNDEFINED, and when nobody is waiting it
+   is re-entered immediately, which costs one predicted call per iteration. That is cheap enough to ask at every
+   step of a walk, which is where it belongs. */
+#define JS_STEP_YIELD   22
 
 /* The machine's own arguments, borrowed. Out-of-range reads undefined, which is what the IDL's optional
    arguments mean at this level. */
