@@ -100098,6 +100098,22 @@ static const JSClassShortDef js_domexception_class_def[] = {
     { JS_ATOM_DOMException, js_domexception_finalizer, js_domexception_mark }, /* JS_CLASS_DOM_EXCEPTION */
 };
 
+/* The internal slots, for a HOST diagnostic. A stored value, never an operation — the accessor on the prototype
+   would be a call, and a reporter runs from outside any flow. */
+JSValue JS_GetDOMExceptionName(JSContext *ctx, JSValueConst val)
+{
+    JSDOMExceptionData *s = JS_GetOpaque(val, JS_CLASS_DOM_EXCEPTION);
+    (void)ctx;
+    return s ? js_dup(s->name) : JS_UNDEFINED;
+}
+
+JSValue JS_GetDOMExceptionMessage(JSContext *ctx, JSValueConst val)
+{
+    JSDOMExceptionData *s = JS_GetOpaque(val, JS_CLASS_DOM_EXCEPTION);
+    (void)ctx;
+    return s ? js_dup(s->message) : JS_UNDEFINED;
+}
+
 JSValue JS_PRINTF_FORMAT_ATTR(3, 4) JS_ThrowDOMException(JSContext *ctx, const char *name, JS_PRINTF_FORMAT const char *fmt, ...)
 {
     JSValue obj, js_name, js_message;

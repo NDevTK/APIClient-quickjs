@@ -849,6 +849,12 @@ JS_EXTERN JSValue JS_GetException(JSContext *ctx);
 /* An Error's recorded stack as a string, or undefined. Never invokes an accessor, so it never runs the
    page's Error.prepareStackTrace — use it wherever a HOST prints a diagnostic. */
 JS_EXTERN JSValue JS_GetErrorStackString(JSContext *ctx, JSValueConst error);
+/* A DOMException's name and message, read from the [[Name]]/[[Message]] internal slots, or undefined for any
+   other value. The SAME reason as the stack above: they live behind accessors on DOMException.prototype, so a
+   host diagnostic that looks for own properties finds nothing and reports a thrown DOMException — the single
+   most common throw in a DOM engine — as an anonymous object. */
+JS_EXTERN JSValue JS_GetDOMExceptionName(JSContext *ctx, JSValueConst val);
+JS_EXTERN JSValue JS_GetDOMExceptionMessage(JSContext *ctx, JSValueConst val);
 JS_EXTERN bool JS_HasException(JSContext *ctx);
 JS_EXTERN bool JS_IsError(JSValueConst val);
 JS_EXTERN bool JS_IsUncatchableError(JSValueConst val);
