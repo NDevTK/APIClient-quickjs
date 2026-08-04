@@ -27980,7 +27980,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
-                    if (idiscard) { JS_FreeValue(ctx, r); BREAK; }   /* an opcode whose operation yields nothing */
+                    /* A PROPERTY WRITE PUSHES NOTHING, and that is one statement with two spellings here:
+                       `idiscard` is the opcode-driven case (an object spread mutates its target in place), and
+                       CONT_SETTER is the same thing said about a setter. The frame-return arm and the
+                       inline-call arm both discard a setter's result; this one did not, so a setter that IS a
+                       step machine — every Web IDL attribute setter in the browser layer — pushed its result
+                       onto a compiled operand stack with no slot for it. ONE LEAKED SLOT PER ASSIGNMENT, which
+                       creeps up until it overruns the trampoline scratch reserve and writes into the var-ref
+                       array past it; close_var_refs then frees a JSValue as a JSVarRef *. It surfaced as a
+                       refcount underflow or as whichever tramp-push DCHECK the creep reached first, which is
+                       why it looked like a scratch-size problem and is not one. */
+                    if (idiscard || souter_kind == CONT_SETTER) { JS_FreeValue(ctx, r); BREAK; }
                     if (souter) {   /* something is waiting on this machine's result */
                         ret_val = r; cont_st = souter;
                         if (souter_kind == CONT_TOPRIM)
