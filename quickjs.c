@@ -90979,13 +90979,17 @@ static __exception int perform_promise_then(JSContext *ctx,
         rd_array[i] = rd;
     }
 
+    /* ATTACHING a reaction to a shared promise is a WRITE to it, exactly as settling it is — and that is true
+       whichever state it is in, so the capture belongs HERE rather than inside the pending arm. The record
+       joins a list every flow can reach (`if (flag) p.then(h1); else p.then(h2);` forks BEFORE the attach, so
+       each arm owns its own registration — without this the arm that attached second ran both handlers), and
+       `is_handled` below is a write on BOTH paths. Capturing only the pending one left the already-settled
+       attach mutating shared state: the first arm to attach a `.catch` marked the promise handled for every
+       arm, so no sibling's rejection tracker ever fired and each of them reported a rejection its own world
+       had in fact handled. */
+    if (g_time_travel.async_state)
+        g_time_travel.async_state(ctx, promise);
     if (s->promise_state == JS_PROMISE_PENDING) {
-        /* ATTACHING a reaction to a shared pending promise is a WRITE to it, exactly as settling it is: the
-           record joins a list every flow can reach. `if (flag) p.then(h1); else p.then(h2);` forks BEFORE the
-           attach, so each arm owns its own registration — and without this capture the arm that attached second
-           ran both handlers, because it inherited the other arm's record. */
-        if (g_time_travel.async_state)
-            g_time_travel.async_state(ctx, promise);
         for(i = 0; i < 2; i++)
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {
