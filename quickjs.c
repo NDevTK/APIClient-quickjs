@@ -22026,14 +22026,14 @@ static bool tramp_walk_continues(JSContext *ctx, JSObject *p, JSAtom atom)
         return !(__JS_AtomIsTaggedInt(atom) && __JS_AtomToUInt32(atom) < p->u.array.count);
     em = ctx->rt->class_array[p->class_id].exotic;
     if (em && em->get_own_property) {
-        /* Exactly two classes define that hook, and the Proxy is already gone above -- so the only one that can
-           reach here is the String exotic's index lookup, which is pure C. ASSERTED rather than claimed, the
-           same way the spread's exclusion list is: if a third class ever defines the hook, this line is where
-           the page's code would start running from C with no flow base, and it says so at that point instead of
-           being discovered by a hang. */
-        DCHECK(p->class_id == JS_CLASS_STRING,
-               "an exotic [[GetOwnProperty]] other than the String index lookup reached the accessor walk — "
-               "route that class onto the keyed entry's GP_GETOWNPROP before it runs page code from C");
+        /* The String exotic's index lookup is pure C; so is any class that DECLARES its hook to be. Anything
+           else reaching here would start running the page's code from C with no flow base, and says so at
+           that point instead of being discovered by a hang. The declaration is the class's own, made where
+           the hook is defined — not a list of class ids kept in step from over here. */
+        DCHECK(p->class_id == JS_CLASS_STRING || em->get_own_property_no_user_code,
+               "an exotic [[GetOwnProperty]] that has not declared itself free of the page's code reached the "
+               "accessor walk — declare get_own_property_no_user_code where the hook is defined, or route the "
+               "class onto the keyed entry's GP_GETOWNPROP");
         return JS_GetOwnPropertyInternal(ctx, NULL, p, atom) == 0;
     }
     return true;

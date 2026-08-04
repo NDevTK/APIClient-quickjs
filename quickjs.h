@@ -679,6 +679,13 @@ typedef struct JSClassExoticMethods {
     /* return < 0 if exception or true/false */
     int (*set_property)(JSContext *ctx, JSValueConst obj, JSAtom atom,
                         JSValueConst value, JSValueConst receiver, int flags);
+    /* THE [[GetOwnProperty]] ABOVE CONSULTS ONLY THIS CLASS'S OWN STATE and can never reach the page's code.
+       The accessor walk needs to be told, because it runs the hook FROM C with no flow base to park into: one
+       that can reach the page must be routed onto the trampoline instead, and there is no way to tell the two
+       apart by looking at the pointer. A class that says nothing is assumed to be the second kind, which is
+       the safe direction — it asserts rather than runs. Web IDL's indexed property getter is the first kind
+       by construction: an index lookup has no accessors in it. */
+    bool get_own_property_no_user_code;
 } JSClassExoticMethods;
 
 typedef void JSClassFinalizer(JSRuntime *rt, JSValueConst val);
