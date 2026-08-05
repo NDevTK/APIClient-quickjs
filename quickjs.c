@@ -2915,6 +2915,17 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JSValue res;
     int i, ret;
 
+    /* NO JOB RUNS WHILE A FLOW IS PARKED, asserted where the job is drained rather than trusted to each host.
+       The contract is already written on JS_ParkFlow — "the host must resume parked flows BEFORE draining a
+       job, so a forced preempt stays transparent to ordering" — and it was kept by convention, which means it
+       was kept by whoever remembered. Three pumps exist in run-test262 alone and one of them did not resume
+       first, so an agent's parked flow would have watched queued jobs run ahead of it, or never resumed at all.
+       That is unobservable until some test's microtask sequence comes out reordered and the cause looks like a
+       promise bug. A convention nothing checks is not an invariant; this makes any host that drains a job with
+       a flow still parked crash at the drain, naming the rule it broke. */
+    DCHECK(!JS_HasParkedFlow(rt),
+           "a job was drained while a flow was PARKED — the host pump must resume parked flows first "
+           "(while (JS_ResumeParkedFlow(rt));) or the park reorders observable microtasks");
     js_finrec_drain(rt, true);
     if (list_empty(&rt->job_list)) {
         *pctx = NULL;

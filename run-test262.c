@@ -722,6 +722,16 @@ static void agent_start(void *arg)
 
     for(;;) {
         JSContext *ctx1;
+        /* THE PUMP, and this is the THIRD one — the two that drive the main thread already drain the parked
+           slot before any job and say why. This one did not, and the line above is why that matters: the
+           agent's script runs on the flow machinery, so a loop in it PARKS. A parked agent flow with nothing
+           to resume it either sits while queued jobs run ahead of it — reordering observable microtasks, which
+           the resume razor forbids — or is never resumed at all and the agent silently stops mid-script.
+           Three pumps with two of them transparent is the same class of gap as one call spelling behaving
+           differently from another: the property has to hold wherever a flow can park, not where we happened
+           to look. */
+        while (JS_ResumeParkedFlow(JS_GetRuntime(ctx)))
+            ;
         host_pump_atomics_async(JS_GetRuntime(ctx), false);
         ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
         if (ret < 0) {
