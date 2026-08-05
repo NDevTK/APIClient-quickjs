@@ -24862,9 +24862,24 @@ uint64_t JS_SyncDriveToCompletionCount(void) { return __atomic_load_n(&g_sync_dr
    a sibling here. On a fork we snapshot the CURRENT frame AT the OP_if (cond still on the stack) so the
    sibling resumes HERE and replays the other arm — never a re-run. NO FALLBACK: a deep (tramp-chain) or
    nested (non-generator activation) branch is a not-yet-built capability that crashes loud. */
+/* A FORK IS A SUSPEND POINT — `*park_after` says so to the branch site.
+   The preempt hook was consulted only at loop back-edges, which is the right set for a program that LOOPS and
+   the empty set for one that does not. A page's top-level bundle is thousands of straight-line statements with a
+   concolic `if` at many of them, so the flow forked a sibling per branch for seconds on end without ever
+   reaching a suspend point: the scheduler could not interleave, could not re-rank against the siblings just
+   created, and could not honour its own quantum. Measured at requested=1 fired=1 across five seconds — the seam
+   was never broken, it was never REACHED.
+   §scheduler already names this yield: the value yield fires "on an emit/fork/suspension that changes ranks",
+   and a fork is precisely the event that changes them, since the sibling it just created may outrank the parent
+   immediately. Asking here is that clause, not a new bound: nothing is dropped or reordered, the flow resumes
+   byte-identically at the arm it took, and the sibling was already on the frontier either way.
+   Only where a preempt is routable — a fork in a non-base activation is the residual drive-to-completion the
+   DFAIL below already names, and parking it would be the second wrong answer to the same gap. */
 static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
-                           JSStackFrame *sf, JSValue *sp, void *tf_top, JSAsyncFunctionState *gen_state) {
+                           JSStackFrame *sf, JSValue *sp, void *tf_top, JSAsyncFunctionState *gen_state,
+                           int *park_after) {
     int harm = (g_flow_control.branch && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_flow_control.branch(ctx, op1) : -1;
+    *park_after = 0;
     if (harm >= 0 && (harm & 0x100)) {
         harm &= 0xff;
         if (gen_state == g_flow_base_gen && tf_top == NULL) {
@@ -24906,6 +24921,8 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
                identity. Until then this CRASHES loud (replay is banned). */
             DFAIL("generator .next() driven off the tramp chain (C-builtin-internal drive of js_generator_next) — route it through do_generator_tramp; the js_generator_next drive-to-completion is the residue to delete");
         }
+        if (gen_state == g_flow_base_gen && g_flow_control.preempt != NULL && g_flow_control.preempt())
+            *park_after = 1;
     }
     return harm;
 }
@@ -35323,14 +35340,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_if_true):
             {
-                int res;
+                int res, park_after;
                 JSValue op1;
 
                 uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 4;
                 {
-                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state, &park_after);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -35338,6 +35355,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp--;
                 if (res) {
                     pc += (int32_t)get_u32(pc - 4) - 4;
+                }
+                /* The fork just changed the ranking; park at the arm this flow took, so the sibling created a
+                   moment ago can be scheduled against it. pc and sp are already at the continuation, which is
+                   the same shape a back-edge preempt parks in. Counted as requested AND fired: the point was
+                   reached and it did park, so engagement stays an honest ratio. */
+                if (unlikely(park_after)) {
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                    goto do_preempt;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
@@ -35345,14 +35371,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_if_false):
             {
-                int res;
+                int res, park_after;
                 JSValue op1;
 
                 uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 4;
                 {
-                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state, &park_after);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -35361,20 +35387,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (!res) {
                     pc += (int32_t)get_u32(pc - 4) - 4;
                 }
+                /* The fork just changed the ranking; park at the arm this flow took, so the sibling created a
+                   moment ago can be scheduled against it. pc and sp are already at the continuation, which is
+                   the same shape a back-edge preempt parks in. Counted as requested AND fired: the point was
+                   reached and it did park, so engagement stays an honest ratio. */
+                if (unlikely(park_after)) {
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                    goto do_preempt;
+                }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
             }
             BREAK;
         CASE(OP_if_true8):
             {
-                int res;
+                int res, park_after;
                 JSValue op1;
 
                 uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 1;
                 {
-                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state, &park_after);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -35383,20 +35418,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (res) {
                     pc += (int8_t)pc[-1] - 1;
                 }
+                /* The fork just changed the ranking; park at the arm this flow took, so the sibling created a
+                   moment ago can be scheduled against it. pc and sp are already at the continuation, which is
+                   the same shape a back-edge preempt parks in. Counted as requested AND fired: the point was
+                   reached and it did park, so engagement stays an honest ratio. */
+                if (unlikely(park_after)) {
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                    goto do_preempt;
+                }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
             }
             BREAK;
         CASE(OP_if_false8):
             {
-                int res;
+                int res, park_after;
                 JSValue op1;
 
                 uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 1;
                 {
-                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state, &park_after);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -35404,6 +35448,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp--;
                 if (!res) {
                     pc += (int8_t)pc[-1] - 1;
+                }
+                /* The fork just changed the ranking; park at the arm this flow took, so the sibling created a
+                   moment ago can be scheduled against it. pc and sp are already at the continuation, which is
+                   the same shape a back-edge preempt parks in. Counted as requested AND fired: the point was
+                   reached and it did park, so engagement stays an honest ratio. */
+                if (unlikely(park_after)) {
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                    goto do_preempt;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
