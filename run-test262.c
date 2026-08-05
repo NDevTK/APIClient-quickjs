@@ -1462,7 +1462,18 @@ int longest_match(const char *str, const char *find, int pos, int *ppos, int lin
    corrupted state — a fork-feature bug conformance testing can never surface. This is the point of test262 here:
    NOT "does QuickJS run JS" (known), but "does our time-travel preserve JS across thousands of suspend/resumes".
    Modules + async ($DONE) fall back to JS_Eval for now (JS_FlowNew is a global program; that surface is next). */
-static int fork_preempt_always(void) { return 1; }
+/* EVERY back-edge and every fork, and calls SAMPLED. Forcing every call too is not a stronger test that was
+   declined — it is one the corpus cannot finish: a call is reached orders of magnitude more often than a loop
+   back-edge, and parking + rebuilding the heap-frame chain at each one timed built-ins/Array out on its own.
+   The stride keeps call-parking heavily exercised (the corpus makes hundreds of millions of calls, so 1-in-64
+   is still millions of forced call-parks) while leaving back-edge coverage exactly as strong. It samples WHEN
+   to force the seam; it is not a fallback to a second implementation, because a call the sample skips parks by
+   the same one mechanism the moment the sample selects it. */
+static unsigned fork_call_stride = 0;
+static int fork_preempt_always(int kind) {
+    if (kind == JS_PREEMPT_CALL) return (++fork_call_stride & 63) == 0;
+    return 1;
+}
 /* JSFlowControlHooks is {branch, fork, preempt} — THREE fields. A fourth initializer silently left `preempt` NULL,
    so the forced back-edge preemption never armed and the engagement metric read a vacuous 0/0. Designated
    initializers so the field can never drift again. */

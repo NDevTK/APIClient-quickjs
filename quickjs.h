@@ -1220,7 +1220,15 @@ typedef struct JSFlowControlHooks {
                                                            (The deleted `replay` hook re-ran a nested/deep flow from its
                                                            start — BANNED, not byte-identical; that fork now DFAILs until a
                                                            sound async-frame snapshot is built.) */
-    int  (*preempt)(void);
+    /* The KIND of suspend point being offered, so a policy can answer per kind. Parking is ONE mechanism —
+       this is not a selection between two of them — but "force every point" means wildly different amounts of
+       work at a back-edge (once per loop iteration) and at a call (millions of times), and a policy that cannot
+       tell them apart must answer the same for both. run-test262 forces every back-edge and samples calls for
+       exactly that reason; the solver's own policy is wall-clock and does not care which kind asked. */
+#define JS_PREEMPT_BACKEDGE 0
+#define JS_PREEMPT_FORK     1
+#define JS_PREEMPT_CALL     2
+    int  (*preempt)(int kind);
 } JSFlowControlHooks;
 JS_EXTERN void JS_SetFlowControlHooks(const JSFlowControlHooks *hooks);
 

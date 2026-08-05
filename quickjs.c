@@ -24932,15 +24932,41 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
                identity. Until then this CRASHES loud (replay is banned). */
             DFAIL("generator .next() driven off the tramp chain (C-builtin-internal drive of js_generator_next) — route it through do_generator_tramp; the js_generator_next drive-to-completion is the residue to delete");
         }
-        if (gen_state == g_flow_base_gen && g_flow_control.preempt != NULL && g_flow_control.preempt())
+        if (gen_state == g_flow_base_gen && g_flow_control.preempt != NULL && g_flow_control.preempt(JS_PREEMPT_FORK))
             *park_after = 1;
     }
     return harm;
 }
 
-/* Preemption (JSFlowControlHooks.preempt): when it returns 1 at a yield point (a loop back-edge), the
-   interpreter unwinds the whole heap-frame chain into the generator base and returns FUNC_RET_PREEMPT, so the
-   flow parks mid-execution at ANY depth. Resume rebuilds the chain. */
+/* Preemption (JSFlowControlHooks.preempt): when it returns 1 at a yield point (a loop back-edge or a call),
+   the interpreter unwinds the whole heap-frame chain into the generator base and returns FUNC_RET_PREEMPT, so
+   the flow parks mid-execution at ANY depth. Resume rebuilds the chain. */
+
+/* A CALL IS A SUSPEND POINT, on a CLASSIC-SCRIPT base only, and that restriction is the honest boundary rather
+   than a hedge. A park is free only if it is transparent to observable ordering. On a FLOW_BASE_BYTECODE base
+   the driver re-enters the program synchronously, so parking mid-run and resuming cannot be observed: the
+   sequence of side effects is unchanged. A reaction base (FLOW_BASE_STEP_ROOT) and an async/module base
+   (FLOW_BASE_ASYNC_CALL) resume through the pump instead, and offering call points there MEASURABLY reordered
+   microtasks — Promise/race/resolved-sequence-extra-ticks came out '1,2,4,3,5',
+   Promise/race/S25.4.4.3_A6.2_T1 gained a fifth entry, and async-generator/yield-return-then-getter-ticks read
+   [start, get then, tick 1] where the spec sequence is [start, tick 1, get then]. That is the back-edge sites'
+   own written objection, confirmed by measurement.
+   So the seam starts where transparency is provable. Making those two bases' resume transparent is the next
+   capability, NAMED here rather than silently skipped, and this guard widens the moment it exists — it is not
+   a fallback, because a base it excludes still parks at every back-edge and fork exactly as before.
+   call_op_pc NULL means the entry rewrote its operands and cannot be re-entered at its opcode
+   (OP_using_dispose — see there); it offers no point rather than an unsound one. */
+#define CALL_SUSPEND_POINT() do {                                                        \
+        if (unlikely(g_flow_control.preempt != NULL) && call_op_pc != NULL &&            \
+            gen_state != NULL && gen_state == g_flow_base_gen &&                         \
+            gen_state->base_kind == FLOW_BASE_BYTECODE &&                                \
+            g_flow_control.preempt(JS_PREEMPT_CALL)) {                                   \
+            FLOW_PREEMPT_COUNT(g_flow_preempt_requested);                                \
+            FLOW_PREEMPT_COUNT(g_flow_preempt_fired);                                    \
+            pc = call_op_pc;                                                             \
+            goto do_preempt;                                                             \
+        }                                                                                \
+    } while (0)
 
 /* Install the forced-execution hook interfaces — one registration per concern (see quickjs.h). Each installs
    ONCE at engine setup; a NULL argument crashes (offensive: the interface is not optional). g_flow_local_mark
@@ -25001,6 +25027,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int tramp_first = -1; uint8_t tramp_is_tail = 0;   /* set before goto do_tramp_call */
     JSValue *call_argv; int call_argc;   /* the current call's operands; function-scope so the flow-base entry can
                                             set up a call-root step base before `restart:` (see FLOW_BASE_STEP_ROOT) */
+    /* THE CALL OPCODE'S OWN ADDRESS, so a call can be a SUSPEND POINT. A straight-line program offers neither
+       of the points that existed — no loop back-edge, and once its decisions are pinned no fork — so a page's
+       top-level bundle ran seconds at a time with the scheduler unable to park it (measured: 5084 ms with 4
+       points offered, all in the first instants). Calls are where such a program spends itself.
+       Parking at the opcode's START is what makes it sound: nothing has been consumed, the operands sit on the
+       stack exactly as the opcode expects, so the resume re-executes the call from scratch — the shape the
+       OP_if fork snapshot already uses when it captures with the condition still on the stack. */
+    uint8_t *call_op_pc = NULL;
     /* constructor trampoline (do_construct_tramp): con_func/con_ntgt/con_args/con_argc + con_from_super are set
        by OP_call_constructor (new C()) or OP_init_ctor (super()) before the goto. */
     JSValueConst con_func = JS_UNDEFINED, con_ntgt = JS_UNDEFINED;
@@ -25859,15 +25893,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_call1):
         CASE(OP_call2):
         CASE(OP_call3):
+            call_op_pc = pc - 1;
             call_argc = opcode - OP_call0;
             goto has_call_argc;
         CASE(OP_call):
         CASE(OP_tail_call):
             {
+                call_op_pc = pc - 1;
                 call_argc = get_u16(pc);
                 pc += 2;
                 goto has_call_argc;
             has_call_argc:
+                CALL_SUSPEND_POINT();
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 TRAMP_BODY_DISPATCH(-1, opcode == OP_tail_call);   /* f() with a bytecode body -> that body on THIS chain */
@@ -25884,8 +25921,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_call_constructor):
             {
+                call_op_pc = pc - 1;
                 call_argc = get_u16(pc);
                 pc += 2;
+                CALL_SUSPEND_POINT();
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 con_func = call_argv[-2]; con_ntgt = call_argv[-1];
@@ -25897,9 +25936,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_call_method):
         CASE(OP_tail_call_method):
             {
+                call_op_pc = pc - 1;
                 call_argc = get_u16(pc);
                 pc += 2;
             has_method_call_argc:
+                CALL_SUSPEND_POINT();
                 /* Entry for an opcode that IS a method call but spells its operands differently (OP_using_dispose's
                    [value][method] is [this][f] with zero args). It must jump HERE and not re-derive the chain: the
                    chain below is bound functions, proxy [[Call]], the async-from-sync .next, the generator methods,
@@ -28224,7 +28265,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        the substrate; THIS is the feature.
                        When nobody is waiting the machine is simply re-entered, which costs one predicted call
                        per back-edge and is why a machine may ask at every iteration. */
-                    if (likely(g_flow_control.preempt == NULL || !g_flow_control.preempt())) {
+                    if (likely(g_flow_control.preempt == NULL || !g_flow_control.preempt(JS_PREEMPT_BACKEDGE))) {
                         ret_val = JS_UNDEFINED;
                         goto do_step_step;
                     }
@@ -35299,7 +35340,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                suspends as ONE snapshot and resumes at the same point — is the best-advanced-design mechanism being
                built. Until it lands, a nested loop preempt CRASHES (never self-resumes it, which is the drive-to-
                completion this forbids; never silently skips the feature). */
-            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
+            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                 if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
                 if (gen_state == NULL)
@@ -35316,7 +35357,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (gdiff16 >= 0)
                     BREAK;   /* back-edge only — see OP_goto */
             }
-            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
+            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                 if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
                 /* Name WHICH activation cannot park, so the missing driver is identified rather than guessed:
@@ -35337,7 +35378,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (gdiff8 >= 0)
                     BREAK;   /* back-edge only — see OP_goto */
             }
-            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
+            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
                 FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                 if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
                 /* Name WHICH activation cannot park, so the missing driver is identified rather than guessed:
@@ -35963,6 +36004,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 call_argc = 0;
                 opcode = OP_call_method;   /* never a tail call: the result is dropped by the expansion */
+                /* THE ONE CALL ENTRY THAT OFFERS NO SUSPEND POINT, named rather than silently skipped. Every
+                   other entry parks at its opcode's start because the opcode has consumed nothing yet; this one
+                   has already freed its operands and rewritten the stack into [this][f] before jumping here, so
+                   re-executing OP_using_dispose from its start would redo that. Giving it a re-enterable park
+                   point is the follow-up; until then a `using` disposal is the one call a flow cannot park at. */
+                call_op_pc = NULL;
                 goto has_method_call_argc;
             }
 
@@ -82147,7 +82194,7 @@ static JSValue js_regexp_tostring_fini(JSContext *ctx, void *st, bool take_resul
 int lre_want_yield(void *opaque)
 {
     (void)opaque;
-    return g_flow_control.preempt != NULL && g_flow_control.preempt();
+    return g_flow_control.preempt != NULL && g_flow_control.preempt(JS_PREEMPT_BACKEDGE);
 }
 
 void *lre_realloc(void *opaque, void *ptr, size_t size)
@@ -84403,7 +84450,7 @@ static int json_parse_step(JSParseState *s, JSONParse *p)
  value_done:
     /* THE BACK-EDGE, once per completed value. Asking here rather than per token keeps the check off the
        character loop while still bounding how long a parse can hold the flow: a value is the unit of progress. */
-    if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt()) {
+    if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
         p->resume = JPR_DONE_VALUE;
         JSON_SAVE();
         return 1;
