@@ -89490,7 +89490,7 @@ typedef struct JSReactionFlow {
     uint8_t phase;             /* 0 = the handler is running, 1 = the settle is */
 } JSReactionFlow;
 
-static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv);
+static void js_reaction_park_resume(JSContext *ctx, void *opaque);
 
 /* Populate `fs` as a CALL-ROOT flow base (FLOW_BASE_STEP_ROOT): a flow whose entire body is one call,
    handler(arg), for a handler of ANY kind. cur_func is the handler (not necessarily bytecode);
@@ -89642,7 +89642,7 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
 {
     for(;;) {
         JSAsyncFunctionState *prev_base = g_flow_base_gen;
-        JSValue res, jv;
+        JSValue res;
 
         rf->fs.throw_flag = false;   /* a preempt-resume is a continuation, never a re-throw */
         g_flow_base_gen = &rf->fs;
@@ -89652,9 +89652,17 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
            never the value: a handler returning the integer 3 would collide with js_int32(FUNC_RET_PREEMPT). */
         if (rf->fs.frame.cur_sp != NULL || rf->fs.tramp_top != NULL) {
             JS_FreeValue(ctx, res);
-            jv = JS_MKPTR(JS_TAG_INT, rf);
-            if (JS_EnqueueJob(ctx, js_reaction_resume_job, 1, (JSValueConst *)&jv) < 0)
-                return JS_EXCEPTION;
+            /* PARK IN THE SLOT, never on the job queue — the same rule the async and async-generator resumes
+               already keep, and this was the one park that did not. A forced preempt is not a microtask: the
+               FIFO puts the continuation behind every job already queued, so the handler finishes LATER than it
+               would have and the promise it owes settles later with it. That is observable and the corpus says
+               so — Promise/allSettled/resolved-sequence counts one step too many, and
+               Promise/race/reject-ignored-immed sees a rejection that should have lost the race, because the
+               settle that would have made it a no-op had not happened yet.
+               It was invisible while a reaction could only preempt at a loop back-edge, which a `.then` handler
+               rarely has; it is not a new bug, it is one that had nothing to reach it. The host pump drains this
+               slot before starting any job, so the resume is transparent. */
+            JS_ParkFlow(ctx, js_reaction_park_resume, rf);
             return JS_UNDEFINED;   /* PARKED: the pump resumes it; the promise settles when it completes */
         }
         /* COMPLETED via `done:` — that path frees the stack/vars inline but not the frame buffer + cur_func/this */
@@ -89676,9 +89684,11 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
     }
 }
 
-static JSValue js_reaction_resume_job(JSContext *ctx, int argc, JSValueConst *argv)
+/* The slot's resume. reaction_flow_step leaves any exception on the context, which is where the pump's caller
+   reads it from — the same place the job wrapper's return value ended up. */
+static void js_reaction_park_resume(JSContext *ctx, void *opaque)
 {
-    return reaction_flow_step(ctx, (JSReactionFlow *)JS_VALUE_GET_PTR(argv[0]));
+    reaction_flow_step(ctx, (JSReactionFlow *)opaque);
 }
 
 /* `func(value)` as a call-root FLOW. JSReactionFlow is exactly the vehicle — a flow plus the capability it
