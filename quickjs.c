@@ -24959,10 +24959,14 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
    there is nothing left for a base-kind test to select and it is gone. What remains is the routability
    condition the back-edge sites also carry: a preempt in an activation that is not the flow base cannot be
    routed, which is a fact about the activation and not about the base's kind.
-   call_op_pc NULL means the entry rewrote its operands and cannot be re-entered at its opcode
-   (OP_using_dispose — see there); it offers no point rather than an unsound one. */
+   EVERY call entry records its opcode's address, including OP_using_dispose, which was thought not to be
+   re-enterable and is — see there. So there is no entry left that offers no point, and the condition that used
+   to allow one is a DCHECK instead: an entry that forgets crashes rather than quietly losing its suspend
+   point, which is the sort of gap that only shows up as a page that will not park. */
 #define CALL_SUSPEND_POINT() do {                                                        \
-        if (unlikely(g_flow_control.preempt != NULL) && call_op_pc != NULL &&            \
+        DCHECK(call_op_pc != NULL, "a call entry reached the shared dispatch without recording its opcode's  \
+               address — it cannot be re-entered, so its call would silently offer no suspend point");          \
+        if (unlikely(g_flow_control.preempt != NULL) &&                                  \
             gen_state != NULL && gen_state == g_flow_base_gen &&                         \
             g_flow_control.preempt(JS_PREEMPT_CALL)) {                                   \
             FLOW_PREEMPT_COUNT(g_flow_preempt_requested);                                \
@@ -36027,12 +36031,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 call_argc = 0;
                 opcode = OP_call_method;   /* never a tail call: the result is dropped by the expansion */
-                /* THE ONE CALL ENTRY THAT OFFERS NO SUSPEND POINT, named rather than silently skipped. Every
-                   other entry parks at its opcode's start because the opcode has consumed nothing yet; this one
-                   has already freed its operands and rewritten the stack into [this][f] before jumping here, so
-                   re-executing OP_using_dispose from its start would redo that. Giving it a re-enterable park
-                   point is the follow-up; until then a `using` disposal is the one call a flow cannot park at. */
-                call_op_pc = NULL;
+                /* RE-ENTERABLE, like every other call entry, and the note that used to sit here saying
+                   otherwise was simply a misreading of this code. It claimed the opcode "has already freed its
+                   operands and rewritten the stack into [this][f] before jumping here". It has not: `val` and
+                   `method` are read into locals and the frees belong to the null/undefined branch above, which
+                   BREAKs and never arrives at the shared label. On the path that does arrive, sp is untouched —
+                   [value][method] IS the [this][f] shape with zero args, which is the whole reason this opcode
+                   hands its operands over instead of calling.
+                   So re-entering at the opcode re-reads two unchanged slots and re-runs a pure test, which is
+                   the same idempotence every other entry relies on, and a `using` disposal parks at its call
+                   like any other. The gap was in the comment, not in the engine. */
+                call_op_pc = pc - 1;
                 goto has_method_call_argc;
             }
 
