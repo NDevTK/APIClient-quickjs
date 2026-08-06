@@ -24942,24 +24942,24 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
    the interpreter unwinds the whole heap-frame chain into the generator base and returns FUNC_RET_PREEMPT, so
    the flow parks mid-execution at ANY depth. Resume rebuilds the chain. */
 
-/* A CALL IS A SUSPEND POINT, on a CLASSIC-SCRIPT base only, and that restriction is the honest boundary rather
-   than a hedge. A park is free only if it is transparent to observable ordering. On a FLOW_BASE_BYTECODE base
-   the driver re-enters the program synchronously, so parking mid-run and resuming cannot be observed: the
-   sequence of side effects is unchanged. A reaction base (FLOW_BASE_STEP_ROOT) and an async/module base
-   (FLOW_BASE_ASYNC_CALL) resume through the pump instead, and offering call points there MEASURABLY reordered
-   microtasks — Promise/race/resolved-sequence-extra-ticks came out '1,2,4,3,5',
-   Promise/race/S25.4.4.3_A6.2_T1 gained a fifth entry, and async-generator/yield-return-then-getter-ticks read
-   [start, get then, tick 1] where the spec sequence is [start, tick 1, get then]. That is the back-edge sites'
-   own written objection, confirmed by measurement.
-   So the seam starts where transparency is provable. Making those two bases' resume transparent is the next
-   capability, NAMED here rather than silently skipped, and this guard widens the moment it exists — it is not
-   a fallback, because a base it excludes still parks at every back-edge and fork exactly as before.
+/* A CALL IS A SUSPEND POINT — on every flow base, with no test for which kind it is.
+   That test used to be here and deleting it is the point, not a tidy-up. It read FLOW_BASE_BYTECODE only,
+   because offering call points on a reaction or an async base measurably reordered microtasks:
+   Promise/allSettled/resolved-sequence counted a step too many and Promise/race/reject-ignored-immed saw a
+   rejection that should have lost the race. The obvious reading was that those bases resume through the pump
+   and a pump resume is not transparent, so the restriction looked like an honest boundary.
+   That reading was wrong, and the tests were pointing at something else. Those bases resumed through the job
+   FIFO because the promise-reaction park called JS_EnqueueJob where the other two park paths call JS_ParkFlow —
+   a bug in the park, not a property of the base. With the park in the slot all three kinds are transparent, so
+   there is nothing left for a base-kind test to select and it is gone. What remains is the routability
+   condition the back-edge sites also carry: a preempt in an activation that is not the flow base cannot be
+   routed, which is a fact about the activation and not about the base's kind.
    call_op_pc NULL means the entry rewrote its operands and cannot be re-entered at its opcode
    (OP_using_dispose — see there); it offers no point rather than an unsound one. */
 #define CALL_SUSPEND_POINT() do {                                                        \
         if (unlikely(g_flow_control.preempt != NULL) && call_op_pc != NULL &&            \
             gen_state != NULL && gen_state == g_flow_base_gen &&                         \
-            gen_state->base_kind == FLOW_BASE_BYTECODE &&                                \
+            gen_state->base_kind != FLOW_BASE_ASYNC_CALL &&                              \
             g_flow_control.preempt(JS_PREEMPT_CALL)) {                                   \
             FLOW_PREEMPT_COUNT(g_flow_preempt_requested);                                \
             FLOW_PREEMPT_COUNT(g_flow_preempt_fired);                                    \
