@@ -26935,7 +26935,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
             do_construct_no_arm:
                 /* No arm matched: a C constructor with no body to suspend. The cleanup is fully determined by the
-                   operand shape, which is why these were two blocks. */
+                   operand shape, which is why these were two blocks.
+                   AND IT REALLY HAS NO BODY — asserted rather than said. tramp_can_construct sends every bytecode
+                   constructor to do_construct_tramp before this point is reached, so what arrives here cannot be
+                   one; JS_CallConstructorInternal below would run its body with JS_CallInternal, a C-stack
+                   re-entry where a loop in the constructor drives to completion. The recognizer ratchet counts
+                   these two sites as C-side Constructs, and this is what retires them from suspicion: the claim
+                   that made them safe is now checked on every construct the interpreter performs. */
+                DCHECK(!tramp_can_construct(con_func),
+                       "a BYTECODE constructor reached the interpreter's no-arm construct — its body would run on "
+                       "the C stack with no flow base, and do_construct_tramp exists to take exactly this");
                 if (tramp_first == -2) {
                     JSValue *cargv = sp - con_pop;   /* the OPERANDS, which are not con_args when those are a list */
                     DCHECK(!con_outer, "a step machine's Construct never puts operands on the caller stack");
@@ -39869,25 +39878,28 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
                          argv, flags);
     }
 
-    b = p->u.func.function_bytecode;
-    if (b->is_derived_class_constructor) {
-        return JS_CallInternal(ctx, func_obj, JS_UNDEFINED, new_target, argc, argv, flags);
-    } else {
-        JSValue obj, ret;
-        /* legacy constructor behavior */
-        obj = js_create_from_ctor(ctx, new_target, JS_CLASS_OBJECT);
-        if (JS_IsException(obj))
-            return JS_EXCEPTION;
-        ret = JS_CallInternal(ctx, func_obj, obj, new_target, argc, argv, flags);
-        if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT ||
-            JS_IsException(ret)) {
-            JS_FreeValue(ctx, obj);
-            return ret;
-        } else {
-            JS_FreeValue(ctx, ret);
-            return obj;
-        }
-    }
+    /* A BYTECODE CONSTRUCTOR DOES NOT RUN HERE, and there is no longer a body that could.
+     *
+     * This is where `new C()` used to re-enter the interpreter from C — JS_CallInternal on the constructor's
+     * body — and it is the last edge of the interpreter's own recursion cycle. A constructor entered that way
+     * is on the C stack: it cannot suspend, so a loop in it drives to completion, and the whole point of the
+     * trampoline is that no page code is ever in that position.
+     *
+     * Every route here is converted. The interpreter's construct point sends a bytecode ctor to
+     * do_construct_tramp, where its body runs on the caller's heap-frame chain; a bound target is flattened at
+     * the operator site and re-dispatched, so it answers exactly as a bare one; a step machine's Construct is a
+     * request. The last C caller was js_typed_array_create, deleted above as the twin of a conversion that had
+     * already happened.
+     *
+     * So the branch is DELETED rather than kept behind a check. Keeping it would be the legacy fallback this
+     * engine's whole discipline is against: a second implementation of Construct, reachable by anyone who
+     * reaches for the public entry, silently un-suspendable. What is left is the DFAIL, which names what to
+     * build for the caller that finds it — route the Construct through the trampoline, as every caller in the
+     * engine already does. */
+    DFAIL("a BYTECODE constructor was constructed from C — its body would run on the C stack with no flow base, "
+          "so a loop in it drives to completion; route this Construct through the trampoline "
+          "(do_construct_tramp, or a step machine's CONSTRUCT request) as every caller in the engine does");
+    return JS_ThrowTypeError(ctx, "constructing a scripted constructor from C is not supported");
 }
 
 JSValue JS_CallConstructor2(JSContext *ctx, JSValueConst func_obj,
@@ -96085,39 +96097,13 @@ static JSValue js_create_typed_array_iterator(JSContext *ctx, JSValueConst this_
     return js_create_array_iterator(ctx, this_val, argc, argv, magic);
 }
 
-static JSValue js_typed_array_create(JSContext *ctx, JSValueConst ctor,
-                                     int argc, JSValueConst *argv,
-                                     bool require_mutable)
-{
-    JSValue ret;
-    int new_len;
-    int64_t len;
-
-    ret = JS_CallConstructor(ctx, ctor, argc, argv);
-    if (JS_IsException(ret))
-        return ret;
-    /* validate the typed array */
-    new_len = js_typed_array_get_length_unsafe(ctx, ret);
-    if (new_len < 0)
-        goto fail;
-    if (require_mutable && typed_array_is_immutable(JS_VALUE_GET_OBJ(ret))) {
-        JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
-        goto fail;
-    }
-    if (argc == 1) {
-        /* ensure that it is large enough */
-        if (JS_ToLengthFree(ctx, &len, js_dup(argv[0])))
-            goto fail;
-        if (new_len < len) {
-            JS_ThrowTypeError(ctx, "TypedArray length is too small");
-        fail:
-            JS_FreeValue(ctx, ret);
-            return JS_EXCEPTION;
-        }
-    }
-    return ret;
-}
-
+/* DELETED: js_typed_array_create. TypedArraySpeciesCreate's Construct is a real Construct(C, «len») on the
+   trampoline now — the same conversion that took js_typed_array_from and js_typed_array_of below — and its
+   validation lives with it (see the construct-settled arm that names this function). What was left here was the
+   C twin: a second implementation of the same step, reachable by anyone who reached for it, running the page's
+   subclass constructor with JS_CallConstructor from a C activation with no flow base. It had no callers at all,
+   which is the only reason the interpreter's recursion cycle survived this long without anyone noticing whose
+   edge it was. */
 
 /* DELETED: js_typed_array_from. Every part of it is a phase of the consume walk it now declares at its own
    definition — the create is a real Construct(C, «len») on the tramp and the sets follow it — so the body was
