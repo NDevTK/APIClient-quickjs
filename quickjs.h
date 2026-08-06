@@ -1161,6 +1161,13 @@ JS_EXTERN JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_fun
    a page's `then` getter or a loop inside its handler drives to completion there. Every host delivery uses this.
    0 = done, -1 = it threw (the exception is live). */
 JS_EXTERN int JS_CallAsFlow(JSContext *ctx, JSValueConst func, JSValueConst value);
+
+/* ATTACH REACTIONS THE WAY THE SPEC DOES — PerformPromiseThen, which does NOT read `then` off the promise. A
+   host component reacting to a promise it did not create had only `.then`, and a page that replaces
+   Promise.prototype.then must not thereby change what a spec algorithm does. Returns the reactions' capability
+   promise; either handler may be JS_UNDEFINED. */
+JS_EXTERN JSValue JS_PerformPromiseThen(JSContext *ctx, JSValueConst promise, JSValueConst on_fulfilled,
+                                        JSValueConst on_rejected);
 /* Atomics.waitAsync timeouts are the HOST's to wait for — 25.4.3.14 enqueues a host timeout job. Ask how long
    until the earliest deadline (-1 = none), wait for it wherever the host already waits, then settle what is
    due. The engine never blocks on this itself. */

@@ -74725,6 +74725,39 @@ JSValueConst JS_StepClosureData(const JSStepHdr *h, int i)
     return rec->data[i];
 }
 
+/* ATTACH REACTIONS TO A PROMISE THE WAY THE SPEC DOES — PerformPromiseThen, not a `.then` read.
+ *
+ * A host component that must react to a promise it did not create has only had one way to do it from outside
+ * this file: read `then` off the value and call it. That is observably different from what every spec algorithm
+ * actually says. §4.5's ReadableStreamDefaultControllerCallPullIfNeeded performs PerformPromiseThen on the
+ * pull promise, which does NOT read `then` — so a page that replaces `Promise.prototype.then` changes what its
+ * own `.then()` does and changes nothing about what the stream does, and the difference is exactly the kind of
+ * thing this engine exists to get right rather than approximate.
+ *
+ * `on_fulfilled`/`on_rejected` may be JS_UNDEFINED. Returns the reactions' own capability promise, so a caller
+ * that chains gets the chained promise rather than the one it reacted to. */
+JSValue JS_PerformPromiseThen(JSContext *ctx, JSValueConst promise, JSValueConst on_fulfilled,
+                              JSValueConst on_rejected)
+{
+    JSValueConst handlers[2];
+    JSValue funcs[2], cap;
+
+    cap = JS_NewPromiseCapability(ctx, funcs);
+    if (JS_IsException(cap))
+        return cap;
+    handlers[0] = on_fulfilled;
+    handlers[1] = on_rejected;
+    if (perform_promise_then(ctx, promise, handlers, vc(funcs)) < 0) {
+        JS_FreeValue(ctx, funcs[0]);
+        JS_FreeValue(ctx, funcs[1]);
+        JS_FreeValue(ctx, cap);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(ctx, funcs[0]);
+    JS_FreeValue(ctx, funcs[1]);
+    return cap;
+}
+
 int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def)
 {
     const JSTrampStepDef **a;
