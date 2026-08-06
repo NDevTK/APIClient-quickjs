@@ -2861,6 +2861,33 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
 static _Thread_local JSJobEnqueueHook g_job_enqueue_hook = NULL;
 void JS_SetJobEnqueueHook(JSJobEnqueueHook h) { g_job_enqueue_hook = h; }
 
+/* A C CALL CYCLE'S DEPTH, ASSERTED WHERE IT IS RELIED ON.
+ *
+ * engine/check_recursion.mjs reports four self-contained cycles over the whole program, and every one of them
+ * is BOUNDED — but three were bounded by an ARGUMENT rather than by a measurement. free_zero_refcount set the
+ * standard the other two are held to here: it is a worklist, it says so, and a DCHECK proves the phase flag
+ * that makes it one is never violated, so its cycle is a static artefact and not a stack. An argument written
+ * in a comment is what people read INSTEAD of looking — the same reason the DOM chokepoint claim was false for
+ * two components, and the same reason the recursion checker itself covered a third of the program while saying
+ * it covered all of it.
+ *
+ * So a cycle whose bound is "these cases are disjoint, so it cannot nest deeper than N" states N here and
+ * crashes if it is ever wrong. It is dev-only and it CLAMPS NOTHING: the depth is not limited, it is asserted,
+ * and a violation is a should-never-happen with a name rather than a stack that grows until it does not. */
+#if APICLIENT_DEV
+typedef struct { int depth; const char *what; int max; } JSCycleGuard;
+#define CYCLE_GUARD_ENTER(g, N, WHAT)                                                        \
+    static _Thread_local JSCycleGuard g = { 0, WHAT, N };                                     \
+    do {                                                                                      \
+        g.depth++;                                                                            \
+        DCHECK(g.depth <= (N), WHAT);                                                         \
+    } while (0)
+#define CYCLE_GUARD_LEAVE(g)  do { (g).depth--; } while (0)
+#else
+#define CYCLE_GUARD_ENTER(g, N, WHAT)  do { } while (0)
+#define CYCLE_GUARD_LEAVE(g)           do { } while (0)
+#endif
+
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                   int argc, JSValueConst *argv)
 {
@@ -5903,6 +5930,13 @@ static JSValue js_rebalance_string_rope(JSContext *ctx, JSValueConst rope)
     JSValue buckets[ROPE_N_BUCKETS], a, b;
     int i;
 
+    /* THE BOUND ABOVE, MEASURED. The comment on the walk argues this cycle cannot nest — the ropes it builds
+       out of buckets are balanced, so building one never asks for a rebalance again — and an argument in a
+       comment is what gets read instead of the code. Depth 1 is now a should-never-happen with a name. */
+    CYCLE_GUARD_ENTER(g_rebalance_guard, 1,
+                      "js_rebalance_string_rope re-entered — the ropes it builds out of buckets are balanced, "
+                      "so building one must never ask for a rebalance; this cycle is supposed to be a static "
+                      "artefact and it just became a stack");
     for(i = 0; i < ROPE_N_BUCKETS; i++)
         buckets[i] = JS_NULL;
     if (js_rebalance_string_rope_walk(ctx, buckets, rope))
@@ -5922,11 +5956,13 @@ static JSValue js_rebalance_string_rope(JSContext *ctx, JSValueConst rope)
         }
     }
     /* fail safe */
+    CYCLE_GUARD_LEAVE(g_rebalance_guard);
     if (JS_IsNull(a))
         return JS_AtomToString(ctx, JS_ATOM_empty_string);
     else
         return a;
  fail:
+    CYCLE_GUARD_LEAVE(g_rebalance_guard);
     for(i = 0; i < ROPE_N_BUCKETS; i++) {
         JS_FreeValue(ctx, buckets[i]);
     }
