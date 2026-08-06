@@ -1763,6 +1763,12 @@ typedef struct JSCFunctionListEntry {
    this file learned the hard way. A set_id of -1 declares a getter-only accessor. */
 #define JS_CGETSET_STEP_BOTH_DEF(name, get_stepid, set_stepid) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET_STEP_BOTH, 0, { .getset_step = { get_stepid, set_stepid } } }
 #define JS_CGETSET_MAGIC_DEF(name, fgetter, fsetter, magic) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET_MAGIC, magic, { .getset = { .get = { .getter_magic = fgetter }, .set = { .setter_magic = fsetter } } } }
+/* The same with EXPLICIT property attributes, for a WEB IDL interface rather than an ECMAScript builtin. The
+   two disagree: §3.7.6 makes an interface's attributes { enumerable: true, configurable: true } where an
+   ECMAScript accessor is configurable-only, and the difference is observable — a non-enumerable `name` on
+   DOMException.prototype is one Web IDL's own record conversion SKIPS, so the brand check that should have
+   thrown never ran. */
+#define JS_CGETSET_MAGIC_DEF2(name, fgetter, fsetter, magic, prop_flags) { name, prop_flags, JS_DEF_CGETSET_MAGIC, magic, { .getset = { .get = { .getter_magic = fgetter }, .set = { .setter_magic = fsetter } } } }
 #define JS_PROP_STRING_DEF(name, cstr, prop_flags) { name, prop_flags, JS_DEF_PROP_STRING, 0, { .str = cstr } }
 #define JS_PROP_INT32_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_INT32, 0, { .i32 = val } }
 #define JS_PROP_INT64_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_INT64, 0, { .i64 = val } }

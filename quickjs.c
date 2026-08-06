@@ -100549,12 +100549,18 @@ static JSValue js_domexception_get_code(JSContext *ctx, JSValueConst this_val)
     return js_int32(s->code);
 }
 
+/* DOMException IS A WEB IDL INTERFACE, so its prototype members carry WEB IDL's property attributes and not an
+   ECMAScript builtin's. §3.7.6: an attribute is { enumerable: true, configurable: true }. It was
+   configurable-only, which is what an ECMAScript accessor is — and the difference is not cosmetic: Web IDL's
+   own §3.2.21 record conversion walks ENUMERABLE own properties, so `new URLSearchParams(DOMException.prototype)`
+   read nothing and quietly built an empty object where every browser throws from the brand check on `name`. */
+#define JS_IDL_ATTRIBUTE (JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE)
 static const JSCFunctionListEntry js_domexception_proto_funcs[] = {
-    JS_CGETSET_MAGIC_DEF("name", js_domexception_getfield, NULL,
-        offsetof(JSDOMExceptionData, name) ),
-    JS_CGETSET_MAGIC_DEF("message", js_domexception_getfield, NULL,
-        offsetof(JSDOMExceptionData, message) ),
-    JS_CGETSET_DEF("code", js_domexception_get_code, NULL ),
+    JS_CGETSET_MAGIC_DEF2("name", js_domexception_getfield, NULL,
+        offsetof(JSDOMExceptionData, name), JS_IDL_ATTRIBUTE ),
+    JS_CGETSET_MAGIC_DEF2("message", js_domexception_getfield, NULL,
+        offsetof(JSDOMExceptionData, message), JS_IDL_ATTRIBUTE ),
+    JS_CGETSET_DEF2("code", js_domexception_get_code, NULL, JS_IDL_ATTRIBUTE ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "DOMException", JS_PROP_CONFIGURABLE ),
 };
 
