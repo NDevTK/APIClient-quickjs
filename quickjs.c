@@ -2922,7 +2922,12 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
        first, so an agent's parked flow would have watched queued jobs run ahead of it, or never resumed at all.
        That is unobservable until some test's microtask sequence comes out reordered and the cause looks like a
        promise bug. A convention nothing checks is not an invariant; this makes any host that drains a job with
-       a flow still parked crash at the drain, naming the rule it broke. */
+       a flow still parked crash at the drain, naming the rule it broke.
+       THIS IS THE EARLY ONE, not a duplicate of the universal check at JS_CallInternal's entry. That one says
+       nothing may EXECUTE while a flow is parked and is the backstop for every driver; this one fires a step
+       sooner, at the decision to run a job at all, and catches a job that would not have reached bytecode —
+       a native one — before it does anything. Same invariant, two granularities, and the specific site gives
+       the specific message. */
     DCHECK(!JS_HasParkedFlow(rt),
            "a job was drained while a flow was PARKED — the host pump must resume parked flows first "
            "(while (JS_ResumeParkedFlow(rt));) or the park reorders observable microtasks");
@@ -25017,6 +25022,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSObject *p;
     JSFunctionBytecode *b;
     JSStackFrame sf_s, *sf = &sf_s;
+    /* NOTHING RUNS WHILE A FLOW IS PARKED, asserted where running begins.
+       A forced preempt is only transparent if the flow resumes before anything observable happens, and the only
+       observable thing this engine does is run JS — so the invariant is not "do not drain a job while parked",
+       it is "do not execute AT ALL while parked", and this is the single door execution comes through.
+       It was learned three times, each time as a different-looking bug. run-test262 had three job pumps and one
+       drained without resuming parked flows first. The promise reaction parked onto the job FIFO instead of the
+       slot, so its handler finished a tick late and the promise it owed settled late with it. Module evaluation
+       read a parked body as a finished one and started the next module, so two siblings interleaved and
+       eval-rqstd-order evaluated 123456798 for 123456789. Three sites, three fixes, one rule — and the rule was
+       being kept by whoever remembered it, which is how it was missed three times.
+       Asserted here it is structural: any future driver that holds a parked flow and reaches for more work
+       crashes at the first instruction of that work, naming the rule, instead of shipping a reordering that
+       surfaces as a promise bug somewhere else. The scheduler's own switch is unaffected by construction —
+       flow_switch_out TAKES the parked continuation out of the runtime and carries it on the Flow, precisely so
+       a sibling can run — and JS_ResumeParkedFlow clears the slot before it calls the resume, so the resume
+       itself comes through here with the slot empty. */
+    DCHECK(rt->parked_flow.fn == NULL,
+           "JS was entered while a flow is PARKED — resume it first (while (JS_ResumeParkedFlow(rt));). A "
+           "forced preempt is transparent only if nothing runs between the park and its resume");
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
