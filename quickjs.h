@@ -1245,6 +1245,10 @@ JS_EXTERN void JS_SetFlowControlHooks(const JSFlowControlHooks *hooks);
    actually written). Install the whole boundary ONCE with JS_SetTimeTravelHooks at engine setup — it is not
    optional and a NULL argument crashes. Baseline setup runs uncaptured NOT by leaving the hooks unset but
    because there is no CURRENT flow to capture into yet (the host routes captures to the running flow's delta). */
+/* The generator-fork hook's type, named because the HOST's COW layer takes it as a parameter: the primitive
+   that installs the table does not own this one entry — whoever assembles the sibling flow does. */
+typedef void (*JSTimeTravelGenFork)(JSContext *ctx, JSValueConst genobj, void *base_gd, void *cur_gd);
+
 typedef struct JSTimeTravelHooks {
     void (*prop_write)(JSContext *ctx, JSValueConst obj, JSAtom atom);  /* before writing a shared obj[atom] */
     void (*cell_write)(JSContext *ctx, void *cell);                     /* before writing a shared closure cell */
@@ -1258,7 +1262,7 @@ typedef struct JSTimeTravelHooks {
        current, object-owned state). The host records a per-flow gendata swap on the forking sibling's delta so
        genobj->[[GeneratorState]] resolves to cur_gd while the sibling runs and to base_gd otherwise; the sibling
        delta OWNS cur_gd (JS_GenDataRef/Unref). Only fires for a direct .next() drive (genobj is a generator). */
-    void (*gen_fork)(JSContext *ctx, JSValueConst genobj, void *base_gd, void *cur_gd);
+    JSTimeTravelGenFork gen_fork;
     /* Before a NEW record (key not already present) is added to a shared Set/Map (Set.add / Map.set of a fresh
        key). The host records the KNOWN-NEW add on the current flow's delta so a snapshot-forked sibling stays
        isolated: unapply deletes the flow's added record, apply re-adds it (JS_MapAddRecord / JS_MapDeleteRecord).

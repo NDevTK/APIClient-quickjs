@@ -95962,6 +95962,26 @@ JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
                                       JS_CLASS_UINT8C_ARRAY + type);
 }
 
+/* WEB IDL'S `BufferSource` — see quickjs-step.h. A DataView is one and is not a typed array, which is the whole
+   reason this exists beside JS_GetTypedArrayBuffer: both wear u.typed_array, and only the class test differs. */
+JSValue JS_GetArrayBufferView(JSContext *ctx, JSValueConst obj, size_t *pbyte_offset, size_t *pbyte_length)
+{
+    JSObject *p;
+    JSTypedArray *ta;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return JS_ThrowTypeError(ctx, "not an ArrayBufferView");
+    p = JS_VALUE_GET_OBJ(obj);
+    if (!is_typed_array(p->class_id) && p->class_id != JS_CLASS_DATAVIEW)
+        return JS_ThrowTypeError(ctx, "not an ArrayBufferView");
+    if (typed_array_is_oob(p))
+        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+    ta = p->u.typed_array;
+    if (pbyte_offset) *pbyte_offset = ta->offset;
+    if (pbyte_length) *pbyte_length = ta->length;
+    return js_dup(JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
+}
+
 /* Return the buffer associated to the typed array or an exception if
    it is not a typed array or if the buffer is detached. pbyte_offset,
    pbyte_length or pbytes_per_element can be NULL. */

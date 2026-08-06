@@ -334,6 +334,16 @@ JS_EXTERN JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which);
 JS_EXTERN const char *JS_DiagCString(JSContext *ctx, JSValueConst v, char **powned);
 JS_EXTERN void JS_DiagFreeCString(JSContext *ctx, const char *s, char *owned);
 
+/* WEB IDL'S `BufferSource` AS ONE READ. The type is `(ArrayBuffer or ArrayBufferView)` and ArrayBufferView is
+   `(Int8Array or ... or DataView)` — so a host component reading a BodyInit has to accept a DataView, which
+   JS_GetTypedArrayBuffer refuses because it is not a typed array even though it carries the same
+   JSTypedArray. The alternative from outside the engine is reading `buffer`/`byteOffset`/`byteLength` as
+   PROPERTIES, which are accessors — page-visible, patchable, and a C-driven getter call the flow design has no
+   driver for. Returns the underlying ArrayBuffer (owned) with the view's window, or an exception.
+   The bytes come from JS_GetArrayBuffer on the result. */
+JS_EXTERN JSValue JS_GetArrayBufferView(JSContext *ctx, JSValueConst obj, size_t *pbyte_offset,
+                                        size_t *pbyte_length);
+
 /* %IteratorPrototype%. Web IDL §3.7.10 states that the ITERATOR PROTOTYPE OBJECT of an `iterable<>` interface
    has %IteratorPrototype% as its [[Prototype]] — that inheritance is what gives `headers.keys()` the whole
    iterator-helper surface (`@@iterator` returning this, `take`, `drop`, `map`) without the component defining
