@@ -382,6 +382,14 @@ JS_EXTERN JSValue JS_GetIteratorPrototype(JSContext *ctx);
    hand. Dup'd. */
 JS_EXTERN JSValue JS_GetAsyncIteratorPrototype(JSContext *ctx);
 
+/* 27.1.4.1 CreateAsyncFromSyncIterator — the ONE step of GetIterator(obj, ASYNC) a host cannot perform itself.
+   The @@asyncIterator read, the fallback @@iterator read and the method call are all requests this header
+   already exports; the wrapper is an intrinsic whose `next` awaits the sync result's VALUE, which is what makes
+   an iterable of promises yield what they resolve to. `sync_iter` and `next_method` are CONSUMED; *pnext is the
+   wrapper's `next`, called exactly as the sync one would be. */
+JS_EXTERN JSValue JS_NewAsyncFromSyncIterator(JSContext *ctx, JSValue sync_iter, JSValue next_method,
+                                              JSValue *pnext);
+
 /* [[OwnPropertyKeys]] AS A REQUEST — what a Web IDL `record<K, V>` argument is made of, and the last operation a
    browser component needed that it could not perform. `fetch(u, {headers: {...}})` converts that bag by taking
    its own keys and then reading each one, and on a Proxy the key list IS the page's `ownKeys` trap — so taking

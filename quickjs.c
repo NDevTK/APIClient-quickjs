@@ -18673,6 +18673,25 @@ JSValue JS_GetAsyncIteratorPrototype(JSContext *ctx)
     return js_dup(ctx->async_iterator_proto);
 }
 
+/* 27.1.4.1 CreateAsyncFromSyncIterator, for a HOST performing GetIterator(obj, ASYNC).
+ *
+ * A host can do every OTHER step of that abstract operation with what quickjs-step.h already exports — the
+ * @@asyncIterator and @@iterator reads and the method call are requests like any other. This one step it
+ * cannot: the wrapper is an engine intrinsic whose `next` AWAITS the sync result's value, which is what makes
+ * `ReadableStream.from([Promise.resolve(1)])` yield 1 rather than the promise. Writing that unwrap in the host
+ * would be re-implementing an ECMAScript intrinsic beside the engine's own.
+ * `sync_iter` and `next_method` are CONSUMED; *pnext is the wrapper's own `next`, which the caller then calls
+ * exactly as it would the sync one. */
+JSValue JS_NewAsyncFromSyncIterator(JSContext *ctx, JSValue sync_iter, JSValue next_method, JSValue *pnext)
+{
+    /* BOTH arguments are consumed here, though the internal form borrows the iterator and takes the method.
+       A boundary whose two arguments have two different ownerships is a boundary a caller gets wrong, and this
+       one did on its first use — leaking the array iterator, and with it the whole runtime graph. */
+    JSValue r = JS_CreateAsyncFromSyncIterator(ctx, sync_iter, next_method, pnext);
+    JS_FreeValue(ctx, sync_iter);
+    return r;
+}
+
 /* [[GetOwnProperty]] AS A REQUEST — see quickjs-step.h. The request is the one the engine's own enumerable-key
    cursor issues (step code 12, the object borrowed in the header's buffer and the key passed as the request's
    argument); this is the two-phase wrapper that lets a HOST machine issue it. */
@@ -74752,6 +74771,10 @@ JSValue JS_PerformPromiseThen(JSContext *ctx, JSValueConst promise, JSValueConst
     JSValueConst handlers[2];
     JSValue funcs[2], cap;
 
+    DCHECK(JS_PromiseState(ctx, promise) != JS_PROMISE_NOT_A_PROMISE,
+           "PerformPromiseThen was given something that is not a promise — the spec reaches this only after a "
+           "PromiseResolve, so the caller skipped one; reacting to a plain object reads a promise's reaction "
+           "lists off an object that has none");
     cap = JS_NewPromiseCapability(ctx, funcs);
     if (JS_IsException(cap))
         return cap;
