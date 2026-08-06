@@ -19411,6 +19411,33 @@ int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, i
     return JS_ToInt64SatFree(ctx, pres, in);
 }
 
+/* THE SAME REQUEST DELIVERING THE NUMBER ITSELF. Web IDL's integer conversions are not ToIntegerOrInfinity:
+   §3.2.7's `long` is ToNumber and then a MODULO 2^32, and §3.2.4.2's [Clamp] is ToNumber and then a round to the
+   nearest integer choosing the EVEN one at a half. A saturating int64 has already lost what both of those need —
+   `f(2**32 + 5)` is 5 for a `long` and INT64 5000000005 for a saturated one, and `f(1.5)` is 2 for a [Clamp] and
+   1 for a truncation. So the coercion stops at the number and the caller's type says what happens next. */
+int step_todouble_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, double *pres,
+                      JSValue **out_cb, int *out_argc)
+{
+    if (h->num_phase == NUM_PH_START) {
+        JS_FreeValue(ctx, in);
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
+                   "a coercion is already in flight on this machine's header");
+            h->coerce = js_dup(v);
+            h->cb_coerce[0] = h->coerce;     /* borrowed view */
+            *out_cb = h->cb_coerce; *out_argc = HINT_NUMBER;
+            h->num_phase = NUM_PH_PRIM;
+            return 5;
+        }
+        return JS_ToFloat64(ctx, pres, v);
+    }
+    JS_FreeValue(ctx, h->coerce);
+    h->coerce = JS_UNDEFINED;
+    h->num_phase = NUM_PH_START;
+    return JS_ToFloat64Free(ctx, pres, in);
+}
+
 /* A CALL AS A REQUEST — the operation a browser component needs most, and the last one that was missing.
    Every host machine so far COERCED its arguments and then computed; dispatchEvent has to RUN the page's
    listeners, in order, and report whether one of them cancelled — which §2.9 makes SYNCHRONOUS. Calling them

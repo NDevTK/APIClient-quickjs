@@ -297,6 +297,13 @@ JS_EXTERN int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, J
 JS_EXTERN int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, int64_t *pres,
                                JSValue **out_cb, int *out_argc);
 
+/* THE SAME REQUEST STOPPING AT THE NUMBER. Web IDL's integer conversions are NOT ToIntegerOrInfinity: `long` is
+   ToNumber then a modulo 2^32 and `[Clamp] long long` is ToNumber then a round-half-to-EVEN, and a saturating
+   int64 has thrown away what each of those needs before it is one. The coercion is the part that runs the page's
+   code; the arithmetic after it is the caller's type. */
+JS_EXTERN int step_todouble_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, double *pres,
+                                JSValue **out_cb, int *out_argc);
+
 /* A CALL AS A REQUEST — see the definition in quickjs.c. A browser component that must RUN the page's code and
    then continue (dispatchEvent walking a listener list, §2.9's synchronous dispatch) cannot JS_Call from C:
    that is the drive-to-completion the engine aborts on. `phase` and `cb` are the MACHINE's own — a host machine
