@@ -96064,6 +96064,8 @@ static bool typed_array_is_immutable(JSObject *p)
 
 // is the typed array detached or out of bounds relative to its RAB?
 // |p| must be a typed array, *not* a DataView
+static bool dataview_is_oob(JSObject *p);
+
 static bool typed_array_is_oob(JSObject *p)
 {
     JSArrayBuffer *abuf;
@@ -96184,7 +96186,10 @@ JSValue JS_GetArrayBufferView(JSContext *ctx, JSValueConst obj, size_t *pbyte_of
     p = JS_VALUE_GET_OBJ(obj);
     if (!is_typed_array(p->class_id) && p->class_id != JS_CLASS_DATAVIEW)
         return JS_ThrowTypeError(ctx, "not an ArrayBufferView");
-    if (typed_array_is_oob(p))
+    /* THE OOB TEST IS PER KIND. typed_array_is_oob says in its own comment that its argument must not be a
+       DataView — it reads a bytes-per-element off the class — and handing it one aborted on that assertion,
+       which is what `new TextDecoder().decode(new DataView(buf))` did. A DataView has its own. */
+    if (p->class_id == JS_CLASS_DATAVIEW ? dataview_is_oob(p) : typed_array_is_oob(p))
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
     ta = p->u.typed_array;
     if (pbyte_offset) *pbyte_offset = ta->offset;
