@@ -28285,6 +28285,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             cont_st = souter;
                             goto do_promise_try_settled;
                         }
+                        if (souter_kind == CONT_PROMISE_EXEC) {
+                            /* THE EXECUTOR WAS A STEP MACHINE. `new Promise(p.then.bind(p))` is the shape that
+                               reaches this — testharness.js's own bring_promise_to_current_realm is written
+                               that way, so every promise_rejects_js in the corpus goes through it — and
+                               `Promise.prototype.then` is a machine. 27.2.3.1 steps 10-11 are the same here as
+                               for every other executor shape: the result is DISCARDED and the promise is
+                               yielded, or an abrupt value rejects it and the promise is yielded anyway. The
+                               operands are already gone, which is what the finish label expects. */
+                            ret_val = r;
+                            pexec_finish_state = souter;
+                            goto do_promise_exec_finish;
+                        }
                         DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown sequence kind");
                         goto do_step_step;
                     }
