@@ -1155,6 +1155,12 @@ typedef enum JSPromiseStateEnum {
 } JSPromiseStateEnum;
 
 JS_EXTERN JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
+
+/* CALL `func(value)` AS A CALL-ROOT FLOW — the base a promise reaction runs on — rather than as a C activation.
+   A trusted-host reply is delivered by calling something, and JS_Call from the host's pump has no flow base, so
+   a page's `then` getter or a loop inside its handler drives to completion there. Every host delivery uses this.
+   0 = done, -1 = it threw (the exception is live). */
+JS_EXTERN int JS_CallAsFlow(JSContext *ctx, JSValueConst func, JSValueConst value);
 /* Atomics.waitAsync timeouts are the HOST's to wait for — 25.4.3.14 enqueues a host timeout job. Ask how long
    until the earliest deadline (-1 = none), wait for it wherever the host already waits, then settle what is
    due. The engine never blocks on this itself. */

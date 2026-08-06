@@ -257,6 +257,14 @@ typedef struct JSStepHdr {
    one state. */
 JS_EXTERN int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def);
 
+/* A STEP MACHINE THAT CARRIES CAPTURED VALUES — the step analogue of JS_NewCFunctionData, and the shape a
+   PROMISE REACTION has to be. A reaction knows which object it belongs to only by capture, and the work it does
+   (calling the page's algorithm again, rejecting parked requests) is work only a machine may do; without this
+   the two were mutually exclusive from outside quickjs.c. `stepid` is what JS_RegisterStepDef handed out; the
+   machine reads what it captured with JS_StepClosureData, off the callee its header already carries. */
+JS_EXTERN JSValue JS_NewStepClosure(JSContext *ctx, int stepid, int length, int data_len, JSValueConst *data);
+JS_EXTERN JSValueConst JS_StepClosureData(const JSStepHdr *h, int i);
+
 /* WHAT step() RETURNS. A machine reports one of these at every stage, and a host machine reports them for the
    same reasons the engine's own do. */
 #define JS_STEP_DONE     0   /* the machine is finished; fini yields its result */

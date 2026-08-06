@@ -74679,6 +74679,52 @@ typedef struct JSSyncDisposeWrap {
 
 /* Register a host component's step machine and return the id JS_CFUNC_STEP_DEF names it by. The def is
    BORROWED: a definition is static data, exactly as the built-in table's rows are. */
+/* A STEP MACHINE THAT CARRIES CAPTURED VALUES — the step analogue of JS_NewCFunctionData, and the shape a
+   PROMISE REACTION has to be.
+ *
+ * A reaction knows which object it belongs to only by capture: §4.5's ReadableStreamDefaultControllerCallPullIfNeeded
+ * reacts to the pull promise by clearing `pulling` and, if `pullAgain`, CALLING THE PAGE'S `pull` again, and its
+ * rejection path errors the controller, which REJECTS every parked read request. Both of those are things only a
+ * machine may do — a plain C reaction would have to JS_Call from an activation with no flow base — so the
+ * reaction must be a machine AND must carry its controller. The two were mutually exclusive from outside this
+ * file: JS_NewCFunctionData gives capture without the machine, JS_CFUNC_step gives the machine without capture.
+ *
+ * The engine's own Await is built exactly this way (js_new_async_await), so this opens a door rather than adding
+ * a mechanism: the closure is a C_FUNCTION_DATA whose record names a step def, and tramp_step_def_of already
+ * drives it through do_step_tramp like any other machine. `stepid` is what JS_RegisterStepDef handed out. */
+static JSValue js_host_step_closure_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
+                                            JSValueConst *argv, int magic, JSValueConst *func_data)
+{
+    (void)this_val; (void)argc; (void)argv; (void)magic; (void)func_data;
+    DFAIL("a host step closure reached its C entry — every call shape must route onto do_step_tramp");
+    return JS_ThrowTypeError(ctx, "a host step closure reached its C entry");
+}
+
+JSValue JS_NewStepClosure(JSContext *ctx, int stepid, int length, int data_len, JSValueConst *data)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue f;
+
+    CHECK(stepid >= STEPDEF_COUNT && stepid - STEPDEF_COUNT < rt->host_step_def_count,
+          "JS_NewStepClosure was given an id JS_RegisterStepDef never handed out");
+    f = JS_NewCFunctionData(ctx, js_host_step_closure_c_entry, length, 0, data_len, data);
+    if (JS_IsException(f))
+        return f;
+    promise_closure_set_step(f, rt->host_step_defs[stepid - STEPDEF_COUNT]);
+    return f;
+}
+
+JSValueConst JS_StepClosureData(const JSStepHdr *h, int i)
+{
+    JSObject *fp = JS_VALUE_GET_TAG(h->func_obj) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(h->func_obj) : NULL;
+    JSCFunctionDataRecord *rec = (fp && fp->class_id == JS_CLASS_C_FUNCTION_DATA)
+                               ? fp->u.c_function_data_record : NULL;
+    DCHECK(rec != NULL, "JS_StepClosureData ran on a machine whose callee is not a closure — the value it wants "
+                        "was never captured, so there is nothing to read");
+    DCHECK(i >= 0 && i < rec->data_len, "a step closure read past the values it captured");
+    return rec->data[i];
+}
+
 int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def)
 {
     const JSTrampStepDef **a;
@@ -90053,6 +90099,17 @@ static int js_settle_as_flow(JSContext *ctx, JSValueConst func, JSValueConst val
     rf->phase = 1;   /* there is no handler phase: the settle is the entire flow */
     if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&value)) < 0) { reaction_flow_free(ctx, rf); return -1; }
     return JS_IsException(reaction_flow_step(ctx, rf)) ? -1 : 0;
+}
+
+/* THE HOST-FACING FORM. A reply the trusted host owes a page is delivered by CALLING something — a promise's
+   resolving function, or a closure that builds the Response and then calls one — and the host did that with
+   JS_Call, which is a C activation with no flow base: 27.2.1.3.2 step 8 reads `Get(resolution, "then")` off the
+   value, so `Object.prototype.then = { get(){ for(;;){} } }` drove to completion inside the host's pump. It is
+   the same defect body.c fixed for its readers, one layer out, and the same answer: the call becomes a
+   CALL-ROOT FLOW, which is the base a promise reaction already runs on. 0 = done, -1 = it threw. */
+int JS_CallAsFlow(JSContext *ctx, JSValueConst func, JSValueConst value)
+{
+    return js_settle_as_flow(ctx, func, value);
 }
 
 static JSValue promise_reaction_job(JSContext *ctx, int argc,
