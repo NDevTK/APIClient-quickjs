@@ -18606,6 +18606,18 @@ int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom
     return step_getprop_done(ctx, h, atom, in, pout);
 }
 
+/* A WELL-KNOWN SYMBOL'S ATOM — see quickjs-step.h. A switch rather than a table because a value nobody wrote an
+   arm for must abort here rather than index past the end of one. */
+JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which)
+{
+    switch (which) {
+    case JS_WKS_ASYNC_ITERATOR: return JS_ATOM_Symbol_asyncIterator;
+    default:
+        DCHECK(which == JS_WKS_ITERATOR, "a well-known symbol was asked for by a name this engine does not map");
+        return JS_ATOM_Symbol_iterator;
+    }
+}
+
 /* [[OwnPropertyKeys]] AS A REQUEST — see quickjs-step.h. The request itself is what the engine's own property
    walk already issues (step code 11, the object borrowed in the header's request buffer); this is the two-phase
    wrapper that lets a HOST machine issue it, which is the half that was missing. It carries no key, so its

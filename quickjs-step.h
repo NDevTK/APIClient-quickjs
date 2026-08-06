@@ -303,6 +303,19 @@ JS_EXTERN int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, JSValue
                             JSValueConst this_val, int argc, JSValueConst *argv, JSValue in, JSValue *pout,
                             JSValue **out_cb, int *out_argc);
 
+/* A WELL-KNOWN SYMBOL'S ATOM. A host machine can read any NAMED property (step_getprop_run takes an atom, and
+   JS_NewAtom makes one from a string), but a symbol-keyed one it could not name at all — and @@iterator is the
+   discriminator Web IDL uses for every `sequence or record` union. Headers' fill is the first to need it: the
+   spec picks the sequence arm when the init is ITERABLE, and without this the closest available test was
+   JS_IsArray, which is narrower — `new Headers(new Map(...))` is iterable, is not an array, and would have
+   taken the record arm and produced an EMPTY header list. These are permanent atoms, so the answer needs
+   neither a dup nor a free. */
+typedef enum {
+    JS_WKS_ITERATOR = 0,
+    JS_WKS_ASYNC_ITERATOR,
+} JSWellKnownSymbol;
+JS_EXTERN JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which);
+
 /* [[OwnPropertyKeys]] AS A REQUEST — what a Web IDL `record<K, V>` argument is made of, and the last operation a
    browser component needed that it could not perform. `fetch(u, {headers: {...}})` converts that bag by taking
    its own keys and then reading each one, and on a Proxy the key list IS the page's `ownKeys` trap — so taking
