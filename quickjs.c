@@ -24959,7 +24959,6 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
 #define CALL_SUSPEND_POINT() do {                                                        \
         if (unlikely(g_flow_control.preempt != NULL) && call_op_pc != NULL &&            \
             gen_state != NULL && gen_state == g_flow_base_gen &&                         \
-            gen_state->base_kind != FLOW_BASE_ASYNC_CALL &&                              \
             g_flow_control.preempt(JS_PREEMPT_CALL)) {                                   \
             FLOW_PREEMPT_COUNT(g_flow_preempt_requested);                                \
             FLOW_PREEMPT_COUNT(g_flow_preempt_fired);                                    \
@@ -54933,6 +54932,18 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
     JS_FreeValue(ctx, promise);
     if (!js_async_function_run(ctx, s))
         return -1;
+    /* A PARKED BODY IS STILL EVALUATING, so finish it before this returns and the walk starts the next module.
+       §16.2.1.5.3 evaluates [[RequestedModules]] in source order, and a module with no top-level await must be
+       DONE before its sibling begins. Every bytecode body goes through this function precisely so a park is
+       possible, which means "started" and "finished" are no longer the same event — and the caller's loop over
+       available ancestors reads a parked body as finished and moves on. Two siblings then interleave and the
+       later one runs first: eval-rqstd-order evaluated its modules 123456798 rather than 123456789.
+       A forced preempt must be transparent to observable ordering, and module evaluation order is observable,
+       so this drains exactly as the host pump does before it starts a job — the same rule in the third place
+       that needed it. A real top-level AWAIT does not come through here: it registers on its promise and
+       returns without parking, so genuine asynchrony is untouched and only the forced preempt is absorbed. */
+    while (JS_ResumeParkedFlow(ctx->rt))
+        ;
     return 0;
 }
 
