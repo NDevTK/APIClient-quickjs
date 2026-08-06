@@ -376,6 +376,12 @@ JS_EXTERN JSValue JS_GetArrayBufferView(JSContext *ctx, JSValueConst obj, size_t
    assertion performs, so deriving it that way from C would be checking the engine against itself. Dup'd. */
 JS_EXTERN JSValue JS_GetIteratorPrototype(JSContext *ctx);
 
+/* %AsyncIteratorPrototype%, for the same reason and with less of a workaround available: Web IDL §3.7.11 makes
+   it the [[Prototype]] of every `async iterable<>` interface's iterator prototype object, and unlike
+   %IteratorPrototype% there is no script-level walk to it at all from a host that has no async generator to
+   hand. Dup'd. */
+JS_EXTERN JSValue JS_GetAsyncIteratorPrototype(JSContext *ctx);
+
 /* [[OwnPropertyKeys]] AS A REQUEST — what a Web IDL `record<K, V>` argument is made of, and the last operation a
    browser component needed that it could not perform. `fetch(u, {headers: {...}})` converts that bag by taking
    its own keys and then reading each one, and on a Proxy the key list IS the page's `ownKeys` trap — so taking

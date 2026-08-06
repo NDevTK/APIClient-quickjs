@@ -18663,6 +18663,16 @@ JSValue JS_GetIteratorPrototype(JSContext *ctx)
     return js_dup(ctx->class_proto[JS_CLASS_ITERATOR]);
 }
 
+/* %AsyncIteratorPrototype% — the same intrinsic one level over, and needed for the same reason: Web IDL
+   §3.7.11 states that the ASYNCHRONOUS iterator prototype object of an `async iterable<>` interface has this
+   as its [[Prototype]], which is what gives `for await (const chunk of stream)` its @@asyncIterator and the
+   async-iterator helpers. It is not a global and not reachable by name, so a host has no way to it at all —
+   %IteratorPrototype% at least has a walk from `[][Symbol.iterator]()`, and this one does not. Dup'd. */
+JSValue JS_GetAsyncIteratorPrototype(JSContext *ctx)
+{
+    return js_dup(ctx->async_iterator_proto);
+}
+
 /* [[GetOwnProperty]] AS A REQUEST — see quickjs-step.h. The request is the one the engine's own enumerable-key
    cursor issues (step code 12, the object borrowed in the header's buffer and the key passed as the request's
    argument); this is the two-phase wrapper that lets a HOST machine issue it. */
