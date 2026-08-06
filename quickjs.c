@@ -31331,6 +31331,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     so = js_iter_consume_new(ctx);
                     if (unlikely(!so)) { JS_FreeValue(ctx, lst); JS_ThrowOutOfMemory(ctx); goto exception; }
                     so->r = lst;
+                    /* The owned argument LIST goes on the state, by the rule the `from` arm below states in as
+                       many words: a spread or an .apply builds the arguments on the heap, the teardown frees
+                       exactly what the state holds, and this arm was the one that never took them. That leaked
+                       the whole runtime graph on `Uint8Array.of(...[1,2])` — every call-site-resolved spelling
+                       of it — while the plain call, which has no such list, was clean. */
+                    so->args_own = tac_args_own; so->args_own_n = tac_args_own_n;
+                    tac_args_own = NULL; tac_args_own_n = 0;
                     so->adder = js_dup(ntgt);
                     so->k = ta_argc; so->ta_k = 0;
                     so->sink = ITERCONS_FROM; so->ta_isfrom = 1; so->ta_classid = 0;
@@ -38890,6 +38897,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        resolved pop count would be read by the next call this frame makes (a catch resumes in this same frame).
        The same rule as the construct side's con_cargc, applied where every abrupt path converges. */
     if (call_args_owned) { free_arg_list(ctx, call_args_owned, call_args_owned_n); call_args_owned = NULL; call_args_owned_n = 0; }
+    /* The same rule for the list a TypedArray consume arm has TAKEN but not yet handed to its state. Between
+       those two points the arm runs `IsConstructor`, builds an array and defines into it — all of which can
+       throw, and none of which can free a list it does not know about. */
+    if (tac_args_own) { free_arg_list(ctx, tac_args_own, tac_args_own_n); tac_args_own = NULL; tac_args_own_n = 0; }
     call_cargc = -1;
     /* The same rule for the construct's REQUESTER. Every arm that adopts con_outer clears it, so a non-NULL one
        here means the dispatch threw BETWEEN taking it and handing it to a state — and the code in between reads
