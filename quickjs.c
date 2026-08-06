@@ -18592,6 +18592,7 @@ static void step_hdr_request_abandon(JSContext *ctx, JSStepHdr *h)
         h->get_atom = JS_ATOM_NULL;
     }
     h->get_phase = GET_PH_START;
+    h->keys_phase = GET_PH_START;   /* the own-keys sub-sequence ends with the request too, for the same reason */
 }
 
 /* a NAMED key, borrowed from the caller (a permanent atom in every current use). */
@@ -18603,6 +18604,29 @@ int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom
         return step_getprop_begin(ctx, h, obj, JS_DupAtom(ctx, atom), out_cb, out_argc);
     }
     return step_getprop_done(ctx, h, atom, in, pout);
+}
+
+/* [[OwnPropertyKeys]] AS A REQUEST — see quickjs-step.h. The request itself is what the engine's own property
+   walk already issues (step code 11, the object borrowed in the header's request buffer); this is the two-phase
+   wrapper that lets a HOST machine issue it, which is the half that was missing. It carries no key, so its
+   phase byte is the whole of its state — and it is its OWN byte because the record<> conversion that needs this
+   reads each key straight afterwards, with a getprop sub-sequence in flight at the same time. */
+int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in, JSValue *pout,
+                     JSValue **out_cb, int *out_argc)
+{
+    if (h->keys_phase == GET_PH_START) {
+        JS_FreeValue(ctx, in);
+        h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver across the request */
+        *out_cb = h->cb_coerce; *out_argc = 0;
+        h->keys_phase = GET_PH_GOT;
+        return 11;
+    }
+    DCHECK(h->keys_phase == GET_PH_GOT, "an own-keys request was delivered with none in flight on this header");
+    h->keys_phase = GET_PH_START;
+    if (JS_IsException(in))
+        return -1;
+    *pout = in;
+    return 0;
 }
 
 /* GetOption(options, key) for an ENUMERATED STRING option, over step_getprop_run. The read is an ordinary

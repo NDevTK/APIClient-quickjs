@@ -227,6 +227,11 @@ typedef struct JSStepHdr {
                                receiver is a separate operand in the spec and a builtin's Set(O,P,V,true) is the
                                one form that can leave it implicit. */
     uint8_t len_phase, spc_phase, num_phase, str_phase, get_phase, cs_phase, exec_phase, prog_phase;
+    /* the [[OwnPropertyKeys]] sub-sequence's own cursor. Its OWN byte rather than get_phase's, because the one
+       algorithm that needs it — Web IDL's record<> conversion — takes the key list and then reads each key,
+       so the two sub-sequences are in flight in the same stage and sharing a phase would answer one at the
+       other's call site. */
+    uint8_t keys_phase;
     /* an ARGUMENT COERCION is outstanding, so an abandon here is the spec's abrupt-completion case (take/drop's
        IfAbruptCloseIterator). It lives on the header because the teardown is what has to act on it, and the
        teardown releases this_val — the receiver the handler needs — before the machine's own fini can see it. */
@@ -297,6 +302,17 @@ JS_EXTERN int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSV
 JS_EXTERN int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, JSValueConst func,
                             JSValueConst this_val, int argc, JSValueConst *argv, JSValue in, JSValue *pout,
                             JSValue **out_cb, int *out_argc);
+
+/* [[OwnPropertyKeys]] AS A REQUEST — what a Web IDL `record<K, V>` argument is made of, and the last operation a
+   browser component needed that it could not perform. `fetch(u, {headers: {...}})` converts that bag by taking
+   its own keys and then reading each one, and on a Proxy the key list IS the page's `ownKeys` trap — so taking
+   it with JS_GetOwnPropertyNames from C is the drive-to-completion every other C-side key walk was converted
+   away from, and adding a third one would move the build's own C-enum-only-walk ratchet backwards.
+   The answer is the ARRAY the spec's CreateArrayFromList builds, of Strings and Symbols 10.5.11's invariant has
+   already validated — so the caller may walk it with plain index reads. Returns 11 (the caller returns it), 0
+   once *pout is the array, or -1. */
+JS_EXTERN int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in, JSValue *pout,
+                               JSValue **out_cb, int *out_argc);
 
 /* ToString AS A REQUEST — the coercion nearly every Web IDL argument actually is. `DOMString type`,
    `DOMString name`, `DOMString selector`: each is ToString on whatever the page passed, so
