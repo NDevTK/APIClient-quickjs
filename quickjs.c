@@ -65761,6 +65761,54 @@ JSValue JS_ToObjectString(JSContext *ctx, JSValueConst val)
     return JS_ConcatString3(ctx, "[object ", tag, "]");
 }
 
+/* WEB IDL §3.2.11's "convert a DOMString to a scalar value string" — see quickjs-step.h. `str` is OWNED. */
+JSValue JS_ToScalarValueString(JSContext *ctx, JSValue str)
+{
+    JSString *p;
+    uint16_t *buf;
+    int i, len, bad = 0;
+    JSValue r;
+
+    if (JS_VALUE_GET_TAG(str) != JS_TAG_STRING)
+        return str;
+    p = JS_VALUE_GET_STRING(str);
+    if (!p->is_wide_char)
+        return str;   /* a one-byte string holds no surrogate at all */
+    len = p->len;
+    for (i = 0; i < len; i++) {
+        uint16_t c = str16(p)[i];
+        if (is_hi_surrogate(c)) {
+            if (i + 1 < len && is_lo_surrogate(str16(p)[i + 1])) { i++; continue; }
+            bad = 1; break;
+        }
+        if (is_lo_surrogate(c)) { bad = 1; break; }
+    }
+    if (!bad)
+        return str;
+    buf = js_malloc(ctx, sizeof(uint16_t) * (size_t)(len ? len : 1));
+    if (!buf) { JS_FreeValue(ctx, str); return JS_EXCEPTION; }
+    for (i = 0; i < len; i++) {
+        uint16_t c = str16(p)[i];
+        if (is_hi_surrogate(c)) {
+            if (i + 1 < len && is_lo_surrogate(str16(p)[i + 1])) {
+                buf[i] = c;
+                buf[i + 1] = str16(p)[i + 1];
+                i++;
+                continue;
+            }
+            buf[i] = 0xfffd;
+        } else if (is_lo_surrogate(c)) {
+            buf[i] = 0xfffd;
+        } else {
+            buf[i] = c;
+        }
+    }
+    r = js_new_string16_len(ctx, buf, len);
+    js_free(ctx, buf);
+    JS_FreeValue(ctx, str);
+    return r;
+}
+
 /* A DIAGNOSTIC string for a value — see quickjs-step.h. */
 const char *JS_DiagCString(JSContext *ctx, JSValueConst v, char **powned)
 {

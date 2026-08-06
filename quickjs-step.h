@@ -321,6 +321,14 @@ typedef enum {
 } JSWellKnownSymbol;
 JS_EXTERN JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which);
 
+/* WEB IDL §3.2.11's `USVString`: a DOMString whose UNPAIRED SURROGATES have each been replaced by U+FFFD.
+   That replacement is the whole of what makes the type different from a DOMString, and it cannot be done from
+   outside the engine — a host sees only the UTF-8 the C-string conversion produces, where an unpaired
+   surrogate has already been written out in whatever form that conversion chose. Every URL member takes
+   USVStrings, and wpt asserts the replacement directly. `str` is OWNED; a string with no unpaired surrogate is
+   returned unchanged, so the common case allocates nothing. */
+JS_EXTERN JSValue JS_ToScalarValueString(JSContext *ctx, JSValue str);
+
 /* A DIAGNOSTIC string for a value, built WITHOUT invoking the page's `toString`. JS_ToCString does invoke it,
    and at a C entry there is no flow to run it on — which since the coercion methods became step machines is
    the state the engine's own backstop names ("route this site to the ToPrimitive trampoline"). That backstop
