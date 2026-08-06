@@ -232,6 +232,10 @@ typedef struct JSStepHdr {
        so the two sub-sequences are in flight in the same stage and sharing a phase would answer one at the
        other's call site. */
     uint8_t keys_phase;
+    /* the [[GetOwnProperty]] sub-sequence's own cursor, for the same reason keys_phase has one: Web IDL's
+       record<> conversion asks for a key's DESCRIPTOR and then READS that key, so the two are in flight in the
+       same stage and a shared phase would answer one at the other's call site. */
+    uint8_t desc_phase;
     /* an ARGUMENT COERCION is outstanding, so an abandon here is the spec's abrupt-completion case (take/drop's
        IfAbruptCloseIterator). It lives on the header because the teardown is what has to act on it, and the
        teardown releases this_val — the receiver the handler needs — before the machine's own fini can see it. */
@@ -313,8 +317,31 @@ JS_EXTERN int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, JSValue
 typedef enum {
     JS_WKS_ITERATOR = 0,
     JS_WKS_ASYNC_ITERATOR,
+    JS_WKS_TO_STRING_TAG,
 } JSWellKnownSymbol;
 JS_EXTERN JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which);
+
+/* A DIAGNOSTIC string for a value, built WITHOUT invoking the page's `toString`. JS_ToCString does invoke it,
+   and at a C entry there is no flow to run it on — which since the coercion methods became step machines is
+   the state the engine's own backstop names ("route this site to the ToPrimitive trampoline"). That backstop
+   is right, and this is the answer for the one shape of caller that cannot take its advice: a HOST reporting
+   what went wrong must not depend on the code that went wrong. Every C embedder reaching it derives the same
+   fallback, so the engine owns it once instead: an object is its `name`/`message`, falling back to its
+   CONSTRUCTOR's name — test262's Test262Error carries only `message` and a custom `toString`, which is exactly
+   the page code this must not run — and anything else is its class via JS_ToObjectString.
+   The result is malloc'd when *powned is set and a JS C-string otherwise, which is the only reason the caller
+   has to know which; JS_DiagFreeCString takes both and releases the right one. */
+JS_EXTERN const char *JS_DiagCString(JSContext *ctx, JSValueConst v, char **powned);
+JS_EXTERN void JS_DiagFreeCString(JSContext *ctx, const char *s, char *owned);
+
+/* %IteratorPrototype%. Web IDL §3.7.10 states that the ITERATOR PROTOTYPE OBJECT of an `iterable<>` interface
+   has %IteratorPrototype% as its [[Prototype]] — that inheritance is what gives `headers.keys()` the whole
+   iterator-helper surface (`@@iterator` returning this, `take`, `drop`, `map`) without the component defining
+   one member of it. A host component cannot reach the intrinsic from outside: it is neither a global nor
+   reachable by name, and the only script-level route is
+   `Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()))` — which is exactly the walk the WPT
+   assertion performs, so deriving it that way from C would be checking the engine against itself. Dup'd. */
+JS_EXTERN JSValue JS_GetIteratorPrototype(JSContext *ctx);
 
 /* [[OwnPropertyKeys]] AS A REQUEST — what a Web IDL `record<K, V>` argument is made of, and the last operation a
    browser component needed that it could not perform. `fetch(u, {headers: {...}})` converts that bag by taking
@@ -326,6 +353,18 @@ JS_EXTERN JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which);
    once *pout is the array, or -1. */
 JS_EXTERN int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in, JSValue *pout,
                                JSValue **out_cb, int *out_argc);
+
+/* [[GetOwnProperty]] AS A REQUEST — the other half of a `record<K, V>` conversion, and the half that decides
+   whether a key counts at all. Web IDL §es-to-record step 5.1 asks for each key's DESCRIPTOR and step 5.2 keeps
+   the key only if it is present and ENUMERABLE; on a Proxy that is the page's `getOwnPropertyDescriptor` trap.
+   Skipping it does not merely lose the trap — it silently includes non-enumerable properties, and wpt's
+   headers-record pins the operation SEQUENCE (get @@iterator, ownKeys, then getOwnPropertyDescriptor and get per
+   key), so the omission is observable as a count.
+   The answer is the descriptor OBJECT the engine builds, or undefined when the property is gone between the
+   key snapshot and here — reading `enumerable` off it runs none of the page's code. `atom` is BORROWED.
+   Returns 12 (the caller returns it), 0 once *pout is set, or -1. */
+JS_EXTERN int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
+                                  JSValue *pout, JSValue **out_cb, int *out_argc);
 
 /* ToString AS A REQUEST — the coercion nearly every Web IDL argument actually is. `DOMString type`,
    `DOMString name`, `DOMString selector`: each is ToString on whatever the page passed, so

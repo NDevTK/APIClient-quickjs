@@ -702,7 +702,6 @@ struct JSContext {
     JSValue error_stack_trace_limit;
     JSValue iterator_ctor;
     JSValue iterator_ctor_getset;
-    JSValue iterator_proto;
     JSValue async_iterator_proto;
     JSValue array_proto_values;
     JSValue throw_type_error;
@@ -18629,6 +18628,7 @@ static void step_hdr_request_abandon(JSContext *ctx, JSStepHdr *h)
     }
     h->get_phase = GET_PH_START;
     h->keys_phase = GET_PH_START;   /* the own-keys sub-sequence ends with the request too, for the same reason */
+    h->desc_phase = GET_PH_START;
 }
 
 /* a NAMED key, borrowed from the caller (a permanent atom in every current use). */
@@ -18648,10 +18648,41 @@ JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which)
 {
     switch (which) {
     case JS_WKS_ASYNC_ITERATOR: return JS_ATOM_Symbol_asyncIterator;
+    case JS_WKS_TO_STRING_TAG: return JS_ATOM_Symbol_toStringTag;
     default:
         DCHECK(which == JS_WKS_ITERATOR, "a well-known symbol was asked for by a name this engine does not map");
         return JS_ATOM_Symbol_iterator;
     }
+}
+
+/* %IteratorPrototype% — see quickjs-step.h. It is class_proto[JS_CLASS_ITERATOR] because ES2025 gave the
+   intrinsic a constructor (`Iterator`), so the object the iterator helpers hang off IS that class's prototype.
+   Returned dup'd: the caller installs it as some object's [[Prototype]] and owns that reference. */
+JSValue JS_GetIteratorPrototype(JSContext *ctx)
+{
+    return js_dup(ctx->class_proto[JS_CLASS_ITERATOR]);
+}
+
+/* [[GetOwnProperty]] AS A REQUEST — see quickjs-step.h. The request is the one the engine's own enumerable-key
+   cursor issues (step code 12, the object borrowed in the header's buffer and the key passed as the request's
+   argument); this is the two-phase wrapper that lets a HOST machine issue it. */
+int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
+                        JSValue *pout, JSValue **out_cb, int *out_argc)
+{
+    if (h->desc_phase == GET_PH_START) {
+        JS_FreeValue(ctx, in);
+        h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver across the request */
+        *out_cb = h->cb_coerce; *out_argc = (int)atom;
+        h->desc_phase = GET_PH_GOT;
+        return 12;
+    }
+    DCHECK(h->desc_phase == GET_PH_GOT,
+           "a [[GetOwnProperty]] request was delivered with none in flight on this header");
+    h->desc_phase = GET_PH_START;
+    if (JS_IsException(in))
+        return -1;
+    *pout = in;
+    return 0;
 }
 
 /* [[OwnPropertyKeys]] AS A REQUEST — see quickjs-step.h. The request itself is what the engine's own property
@@ -65728,6 +65759,59 @@ JSValue JS_ToObjectString(JSContext *ctx, JSValueConst val)
     if (JS_IsException(tag))
         return tag;
     return JS_ConcatString3(ctx, "[object ", tag, "]");
+}
+
+/* A DIAGNOSTIC string for a value — see quickjs-step.h. */
+const char *JS_DiagCString(JSContext *ctx, JSValueConst v, char **powned)
+{
+    JSValue n, m, t;
+    const char *ns, *ms, *r;
+    size_t need;
+
+    *powned = NULL;
+    if (!JS_IsObject(v))
+        return JS_ToCString(ctx, v);   /* a primitive's conversion invokes nothing */
+
+    n = JS_GetPropertyStr(ctx, v, "name");
+    if (!JS_IsString(n)) {
+        JSValue c = JS_GetPropertyStr(ctx, v, "constructor");
+        JS_FreeValue(ctx, n);
+        n = JS_IsObject(c) ? JS_GetPropertyStr(ctx, c, "name") : JS_UNDEFINED;
+        JS_FreeValue(ctx, c);
+    }
+    m = JS_GetPropertyStr(ctx, v, "message");
+    ns = JS_IsString(n) ? JS_ToCString(ctx, n) : NULL;
+    ms = JS_IsString(m) ? JS_ToCString(ctx, m) : NULL;
+    JS_FreeValue(ctx, n);
+    JS_FreeValue(ctx, m);
+    if (ns) {
+        need = strlen(ns) + (ms ? strlen(ms) + 2 : 0) + 1;
+        /* js_malloc_rt, not js_malloc: this runs on a path that may ALREADY hold a pending exception (the
+           caller is reporting one), and the throwing allocator would replace it. NULL falls through to the
+           class-name form below, which is the honest answer when there is no memory for the better one. */
+        *powned = js_malloc_rt(ctx->rt, need);
+        if (*powned) {
+            if (ms && *ms) snprintf(*powned, need, "%s: %s", ns, ms);
+            else           snprintf(*powned, need, "%s", ns);
+        }
+    }
+    if (ns) JS_FreeCString(ctx, ns);
+    if (ms) JS_FreeCString(ctx, ms);
+    if (*powned)
+        return *powned;
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    t = JS_ToObjectString(ctx, v);   /* "[object Class]": a class read, no user code */
+    if (JS_IsException(t))
+        return NULL;
+    r = JS_ToCString(ctx, t);
+    JS_FreeValue(ctx, t);
+    return r;
+}
+
+void JS_DiagFreeCString(JSContext *ctx, const char *s, char *owned)
+{
+    if (owned) js_free(ctx, owned);
+    else if (s) JS_FreeCString(ctx, s);
 }
 
 /* 20.1.3.5 Object.prototype.toLocaleString is `? Invoke(O, "toString")` — a Get and then a CALL, both the
