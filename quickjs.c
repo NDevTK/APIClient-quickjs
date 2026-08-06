@@ -20882,6 +20882,11 @@ struct JSPromiseAll;
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
 /* CONT_PROMISE_ALL's value, forward for the same reason CONT_ITER_CONSUME_FWD is: the abandon walks run above the
    kind's own declaration, and the static assert beside that declaration is what keeps the two in step. */
+/* THE SAME AGGREGATE, ASKING AGAIN. A freshly-forked Promise.all sibling owes itself a capability the clone
+   could not build (see JSPromiseAll.cap_owed), so it asks on its first step. Its own kind rather than
+   CONT_PROMISE_ALL because the delivery differs: the original acquisition goes on to read `constructor.resolve`
+   and start the walk, while this one is filling a hole in a machine that is already mid-walk. */
+#define CONT_PROMISE_ALL_RECAP 76
 #define CONT_PROMISE_ALL_FWD 9
 static void js_promise_cap_abandon(JSContext *ctx, JSPromiseCap *pc)
 {
@@ -20908,6 +20913,9 @@ static void js_promise_cap_requester_abandon(JSContext *ctx, void *st)
     js_promise_cap_abandon(ctx, pc);
     if (req) {
         if (rk == CONT_PROMISE_ALL_FWD) { js_promise_all_end(ctx, req); js_free_rt(ctx->rt, req); return; }
+        /* A sibling that never got its capability cannot run: it goes with the throw, through the same teardown
+           the forward acquisition's does. */
+        if (rk == CONT_PROMISE_ALL_RECAP) { js_promise_all_end(ctx, req); js_free_rt(ctx->rt, req); return; }
         if (rk == CONT_STEP) { tramp_step_chain_free(ctx, req); return; }
         DCHECK(rk == CONT_PROMISE_TRY, "promise-capability requester: unknown machine kind");
         js_promise_try_abandon(ctx, req);
@@ -22672,6 +22680,14 @@ typedef struct JSPromiseAll {
     int reattach_pending;        /* >0 on a freshly-forked sibling: re-attach elements [0..reattach_pending) to THIS
                                     aggregate on the sibling's first do_promise_all_step entry (deferred out of the
                                     clone so no interpreter re-entry — .then — happens mid-clone_deep_flow). */
+    /* THE AGGREGATE CAPABILITY IS OWED, for the same reason and deferred the same way. The clone used to build
+       it with js_new_promise_capability(ctx, funcs, os->this_val), and for `Promise.all.call(Sub, …)` that
+       Construct is the page's constructor — run from inside clone_deep_flow, which is a FORK and has nowhere to
+       suspend. It was the last C-route caller of that function with a subclass, and it is what put
+       js_new_promise_capability, JS_CallConstructor and the whole async-generator group in the interpreter's
+       recursion cycle. The sibling asks for its own capability on its first step, through the same
+       do_promise_cap_tramp seam the ORIGINAL acquisition already used. */
+    uint8_t cap_owed;
     int index;                   /* next element index */
     int magic;                   /* PROMISE_MAGIC_all / allSettled (per-element reject handling differs) */
     uint8_t finalizing;          /* 1 while the aggregate resolve/reject callback is being driven on the tramp: the
@@ -26515,6 +26531,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* the capability exists: tramp_cap_promise + tramp_cap_funcs, and tramp_cap_outer/_kind say who asked.
                Reached identically whether the Construct ran user code or there was none to run. */
             if (tramp_cap_kind == CONT_PROMISE_ALL) goto do_promise_all_have_cap;
+            if (tramp_cap_kind == CONT_PROMISE_ALL_RECAP) goto do_promise_all_recap;
             if (tramp_cap_kind == CONT_STEP) {
                 /* a step machine asked: the record goes on its header (which owns it) and the machine is
                    re-entered with UNDEFINED as its step result — the capability is not a value it returns. */
@@ -31648,6 +31665,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_promise_cap_tramp;
             }
 
+        do_promise_all_recap:
+            /* A FORKED SIBLING'S OWN AGGREGATE. Everything else about the machine survived the clone; only the
+               capability could not be built there. Fill it and re-enter the step — no acquire follows, because
+               `constructor.resolve` was read before the fork and came across on the state. */
+            {
+                JSPromiseAll *s = tramp_cap_outer;
+                tramp_cap_outer = NULL; tramp_cap_kind = CONT_NONE;
+                DCHECK(JS_IsUndefined(s->result_promise),
+                       "a forked Promise.all sibling was handed a capability it already had — cap_owed is the "
+                       "one thing that asks, and it clears before the request");
+                s->result_promise = tramp_cap_promise; tramp_cap_promise = JS_UNDEFINED;
+                s->resolving_funcs[0] = tramp_cap_funcs[0]; tramp_cap_funcs[0] = JS_UNDEFINED;
+                s->resolving_funcs[1] = tramp_cap_funcs[1]; tramp_cap_funcs[1] = JS_UNDEFINED;
+                cont_st = s;
+                ret_val = JS_UNINITIALIZED;
+                goto do_promise_all_step;
+            }
+
         do_promise_all_have_cap:
             {
                 JSPromiseAll *s = tramp_cap_outer;
@@ -31771,6 +31806,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSPromiseAll *s = (JSPromiseAll *)cont_st;   /* re-derived at do_promise_all_finalize too */
                 int st;
+                /* THE OWED CAPABILITY COMES FIRST, before the re-attach that resolves into it. A freshly-forked
+                   sibling has none: the clone could not build one, because for a subclass that Construct is the
+                   page's constructor and a fork has nowhere to suspend. This is the same request the original
+                   acquisition makes, at the first point in the sibling's own execution where suspending is
+                   possible. */
+                if (unlikely(s->cap_owed)) {
+                    s->cap_owed = 0;
+                    tramp_cap_ctor = s->this_val; tramp_cap_outer = s; tramp_cap_kind = CONT_PROMISE_ALL_RECAP;
+                    goto do_promise_cap_tramp;
+                }
                 if (unlikely(s->reattach_pending > 0 && !s->attaching)) {
                     /* freshly-forked sibling: re-attach the retained pre-fork element wrappers [0..reattach_pending)
                        to THIS aggregate (deferred out of clone_deep_flow so the .then re-entry runs in the
@@ -40609,13 +40654,19 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->cur_key = js_dup(os->cur_key);
                 ns->cur_atom = JS_DupAtom(ctx, os->cur_atom);
                 ns->keys = JS_UNDEFINED;
-                ns->result_promise = js_new_promise_capability(ctx, ns->resolving_funcs, os->this_val);   /* fresh aggregate + [resolve,reject] */
+                /* NOT BUILT HERE. For a subclass this is the page's constructor, and a fork has nowhere to
+                   suspend — the same reason the .then re-attach below is deferred. The sibling asks on its
+                   first step, through the seam the original acquisition already uses. */
+                ns->result_promise = JS_UNDEFINED;
+                ns->resolving_funcs[0] = JS_UNDEFINED;
+                ns->resolving_funcs[1] = JS_UNDEFINED;
+                ns->cap_owed = 1;
                 ns->values = JS_NewArray(ctx);
                 ns->resolve_element_env = JS_NewArray(ctx);
                 ns->elem_promises = JS_NewArray(ctx);
                 if (os->keyed) ns->keys = JS_NewArray(ctx);
                 if (JS_IsException(ns->keys)
-                    || JS_IsException(ns->result_promise) || JS_IsException(ns->values)
+                    || JS_IsException(ns->values)
                     || JS_IsException(ns->resolve_element_env) || JS_IsException(ns->elem_promises)
                     || JS_DefinePropertyValueUint32(ctx, ns->resolve_element_env, 0, js_int32(1),
                                                     JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE) < 0) {
@@ -90419,35 +90470,30 @@ static JSValue js_promise_executor_new(JSContext *ctx)
                                0, 2, func_data);
 }
 
+/* NEWPROMISECAPABILITY WITH THE NATIVE CONSTRUCTOR, and there is no other kind here any more.
+ *
+ * 27.2.1.5 has two halves and they are DIFFERENT ALGORITHMS, not a fast path and a fallback. With C = %Promise%
+ * there is no user code in it at all: the promise is created directly and the resolving functions are the
+ * engine's own. With a SUBCLASS, step 4 is Construct(C, «executor») — the page's constructor — and this
+ * function ran it with JS_CallConstructor from C, which is what made every capability consumer unsuspendable
+ * and what put this function, JS_CallConstructor and the whole async-generator group in the interpreter's
+ * recursion cycle.
+ *
+ * The subclass half lives on the trampoline (do_promise_cap_tramp) and has since CONT_PROMISE_CAP was built.
+ * What kept the C half alive was ONE caller that could still reach it with a subclass — the Promise.all clone,
+ * which had nowhere to suspend — and with that deferred to the sibling's first step the body here was dead
+ * code that only the call graph could still see. Keeping it would be the legacy twin the whole conversion
+ * discipline exists to delete: a second implementation of the same step, reachable by anyone who forgets.
+ * The DCHECK is what makes "every caller is native" a checked property rather than a survey. */
 static JSValue js_new_promise_capability(JSContext *ctx,
                                          JSValue *resolving_funcs,
                                          JSValueConst ctor)
 {
-    JSValue executor, result_promise;
-    JSCFunctionDataRecord *s;
-    int i;
-
-    if (JS_IsUndefined(ctor) || js_same_value(ctx, ctor, ctx->promise_ctor))
-        return js_promise_new(ctx, JS_UNDEFINED, resolving_funcs);
-    executor = js_promise_executor_new(ctx);
-    if (JS_IsException(executor))
-        return JS_EXCEPTION;
-    result_promise = JS_CallConstructor(ctx, ctor, 1, vc(&executor));
-    if (JS_IsException(result_promise))
-        goto fail;
-    s = JS_GetOpaque(executor, JS_CLASS_C_FUNCTION_DATA);
-    for(i = 0; i < 2; i++) {
-        if (check_function(ctx, s->data[i]))
-            goto fail;
-    }
-    for(i = 0; i < 2; i++)
-        resolving_funcs[i] = js_dup(s->data[i]);
-    JS_FreeValue(ctx, executor);
-    return result_promise;
- fail:
-    JS_FreeValue(ctx, executor);
-    JS_FreeValue(ctx, result_promise);
-    return JS_EXCEPTION;
+    DCHECK(JS_IsUndefined(ctor) || js_same_value(ctx, ctor, ctx->promise_ctor),
+           "NewPromiseCapability reached the C route with a SUBCLASS constructor — that Construct is the page's "
+           "code and belongs on the trampoline (do_promise_cap_tramp / CONT_PROMISE_CAP), because a C activation "
+           "has no flow base to suspend its loops into");
+    return js_promise_new(ctx, JS_UNDEFINED, resolving_funcs);
 }
 
 JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs)
