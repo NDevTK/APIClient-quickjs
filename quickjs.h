@@ -1210,6 +1210,11 @@ typedef void JSPromiseHook(JSContext *ctx, JSPromiseHookType type,
    callback (an event listener, a timer). Not a JS_Call: the callback is the page's code and must be able to
    loop, await and fork, which a C activation cannot host. */
 JS_EXTERN void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
+/* THE SAME, ON A TASK SOURCE rather than the microtask queue — HTML 8.1.7's other half. A platform edge that
+   the spec words as "queue a task" (8.6's timer task source, a queued event fire, a delivered reply) uses this
+   one, and the event loop will not begin it until every microtask outstanding has run. Choosing the wrong one
+   is not a performance detail: it reorders what the page observes. */
+JS_EXTERN void JS_EnqueueCallTask(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
 JS_EXTERN void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook,
                                  void *opaque);
 
@@ -1556,6 +1561,9 @@ JS_EXTERN JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m);
 typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
 JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                             int argc, JSValueConst *argv);
+/* …onto a TASK SOURCE instead of the microtask queue. See JS_EnqueueCallTask. */
+JS_EXTERN int JS_EnqueueTaskJob(JSContext *ctx, JSJobFunc *job_func,
+                                int argc, JSValueConst *argv);
 
 /* forced-exec ASYNC-AS-FLOW: every enqueued job (a promise .then/.catch/.finally reaction, queueMicrotask, a
    thenable-resolve, a dynamic-import continuation) is routed to the SCHEDULER as a first-class flow instead of a
@@ -1563,8 +1571,13 @@ JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
    job (the fork then does NOT add it to the global job list), or 0 to fall back to the default global enqueue.
    The host dups argv and later invokes job_func(ctx, argc, argv) under the enqueuing flow's per-flow COW — so a
    reaction runs in its flow's timeline (correct microtask ordering) and is isolated from other flows' reactions.
-   job_func is an opaque JSJobFunc pointer the host calls back through; it never needs the quickjs-internal symbol. */
-typedef int (*JSJobEnqueueHook)(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv);
+   job_func is an opaque JSJobFunc pointer the host calls back through; it never needs the quickjs-internal symbol.
+   `is_task` says WHICH of HTML 8.1.7's two queues this belongs to — false for a microtask, true for a task
+   source. A host that takes ownership takes the ordering rule with it: it may not begin a task while any
+   microtask it holds is still outstanding. It is a parameter rather than a second hook because a host that
+   registers one and forgets the other silently loses every job of the kind it forgot. */
+typedef int (*JSJobEnqueueHook)(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv,
+                                bool is_task);
 JS_EXTERN void JS_SetJobEnqueueHook(JSJobEnqueueHook h);
 
 JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);

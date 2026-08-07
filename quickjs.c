@@ -402,7 +402,17 @@ struct JSRuntime {
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
 
-    struct list_head job_list; /* list of JSJobEntry.link */
+    /* HTML 8.1.7's TWO QUEUES, which are not one queue with two kinds of entry in it. `job_list` is the
+       MICROTASK queue — promise reactions, queueMicrotask, thenable resolution, dynamic-import continuations.
+       `task_list` holds the platform's TASK SOURCES: HTML 8.6's timer task source, a queued event fire, a
+       delivered network reply. The event loop runs ONE task and then performs a MICROTASK CHECKPOINT, which
+       drains every microtask — including ones the microtasks themselves enqueue — before the next task begins.
+       A single FIFO gets that backwards the moment a task and a microtask are outstanding together, and it did:
+       `setTimeout(f, 0)` ran ahead of a promise chain that was already twenty reactions deep, so a transform
+       stream's write settled AFTER a `delay(0)` that had to observe it settled. The ordering is not a policy
+       this engine picks — it is what the event loop IS — so it lives in the queue rather than in each pump. */
+    struct list_head job_list;  /* the MICROTASK queue; list of JSJobEntry.link */
+    struct list_head task_list; /* the TASK queues, in the one order a task source's tasks are picked */
     /* FINALIZATION-REGISTRY ENTRIES WHOSE TARGET HAS DIED, waiting to become cleanup jobs. 9.13's
        HostEnqueueFinalizationRegistryCleanupJob is the HOST's, "at some future time" — V8 posts it from the GC
        epilogue — and this list is that seam. Enqueueing it where the target is freed instead put allocation
@@ -2703,6 +2713,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->string_list);
 #endif
     init_list_head(&rt->job_list);
+    init_list_head(&rt->task_list);
     init_list_head(&rt->finrec_pending);
 
     if (JS_InitAtoms(rt))
@@ -2887,8 +2898,7 @@ typedef struct { int depth; const char *what; int max; } JSCycleGuard;
 #define CYCLE_GUARD_LEAVE(g)           do { } while (0)
 #endif
 
-int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
-                  int argc, JSValueConst *argv)
+static int js_enqueue(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv, bool is_task)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
@@ -2897,8 +2907,10 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     DCHECK(!rt->in_free, "!rt->in_free");
 
     /* ASYNC-AS-FLOW: if the host routes this job to a scheduler flow (returns 1), it OWNS it now — do not add it
-       to the global job list (there is no global drain in forced-execution; each reaction is a first-class flow). */
-    if (g_job_enqueue_hook && g_job_enqueue_hook(ctx, job_func, argc, argv))
+       to the global job list (there is no global drain in forced-execution; each reaction is a first-class flow).
+       The host is told WHICH queue it is taking over, because the checkpoint rule is the queue's and a host that
+       cannot tell a task from a microtask reimplements the ordering bug this split exists to remove. */
+    if (g_job_enqueue_hook && g_job_enqueue_hook(ctx, job_func, argc, argv, is_task))
         return 0;
 
     e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
@@ -2910,22 +2922,47 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     for(i = 0; i < argc; i++) {
         e->argv[i] = js_dup(argv[i]);
     }
-    list_add_tail(&e->link, &rt->job_list);
+    list_add_tail(&e->link, is_task ? &rt->task_list : &rt->job_list);
     return 0;
+}
+
+int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                  int argc, JSValueConst *argv)
+{
+    return js_enqueue(ctx, job_func, argc, argv, false);
+}
+
+int JS_EnqueueTaskJob(JSContext *ctx, JSJobFunc *job_func,
+                      int argc, JSValueConst *argv)
+{
+    return js_enqueue(ctx, job_func, argc, argv, true);
 }
 
 bool JS_IsJobPending(JSRuntime *rt)
 {
     js_finrec_drain(rt, true);
-    return !list_empty(&rt->job_list);
+    return !list_empty(&rt->job_list) || !list_empty(&rt->task_list);
+}
+
+/* THE ONE THE EVENT LOOP RUNS NEXT: a microtask if any is queued, otherwise the next task. Reading it here is
+   what makes "drain the microtask queue, THEN take one task" a property of the queue rather than of each pump. */
+static struct list_head *js_next_job(JSRuntime *rt)
+{
+    if (!list_empty(&rt->job_list))
+        return rt->job_list.next;
+    if (!list_empty(&rt->task_list))
+        return rt->task_list.next;
+    return NULL;
 }
 
 JSContext *JS_GetPendingJobContext(JSRuntime *rt)
 {
-    if (JS_IsJobPending(rt)) {
-        return list_entry(rt->job_list.next, JSJobEntry, link)->ctx;
-    }
-    return NULL;
+    struct list_head *el;
+    if (!JS_IsJobPending(rt))
+        return NULL;
+    el = js_next_job(rt);
+    DCHECK(el != NULL, "a job was pending and then was not — nothing runs between the two reads");
+    return list_entry(el, JSJobEntry, link)->ctx;
 }
 
 /* return < 0 if exception, 0 if no job pending, 1 if a job was
@@ -2958,13 +2995,16 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
            "a job was drained while a flow was PARKED — the host pump must resume parked flows first "
            "(while (JS_ResumeParkedFlow(rt));) or the park reorders observable microtasks");
     js_finrec_drain(rt, true);
-    if (list_empty(&rt->job_list)) {
-        *pctx = NULL;
-        return 0;
+    {
+        /* HTML 8.1.7: a MICROTASK CHECKPOINT runs between one task and the next, so a task is only picked when
+           the microtask queue is empty. js_next_job is that rule; this is the only place it is consulted. */
+        struct list_head *el = js_next_job(rt);
+        if (!el) {
+            *pctx = NULL;
+            return 0;
+        }
+        e = list_entry(el, JSJobEntry, link);
     }
-
-    /* get the first pending job and execute it */
-    e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->ctx;
     res = e->job_func(e->ctx, e->argc, vc(e->argv));
@@ -3097,6 +3137,13 @@ void JS_FreeRuntime(JSRuntime *rt)
         js_free_rt(rt, e);
     }
     init_list_head(&rt->job_list);
+    list_for_each_safe(el, el1, &rt->task_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        for(i = 0; i < e->argc; i++)
+            JS_FreeValueRT(rt, e->argv[i]);
+        js_free_rt(rt, e);
+    }
+    init_list_head(&rt->task_list);
 
     /* A parked cleanup entry that never became a job still owns its callback, held value and context, so it is
        released here rather than reported as a leak by the walk below. */
@@ -90281,7 +90328,7 @@ static JSValue host_call_job(JSContext *ctx, int argc, JSValueConst *argv)
     return reaction_flow_step(ctx, rf);
 }
 
-void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv)
+static void js_enqueue_call(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv, bool is_task)
 {
     JSValueConst stack[9], *args = stack;
     int i;
@@ -90294,9 +90341,19 @@ void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst
     args[0] = func;
     for (i = 0; i < argc; i++)
         args[i + 1] = argv[i];
-    JS_EnqueueJob(ctx, host_call_job, argc + 1, args);
+    js_enqueue(ctx, host_call_job, argc + 1, args, is_task);
     if (args != stack)
         js_free(ctx, (void *)args);
+}
+
+void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv)
+{
+    js_enqueue_call(ctx, func, argc, argv, false);
+}
+
+void JS_EnqueueCallTask(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv)
+{
+    js_enqueue_call(ctx, func, argc, argv, true);
 }
 
 void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook, void *opaque)
