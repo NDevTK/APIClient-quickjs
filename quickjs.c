@@ -61926,6 +61926,41 @@ static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
     return -1;
 }
 
+/* A DataView over a buffer, with BOTH bounds already known — the reader's case, and the one place a DataView is
+   built from values that are not the page's. 25.3.2.1's constructor is a step machine because ToIndex on each
+   bound runs the page's valueOf and OrdinaryCreateFromConstructor reads new.target's prototype; none of that
+   applies to two integers this file just decoded, so the object-building tail is what is needed and the
+   coercion prologue is not. The checks stay: a buffer that was detached between write and read, or bounds that
+   do not fit it, must not produce a view pointing outside it. */
+static JSValue js_dataview_new(JSContext *ctx, JSValueConst buffer, uint32_t offset, uint32_t len)
+{
+    JSArrayBuffer *abuf = js_get_array_buffer(ctx, buffer);
+    JSTypedArray *ta;
+    JSObject *p;
+    JSValue obj;
+
+    if (!abuf)
+        return JS_EXCEPTION;
+    if (abuf->detached)
+        return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+    if ((int64_t)offset + len > abuf->byte_length)
+        return JS_ThrowRangeError(ctx, "invalid byteOffset or byteLength");
+    obj = JS_NewObjectClass(ctx, JS_CLASS_DATAVIEW);
+    if (JS_IsException(obj))
+        return obj;
+    ta = js_malloc(ctx, sizeof(*ta));
+    if (!ta) { JS_FreeValue(ctx, obj); return JS_EXCEPTION; }
+    p = JS_VALUE_GET_OBJ(obj);
+    ta->obj = p;
+    ta->buffer = JS_VALUE_GET_OBJ(js_dup(buffer));
+    ta->offset = offset;
+    ta->length = len;
+    ta->track_rab = false;
+    list_add_tail(&ta->link, &abuf->array_list);
+    p->u.typed_array = ta;
+    return obj;
+}
+
 static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
@@ -61933,7 +61968,10 @@ static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
 
     bc_put_u8(s, BC_TAG_TYPED_ARRAY);
     bc_put_u8(s, p->class_id - JS_CLASS_UINT8C_ARRAY);
-    bc_put_leb128(s, p->u.array.count);
+    /* THE LENGTH THE MATCHING CONSTRUCTOR TAKES. A typed array's third argument counts ELEMENTS and lives in
+       u.array.count; a DataView's counts BYTES and lives on the JSTypedArray record, because a DataView has no
+       element type to count in. Writing one and reading it as the other is a view of the wrong length. */
+    bc_put_leb128(s, p->class_id == JS_CLASS_DATAVIEW ? ta->length : p->u.array.count);
     bc_put_leb128(s, ta->offset);
     if (bcw_push(s, bcw_val(JS_MKPTR(JS_TAG_OBJECT, ta->buffer), false)))
         return -1;
@@ -62116,7 +62154,7 @@ static int bcw_step_value(BCWriterState *s, JSValueConst obj)
                 ret = JS_WriteSet(s, p->u.map_state);
                 break;
             default:
-                if (is_typed_array(p->class_id)) {
+                if (is_typed_array(p->class_id) || p->class_id == JS_CLASS_DATAVIEW) {
                     ret = JS_WriteTypedArray(s, obj);
                 } else {
                     JS_ThrowTypeError(s->ctx, "unsupported object class");
@@ -63250,7 +63288,12 @@ static JSValue JS_ReadTypedArray(BCReaderState *s)
 
     if (bc_get_u8(s, &array_tag))
         return JS_EXCEPTION;
-    if (array_tag >= JS_TYPED_ARRAY_COUNT)
+    /* A DATAVIEW rides the same tag, one past the typed arrays. HTML 2.7's StructuredSerialize puts both in
+       its ArrayBufferView branch — a DataView is a view over a buffer exactly as a Uint8Array is, and the only
+       difference on the wire is which constructor rebuilds it. Refusing it here is what made
+       `structuredClone(new DataView(b))` a DataCloneError and what made Fetch's `response.clone()` unable to
+       give its second branch a DataView chunk. */
+    if (array_tag > JS_CLASS_DATAVIEW - JS_CLASS_UINT8C_ARRAY)
         return JS_ThrowTypeError(ctx, "invalid typed array");
     if (bc_get_leb128(s, &len))
         return JS_EXCEPTION;
@@ -63676,13 +63719,18 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
                 if (f->kind == BCR_TA) {
                     JSValueConst args[3];
                     JSValue o;
+                    int cid = JS_CLASS_UINT8C_ARRAY + f->u1;
                     if (!js_get_array_buffer(ctx, result))
                         goto fail;
                     args[0] = result;
                     args[1] = js_int64(f->u3);
                     args[2] = js_int64(f->u2);
-                    o = js_typed_array_constructor(ctx, JS_UNDEFINED, 3, args,
-                                                   JS_CLASS_UINT8C_ARRAY + f->u1);
+                    /* A DataView's length is BYTES and a typed array's is ELEMENTS, which is why the writer
+                       stores `u.array.count` for one and the byte length for the other and why the two
+                       constructors are not interchangeable. */
+                    o = cid == JS_CLASS_DATAVIEW
+                      ? js_dataview_new(ctx, result, f->u3, f->u2)
+                      : js_typed_array_constructor(ctx, JS_UNDEFINED, 3, args, cid);
                     if (JS_IsException(o))
                         goto fail;
                     if (s->allow_reference)
