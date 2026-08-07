@@ -19481,10 +19481,20 @@ int step_todouble_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, 
    way in and releases on the way out, so a machine never has to remember either half.
      0 = *pout is the result, 3 = the caller must return that step code, and a throw ABANDONS the machine — a
    listener's uncaught exception is the page's, and the engine does not swallow it. */
-int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, JSValueConst func, JSValueConst this_val,
-                  int argc, JSValueConst *argv, JSValue in, JSValue *pout, JSValue **out_cb, int *out_argc)
+int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, int cb_cap, JSValueConst func,
+                  JSValueConst this_val, int argc, JSValueConst *argv, JSValue in, JSValue *pout,
+                  JSValue **out_cb, int *out_argc)
 {
     int i;
+
+    /* THE BUFFER IS THE CALLER'S, SO ITS SIZE HAS TO ARRIVE WITH IT. Without this the shape `[this, func,
+       args...]` was a comment the caller was trusted to have read, and the first caller to pass two arguments
+       into a three-slot buffer dupped a controller one slot PAST the array — onto the next field of the owning
+       state, which happened to be that same controller. It failed nowhere near the write, as a reaction
+       capturing "something that is not a controller". The capacity travels through STEP_CB so it is derived
+       from the array rather than restated, and a caller that forwards a bare pointer gets a capacity of zero
+       and fails here on its first call instead of silently. */
+    DCHECK(cb_cap >= 2 + argc, "a host call request has more arguments than its buffer has slots");
 
     if (*phase == 0) {
         JS_FreeValue(ctx, in);
@@ -90816,6 +90826,17 @@ static JSValue js_new_promise_capability(JSContext *ctx,
 JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs)
 {
     return js_new_promise_capability(ctx, resolving_funcs, JS_UNDEFINED);
+}
+
+/* See the declaration: [[PromiseIsHandled]] on its own, for the spec steps that set it without attaching a
+   reaction. Setting the flag is exactly what suppresses the rejection tracker, so it is done by the same write
+   PerformPromiseThen makes rather than by a second mechanism. */
+void JS_MarkPromiseHandled(JSContext *ctx, JSValueConst promise)
+{
+    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    (void)ctx;
+    DCHECK(s != NULL, "a spec step marked something that is not a promise as handled");
+    s->is_handled = true;
 }
 
 /* PromiseResolve(C, x) with the NATIVE constructor, which is what every C-INTERNAL caller passes (a job's

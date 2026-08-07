@@ -1156,6 +1156,13 @@ typedef enum JSPromiseStateEnum {
 
 JS_EXTERN JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
 
+/* SET [[PromiseIsHandled]] WITHOUT ATTACHING A REACTION — a spec step several web specs perform verbatim.
+   Streams §5.3's EnsureReadyPromiseRejected replaces an already-settled `ready` with a promise REJECTED at
+   birth and immediately marks it handled, because the writer may never be read again and the rejection is the
+   stream's own bookkeeping rather than an error the page failed to catch. Without this the only way to set the
+   flag is to attach a reaction, which is a different, observable operation: it queues a job. */
+JS_EXTERN void JS_MarkPromiseHandled(JSContext *ctx, JSValueConst promise);
+
 /* CALL `func(value)` AS A CALL-ROOT FLOW — the base a promise reaction runs on — rather than as a C activation.
    A trusted-host reply is delivered by calling something, and JS_Call from the host's pump has no flow base, so
    a page's `then` getter or a loop inside its handler drives to completion there. Every host delivery uses this.

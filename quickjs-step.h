@@ -318,9 +318,16 @@ JS_EXTERN int step_todouble_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JS
    holds a call across several of its stages, and the buffer must be in its `visit` for a fork to copy it.
    `cb` is 2 + argc slots, [this, func, args...]; this dups in and releases out, so the machine owns nothing it
    has to remember. Returns 3 (the caller returns it), or 0 once *pout is the call's result. */
-JS_EXTERN int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, JSValueConst func,
+JS_EXTERN int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, int cb_cap, JSValueConst func,
                             JSValueConst this_val, int argc, JSValueConst *argv, JSValue in, JSValue *pout,
                             JSValue **out_cb, int *out_argc);
+
+/* PASS THE BUFFER THROUGH THIS, and pass it the ARRAY. The capacity is then the array's own size rather than a
+   number written beside it that a later argument can outgrow — which is exactly how a two-argument call into a
+   three-slot buffer scribbled over the field next door. A machine that FORWARDS someone else's buffer takes
+   `(JSValue *cb, int cb_cap)` and forwards both; handing this macro that pointer yields a capacity of zero, so
+   the mistake is a DCHECK on the first call rather than a corrupted neighbour. */
+#define STEP_CB(arr) (arr), (int)(sizeof(arr) / sizeof((arr)[0]))
 
 /* A WELL-KNOWN SYMBOL'S ATOM. A host machine can read any NAMED property (step_getprop_run takes an atom, and
    JS_NewAtom makes one from a string), but a symbol-keyed one it could not name at all — and @@iterator is the
