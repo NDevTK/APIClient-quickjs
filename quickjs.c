@@ -8762,6 +8762,29 @@ void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt)
     }
 }
 
+bool JS_AtomIsIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
+{
+    return JS_AtomIsArrayIndex(ctx, pval, atom);
+}
+
+int JS_SetGlobalClass(JSContext *ctx, JSClassID class_id)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p = JS_VALUE_GET_OBJ(ctx->global_obj);
+
+    if (class_id == 0 || class_id >= (JSClassID)rt->class_count ||
+        rt->class_array[class_id].class_id != class_id)
+        return -1;
+    /* See quickjs.h: the global's union has never been filled, so a class that owns per-object data would free
+       or trace whatever happens to be in it. */
+    if (rt->class_array[class_id].finalizer || rt->class_array[class_id].gc_mark)
+        return -1;
+    p->u.opaque = NULL;
+    p->class_id = class_id;
+    p->is_exotic = rt->class_array[class_id].exotic != NULL;
+    return 0;
+}
+
 JSValue JS_GetGlobalObject(JSContext *ctx)
 {
     return js_dup(ctx->global_obj);
@@ -65993,6 +66016,36 @@ JSValue JS_ToScalarValueString(JSContext *ctx, JSValue str)
     return r;
 }
 
+/* A DIAGNOSTIC READ: the value of a DATA property named `prop` on `v` or its prototype chain, JS_UNDEFINED if
+   there is none. IT NEVER INVOKES AN ACCESSOR, and that is not a simplification — reaching a getter from C is
+   the one thing this engine refuses outright, because there is no flow base under a C activation and a loop in
+   the getter's body would drive to completion instead of parking. A diagnostic is the worst possible place to
+   run code: it is on the path that REPORTS an error, so a getter that throws replaces the exception being
+   reported with its own.
+   IT WAS AN ORDINARY READ, and DOMException's `name` and `message` are IDL ACCESSORS — so every DOMException
+   the host reported aborted the process at that DCHECK, three layers from anything a test could see. An object
+   whose name is behind a getter now falls through to the "[object Class]" form below, which is the honest
+   answer rather than a crash. */
+static JSValue JS_DiagGetData(JSContext *ctx, JSValueConst v, const char *prop)
+{
+    JSAtom atom = JS_NewAtom(ctx, prop);
+    JSObject *p;
+    JSValue out = JS_UNDEFINED;
+
+    if (atom == JS_ATOM_NULL) return JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT) { JS_FreeAtom(ctx, atom); return JS_UNDEFINED; }
+    for (p = JS_VALUE_GET_OBJ(v); p != NULL; p = p->shape->proto) {
+        JSShapeProperty *prs;
+        JSProperty *pr;
+        prs = find_own_property(&pr, p, atom);
+        if (!prs) continue;
+        if ((prs->flags & JS_PROP_TMASK) == 0) out = js_dup(pr->u.value);
+        break;   /* an accessor, a varref or an autoinit shadows the chain — and none of them may be run here */
+    }
+    JS_FreeAtom(ctx, atom);
+    return out;
+}
+
 /* A DIAGNOSTIC string for a value — see quickjs-step.h. */
 const char *JS_DiagCString(JSContext *ctx, JSValueConst v, char **powned)
 {
@@ -66004,14 +66057,14 @@ const char *JS_DiagCString(JSContext *ctx, JSValueConst v, char **powned)
     if (!JS_IsObject(v))
         return JS_ToCString(ctx, v);   /* a primitive's conversion invokes nothing */
 
-    n = JS_GetPropertyStr(ctx, v, "name");
+    n = JS_DiagGetData(ctx, v, "name");
     if (!JS_IsString(n)) {
-        JSValue c = JS_GetPropertyStr(ctx, v, "constructor");
+        JSValue c = JS_DiagGetData(ctx, v, "constructor");
         JS_FreeValue(ctx, n);
-        n = JS_IsObject(c) ? JS_GetPropertyStr(ctx, c, "name") : JS_UNDEFINED;
+        n = JS_IsObject(c) ? JS_DiagGetData(ctx, c, "name") : JS_UNDEFINED;
         JS_FreeValue(ctx, c);
     }
-    m = JS_GetPropertyStr(ctx, v, "message");
+    m = JS_DiagGetData(ctx, v, "message");
     ns = JS_IsString(n) ? JS_ToCString(ctx, n) : NULL;
     ms = JS_IsString(m) ? JS_ToCString(ctx, m) : NULL;
     JS_FreeValue(ctx, n);

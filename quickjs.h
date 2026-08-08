@@ -726,6 +726,25 @@ JS_EXTERN JSClassID JS_NewClassID(JSRuntime *rt, JSClassID *pclass_id);
 /* Returns the class ID if `v` is an object, otherwise returns JS_INVALID_CLASS_ID. */
 JS_EXTERN JSClassID JS_GetClassID(JSValueConst v);
 JS_EXTERN int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *class_def);
+
+/* GIVE THE GLOBAL OBJECT A CLASS, so it can have EXOTIC own-property behaviour.
+ *
+ * HTML §7.2.5.1 makes the global a legacy platform object: `window[0]` names a child navigable without being an
+ * own property, and `Object.defineProperty(window, 0, …)` must fail. In this engine exotic behaviour comes from
+ * an object's CLASS, and the global is created by JS_NewContext long before any host class is registered — so
+ * a host that needs it hands the already-created global the class it registered.
+ *
+ * THE CLASS MUST OWN NO PER-OBJECT DATA. A finalizer or a gc_mark reads the object's class-specific union,
+ * which the global has never filled, so one that owns anything would free or trace garbage; both are rejected
+ * here rather than left to crash later. Returns 0, or -1 for an unknown or unsuitable class. */
+JS_EXTERN int JS_SetGlobalClass(JSContext *ctx, JSClassID class_id);
+
+/* IS THIS ATOM AN ARRAY INDEX PROPERTY NAME? — ECMAScript's canonical numeric string in 0..2^32-2, which is the
+   same thing Web IDL calls a "supported property index" and HTML §7.2.5.1 branches on. An exotic
+   [[GetOwnProperty]]/[[DefineOwnProperty]]/[[Delete]] written outside this file has to answer it, and doing so
+   from the atom's TEXT would both allocate on a lookup-miss path and re-derive a rule the engine already owns
+   ("01" and "1e2" are not indices). Writes *pval on true. */
+JS_EXTERN bool JS_AtomIsIndex(JSContext *ctx, uint32_t *pval, JSAtom atom);
 JS_EXTERN bool JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id);
 /* Returns the class name or JS_ATOM_NULL if `id` is not a registered class. Must be freed with JS_FreeAtom. */
 JS_EXTERN JSAtom JS_GetClassName(JSRuntime *rt, JSClassID class_id);
