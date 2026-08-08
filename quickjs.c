@@ -9736,6 +9736,18 @@ JSValue JS_ThrowOutOfMemory(JSContext *ctx)
     return JS_Throw(ctx, JS_IsUndefined(ctx->oom_error) ? JS_NULL : js_dup(ctx->oom_error));
 }
 
+/* IS THIS EXCEPTION THE RUNTIME'S OWN OUT OF MEMORY? A POINTER COMPARISON against the singleton the throw
+   above hands out, so it runs no code at all — and that is the point. A host that instead stringifies the
+   exception to look for the words reaches `toString`, and this interpreter refuses to run a method or a getter
+   from a C activation: there is no flow base under one, so a body that loops would drive to completion. The
+   singleton is allocated with the context, so the JS_NULL fallback only exists for a context too starved to
+   have built it — which is the same event, and is why it counts here too. */
+bool JS_IsOutOfMemoryError(JSContext *ctx, JSValueConst v)
+{
+    if (JS_IsUndefined(ctx->oom_error)) return JS_IsNull(v);
+    return JS_VALUE_GET_PTR(v) == JS_VALUE_GET_PTR(ctx->oom_error);
+}
+
 static JSValue JS_ThrowStackOverflow(JSContext *ctx)
 {
     return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");

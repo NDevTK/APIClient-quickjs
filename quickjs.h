@@ -543,6 +543,10 @@ JS_EXTERN bool JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 JS_EXTERN JSContext *JS_NewContext(JSRuntime *rt);
 JS_EXTERN void JS_FreeContext(JSContext *s);
 JS_EXTERN JSContext *JS_DupContext(JSContext *ctx);
+/* IS THIS EXCEPTION THE RUNTIME'S OWN OUT OF MEMORY? A pointer comparison against the singleton the throw
+   hands out — it runs none of the page's code, which is what lets a C activation ask at all. */
+JS_EXTERN bool JS_IsOutOfMemoryError(JSContext *ctx, JSValueConst v);
+
 JS_EXTERN void *JS_GetContextOpaque(JSContext *ctx);
 JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
 JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);
