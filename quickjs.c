@@ -84,7 +84,9 @@
 #define __extension__
 #endif
 
-#ifndef NDEBUG
+/* A DEV BUILD DUMPS. The gates pass -DENABLE_DUMPS explicitly, so this defines it only when nobody has —
+   an unguarded #define redefined it on every one of those builds and printed a warning per translation unit. */
+#if !defined(NDEBUG) && !defined(ENABLE_DUMPS)
 #define ENABLE_DUMPS
 #endif
 
@@ -18570,7 +18572,8 @@ static const JSTrampStepDef *tramp_step_def_by_id(int id);
 typedef struct JSImportCap {
     JSValue promise;
     JSValue funcs[2];      /* [resolve, reject] */
-    const uint8_t *next_pc;/* where the opcode continues once the promise is its result */
+    uint8_t *next_pc;      /* where the opcode continues once the promise is its result — `pc`'s own type,
+                              because it holds exactly a saved `pc`; const here made the restore discard it */
     JSStackFrame *sf;      /* the frame that issued OP_import: the unwind acts only when it gets back here */
 } JSImportCap;
 /* EVERY step state begins with this header. The driver keeps NOTHING in a C local: a flow suspends and resumes
@@ -21327,7 +21330,6 @@ typedef struct JSIteratorWrapData {
 static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_regexp_exec_fini(JSContext *ctx, void *st, bool take_result);
 static void js_regexp_exec_visit(JSContext *ctx, void *st, JSStepVisit *v);
- JSIteratorWrapData;
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
                                   resulting iterator IS the call's result; the deliver just yields it. */
@@ -34006,7 +34008,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_getprop_deliver;
                 }
                 if (0) {
-                do_getprop_deliver:
+                do_getprop_deliver: ;
                     /* THE ONE completion of a keyed property OPERATION — reached from every frame kind the trap or
                        accessor can have: a returned heap frame, and a callee with no frame at all (a C, bound,
                        proxied or step-machine trap, all of which the convergence point runs). Its operands live in
@@ -35128,7 +35130,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tp_resume_at = TPR_IMPORT;
                     goto do_toprim_tramp;
                 }
-            do_import_after_spec:
+            do_import_after_spec: ;
                 /* THE RESUME POINT: the specifier coercion is this opcode's first act, so what follows is the
                    operation itself. The capability created above for the abrupt case is dropped by the delivery
                    when the coercion completes normally — it was never observed, and creating one runs none of the
@@ -36714,7 +36716,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     {
                         JSObject *g = tramp_accessor_getter(ctx, sp[-1], atom);
                         if (g) {   /* bytecode getter -> 0-arg method call; obj STAYS on the stack (get_field2) */
-                            *sp++ = js_dup(sp[-1]);   /* `this` copy on top of the retained receiver */
+                            /* THE RECEIVER IS READ BEFORE THE PUSH, and that is not a style preference:
+                               `*sp++ = js_dup(sp[-1])` modifies `sp` and reads through it in one expression
+                               with no sequence point between them, which is UNDEFINED — a compiler free to
+                               evaluate the argument after the increment reads the slot it is about to write.
+                               It is the same class as the strict-aliasing bug this engine already carries a
+                               rule about: correct at -O0, silently wrong somewhere else. */
+                            JSValue recv = sp[-1];
+                            *sp++ = js_dup(recv);   /* `this` copy on top of the retained receiver */
                             *sp++ = js_dup(JS_MKPTR(JS_TAG_OBJECT, g));   /* stack: [receiver][this][getter] */
                             call_argv = sp; call_argc = 0;
                             tramp_first = -2; tramp_is_tail = 0;
@@ -39429,7 +39438,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             cont_st = xcs;
             goto do_getprop_abandon;
         } else if (0) {
-        do_getprop_abandon:
+        do_getprop_abandon: ;
             /* THE ONE teardown of a keyed property OPERATION that THREW, reached from every frame kind the trap or
                accessor can have. The machine waiting on the value can never be reached again, so it and the
                machines waiting on it go too — but by ITS OWN rule: a consumer still owes IfAbruptCloseIterator and
@@ -61358,8 +61367,8 @@ typedef enum BCTagEnum {
    this file, which named opcodes and atoms by index and so silently resolved the wrong one when either table
    shifted (Iterator.zip read `done` off the atom next to it, thousands of tests from the cause). Every one of
    those blobs is gone: Array.fromAsync was the last self-hosted builtin and this translation unit now
-   deserializes nothing it was built with. What remains — qjsc output and gen/*.c for the shell — is regenerated
-   by `make codegen` and version-checked at READ time by the BC_VERSION byte below, which is the real mechanism;
+   deserializes nothing it was built with. What remains — qjsc output and the shell's generated sources — is
+   regenerated by `make codegen` and version-checked at READ time by the BC_VERSION byte below, which is the real mechanism;
    a build-time magic number that has to be bumped for a guarantee nothing needs is scaffolding for a deleted
    system, and it made every added atom look like a wire-format change. */
 
@@ -66814,9 +66823,9 @@ static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, J
 }
 
 /* Steps 20-23: `parameters` and `body` are ALSO parsed on their OWN — the spec's own NOTE says it is "to ensure
-   that each is valid alone" — and that is the whole of what rejects `new Function("/*", "*&#47;) {")`, whose two
-   halves parse only once concatenated. Assembling each probe from the SAME builder is what gives the parameter
-   list the right goal for the kind (a generator's [+Yield], an async function's [+Await]) with no second
+   that each is valid alone" — and that is the whole of what rejects a `new Function` whose two arguments are
+   the two halves of one block comment, which parse only once concatenated. Assembling each probe from the SAME
+   builder is what gives the parameter list the right goal for the kind (a generator's [+Yield], an async function's [+Await]) with no second
    spelling of that mapping. Parsing runs none of the page's code, so this needs no trampoline. */
 static int js_dynfunc_check_halves(JSContext *ctx, JSFunctionKindEnum func_kind, JSValue *strs, int n)
 {
@@ -73737,7 +73746,7 @@ static int zip_put_result(JSContext *ctx, JSIteratorZipData *it, JSValueConst re
    `iterables` argument, every element of it, and the padding), so it is a sub-sequence rather than three copies.
    The cursor and the held method live in the CALLER's state because a request suspends and this function's locals
    are gone when it resumes.
-     0 = *piter/*pnext are filled, 3 or 6 = the caller must return that step code, -1 = threw. */
+     0 = both *piter and *pnext are filled, 3 or 6 = the caller must return that step code, -1 = threw. */
 enum { GI_START = 0, GI_METHOD, GI_ITER, GI_NEXTM };
 enum { GI_REQUIRED = 0, GI_FLATTEN };
 
@@ -73815,7 +73824,7 @@ static int zip_get_iter_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase, JSValu
    zipper's own next()), and the ORDER of the two reads is observable — which is why `value_always` is a parameter
    rather than a difference each copy would get to make: the padding walk reads BOTH before testing `done`, the
    other two read `value` only when `done` is falsy.
-     0 = *pvalue/*pdone are filled, 3 or 6 = the caller must return that step code, -1 = threw. */
+     0 = both *pvalue and *pdone are filled, 3 or 6 = the caller must return that step code, -1 = threw. */
 /* IS_VALUE_DONE is not a spelling variant of IS_VALUE: `done` is decided BEFORE the `value` read and reported
    AFTER it, so it has to survive a suspension, and the caller's `bool done` local cannot — it is re-initialised on
    every re-entry. Putting the answer in the PHASE is what makes the two reads one resumable operation; without it
@@ -82504,7 +82513,7 @@ static int js_regexp_compile_step(JSContext *ctx, void *st, JSValue cb_result, J
            "The current Realm Record" is the CALLEE's, not the caller's: `other.RegExp.prototype.compile.call(re)`
            must throw other.TypeError, and `ctx` inside a builtin is already the function's realm. */
         if (!re->legacy_features_enabled)
-            return (JS_ThrowTypeError(ctx, "RegExp.prototype.compile requires a regexp %RegExp% itself "
+            return (JS_ThrowTypeError(ctx, "RegExp.prototype.compile requires a regexp %%RegExp%% itself "
                                            "constructed"), -1);
         if (re->realm != ctx)
             return (JS_ThrowTypeError(ctx, "RegExp.prototype.compile requires a regexp from the same realm"), -1);
@@ -84611,7 +84620,7 @@ static JSValue js_re_split_fini(JSContext *ctx, void *st, bool take_result)
 static JSValue js_regexp_get_legacy_magic(JSContext *ctx, JSValueConst this_val, int slot)
 {
     if (!js_same_value(ctx, this_val, ctx->regexp_ctor))
-        return JS_ThrowTypeError(ctx, "RegExp legacy static properties are only readable on %RegExp% itself");
+        return JS_ThrowTypeError(ctx, "RegExp legacy static properties are only readable on %%RegExp%% itself");
     if (JS_IsUninitialized(ctx->regexp_legacy[slot]))
         return JS_ThrowTypeError(ctx, "RegExp legacy static property is not available");
     return js_dup(ctx->regexp_legacy[slot]);
@@ -84635,7 +84644,7 @@ static int js_regexp_set_input_step(JSContext *ctx, void *st, JSValue cb_result,
         s->str = JS_UNDEFINED;
         if (!js_same_value(ctx, s->hdr.this_val, ctx->regexp_ctor)) {
             JS_FreeValue(ctx, cb_result);
-            JS_ThrowTypeError(ctx, "RegExp legacy static properties are only writable on %RegExp% itself");
+            JS_ThrowTypeError(ctx, "RegExp legacy static properties are only writable on %%RegExp%% itself");
             return -1;
         }
     }

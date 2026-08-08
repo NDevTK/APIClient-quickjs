@@ -712,7 +712,11 @@ typedef struct JSClassDef {
     JSClassCall *call;
     /* XXX: suppress this indirection ? It is here only to save memory
        because only a few classes need these methods */
-    JSClassExoticMethods *exotic;
+    /* CONST, because the runtime's own copy of it is (JSClass.exotic) and every read is through a
+       `const JSClassExoticMethods *`. Without it a host declaring its table `static const` — which is what a
+       table of function pointers that nothing writes should be — discards the qualifier at the JSClassDef,
+       and the only ways out are dropping the const or casting it away at every class. */
+    const JSClassExoticMethods *exotic;
 } JSClassDef;
 
 #define JS_EVAL_OPTIONS_VERSION 1
