@@ -22678,8 +22678,6 @@ typedef struct JSArrayEvery {
     int64_t len, k, n;
     int special, pending_k;
     int present;             /* HasProperty(O, k): the plain-array forms skip holes, so they must ask first */
-    uint8_t elem_ph;         /* 0 = the ask is due, 1 = the read is due. The header's get_phase resumes each
-                                sub-sequence; this says WHICH of the two the loop is in. */
     JSValueConst func, this_arg;
     /* cb_args is the callback's operand buffer OWNED BY THE STATE — the callback args must NOT go on the
        caller's stack (its stack_size is compiler-computed for the caller's own needs) and must NOT need a
@@ -22689,39 +22687,25 @@ typedef struct JSArrayEvery {
        func/this_arg from the header's captured invocation), so do_return skips its `cargv = sp - cargc`
        arg-free for a callback frame. The ORIGINAL call's operand shape lives in hdr. */
     JSValue cb_args[5];
-    JSValue ta_dest;      /* filter|TA: the species-created typed array, held across its `set` (owned) */
+    JSValue ta_dest;      /* filter|TA: the species-created destination, held across the per-element stores (owned) */
     JSValue def_val;      /* the element being WRITTEN into the result, held across the write (owned) */
     int64_t def_k;        /* its index — captured, because filter's n advances once and the write can suspend */
-    uint8_t def_ph;       /* 1 = a DEFINE into the result is in flight; 2 = a TypedArray SET is, whose value is
-                             being coerced. Two states rather than two flags because they are the same fact —
-                             which write is suspended — and only one write is ever in flight. */
-    /* cb_args[0..2] are BORROWED views for the callback drive, with ONE exception: the TypedArray-filter
-       writeback holds an OWNED [dest, `set`, collected] there across the call to the destination's `set`. That
-       is a fact about the three slots, so it is a flag on them and not something inferred from a stage — the
-       stage advances before the values are stored, and a teardown between the two would have released the
-       BORROWED values still sitting there. Both the teardown and the deep-fork clone read this. */
-    uint8_t cb_owned;
 } JSArrayEvery;
 /* Array iteration builtins (forEach/map/every/some/filter) drive a JS callback from a C loop — the
    CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
    is a NORMAL frame carrying the state, so it runs with gen_state == the base and a callback BODY LOOP preempts
    the base flow — never a C-recursive JS_Call that could only drive to completion. */
-static int js_array_every_step(JSContext *ctx, struct JSArrayEvery *s, JSValue res, JSValueConst out_args[3],
-                               JSValue **out_cb, int *out_argc);
 static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
 /* reduce/reduceRight: the same continuation-holding shape as js_array_every, with the accumulator as the state. */
 typedef struct JSArrayReduce {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj, acc, val;
     int64_t len, k;
-    int special, pending;        /* pending = a callback result (the next accumulator) is awaited */
+    int special;
     int present;                 /* HasProperty(O, k): the plain-array forms skip holes, so they must ask first */
-    uint8_t elem_ph;             /* 0 = the ask is due, 1 = the read is due (the header's get_phase resumes each) */
     JSValueConst func;
     JSValue cb_args[6];          /* [this=undefined, func, acc, val, index, obj]; call_argv = &cb_args[2], argc=4 */
 } JSArrayReduce;
-static int js_array_reduce_step(JSContext *ctx, struct JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4],
-                               JSValue **out_cb, int *out_argc);
 /* Array.from(GENERATOR): CONSUME the generator on the tramp chain — each .next() runs the generator body HERE so
    a body loop suspend/resumes at any depth, never the C-recursion drive-to-completion js_array_from's loop uses.
    Only the direct-generator, no-mapfn case is routed (the metric drive); every other Array.from shape stays on the
@@ -71898,130 +71882,142 @@ static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj)
 
 
 
-/* One coroutine step: PROCESS the previous callback's `res` (for element pending_k), then ADVANCE to the next
-   present element and fill out_args with (value, index, obj). Returns 1 = CALL (invoke func on out_args), 0 = DONE
-   (s->ret is the final result), -1 = EXCEPTION. Consumes `res`. Identical semantics to the original C loop. */
-static int js_array_every_step(JSContext *ctx, JSArrayEvery *s, JSValue res, JSValueConst out_args[3],
-                               JSValue **out_cb, int *out_argc)
-{
-    int r;
-    /* the element cursor never runs past the length; pending_k is either -1 (no callback in flight) or the
-       index whose callback result is `res` now — a drift would double-process or skip an element. */
-    DCHECK(s->k >= 0 && s->k <= s->len, "s->k >= 0 && s->k <= s->len");
-    DCHECK(s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len), "s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len)");
-    if (s->def_ph == 2)          /* re-entered mid-coercion of a TypedArray write's value */
-        goto do_ta_write;
-    if (s->def_ph)               /* re-entered mid-write: the driver has performed it */
-        goto do_result_write;
-    if (s->pending_k >= 0) {
-        int64_t k = s->pending_k;
-        s->pending_k = -1;
-        switch (s->special) {
-        case special_every:
-        case special_every | special_TA:
-            if (!JS_ToBoolFree(ctx, res)) { s->ret = JS_FALSE; goto done; }
-            break;
-        case special_some:
-        case special_some | special_TA:
-            if (JS_ToBoolFree(ctx, res)) { s->ret = JS_TRUE; goto done; }
-            break;
-        case special_map:
-            /* 23.1.3.21 step 6.c.iii CreateDataPropertyOrThrow(A, Pk, mappedValue): on a @@species result that is
-               a Proxy or a subclass this is the page's `defineProperty` trap, and it ran from C. */
-            s->def_k = k; s->def_val = res; s->def_ph = 1;
-            res = JS_UNDEFINED;
-            goto do_result_write;
-        case special_map | special_TA:
-            /* 23.2.3.20 step 6.c is `? Set(A, Pk, mappedValue, true)`, and 10.4.5.16 TypedArraySetElement's
-               FIRST step coerces the value with ToBigInt or ToNumber — the page's valueOf or toString whenever
-               the callback returned an object. JS_SetPropertyValue performed that coercion inside itself, from
-               C, below a live flow, so `ta.map(() => ({valueOf(){ … }}))` drove it to completion. */
-            s->def_k = k; s->def_val = res; s->def_ph = 2;
-            res = JS_UNDEFINED;
-            goto do_ta_write;
-        case special_filter:
-        case special_filter | special_TA:
-            if (JS_ToBoolFree(ctx, res)) {
-                res = JS_UNDEFINED;
-                s->def_k = s->n++; s->def_val = js_dup(s->val); s->def_ph = 1;
-                goto do_result_write;
-            }
-            res = JS_UNDEFINED;
-            break;
-        default:
-            JS_FreeValue(ctx, res);
-            break;
-        }
-        JS_FreeValue(ctx, s->val);
-        s->val = JS_UNDEFINED;
-        res = JS_UNDEFINED;   /* the switch above consumed it on every arm */
-    }
-    goto advance;
+/* every / some / forEach / map / filter and their TypedArray twins are ONE walk over TEN algorithms, and the
+   standard numbers those ten differently: every's Repeat is step 5, map's is 6, filter's is 7, and each
+   TypedArray twin sits one further along because ValidateTypedArray is a step of its own. So ONE stage list is
+   expanded once PER ALGORITHM with that algorithm's own step text — a stage cannot move in one of them without
+   moving in all ten, and each definition still names the steps of ITS algorithm and nobody else's.
+   THE TAIL IS ITS OWN LIST because an algorithm that cannot reach a stage must not declare one: every's array
+   ENDS after the callback, so a rest at the write stage is a stage PAST THE END and step_stage_check names it
+   rather than reporting a step that belongs to map. */
+#define ACB_STAGES(X, RECV, LEN, SEED, HAS, GET, CALL) \
+    X(ACB_RECV, RECV) \
+    X(ACB_LEN,  LEN)  \
+    X(ACB_SEED, SEED) \
+    X(ACB_HAS,  HAS)  \
+    X(ACB_GET,  GET)  \
+    X(ACB_CALL, CALL)
+/* THE ELEMENT LANDS IN THE RESULT — one stage, four algorithms, because no algorithm reaches two of them: map
+   defines into its species result, filter defines at its own `to` cursor, the TypedArray map SETS (and
+   TypedArraySetElement coerces the value first, which is the page's valueOf), and the TypedArray filter appends
+   to the internal List its species-create is sized from. */
+#define ACB_WRITE_STAGE(X, WRITE) X(ACB_WRITE, WRITE)
+/* Only %TypedArray%.prototype.filter: its destination is created AFTER the walk, out of the kept count, and
+   then written element by element. */
+#define ACB_TAFILTER_STAGES(X, DEST, STORE) \
+    X(ACB_DEST,  DEST) \
+    X(ACB_STORE, STORE)
+enum { ACB_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0, 0)
+       ACB_WRITE_STAGE(JS_STEP_STAGE_ENUM, 0)
+       ACB_TAFILTER_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
 
- do_ta_write:
-    /* 10.4.5.16 step 1/2, as a request. Once the value is a PRIMITIVE the store's own ToNumber/ToBigInt invokes
-       nothing, so the write itself is ordinary C — and the coercion has demonstrably happened BEFORE the index
-       is tested for validity, which is the order TypedArraySetElement states. */
-    {
-        JSValue prim;
-        r = step_toprim_run(ctx, &s->hdr, s->def_val, HINT_NUMBER, res, &prim, out_cb, out_argc);
-        res = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        JS_FreeValue(ctx, s->def_val); s->def_val = JS_UNDEFINED;
-        s->def_ph = 0;
-        if (JS_SetPropertyValue(ctx, s->ret, js_int32(s->def_k), prim, JS_PROP_THROW) < 0) return -1;
-        JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
-    }
-    goto advance;
-
- do_result_write:
-    /* the write into the RESULT, whichever of the two sinks asked for it. It is a keyed operation like the
-       element read below, so the driver performs it and re-enters here — which is why the index is captured:
-       filter's `n` advances once, at the decision, not at every resume. */
-    r = step_defidx_run(ctx, &s->hdr, s->ret, s->def_k, s->def_val, res, out_cb, out_argc);
-    res = JS_UNDEFINED;
-    if (r) return r < 0 ? -1 : r;
-    s->def_ph = 0;
-    JS_FreeValue(ctx, s->def_val); s->def_val = JS_UNDEFINED;
-    JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
-
- advance:
-    /* HasProperty and Get are each the page's code — an index accessor or a Proxy trap — and
-       JS_TryGetPropertyInt64 / JS_GetPropertyInt64 reached both from C, driving them to completion. Each is a
-       step now, so `[].map.call(proxyWithLoopingGetTrap, f)` parks like anything else. */
-    while (s->k < s->len) {
-        if (s->elem_ph == 0) {
-            if (s->special & special_TA) {
-                s->present = 1;   /* a typed array has no holes to ask about */
-            } else {
-                r = step_hasidx_run(ctx, &s->hdr, s->obj, s->k, res, &s->present, out_cb, out_argc);
-                res = JS_UNDEFINED;
-                if (r) return r < 0 ? -1 : r;
-            }
-            s->elem_ph = 1;
-        }
-        if (!s->present) {
-            s->k++;
-            s->elem_ph = 0;
-            continue;
-        }
-        r = step_getidx_run(ctx, &s->hdr, s->obj, s->k, res, &s->val, out_cb, out_argc);
-        res = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->elem_ph = 0;
-        s->pending_k = s->k++;
-        out_args[0] = s->val;
-        out_args[1] = js_int64(s->pending_k);
-        out_args[2] = s->obj;
-        return 1;
-    }
-done:
-    /* TypedArray filter's writeback — the species create and the destination's own `set` — is NOT here: both run
-       the page's code (a Construct, a property read that may be an accessor, and a call to a method that is
-       itself a step machine), so they are stages of the driver below. Doing them here meant JS_Invoke from C,
-       which is js_call_c_function's DFAIL now that `set` is a machine. */
-    return 0;
-}
+/* every, some and forEach are numbered identically, so they name one array; each still declares its OWN
+   algorithm, which is what a parked machine reports beside the step. */
+static const char *const js_array_every_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.6 step 1 (O is ToObject(this value))",
+        "23.1.3.6 step 2 (len is LengthOfArrayLike(O))",
+        "23.1.3.6 steps 3-4 (IsCallable(callbackfn); k is 0)",
+        "23.1.3.6 step 5.b (kPresent is HasProperty(O, Pk))",
+        "23.1.3.6 step 5.c.i (kValue is Get(O, Pk))",
+        "23.1.3.6 step 5.c.ii (Call(callbackfn, thisArg, <<kValue, k, O>>))")
+    NULL };
+static const char *const js_array_some_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.29 step 1 (O is ToObject(this value))",
+        "23.1.3.29 step 2 (len is LengthOfArrayLike(O))",
+        "23.1.3.29 steps 3-4 (IsCallable(callbackfn); k is 0)",
+        "23.1.3.29 step 5.b (kPresent is HasProperty(O, Pk))",
+        "23.1.3.29 step 5.c.i (kValue is Get(O, Pk))",
+        "23.1.3.29 step 5.c.ii (Call(callbackfn, thisArg, <<kValue, k, O>>))")
+    NULL };
+static const char *const js_array_forEach_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.15 step 1 (O is ToObject(this value))",
+        "23.1.3.15 step 2 (len is LengthOfArrayLike(O))",
+        "23.1.3.15 steps 3-4 (IsCallable(callbackfn); k is 0)",
+        "23.1.3.15 step 5.b (kPresent is HasProperty(O, Pk))",
+        "23.1.3.15 step 5.c.i (kValue is Get(O, Pk))",
+        "23.1.3.15 step 5.c.ii (Call(callbackfn, thisArg, <<kValue, k, O>>))")
+    NULL };
+static const char *const js_array_map_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.21 step 1 (O is ToObject(this value))",
+        "23.1.3.21 step 2 (len is LengthOfArrayLike(O))",
+        "23.1.3.21 steps 3-5 (IsCallable(callbackfn); A is ArraySpeciesCreate(O, len); k is 0)",
+        "23.1.3.21 step 6.b (kPresent is HasProperty(O, Pk))",
+        "23.1.3.21 step 6.c.i (kValue is Get(O, Pk))",
+        "23.1.3.21 step 6.c.ii (mappedValue is Call(callbackfn, thisArg, <<kValue, k, O>>))")
+    ACB_WRITE_STAGE(JS_STEP_STAGE_LABEL,
+        "23.1.3.21 step 6.c.iii (CreateDataPropertyOrThrow(A, Pk, mappedValue))")
+    NULL };
+static const char *const js_array_filter_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.8 step 1 (O is ToObject(this value))",
+        "23.1.3.8 step 2 (len is LengthOfArrayLike(O))",
+        "23.1.3.8 steps 3-6 (IsCallable(callbackfn); A is ArraySpeciesCreate(O, 0); k is 0; to is 0)",
+        "23.1.3.8 step 7.b (kPresent is HasProperty(O, Pk))",
+        "23.1.3.8 step 7.c.i (kValue is Get(O, Pk))",
+        "23.1.3.8 step 7.c.ii (selected is ToBoolean(Call(callbackfn, thisArg, <<kValue, k, O>>)))")
+    ACB_WRITE_STAGE(JS_STEP_STAGE_LABEL,
+        "23.1.3.8 step 7.c.iii.1 (CreateDataPropertyOrThrow(A, ToString(to), kValue))")
+    NULL };
+/* The TypedArray twins. Their HAS stage is the one the walk never rests at — a typed array has no absent index
+   to ask about — so it names the step the walk performs there instead of an operation the algorithm does not
+   have, and that keeps it distinct from the GET stage beside it (two stages naming one step is what
+   step_stage_check refuses). */
+static const char *const js_ta_every_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.8 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.8 step 3 (len is TypedArrayLength(taRecord))",
+        "23.2.3.8 steps 4-5 (IsCallable(callbackfn); k is 0)",
+        "23.2.3.8 step 6.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.8 step 6.b (kValue is Get(O, Pk))",
+        "23.2.3.8 step 6.c (Call(callbackfn, thisArg, <<kValue, k, O>>))")
+    NULL };
+static const char *const js_ta_some_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.28 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.28 step 3 (len is TypedArrayLength(taRecord))",
+        "23.2.3.28 steps 4-5 (IsCallable(callbackfn); k is 0)",
+        "23.2.3.28 step 6.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.28 step 6.b (kValue is Get(O, Pk))",
+        "23.2.3.28 step 6.c (Call(callbackfn, thisArg, <<kValue, k, O>>))")
+    NULL };
+static const char *const js_ta_forEach_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.15 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.15 step 3 (len is TypedArrayLength(taRecord))",
+        "23.2.3.15 steps 4-5 (IsCallable(callbackfn); k is 0)",
+        "23.2.3.15 step 6.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.15 step 6.b (kValue is Get(O, Pk))",
+        "23.2.3.15 step 6.c (Call(callbackfn, thisArg, <<kValue, k, O>>))")
+    NULL };
+static const char *const js_ta_map_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.22 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.22 step 3 (len is TypedArrayLength(taRecord))",
+        "23.2.3.22 steps 4-6 (IsCallable(callbackfn); A is TypedArraySpeciesCreate(O, <<len>>); k is 0)",
+        "23.2.3.22 step 7.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.22 step 7.b (kValue is Get(O, Pk))",
+        "23.2.3.22 step 7.c (mappedValue is Call(callbackfn, thisArg, <<kValue, k, O>>))")
+    ACB_WRITE_STAGE(JS_STEP_STAGE_LABEL,
+        "23.2.3.22 step 7.d (Set(A, Pk, mappedValue, true) — 10.4.5.16 step 1 coerces the value)")
+    NULL };
+static const char *const js_ta_filter_steps[] = {
+    ACB_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.10 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.10 step 3 (len is TypedArrayLength(taRecord))",
+        "23.2.3.10 steps 4-7 (IsCallable(callbackfn); kept is a new empty List; captured is 0; k is 0)",
+        "23.2.3.10 step 8.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.10 step 8.b (kValue is Get(O, Pk))",
+        "23.2.3.10 step 8.c (selected is ToBoolean(Call(callbackfn, thisArg, <<kValue, k, O>>)))")
+    ACB_WRITE_STAGE(JS_STEP_STAGE_LABEL,
+        "23.2.3.10 step 8.d (append kValue to kept; captured is captured + 1)")
+    ACB_TAFILTER_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.10 step 9 (A is TypedArraySpeciesCreate(O, <<captured>>))",
+        "23.2.3.10 step 11.a (Set(A, ToString(n), e, true) for each element e of kept)")
+    NULL };
 
 /* The PROLOGUE (obj/len/func/this_arg + the per-special `ret` seed), run as step 0. Returns 0 = ok,
    -1 = exception (the state is safe to js_array_every_end either way). */
@@ -72030,7 +72026,8 @@ done:
 static int js_array_every_recv(JSContext *ctx, JSArrayEvery *s)
 {
     s->obj = JS_UNDEFINED; s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->def_val = JS_UNDEFINED;
-    s->len = 0; s->k = 0; s->n = 0; s->def_k = 0; s->def_ph = 0; s->special = s->hdr.arg; s->pending_k = -1;
+    s->ta_dest = JS_UNDEFINED;
+    s->len = 0; s->k = 0; s->n = 0; s->def_k = 0; s->special = s->hdr.arg; s->pending_k = -1;
     if (s->special & special_TA) {
         s->obj = js_dup(s->hdr.this_val);
         s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
@@ -72047,8 +72044,6 @@ static int js_array_every_recv(JSContext *ctx, JSArrayEvery *s)
 static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s, JSValue in,
                                JSValue **out_cb, int *out_argc)
 {
-    JSValueConst args[2];
-
     if (s->hdr.spc_phase != SPC_START) {   /* mid-SpeciesCreate: the checks below already ran */
         if (s->special == (special_map | special_TA))
             return step_ta_species_run(ctx, &s->hdr, s->obj, in, js_int64(s->len),
@@ -72084,6 +72079,8 @@ static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s, JSValue in,
                                    JS_VALUE_GET_OBJ(s->obj)->class_id, true,
                                    &s->ret, out_cb, out_argc);
     case special_filter | special_TA:
+        /* 23.2.3.10 step 5: `kept` is an internal List. It is a plain Array here because the machine has to
+           PARK it, and the species-create that reads its length is four steps further on. */
         s->ret = JS_NewArray(ctx);
         if (JS_IsException(s->ret)) return -1;
         break;
@@ -72092,11 +72089,10 @@ static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s, JSValue in,
 }
 
 /* Release the transient state. The caller takes s->ret on success (pass take_ret=true); on failure it is freed. */
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). cb_args[3..4] are an index and a borrowed view of obj, and
-   cb_args[0..2] are borrowed too EXCEPT while the TypedArray-filter writeback holds its [dest, `set`,
-   collected] across the destination's own `set` — ownership that is conditional, which is why this is a
-   function and not a list of offsets. `ret` is visited here and the teardown below hands it out instead when
-   the machine SUCCEEDED, which is the one thing a completion knows that this declaration cannot. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). cb_args are borrowed views of `val`, `obj` and the header's
+   captured invocation, plus the loop's index, so none of them is visited. `ret` is visited here and the teardown
+   below hands it out instead when the machine SUCCEEDED, which is the one thing a completion knows that this
+   declaration cannot. */
 static void js_array_every_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSArrayEvery *s = st;
@@ -72105,113 +72101,208 @@ static void js_array_every_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->obj);
     v->val(ctx, &s->def_val);
     v->val(ctx, &s->ta_dest);
-    if (s->cb_owned) {
-        v->val(ctx, &s->cb_args[0]);
-        v->val(ctx, &s->cb_args[1]);
-        v->val(ctx, &s->cb_args[2]);
-    }
 }
 
 static void js_array_every_end(JSContext *ctx, JSArrayEvery *s, bool take_ret)
 {
     /* the RESULT is handed to the caller rather than released, and everything else goes through the one
-       declaration above — including the conditional cb_args, which is why `set` throwing no longer leaks them. */
+       declaration above. */
     if (take_ret) s->ret = JS_UNDEFINED;
-    s->cb_owned = 0;
     tramp_step_visit_free(ctx, s);
 }
 
 /* every/some/forEach/map/filter (and their TypedArray twins) as a STEP builtin. js_array_every was ALREADY split
    into init/step/end — the C function was nothing but a JS_Call driver loop over that same machine, i.e. the
    second, non-suspending driver. It is deleted, so the machine has exactly one driver and the recognizer that
-   chose between them has nothing left to choose. */
+   chose between them has nothing left to choose.
+   THE WALK IS STAGES, NOT PRIVATE PHASES. HasProperty, Get, the callback and the write are four DIFFERENT
+   numbered steps of the Repeat, and each is the page's code, so each is where the machine rests — which
+   `elem_ph`/`def_ph` encoded in bytes only this function could read. A parked flow now says which step of which
+   algorithm it is parked at, and the driver asserts it. */
 static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayEvery *s = st;
     int r;
-    if (s->hdr.stage == 0) {
+
+    if (s->hdr.stage == ACB_RECV) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         if (js_array_every_recv(ctx, s))
             return -1;
-        s->hdr.stage = (s->hdr.arg & special_TA) ? 2 : 1;   /* a TypedArray's length needs no read */
+        s->hdr.stage = (s->hdr.arg & special_TA) ? ACB_SEED : ACB_LEN;   /* a TypedArray's length needs no read */
     }
-    if (s->hdr.stage == 1) {   /* LengthOfArrayLike, re-entered until it finishes */
+    if (s->hdr.stage == ACB_LEN) {   /* LengthOfArrayLike, re-entered until it finishes */
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = ACB_SEED;
     }
-    if (s->hdr.stage == 2) {   /* the seed, re-entered while ArraySpeciesCreate runs the page's code */
+    if (s->hdr.stage == ACB_SEED) {   /* the seed, re-entered while ArraySpeciesCreate runs the page's code */
         r = js_array_every_seed(ctx, s, cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 3;
+        s->hdr.stage = ACB_HAS;
     }
-    if (s->hdr.stage == 6) {   /* filter|TA: species-create the destination, then read its `set` */
-    ta_filter_dest:
-        r = step_ta_species_run(ctx, &s->hdr, s->obj, cb_result, js_int64(s->n),
-                                JS_VALUE_GET_OBJ(s->obj)->class_id, true,
-                                &s->ta_dest, out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 4;
-        s->hdr.cb_coerce[0] = s->ta_dest;     /* borrowed: the state holds it */
-        *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_set;
-        return 6;
-    }
-    if (s->hdr.stage == 4) {   /* filter|TA: the destination's `set` method arrived */
-        JSValue m = cb_result;
-        s->hdr.stage = 5;
-        if (!JS_IsFunction(ctx, m)) {
-            JS_FreeValue(ctx, m);
-            JS_ThrowTypeError(ctx, "not a function");
+
+    for (;;) {
+        /* the element cursor never runs past the length; pending_k is either -1 (no callback in flight) or the
+           index whose callback result has just arrived — a drift would double-process or skip an element. */
+        DCHECK(s->k >= 0 && s->k <= s->len, "s->k >= 0 && s->k <= s->len");
+        DCHECK(s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len), "s->pending_k == -1 || (s->pending_k >= 0 && s->pending_k < s->len)");
+        switch (s->hdr.stage) {
+        case ACB_HAS:
+            if (s->k >= s->len)
+                goto walk_done;
+            /* HasProperty is the page's code — an index accessor or a Proxy trap — and JS_TryGetPropertyInt64
+               reached it from C, driving it to completion. A TypedArray has no absent index, so its walk skips
+               this stage entirely rather than asking a question its algorithm does not contain. */
+            if (s->special & special_TA) {
+                JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+                s->present = 1;
+            } else {
+                r = step_hasidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->present, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            if (!s->present) { s->k++; continue; }
+            s->hdr.stage = ACB_GET;
+            continue;
+
+        case ACB_GET:
+            r = step_getidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->val, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->pending_k = s->k++;
+            s->hdr.stage = ACB_CALL;
+            /* cb_args is [this, func, val, idx, obj] — already the method-call shape the driver wants */
+            s->cb_args[0] = s->this_arg;
+            s->cb_args[1] = s->func;
+            s->cb_args[2] = s->val;
+            s->cb_args[3] = js_int64(s->pending_k);
+            s->cb_args[4] = s->obj;
+            *out_cb = s->cb_args; *out_argc = 3;
+            return JS_STEP_CALL;
+
+        case ACB_CALL:
+            s->def_k = s->pending_k;
+            s->pending_k = -1;
+            s->hdr.stage = ACB_HAS;
+            switch (s->special) {
+            case special_every:
+            case special_every | special_TA:
+                /* the result is CONSUMED by the coercion, so the local must stop naming it before any exit —
+                   walk_done releases whatever it still holds. */
+                if (!JS_ToBoolFree(ctx, cb_result)) { cb_result = JS_UNDEFINED; s->ret = JS_FALSE; goto walk_done; }
+                break;
+            case special_some:
+            case special_some | special_TA:
+                if (JS_ToBoolFree(ctx, cb_result)) { cb_result = JS_UNDEFINED; s->ret = JS_TRUE; goto walk_done; }
+                break;
+            case special_map:
+            case special_map | special_TA:
+                s->def_val = cb_result;
+                s->hdr.stage = ACB_WRITE;
+                cb_result = JS_UNDEFINED;
+                continue;
+            case special_filter:
+            case special_filter | special_TA:
+                if (JS_ToBoolFree(ctx, cb_result)) {
+                    s->def_k = s->n++;
+                    s->def_val = js_dup(s->val);
+                    s->hdr.stage = ACB_WRITE;
+                    cb_result = JS_UNDEFINED;
+                    continue;
+                }
+                break;
+            default:
+                JS_FreeValue(ctx, cb_result);
+                break;
+            }
+            JS_FreeValue(ctx, s->val);
+            s->val = JS_UNDEFINED;
+            cb_result = JS_UNDEFINED;   /* the switch above consumed it on every arm */
+            continue;
+
+        case ACB_WRITE:
+            if (s->special == (special_map | special_TA)) {
+                /* 10.4.5.16 TypedArraySetElement step 1 coerces the value with ToBigInt or ToNumber — the page's
+                   valueOf or toString whenever the callback returned an object. JS_SetPropertyValue performed
+                   that coercion inside itself, from C, below a live flow. Once the value is a PRIMITIVE the
+                   store's own coercion invokes nothing, so the write itself is ordinary C — and the coercion has
+                   demonstrably happened BEFORE the index is tested for validity, which is the order the
+                   abstract operation states. */
+                JSValue prim;
+                r = step_toprim_run(ctx, &s->hdr, s->def_val, HINT_NUMBER, cb_result, &prim, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                JS_FreeValue(ctx, s->def_val); s->def_val = JS_UNDEFINED;
+                if (JS_SetPropertyValue(ctx, s->ret, js_int32(s->def_k), prim, JS_PROP_THROW) < 0) return -1;
+            } else {
+                /* On a @@species result that is a Proxy or a subclass this is the page's `defineProperty` trap,
+                   and it ran from C. */
+                r = step_defidx_run(ctx, &s->hdr, s->ret, s->def_k, s->def_val, cb_result, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+                JS_FreeValue(ctx, s->def_val); s->def_val = JS_UNDEFINED;
+            }
+            JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
+            s->hdr.stage = ACB_HAS;
+            continue;
+
+        case ACB_DEST:
+            /* 23.2.3.10 step 9. It is here and not in the seed because `captured` is not known until the walk
+               is over, and TypedArraySpeciesCreate runs the page's constructor. */
+            r = step_ta_species_run(ctx, &s->hdr, s->obj, cb_result, js_int64(s->n),
+                                    JS_VALUE_GET_OBJ(s->obj)->class_id, true,
+                                    &s->ta_dest, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->k = 0;
+            s->hdr.stage = ACB_STORE;
+            continue;
+
+        case ACB_STORE:
+            /* 23.2.3.10 steps 10-11: `n` from 0, one `Set(A, ToString(n), e, true)` per kept element.
+               THE ENGINE USED TO READ `A.set` AND CALL IT with the whole collected array. That is not in the
+               algorithm at all: it performs a Get(A, "set") the spec never performs (observable on a subclass or
+               through a patched %TypedArray%.prototype.set), it dispatches to a method the page can replace, and
+               %TypedArray%.prototype.set REJECTS a source longer than the destination where step 11's
+               out-of-range Set is simply ignored. */
+            if (s->k >= s->n) {
+                JS_FreeValue(ctx, cb_result);
+                JS_FreeValue(ctx, s->ret);
+                s->ret = s->ta_dest;
+                s->ta_dest = JS_UNDEFINED;
+                return 0;
+            }
+            /* `kept` is the machine's own dense Array, never handed to the page, so reading an element back out
+               of it reaches no accessor and no trap. */
+            s->def_val = JS_GetPropertyInt64(ctx, s->ret, s->k);
+            if (JS_IsException(s->def_val)) { s->def_val = JS_UNDEFINED; return -1; }
+            r = step_setidx_run(ctx, &s->hdr, s->ta_dest, s->k, s->def_val, cb_result, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) {
+                if (r < 0) return -1;
+                return r;   /* the store parked: def_val is the machine's, released by the visit */
+            }
+            JS_FreeValue(ctx, s->def_val); s->def_val = JS_UNDEFINED;
+            s->k++;
+            continue;
+
+        default:
+            DFAIL("an Array callback walk resumed at a stage its algorithm does not have");
             return -1;
         }
-        s->cb_args[0] = js_dup(s->ta_dest);
-        s->cb_args[1] = m;                    /* owned */
-        s->cb_args[2] = js_dup(s->ret);       /* the collected plain array */
-        s->cb_owned = 1;
-        *out_cb = s->cb_args; *out_argc = 1;
-        return 3;
-    }
-    if (s->hdr.stage == 5) {   /* filter|TA: `set` returned; the destination IS the result */
+     walk_done:
+        /* the Repeat is over. For every other algorithm `ret` is already the answer; %TypedArray%'s filter has
+           four more steps, and reaching them is a stage change and not a C call — a machine re-entering itself
+           is the drive-to-completion the trampoline exists to remove. */
         JS_FreeValue(ctx, cb_result);
-        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
-        JS_FreeValue(ctx, s->cb_args[1]); s->cb_args[1] = JS_UNDEFINED;
-        JS_FreeValue(ctx, s->cb_args[2]); s->cb_args[2] = JS_UNDEFINED;
-        s->cb_owned = 0;
-        JS_FreeValue(ctx, s->ret);
-        s->ret = s->ta_dest;
-        s->ta_dest = JS_UNDEFINED;
-        return 0;
-    }
-    r = js_array_every_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
-    if (r < 0)
-        return -1;
-    /* WHICH CODES ARE REQUESTS is not a list. This tested `r == 6 || r == 7 || r == 10` — the keyed reads and
-       the result write, the requests the walk happened to issue when this was written — so the walk could not
-       gain one without the wrapper silently mis-delivering it: adding the TypedArray write's ToPrimitive (5)
-       made the wrapper fall through to the callback dispatch below and hand the driver a CALL built out of a
-       half-set cb_args. The walk has exactly TWO answers of its own, 0 (done) and 1 (the callback is due);
-       everything else is a request it issued and this must propagate, whatever it is. */
-    if (r != 0 && r != 1)
-        return r;
-    if (r == 0) {
+        cb_result = JS_UNDEFINED;
         if (s->special != (special_filter | special_TA))
             return 0;
-        /* the elements are collected in a plain array; the RESULT is a species-created typed array they are
-           written into with its own `set`. Both the create and that method read run the page's code, so both
-           are stages — the create's three steps included. */
-        s->hdr.stage = 6;
-        cb_result = JS_UNDEFINED;   /* consumed by the walk above */
-        goto ta_filter_dest;
+        s->hdr.stage = ACB_DEST;
     }
-    /* cb_args is [this, func, val, idx, obj] — already the method-call shape the driver wants */
-    s->cb_args[0] = s->this_arg;
-    s->cb_args[1] = s->func;
-    *out_cb = s->cb_args; *out_argc = 3;
-    return 3;
 }
 
 static JSValue js_array_every_vfini(JSContext *ctx, void *st, bool take_result)
@@ -72881,15 +72972,33 @@ static const JSTrampStepDef js_str_search_def =
     { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search, .visit = js_str_match_visit };
 static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0, .visit = js_str_replace_visit };
 static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1, .visit = js_str_replace_visit };
-static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every, .visit = js_array_every_visit };
-static const JSTrampStepDef js_array_some_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some, .visit = js_array_every_visit };
-static const JSTrampStepDef js_array_forEach_def   = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach, .visit = js_array_every_visit };
-static const JSTrampStepDef js_array_map_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map, .visit = js_array_every_visit };
-static const JSTrampStepDef js_array_filter_def    = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter, .visit = js_array_every_visit };
-static const JSTrampStepDef js_ta_every_def        = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every | special_TA, .visit = js_array_every_visit };
-static const JSTrampStepDef js_ta_some_def         = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some | special_TA, .visit = js_array_every_visit };
-static const JSTrampStepDef js_ta_forEach_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA, .visit = js_array_every_visit };
-static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map | special_TA, .visit = js_array_every_visit };
+static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every, .visit = js_array_every_visit,
+                                                     .algorithm = "23.1.3.6 Array.prototype.every",
+                                                     .steps = js_array_every_steps };
+static const JSTrampStepDef js_array_some_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some, .visit = js_array_every_visit,
+                                                     .algorithm = "23.1.3.29 Array.prototype.some",
+                                                     .steps = js_array_some_steps };
+static const JSTrampStepDef js_array_forEach_def   = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach, .visit = js_array_every_visit,
+                                                     .algorithm = "23.1.3.15 Array.prototype.forEach",
+                                                     .steps = js_array_forEach_steps };
+static const JSTrampStepDef js_array_map_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map, .visit = js_array_every_visit,
+                                                     .algorithm = "23.1.3.21 Array.prototype.map",
+                                                     .steps = js_array_map_steps };
+static const JSTrampStepDef js_array_filter_def    = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter, .visit = js_array_every_visit,
+                                                     .algorithm = "23.1.3.8 Array.prototype.filter",
+                                                     .steps = js_array_filter_steps };
+static const JSTrampStepDef js_ta_every_def        = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every | special_TA, .visit = js_array_every_visit,
+                                                     .algorithm = "23.2.3.8 %TypedArray%.prototype.every",
+                                                     .steps = js_ta_every_steps };
+static const JSTrampStepDef js_ta_some_def         = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_some | special_TA, .visit = js_array_every_visit,
+                                                     .algorithm = "23.2.3.28 %TypedArray%.prototype.some",
+                                                     .steps = js_ta_some_steps };
+static const JSTrampStepDef js_ta_forEach_def      = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_forEach | special_TA, .visit = js_array_every_visit,
+                                                     .algorithm = "23.2.3.15 %TypedArray%.prototype.forEach",
+                                                     .steps = js_ta_forEach_steps };
+static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map | special_TA, .visit = js_array_every_visit,
+                                                     .algorithm = "23.2.3.22 %TypedArray%.prototype.map",
+                                                     .steps = js_ta_map_steps };
 static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 0, .visit = js_ta_sort_visit };
 static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1, .visit = js_ta_sort_visit };
 static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0, .visit = js_array_sort_visit };
@@ -73731,7 +73840,9 @@ static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_a
 static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight, .visit = js_array_reduce_visit };
 static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA, .visit = js_array_reduce_visit };
 static const JSTrampStepDef js_ta_reduceR_def    = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight | special_TA, .visit = js_array_reduce_visit };
-static const JSTrampStepDef js_ta_filter_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter | special_TA, .visit = js_array_every_visit };
+static const JSTrampStepDef js_ta_filter_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter | special_TA, .visit = js_array_every_visit,
+                                                     .algorithm = "23.2.3.10 %TypedArray%.prototype.filter",
+                                                     .steps = js_ta_filter_steps };
 
 /* Designated initializers, so each row states WHICH id it serves. Inserting a builtin cannot silently repoint an
    existing registration the way a positional table would. */
