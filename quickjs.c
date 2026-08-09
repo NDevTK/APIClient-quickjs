@@ -15589,11 +15589,32 @@ static JSValue js_dtoa2(JSContext *ctx,
    the page reported nothing at all.
    One helper rather than the same four lines per site, because these sites are found one at a time and the
    next one should cost a line. Returns JS_UNINITIALIZED for an ordinary operand — every caller's "carry on". */
-static JSValue js_concolic_builtin(JSContext *ctx, JSValueConst v, const char *op)
+/* IS THIS OPERAND UNKNOWN, AND WHAT IS IT CONCRETELY? JS_UNINITIALIZED means ordinary — carry on. Otherwise
+   the answer is the operand's own EXAMPLE (JS_UNDEFINED when it has none yet), which the caller RUNS THE REAL
+   OPERATION on before deriving. §solver allows no other way for an example to propagate: the engine performs
+   the operation on the concrete, never a rule that predicts what performing it would have produced. */
+static JSValue js_concolic_operand(JSContext *ctx, JSValueConst v)
 {
     if (!(g_concolic.builtin && g_concolic.is && g_concolic.is(v)))
         return JS_UNINITIALIZED;
-    return g_concolic.builtin(ctx, v, op);
+    return g_concolic.example ? g_concolic.example(ctx, v) : JS_UNDEFINED;
+}
+
+/* The derived unknown, carrying whatever the REAL operation produced from that example (consumed). */
+static JSValue js_concolic_derive(JSContext *ctx, JSValueConst v, const char *op, JSValue real)
+{
+    if (!(g_concolic.builtin && g_concolic.is && g_concolic.is(v))) { JS_FreeValue(ctx, real); return JS_UNINITIALIZED; }
+    return g_concolic.builtin(ctx, v, op, real);
+}
+
+/* The operand's example when it is a STRING — what a builtin whose real operation takes a string needs. */
+static JSValue js_concolic_operand_str(JSContext *ctx, JSValueConst v)
+{
+    JSValue ex = js_concolic_operand(ctx, v);
+    if (JS_IsUninitialized(ex)) return JS_UNDEFINED;
+    if (JS_IsString(ex)) return ex;
+    JS_FreeValue(ctx, ex);
+    return JS_UNDEFINED;
 }
 
 static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
@@ -64764,7 +64785,7 @@ static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
            never NaN, which is a concrete answer this engine has no basis for, and never the crash the
            ToString below would give. */
         {
-            JSValue c = js_concolic_builtin(ctx, step_arg(&s->hdr, 0), "parseInt");
+            JSValue c = js_concolic_derive(ctx, step_arg(&s->hdr, 0), "parseInt", JS_UNDEFINED);
             if (!JS_IsUninitialized(c)) { JS_FreeValue(ctx, cb_result); s->result = c; return 0; }
         }
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
@@ -68094,7 +68115,7 @@ static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
                a bundle wraps a failed parse of a URL parameter and logs or displays `e.message`, which is a
                sink. Defining the derived unknown keeps the source attached to it. */
             {
-                JSValue c = js_concolic_builtin(ctx, message, "Error.message");
+                JSValue c = js_concolic_derive(ctx, message, "Error.message", js_concolic_operand_str(ctx, message));
                 if (!JS_IsUninitialized(c)) {
                     JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
                     JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_message, c,
@@ -75784,7 +75805,7 @@ static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
            concrete prefix collected so far is subsumed by the unknown rather than kept: a partial string would
            be a value the page never computes, and the source identity is what a later sink solves for. */
         {
-            JSValue c = js_concolic_builtin(ctx, s->el, "Array.join");
+            JSValue c = js_concolic_derive(ctx, s->el, "Array.join", JS_UNDEFINED);
             if (!JS_IsUninitialized(c)) {
                 JS_FreeValue(ctx, cb_result);
                 JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
@@ -82408,7 +82429,7 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
            the source. `new RegExp(userInput)` is how a bundle builds a filter out of a parameter, and it ended
            the document at the coercion below. */
         {
-            JSValue c = js_concolic_builtin(ctx, step_arg(&s->hdr, 0), "RegExp");
+            JSValue c = js_concolic_derive(ctx, step_arg(&s->hdr, 0), "RegExp", JS_UNDEFINED);
             if (!JS_IsUninitialized(c)) { s->result = c; return 0; }
         }
         /* A non-object is never a RegExp and reads nothing; anything else asks. The read is its OWN stage
@@ -83295,19 +83316,26 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
            never given has no knowable result, so the operator produces an unknown DERIVED from the source: the
            `m ? m[1] : ...` after it then FORKS both arms instead of aborting the document, and the group read
            off it stays tied to the source a later sink solves for. */
-        if (g_concolic.builtin && g_concolic.is && g_concolic.is(step_arg(&s->hdr, 0))) {
-            JSValue c = g_concolic.builtin(ctx, step_arg(&s->hdr, 0), "RegExp.exec");
-            if (!JS_IsUninitialized(c)) {
-                JS_FreeValue(ctx, cb_result);
-                s->result = c;
+        {
+            JSValue ex = js_concolic_operand(ctx, step_arg(&s->hdr, 0));
+            if (!JS_IsUninitialized(ex)) {
+                /* THE MATCH RUNS, on the operand's own example: the example becomes the SUBJECT and the machine
+                   continues through its real stages, so the derived unknown carries the match this pattern
+                   really produced. With no example there is nothing to run and the value is honestly unknown —
+                   which is a non-answer, not a guess. */
+                JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+                JS_FreeValue(ctx, ex);
+                s->result = js_concolic_derive(ctx, step_arg(&s->hdr, 0), "RegExp.exec", JS_UNDEFINED);
                 return 0;
             }
         }
-        /* 22.2.6.2 step 3: S is ? ToString(string), and it precedes every step of RegExpBuiltinExec. */
-        r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str_val, out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        if (s->hdr.stage == 1) {
+            /* 22.2.6.2 step 3: S is ? ToString(string), and it precedes every step of RegExpBuiltinExec. */
+            r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str_val, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = 2;
+        }
     }
     if (s->hdr.stage == 2) {
         /* step 3: Get(R, "lastIndex") — an accessor if the page redefined it. */
@@ -93628,11 +93656,18 @@ static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int k, c, c1, n, c_min;
 
-    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a
-           derived unknown that keeps the source, so a later branch still forks and a later sink
-           still solves for it (§solver: a spec codec is modelled faithfully, never enumerated). */
-        JSValue c = js_concolic_builtin(ctx, argv[0], "decodeURI");
-        if (!JS_IsUninitialized(c)) return c;
+    {   /* THE CODEC RUNS, on the operand's own example. §solver models a spec codec faithfully and
+           never enumerates or predicts it, so the derived unknown carries what this function
+           REALLY produced from the concrete it had — re-entered here with the example in place of
+           the operand, which is the same code path a page with a known value takes. */
+        JSValue ex = js_concolic_operand(ctx, argv[0]);
+        if (!JS_IsUninitialized(ex)) {
+            JSValue real = JS_UNDEFINED;
+            if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_global_decodeURI(ctx, this_val, 1, a2, isComponent); }
+            JS_FreeValue(ctx, ex);
+            if (JS_IsException(real)) real = JS_UNDEFINED;
+            return js_concolic_derive(ctx, argv[0], "decodeURI", real);
+        }
     }
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
@@ -93746,11 +93781,18 @@ static JSValue js_global_encodeURI(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int k, c, c1;
 
-    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a
-           derived unknown that keeps the source, so a later branch still forks and a later sink
-           still solves for it (§solver: a spec codec is modelled faithfully, never enumerated). */
-        JSValue c = js_concolic_builtin(ctx, argv[0], "encodeURI");
-        if (!JS_IsUninitialized(c)) return c;
+    {   /* THE CODEC RUNS, on the operand's own example. §solver models a spec codec faithfully and
+           never enumerates or predicts it, so the derived unknown carries what this function
+           REALLY produced from the concrete it had — re-entered here with the example in place of
+           the operand, which is the same code path a page with a known value takes. */
+        JSValue ex = js_concolic_operand(ctx, argv[0]);
+        if (!JS_IsUninitialized(ex)) {
+            JSValue real = JS_UNDEFINED;
+            if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_global_encodeURI(ctx, this_val, 1, a2, isComponent); }
+            JS_FreeValue(ctx, ex);
+            if (JS_IsException(real)) real = JS_UNDEFINED;
+            return js_concolic_derive(ctx, argv[0], "encodeURI", real);
+        }
     }
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
@@ -93816,11 +93858,18 @@ static JSValue js_global_escape(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int i, len, c;
 
-    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a
-           derived unknown that keeps the source, so a later branch still forks and a later sink
-           still solves for it (§solver: a spec codec is modelled faithfully, never enumerated). */
-        JSValue c = js_concolic_builtin(ctx, argv[0], "escape");
-        if (!JS_IsUninitialized(c)) return c;
+    {   /* THE CODEC RUNS, on the operand's own example. §solver models a spec codec faithfully and
+           never enumerates or predicts it, so the derived unknown carries what this function
+           REALLY produced from the concrete it had — re-entered here with the example in place of
+           the operand, which is the same code path a page with a known value takes. */
+        JSValue ex = js_concolic_operand(ctx, argv[0]);
+        if (!JS_IsUninitialized(ex)) {
+            JSValue real = JS_UNDEFINED;
+            if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_global_escape(ctx, this_val, 1, a2); }
+            JS_FreeValue(ctx, ex);
+            if (JS_IsException(real)) real = JS_UNDEFINED;
+            return js_concolic_derive(ctx, argv[0], "escape", real);
+        }
     }
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
@@ -93848,11 +93897,18 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int i, len, c, n;
 
-    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a
-           derived unknown that keeps the source, so a later branch still forks and a later sink
-           still solves for it (§solver: a spec codec is modelled faithfully, never enumerated). */
-        JSValue c = js_concolic_builtin(ctx, argv[0], "unescape");
-        if (!JS_IsUninitialized(c)) return c;
+    {   /* THE CODEC RUNS, on the operand's own example. §solver models a spec codec faithfully and
+           never enumerates or predicts it, so the derived unknown carries what this function
+           REALLY produced from the concrete it had — re-entered here with the example in place of
+           the operand, which is the same code path a page with a known value takes. */
+        JSValue ex = js_concolic_operand(ctx, argv[0]);
+        if (!JS_IsUninitialized(ex)) {
+            JSValue real = JS_UNDEFINED;
+            if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_global_unescape(ctx, this_val, 1, a2); }
+            JS_FreeValue(ctx, ex);
+            if (JS_IsException(real)) real = JS_UNDEFINED;
+            return js_concolic_derive(ctx, argv[0], "unescape", real);
+        }
     }
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
@@ -101333,10 +101389,15 @@ static JSValue js_btoa(JSContext *ctx, JSValueConst this_val,
     JSString *s, *ostr;
     size_t len, out_len, written;
 
-    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a derived
-           unknown that keeps the source — the twin of atob's rule, and the same one §solver states. */
-        JSValue c = js_concolic_builtin(ctx, argv[0], "btoa");
-        if (!JS_IsUninitialized(c)) return c;
+    {   /* THE CODEC RUNS, on the operand's own example — the twin of atob's rule and the same re-entry. */
+        JSValue ex = js_concolic_operand(ctx, argv[0]);
+        if (!JS_IsUninitialized(ex)) {
+            JSValue real = JS_UNDEFINED;
+            if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_btoa(ctx, this_val, 1, a2); }
+            JS_FreeValue(ctx, ex);
+            if (JS_IsException(real)) { JS_FreeValue(ctx, JS_GetException(ctx)); real = JS_UNDEFINED; }
+            return js_concolic_derive(ctx, argv[0], "btoa", real);
+        }
     }
     val = JS_ToString(ctx, argv[0]);
     if (unlikely(JS_IsException(val)))
@@ -101400,11 +101461,16 @@ static JSValue js_atob(JSContext *ctx, JSValueConst this_val,
     size_t slen, out_cap, out_len;
     int err;
 
-    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a derived
-           unknown that keeps the source (§solver: a spec codec is modelled faithfully, never enumerated, and
-           never hand-rolled by the solver). */
-        JSValue c = js_concolic_builtin(ctx, argv[0], "atob");
-        if (!JS_IsUninitialized(c)) return c;
+    {   /* THE CODEC RUNS, on the operand's own example — re-entered with it in place of the operand, the
+           same path a page with a known value takes, so the derived unknown carries a real decode. */
+        JSValue ex = js_concolic_operand(ctx, argv[0]);
+        if (!JS_IsUninitialized(ex)) {
+            JSValue real = JS_UNDEFINED;
+            if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_atob(ctx, this_val, 1, a2); }
+            JS_FreeValue(ctx, ex);
+            if (JS_IsException(real)) { JS_FreeValue(ctx, JS_GetException(ctx)); real = JS_UNDEFINED; }
+            return js_concolic_derive(ctx, argv[0], "atob", real);
+        }
     }
     val = JS_ToString(ctx, argv[0]);
     if (unlikely(JS_IsException(val)))

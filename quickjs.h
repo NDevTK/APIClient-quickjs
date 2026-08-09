@@ -1484,7 +1484,12 @@ typedef struct JSConcolicHooks {
        reading a cookie LOOKS like in a real bundle — aborted the whole document.
        The result keeps the source's identity, so a later branch still forks and a later sink still solves for
        the original source. JS_UNINITIALIZED when the operand is not concolic. */
-    JSValue (*builtin)(JSContext *ctx, JSValueConst v, const char *op);
+    JSValue (*builtin)(JSContext *ctx, JSValueConst v, const char *op, JSValue example);
+    /* THE OPERAND'S CONCRETE EXAMPLE, so the operator can RUN THE REAL OPERATION on it and hand the answer
+       back as the derived value's example. §solver is explicit that this is the only sound way an example
+       propagates — the engine runs the real op on the concrete, never a rule that predicts what it would have
+       produced. Returns JS_UNDEFINED when the operand carries no example yet. */
+    JSValue (*example)(JSContext *ctx, JSValueConst v);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
