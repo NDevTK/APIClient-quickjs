@@ -3077,6 +3077,8 @@ static inline void js_free_string(JSRuntime *rt, JSString *str)
         js_free_string0(rt, str);
 }
 
+static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size, JSAtom atom);
+
 static inline void js_free_string0(JSRuntime *rt, JSString *str)
 {
     JSStringSlice *slice;
@@ -3194,12 +3196,46 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #endif
 
-    if (!list_empty(&rt->gc_obj_list)) {   /* DIAG: name the leaked GC objects by type before aborting */
+    /* Declared here because the leak report runs in JS_FreeRuntime, which is above their definitions — the
+       atom table is still alive at this point, which is what makes naming the class possible at all. */
+    #define ATOM_GET_STR_BUF_SIZE 64
+    /* DIAG: NAME the leaked GC objects before aborting. A class NUMBER makes the report a lookup table away
+       from being actionable, and the atom that holds the name is still alive at this point — so printing it
+       costs nothing and turns "1552 of class_id=12" into the component that owns them. Counted per kind rather
+       than one line each: a leak is usually thousands of one thing, and a scrollback of identical lines hides
+       the two or three OTHER kinds that name the real owner. */
+    if (!list_empty(&rt->gc_obj_list)) {
         struct list_head *el;
+        struct { int type, cid, n, rc_min, rc_max; } kinds[64];
+        int nk = 0, i;
+
         list_for_each(el, &rt->gc_obj_list) {
             JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
-            int cid = (JS_GC_TYPE(h) == JS_GC_OBJ_TYPE_JS_OBJECT) ? ((JSObject *)h)->class_id : -1;
-            fprintf(stderr, "[gcleak] gc_obj_type=%d class_id=%d ref_count=%d\n", JS_GC_TYPE(h), cid, JS_REF_COUNT(h));
+            int type = JS_GC_TYPE(h);
+            int cid = (type == JS_GC_OBJ_TYPE_JS_OBJECT) ? ((JSObject *)h)->class_id : -1;
+            int rc = JS_REF_COUNT(h);
+            for (i = 0; i < nk; i++)
+                if (kinds[i].type == type && kinds[i].cid == cid) {
+                    kinds[i].n++;
+                    if (rc < kinds[i].rc_min) kinds[i].rc_min = rc;
+                    if (rc > kinds[i].rc_max) kinds[i].rc_max = rc;
+                    break;
+                }
+            if (i == nk && nk < (int)countof(kinds)) {
+                kinds[nk].type = type; kinds[nk].cid = cid; kinds[nk].n = 1;
+                kinds[nk].rc_min = kinds[nk].rc_max = rc; nk++;
+            }
+        }
+        for (i = 0; i < nk; i++) {
+            static const char *const TYPE_NAME[] = { "object", "bytecode", "shape", "var_ref", "async_function", "context" };
+            const char *tn = (kinds[i].type >= 0 && kinds[i].type < (int)countof(TYPE_NAME))
+                             ? TYPE_NAME[kinds[i].type] : "?";
+            char cbuf[ATOM_GET_STR_BUF_SIZE];
+            const char *cn = "";
+            if (kinds[i].cid > 0 && kinds[i].cid < (int)rt->class_count)
+                cn = JS_AtomGetStrRT(rt, cbuf, sizeof(cbuf), rt->class_array[kinds[i].cid].class_name);
+            fprintf(stderr, "[gcleak] %-14s %-28s x%-6d refcount %d..%d\n",
+                    tn, cn, kinds[i].n, kinds[i].rc_min, kinds[i].rc_max);
         }
     }
     DCHECK(list_empty(&rt->gc_obj_list), "list_empty(&rt->gc_obj_list)");
