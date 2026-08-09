@@ -15581,6 +15581,21 @@ static JSValue js_dtoa2(JSContext *ctx,
     return res;
 }
 
+/* THE OPERATOR'S ANSWER FOR AN UNKNOWN OPERAND, and the reason JS_ToStringInternal's concolic DCHECK below is
+   reachable at all. A builtin that coerces its argument to a real string hits that boundary, which owes C a
+   string and can only crash — so the builtin has to answer BEFORE the coercion, with a value derived from the
+   source. `encodeURIComponent(document.cookie)`, `parseInt(location.hash)` and `[cookie].join(",")` are not
+   exotic expressions; each of them ended a whole document, and a crashed instance's findings are discarded, so
+   the page reported nothing at all.
+   One helper rather than the same four lines per site, because these sites are found one at a time and the
+   next one should cost a line. Returns JS_UNINITIALIZED for an ordinary operand — every caller's "carry on". */
+static JSValue js_concolic_builtin(JSContext *ctx, JSValueConst v, const char *op)
+{
+    if (!(g_concolic.builtin && g_concolic.is && g_concolic.is(v)))
+        return JS_UNINITIALIZED;
+    return g_concolic.builtin(ctx, v, op);
+}
+
 static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                                    int flags)
 {
@@ -64744,6 +64759,14 @@ static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
 
     if (s->hdr.stage == 0) {
         if (s->hdr.str_phase == STR_PH_START) { s->str = JS_UNDEFINED; s->result = JS_UNDEFINED; }
+        /* 19.2.5/19.2.4 OVER UNKNOWN INPUT. §solver states it directly: opacity SURVIVES numeric
+           coercion, so parseInt of an unknown is an unknown NUMBER and a branch on it still forks —
+           never NaN, which is a concrete answer this engine has no basis for, and never the crash the
+           ToString below would give. */
+        {
+            JSValue c = js_concolic_builtin(ctx, step_arg(&s->hdr, 0), "parseInt");
+            if (!JS_IsUninitialized(c)) { JS_FreeValue(ctx, cb_result); s->result = c; return 0; }
+        }
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -75740,6 +75763,21 @@ static int js_array_join_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             s->hdr.stage = 7;
         }
         DCHECK(s->hdr.stage == 7, "Array.prototype.join: unknown stage");
+        /* AN UNKNOWN ELEMENT MAKES THE WHOLE JOIN UNKNOWN. The result is a string built out of the elements,
+           so one element this engine was never given is one the result cannot be known without — and the
+           coercion below owes C a real string, which over a concolic is the crash this answers instead. The
+           concrete prefix collected so far is subsumed by the unknown rather than kept: a partial string would
+           be a value the page never computes, and the source identity is what a later sink solves for. */
+        {
+            JSValue c = js_concolic_builtin(ctx, s->el, "Array.join");
+            if (!JS_IsUninitialized(c)) {
+                JS_FreeValue(ctx, cb_result);
+                JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
+                JS_FreeValue(ctx, string_buffer_end(&s->b));
+                s->result = c;
+                return 0;
+            }
+        }
         r = step_tostring_run(ctx, &s->hdr, s->el, cb_result, &str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -93567,6 +93605,12 @@ static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int k, c, c1, n, c_min;
 
+    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a
+           derived unknown that keeps the source, so a later branch still forks and a later sink
+           still solves for it (§solver: a spec codec is modelled faithfully, never enumerated). */
+        JSValue c = js_concolic_builtin(ctx, argv[0], "decodeURI");
+        if (!JS_IsUninitialized(c)) return c;
+    }
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
         return str;
@@ -93679,6 +93723,12 @@ static JSValue js_global_encodeURI(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int k, c, c1;
 
+    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a
+           derived unknown that keeps the source, so a later branch still forks and a later sink
+           still solves for it (§solver: a spec codec is modelled faithfully, never enumerated). */
+        JSValue c = js_concolic_builtin(ctx, argv[0], "encodeURI");
+        if (!JS_IsUninitialized(c)) return c;
+    }
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
         return str;
@@ -93743,6 +93793,12 @@ static JSValue js_global_escape(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int i, len, c;
 
+    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a
+           derived unknown that keeps the source, so a later branch still forks and a later sink
+           still solves for it (§solver: a spec codec is modelled faithfully, never enumerated). */
+        JSValue c = js_concolic_builtin(ctx, argv[0], "escape");
+        if (!JS_IsUninitialized(c)) return c;
+    }
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
         return str;
@@ -93769,6 +93825,12 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
     JSString *p;
     int i, len, c, n;
 
+    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a
+           derived unknown that keeps the source, so a later branch still forks and a later sink
+           still solves for it (§solver: a spec codec is modelled faithfully, never enumerated). */
+        JSValue c = js_concolic_builtin(ctx, argv[0], "unescape");
+        if (!JS_IsUninitialized(c)) return c;
+    }
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
         return str;
@@ -101310,6 +101372,12 @@ static JSValue js_atob(JSContext *ctx, JSValueConst this_val,
     size_t slen, out_cap, out_len;
     int err;
 
+    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a derived
+           unknown that keeps the source (§solver: a spec codec is modelled faithfully, never enumerated, and
+           never hand-rolled by the solver). */
+        JSValue c = js_concolic_builtin(ctx, argv[0], "atob");
+        if (!JS_IsUninitialized(c)) return c;
+    }
     val = JS_ToString(ctx, argv[0]);
     if (unlikely(JS_IsException(val)))
         return JS_EXCEPTION;
