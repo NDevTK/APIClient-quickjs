@@ -21402,6 +21402,29 @@ typedef struct JSIteratorWrapData {
 static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_regexp_exec_fini(JSContext *ctx, void *st, bool take_result);
 static void js_regexp_exec_visit(JSContext *ctx, void *st, JSStepVisit *v);
+
+/* A DECLARED MACHINE RESTS ONLY AT A STEP OF ITS OWN ALGORITHM — see JSTrampStepDef.steps. Compiled out of
+   release with the DCHECK; a machine that has not been converted declares no steps and is not yet asked. */
+static void step_stage_check(const JSStepHdr *h, const char *when)
+{
+#if APICLIENT_DEV
+    if (h->def->steps) {
+        int n = 0;
+        while (h->def->steps[n]) n++;
+        if (h->stage >= (uint16_t)n) {
+            char why[256];
+            snprintf(why, sizeof why,
+                     "a step machine rested %s its step at stage %u, which %s does not declare — a suspension "
+                     "point with no place in the algorithm is one a park, a fork or a cross-session resume "
+                     "cannot name, and the stage numbers agree with themselves either way",
+                     when, (unsigned)h->stage, h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)");
+            DFAIL(why);
+        }
+    }
+#else
+    (void)h; (void)when;
+#endif
+}
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
                                   shared acquire (so a generator-function @@iterator is created ON THE TRAMP) and the
                                   resulting iterator IS the call's result; the deliver just yields it. */
@@ -28221,7 +28244,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSStepHdr *prev_running = g_step_running;
                 int st;
                 g_step_chain = tf_top; g_step_running = h;
+                /* THE STAGE IS A SPEC STEP, ASSERTED WHERE EVERY MACHINE PASSES. A converted machine declares
+                   which step each of its stages rests at, so resting anywhere else is a stage it invented —
+                   a suspension point with no place in the algorithm, which is the one thing a resumable exact
+                   machine may not have. Asked on the way IN and on the way OUT, because the stage a machine
+                   leaves behind is the one a park, a fork or a cross-session resume will find. */
+                step_stage_check(h, "before");
                 st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
+                step_stage_check(h, "after");
                 g_step_chain = prev_chain; g_step_running = prev_running;
                 if (unlikely(st < 0)) {
                     void *souter0 = h->outer; uint8_t sk0 = h->outer_kind;
@@ -73570,7 +73600,12 @@ static const JSTrampStepDef js_sab_grow_def      = PRIMARGS_DEF_PRE(PRIMARGS(0x1
 static const JSTrampStepDef js_ab_transfer_def   = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER, js_array_buffer_transfer_precheck, NULL);
 static const JSTrampStepDef js_ab_transferImm_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE, js_array_buffer_transfer_precheck, NULL);
 static const JSTrampStepDef js_ab_transferFix_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH, js_array_buffer_transfer_precheck, NULL);
-static const JSTrampStepDef js_regexp_exec_def    = { sizeof(JSRegExpExec), js_regexp_exec_step, js_regexp_exec_fini, 0, .visit = js_regexp_exec_visit };
+/* the step table is defined with the machine; the definition here needs its name */
+static const char *const js_regexp_exec_steps[];
+static const JSTrampStepDef js_regexp_exec_def    = { sizeof(JSRegExpExec), js_regexp_exec_step, js_regexp_exec_fini, 0,
+                                                     .visit = js_regexp_exec_visit,
+                                                     .algorithm = "22.2.7.2 RegExpBuiltinExec",
+                                                     .steps = js_regexp_exec_steps };
 /* THE WHOLE numeric-coercion surface, declared rather than re-implemented. Every one of these performed its
    ToNumber from C — js_call_c_function does it for the f_f/f_f_f prototypes, and the generic ones call JS_ToFloat64
    themselves — so a page's `valueOf` containing a loop aborted in `Math.max(o, 1)` while the identical method
@@ -83285,7 +83320,31 @@ fail:
 /* The matcher sits between stage 4 (which sets it up) and stage 5 (the lastIndex write). It is numbered out of
    the sequence rather than renumbering the tail, so a stage constant never means two different things across a
    suspension — the base64 machine learned that the hard way. */
-enum { REX_MATCH = 40 };
+/* 22.2.6.2 RegExp.prototype.exec and the 22.2.7.2 RegExpBuiltinExec it tail-calls, AS THE SPEC NUMBERS THEM.
+   The stages were 0,1,2,3,4 and a 40 named REX_MATCH — internally consistent and externally meaningless, so a
+   flow parked here could be described only as "stage 40 of something". Each stage now rests at a written step,
+   and the labels below are what the driver asserts against and what a parked machine reports. */
+enum {
+    REX_REQUIRE = 0,   /* 22.2.6.2 step 2: RequireInternalSlot(R, [[RegExpMatcher]]) */
+    REX_TOSTRING,      /* 22.2.6.2 step 3: S is ? ToString(string) */
+    REX_GET_LASTINDEX, /* 22.2.7.2 step 2: Get(R, "lastIndex") */
+    REX_TOLENGTH,      /* 22.2.7.2 step 2: ToLength of it */
+    REX_FLAGS,         /* 22.2.7.2 steps 3-4: the original flags decide global/sticky */
+    REX_MATCH,         /* 22.2.7.2 steps 5-12: the matcher itself */
+    REX_SET_LASTINDEX, /* 22.2.7.2 steps 13-15: Set(R, "lastIndex", ...) — a page's own setter may run */
+    REX_RESULT         /* 22.2.7.2 steps 16-28: build the match result array */
+};
+static const char *const js_regexp_exec_steps[] = {
+    "22.2.6.2 step 2 (RequireInternalSlot)",
+    "22.2.6.2 step 3 (S is ToString(string))",
+    "22.2.7.2 step 2 (Get(R, \"lastIndex\"))",
+    "22.2.7.2 step 2 (ToLength of lastIndex)",
+    "22.2.7.2 steps 3-4 (flags decide global/sticky)",
+    "22.2.7.2 steps 5-12 (the matcher)",
+    "22.2.7.2 steps 13-15 (Set(R, \"lastIndex\"))",
+    "22.2.7.2 steps 16-28 (build the match result)",
+    NULL
+};
 
 static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -83293,7 +83352,7 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     JSRegExp *re;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == REX_REQUIRE) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED;
@@ -83307,9 +83366,9 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         s->matching = 0;
         if (!js_get_regexp(ctx, s->hdr.this_val, true))   /* 22.2.6.2 steps 1-2: RequireInternalSlot */
             return -1;
-        s->hdr.stage = 1;
+        s->hdr.stage = REX_TOSTRING;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == REX_TOSTRING) {
         /* 22.2.6.2 OVER UNKNOWN INPUT, answered HERE because the ToString below owes C a real string and can
            only crash on a concolic — which is what `/token=(\w+)/.exec(document.cookie)` did, and that is what
            reading a cookie looks like in every real bundle. Matching a pattern against input this engine was
@@ -83329,30 +83388,30 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
                 return 0;
             }
         }
-        if (s->hdr.stage == 1) {
+        if (s->hdr.stage == REX_TOSTRING) {
             /* 22.2.6.2 step 3: S is ? ToString(string), and it precedes every step of RegExpBuiltinExec. */
             r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str_val, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
-            s->hdr.stage = 2;
+            s->hdr.stage = REX_GET_LASTINDEX;
         }
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == REX_GET_LASTINDEX) {
         /* step 3: Get(R, "lastIndex") — an accessor if the page redefined it. */
         r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_lastIndex, cb_result, &s->li_val,
                              out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 3;
+        s->hdr.stage = REX_TOLENGTH;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == REX_TOLENGTH) {
         /* step 4: ToLength on whatever that Get produced — a valueOf when it is an object. */
         r = step_tolength_run(ctx, &s->hdr, s->li_val, cb_result, &s->last_index, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 4;
+        s->hdr.stage = REX_FLAGS;
     }
-    if (s->hdr.stage == 4) {
+    if (s->hdr.stage == REX_FLAGS) {
         /* steps 5-12: the matcher. The regexp's internal slots are re-read HERE and not before, because the two
            requests above ran the page's code and it may have called `compile()`; the bytecode this run uses is
            then HELD, so a `lastIndex` setter recompiling mid-run cannot free it under the result build. */
@@ -83458,9 +83517,9 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             s->set_pending = 1;
             s->set_val = (int32_t)((s->capture[1] - str_buf) >> shift);
         }
-        s->hdr.stage = 5;
+        s->hdr.stage = REX_SET_LASTINDEX;
     }
-    if (s->hdr.stage == 5) {
+    if (s->hdr.stage == REX_SET_LASTINDEX) {
         if (s->set_pending) {
             /* Set(R, "lastIndex", …, true) — a setter if the page redefined it, and a throw if it is a
                non-writable data property. */
@@ -83471,7 +83530,7 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             if (r) return r < 0 ? -1 : r;
             s->set_pending = 0;
         }
-        s->hdr.stage = 6;
+        s->hdr.stage = REX_RESULT;
     }
     JS_FreeValue(ctx, cb_result);
     if (s->rc != 1) {

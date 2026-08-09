@@ -152,6 +152,26 @@ typedef struct JSTrampStepDef {
        A machine that does not declare one cannot be forked and says so at the fork rather than silently handing
        two flows one state; declaring it is part of declaring the machine. */
     void     (*visit)(JSContext *ctx, void *st, JSStepVisit *v);
+    /* WHICH ALGORITHM THIS MACHINE IS, AND WHICH OF ITS STEPS EACH STAGE NAMES.
+     *
+     * `stage` was documented as "the machine numbers the rest however it likes", and that is the whole of the
+     * problem: a stage is where a machine RESTS — where it parks, where a sibling flow overtakes it, where a
+     * cold-tier resume picks it up — and a private integer says nothing about where in the algorithm that is.
+     * Two spec steps bundled into one stage are two steps between which this engine cannot suspend, which is
+     * exactly the skipped logic the design forbids, and nothing could see it because the machine's own numbers
+     * were internally consistent either way.
+     *
+     * `steps[stage]` is the spec step that stage rests at, as the standard writes it ("22.2.7.2 step 2"). That
+     * makes a resume point EXACT rather than approximate: the driver asserts that a machine only ever rests at
+     * a step of its own algorithm, a parked machine can SAY where it is parked, and a stage number means the
+     * same thing in the next session as in this one — which is what a cross-session resume of a suspended
+     * machine requires and what a private counter can never give it.
+     *
+     * NULL-terminated, indexed by stage, so a stage past the end is a machine that invented one. A definition
+     * that has not been converted yet declares neither, and the count of those is the conversion's work queue —
+     * see engine/build.mjs's step gate, which reports it. */
+    const char *algorithm;
+    const char *const *steps;
 } JSTrampStepDef;
 
 typedef struct JSStepHdr {
