@@ -68089,6 +68089,20 @@ static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     if (s->hdr.stage == ERRC_PH_MSG) {
         JSValueConst message = step_arg(&s->hdr, opts - 1);
         if (!JS_IsUndefined(message)) {
+            /* 20.5.1.1 step 3 OVER UNKNOWN INPUT: `message` is coerced, and an Error built out of unknown
+               input has an unknown message rather than none. Errors made of attacker input are a real path —
+               a bundle wraps a failed parse of a URL parameter and logs or displays `e.message`, which is a
+               sink. Defining the derived unknown keeps the source attached to it. */
+            {
+                JSValue c = js_concolic_builtin(ctx, message, "Error.message");
+                if (!JS_IsUninitialized(c)) {
+                    JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+                    JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_message, c,
+                                           JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+                    s->hdr.stage = ERRC_PH_HASCAUSE;
+                    goto errc_after_msg;
+                }
+            }
             r = step_tostring_run(ctx, &s->hdr, message, cb_result, &s->held, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
@@ -68098,6 +68112,7 @@ static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         }
         s->hdr.stage = ERRC_PH_HASCAUSE;
     }
+errc_after_msg:
     if (s->hdr.stage == ERRC_PH_HASCAUSE) {
         /* InstallErrorCause: only when `options` is an Object, and then a HasProperty before the Get. */
         if (s->hdr.argc > opts && JS_VALUE_GET_TAG(s->hdr.argv[opts]) == JS_TAG_OBJECT) {
@@ -82388,6 +82403,14 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         s->bc = JS_UNDEFINED; s->result = JS_UNDEFINED; s->ntgt = JS_UNDEFINED;
         s->patIsRe = 0;
         s->haveFlags = !JS_IsUndefined(step_arg(&s->hdr, 1));
+        /* 22.2.4.1 OVER AN UNKNOWN PATTERN. A pattern this engine was never given cannot be compiled — there is
+           no matcher to build and no bytecode to hold — so the constructor answers with an unknown derived from
+           the source. `new RegExp(userInput)` is how a bundle builds a filter out of a parameter, and it ended
+           the document at the coercion below. */
+        {
+            JSValue c = js_concolic_builtin(ctx, step_arg(&s->hdr, 0), "RegExp");
+            if (!JS_IsUninitialized(c)) { s->result = c; return 0; }
+        }
         /* A non-object is never a RegExp and reads nothing; anything else asks. The read is its OWN stage
            because this one opens by discarding cb_result — a suspension inside it would land back here and
            throw away the very value the read produced. */
@@ -101310,6 +101333,11 @@ static JSValue js_btoa(JSContext *ctx, JSValueConst this_val,
     JSString *s, *ostr;
     size_t len, out_len, written;
 
+    {   /* the codec runs the REAL transform on a real string; over unknown input it answers with a derived
+           unknown that keeps the source — the twin of atob's rule, and the same one §solver states. */
+        JSValue c = js_concolic_builtin(ctx, argv[0], "btoa");
+        if (!JS_IsUninitialized(c)) return c;
+    }
     val = JS_ToString(ctx, argv[0]);
     if (unlikely(JS_IsException(val)))
         return JS_EXCEPTION;
