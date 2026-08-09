@@ -589,6 +589,13 @@ JS_EXTERN void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size);
 JS_EXTERN void *js_malloc_rt(JSRuntime *rt, size_t size);
 JS_EXTERN void js_free_rt(JSRuntime *rt, void *ptr);
 JS_EXTERN void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size);
+/* WHATWG base64, the encoder half — the engine's own, so a host that has to put bytes on a text channel binds
+   this rather than growing a second implementation of a codec the spec already made this engine implement. */
+JS_EXTERN size_t JS_Base64EncodedSize(size_t len);
+JS_EXTERN size_t JS_Base64Encode(char *dst, size_t dst_size, const uint8_t *src, size_t len);
+JS_EXTERN size_t JS_Base64DecodedMax(size_t len);
+JS_EXTERN size_t JS_Base64Decode(uint8_t *dst, size_t dst_size, const char *src, size_t len, int *err);
+
 JS_EXTERN size_t js_malloc_usable_size_rt(JSRuntime *rt, const void *ptr);
 JS_EXTERN void *js_mallocz_rt(JSRuntime *rt, size_t size);
 

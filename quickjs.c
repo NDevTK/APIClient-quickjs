@@ -101096,6 +101096,24 @@ static size_t b64_encode(const uint8_t *src, size_t len, char *dst,
     return j;
 }
 
+/* THE STANDARD BASE64 ENCODER, EXPORTED — because the HOST NEEDS ONE and this is the engine that has it.
+   A cross-instance message is bytes, the notice channel that carries it to the trusted zone is TEXT, and the
+   choice was between binding the codec that already exists here and hand-rolling a second one in the host.
+   `dst_size` is checked rather than trusted: the caller sizes with JS_Base64EncodedSize and a mismatch between
+   the two is the one way this can corrupt a message, so it fails loudly instead of writing past the buffer.
+   Returns the number of characters written, or 0 when `dst` is too small. */
+size_t JS_Base64EncodedSize(size_t len)
+{
+    return ((len + 2) / 3) * 4;
+}
+
+size_t JS_Base64Encode(char *dst, size_t dst_size, const uint8_t *src, size_t len)
+{
+    if (dst_size < JS_Base64EncodedSize(len))
+        return 0;
+    return b64_encode(src, len, dst, b64_enc);
+}
+
 /* Implements https://infra.spec.whatwg.org/#forgiving-base64-decode */
 static size_t
 b64_decode(const char *src, size_t len, uint8_t *dst, int *err)
@@ -101149,6 +101167,25 @@ b64_decode(const char *src, size_t len, uint8_t *dst, int *err)
 
     *err = i < len;
     return j;
+}
+
+/* THE DECODER HALF, EXPORTED for the same reason the encoder is: a message that crossed a text channel has to
+   come back to bytes on the other side, and the alternative was a second implementation of a codec this engine
+   already has. `err` is the forgiving-base64 error the WHATWG algorithm reports; a caller that gets one has
+   been handed something that is not what this engine encoded, which is a corrupted transport rather than a
+   page's mistake. Returns the number of BYTES written; `dst` must hold at least JS_Base64DecodedMax(len). */
+size_t JS_Base64DecodedMax(size_t len)
+{
+    return (len / 4 + 1) * 3;
+}
+
+size_t JS_Base64Decode(uint8_t *dst, size_t dst_size, const char *src, size_t len, int *err)
+{
+    if (dst_size < JS_Base64DecodedMax(len)) {
+        if (err) *err = -1;
+        return 0;
+    }
+    return b64_decode(src, len, dst, err);
 }
 
 static JSValue js_btoa(JSContext *ctx, JSValueConst this_val,
