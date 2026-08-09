@@ -15600,9 +15600,27 @@ static JSValue js_concolic_operand(JSContext *ctx, JSValueConst v)
     return g_concolic.example ? g_concolic.example(ctx, v) : JS_UNDEFINED;
 }
 
-/* The derived unknown, carrying whatever the REAL operation produced from that example (consumed). */
+/* The derived unknown, carrying whatever the REAL operation produced from that example (consumed).
+   THE MODEL RUN'S THROW IS CONSUMED HERE, at the one point every site converges on. `real` is what the
+   operator got by running the operation on an example THIS ENGINE chose; it is not the page's operation,
+   which is still over the UNKNOWN operand and still undecided. So a throw from it belongs to the model and
+   may not be left standing in the context: a site that returned a value with rt->current_exception still set
+   hands that URIError to the next code that asks for a pending exception — Promise.all's setup failure reads
+   exactly that, and rejects with the stale value — which is a throw from an expression that never threw.
+   Freeing the marker is not enough (JS_EXCEPTION carries no reference), so the exception itself is taken.
+   The example is then absent, which is honest: that concrete has no encoded form.
+   NAMED AND NOT BUILT: the throw ARM is lost with it. §solver says a builtin that can throw over an unknown
+   operand FORKS a feasible success arm and a throw arm — `decodeURIComponent(location.hash)` inside a
+   try/catch is the shape — and this engine has no fork at a C builtin boundary yet, which is the same gap
+   JSON.parse still aborts on rather than hide. */
 static JSValue js_concolic_derive(JSContext *ctx, JSValueConst v, const char *op, JSValue real)
 {
+    if (JS_IsException(real)) {
+        DCHECK(JS_HasException(ctx), "a model run returned the exception marker with no exception pending — the "
+                                     "throw it names is not in the context and cannot be taken out of it");
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        real = JS_UNDEFINED;
+    }
     if (!(g_concolic.builtin && g_concolic.is && g_concolic.is(v))) { JS_FreeValue(ctx, real); return JS_UNINITIALIZED; }
     return g_concolic.builtin(ctx, v, op, real);
 }
@@ -93724,7 +93742,6 @@ static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val,
             JSValue real = JS_UNDEFINED;
             if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_global_decodeURI(ctx, this_val, 1, a2, isComponent); }
             JS_FreeValue(ctx, ex);
-            if (JS_IsException(real)) real = JS_UNDEFINED;
             return js_concolic_derive(ctx, argv[0], "decodeURI", real);
         }
     }
@@ -93849,7 +93866,6 @@ static JSValue js_global_encodeURI(JSContext *ctx, JSValueConst this_val,
             JSValue real = JS_UNDEFINED;
             if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_global_encodeURI(ctx, this_val, 1, a2, isComponent); }
             JS_FreeValue(ctx, ex);
-            if (JS_IsException(real)) real = JS_UNDEFINED;
             return js_concolic_derive(ctx, argv[0], "encodeURI", real);
         }
     }
@@ -93926,7 +93942,6 @@ static JSValue js_global_escape(JSContext *ctx, JSValueConst this_val,
             JSValue real = JS_UNDEFINED;
             if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_global_escape(ctx, this_val, 1, a2); }
             JS_FreeValue(ctx, ex);
-            if (JS_IsException(real)) real = JS_UNDEFINED;
             return js_concolic_derive(ctx, argv[0], "escape", real);
         }
     }
@@ -93965,7 +93980,6 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
             JSValue real = JS_UNDEFINED;
             if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_global_unescape(ctx, this_val, 1, a2); }
             JS_FreeValue(ctx, ex);
-            if (JS_IsException(real)) real = JS_UNDEFINED;
             return js_concolic_derive(ctx, argv[0], "unescape", real);
         }
     }
@@ -101454,7 +101468,6 @@ static JSValue js_btoa(JSContext *ctx, JSValueConst this_val,
             JSValue real = JS_UNDEFINED;
             if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_btoa(ctx, this_val, 1, a2); }
             JS_FreeValue(ctx, ex);
-            if (JS_IsException(real)) { JS_FreeValue(ctx, JS_GetException(ctx)); real = JS_UNDEFINED; }
             return js_concolic_derive(ctx, argv[0], "btoa", real);
         }
     }
@@ -101527,7 +101540,6 @@ static JSValue js_atob(JSContext *ctx, JSValueConst this_val,
             JSValue real = JS_UNDEFINED;
             if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_atob(ctx, this_val, 1, a2); }
             JS_FreeValue(ctx, ex);
-            if (JS_IsException(real)) { JS_FreeValue(ctx, JS_GetException(ctx)); real = JS_UNDEFINED; }
             return js_concolic_derive(ctx, argv[0], "atob", real);
         }
     }
