@@ -21421,6 +21421,25 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
 static JSValue js_regexp_exec_fini(JSContext *ctx, void *st, bool take_result);
 static void js_regexp_exec_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
+/* WHICH STAGE OF `def` RESTS AT `label` — the operation a resume performs, because a parked machine holds a
+   spec step and not a number (see JSTrampStepDef.steps). -1 = this build declares no such step, which is a
+   machine whose algorithm changed under a parked flow; -2 = two stages declare it, which makes the answer
+   ambiguous and the resume a guess. Both are refusals rather than a pick. */
+#if APICLIENT_DEV
+static int js_step_stage_from_label(const JSTrampStepDef *def, const char *label)
+{
+    int i, found = -1;
+
+    if (!def->steps || !label) return -1;
+    for (i = 0; def->steps[i]; i++)
+        if (!strcmp(def->steps[i], label)) {
+            if (found >= 0) return -2;
+            found = i;
+        }
+    return found;
+}
+#endif
+
 /* A DECLARED MACHINE RESTS ONLY AT A STEP OF ITS OWN ALGORITHM — see JSTrampStepDef.steps. Compiled out of
    release with the DCHECK; a machine that has not been converted declares no steps and is not yet asked. */
 static void step_stage_check(const JSStepHdr *h, const char *when)
@@ -21436,6 +21455,20 @@ static void step_stage_check(const JSStepHdr *h, const char *when)
                      "point with no place in the algorithm is one a park, a fork or a cross-session resume "
                      "cannot name, and the stage numbers agree with themselves either way",
                      when, (unsigned)h->stage, h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)");
+            DFAIL(why);
+        }
+        /* THE ROUND TRIP, run at every rest because that is where a rest point becomes a thing to restore. The
+           label is what a parked machine holds across a session, so resolving it back has to land on the stage
+           it came from; two stages declaring the SAME spec step make that resolution a guess, and the resume
+           would silently continue at the first of them. Checked here rather than once at registration because
+           this is the set of stages the machine actually rests at. */
+        if (js_step_stage_from_label(h->def, h->def->steps[h->stage]) != (int)h->stage) {
+            char why[320];
+            snprintf(why, sizeof why,
+                     "%s declares the step \"%s\" at more than one stage, so a machine parked there names a "
+                     "rest point that resolves to two — a resume in a later build picks the first and continues "
+                     "at the wrong step of the algorithm, which nothing downstream can tell from the right one",
+                     h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)", h->def->steps[h->stage]);
             DFAIL(why);
         }
     }
@@ -83335,34 +83368,25 @@ fail:
     return ret;
 }
 
-/* The matcher sits between stage 4 (which sets it up) and stage 5 (the lastIndex write). It is numbered out of
-   the sequence rather than renumbering the tail, so a stage constant never means two different things across a
-   suspension — the base64 machine learned that the hard way. */
 /* 22.2.6.2 RegExp.prototype.exec and the 22.2.7.2 RegExpBuiltinExec it tail-calls, AS THE SPEC NUMBERS THEM.
    The stages were 0,1,2,3,4 and a 40 named REX_MATCH — internally consistent and externally meaningless, so a
-   flow parked here could be described only as "stage 40 of something". Each stage now rests at a written step,
-   and the labels below are what the driver asserts against and what a parked machine reports. */
-enum {
-    REX_REQUIRE = 0,   /* 22.2.6.2 step 2: RequireInternalSlot(R, [[RegExpMatcher]]) */
-    REX_TOSTRING,      /* 22.2.6.2 step 3: S is ? ToString(string) */
-    REX_GET_LASTINDEX, /* 22.2.7.2 step 2: Get(R, "lastIndex") */
-    REX_TOLENGTH,      /* 22.2.7.2 step 2: ToLength of it */
-    REX_FLAGS,         /* 22.2.7.2 steps 3-4: the original flags decide global/sticky */
-    REX_MATCH,         /* 22.2.7.2 steps 5-12: the matcher itself */
-    REX_SET_LASTINDEX, /* 22.2.7.2 steps 13-15: Set(R, "lastIndex", ...) — a page's own setter may run */
-    REX_RESULT         /* 22.2.7.2 steps 16-28: build the match result array */
-};
-static const char *const js_regexp_exec_steps[] = {
-    "22.2.6.2 step 2 (RequireInternalSlot)",
-    "22.2.6.2 step 3 (S is ToString(string))",
-    "22.2.7.2 step 2 (Get(R, \"lastIndex\"))",
-    "22.2.7.2 step 2 (ToLength of lastIndex)",
-    "22.2.7.2 steps 3-4 (flags decide global/sticky)",
-    "22.2.7.2 steps 5-12 (the matcher)",
-    "22.2.7.2 steps 13-15 (Set(R, \"lastIndex\"))",
-    "22.2.7.2 steps 16-28 (build the match result)",
-    NULL
-};
+   flow parked here could be described only as "stage 40 of something". Each stage rests at a written step, and
+   the labels are what the driver asserts against and what a parked machine reports.
+   ONE LIST, EXPANDED TWICE. The constants and the labels were two lists side by side, which is the drift
+   JSTrampStepDef.steps describes: renumber one and every stage after it silently names a different step, and a
+   flow parked at that number resumes at the wrong one. The out-of-sequence REX_MATCH = 40 was the workaround
+   for exactly that, and this removes the need for it — a stage cannot move without its label moving with it. */
+#define REX_STAGES(X) \
+    X(REX_REQUIRE,       "22.2.6.2 step 2 (RequireInternalSlot)") \
+    X(REX_TOSTRING,      "22.2.6.2 step 3 (S is ToString(string))") \
+    X(REX_GET_LASTINDEX, "22.2.7.2 step 2 (Get(R, \"lastIndex\"))") \
+    X(REX_TOLENGTH,      "22.2.7.2 step 2 (ToLength of lastIndex)") \
+    X(REX_FLAGS,         "22.2.7.2 steps 3-4 (flags decide global/sticky)") \
+    X(REX_MATCH,         "22.2.7.2 steps 5-12 (the matcher)") \
+    X(REX_SET_LASTINDEX, "22.2.7.2 steps 13-15 (Set(R, \"lastIndex\"))") \
+    X(REX_RESULT,        "22.2.7.2 steps 16-28 (build the match result)")
+enum { REX_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_regexp_exec_steps[] = { REX_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {

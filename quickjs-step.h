@@ -169,10 +169,36 @@ typedef struct JSTrampStepDef {
      *
      * NULL-terminated, indexed by stage, so a stage past the end is a machine that invented one. A definition
      * that has not been converted yet declares neither, and the count of those is the conversion's work queue —
-     * see engine/build.mjs's step gate, which reports it. */
+     * see engine/build.mjs's step gate, which reports it.
+     *
+     * THE LABEL IS THE STAGE'S IDENTITY; THE INDEX IS ONLY THIS BUILD'S NAME FOR IT — and that is why the two
+     * are ONE declaration (JS_STEP_STAGES below) rather than an enum beside an array. Written apart they are
+     * two statements of one fact: RegExpBuiltinExec had eight constants and eight strings, and inserting a step
+     * into one and not the other renames every stage after it, so `steps[stage]` names the wrong step and the
+     * numbers still agree with themselves. The old defence was to number a stage OUT of sequence rather than
+     * renumber the tail, which is a workaround for a drift the single declaration makes impossible.
+     * ACROSS BUILDS the index cannot be the identity at all: a flow parked at stage 5 and resumed by a build
+     * whose stages moved resumes at a different step of its algorithm, silently. So a parked machine's rest
+     * point is its LABEL, and a resume RESOLVES that label back to an index in the build doing the resuming —
+     * which is also why two stages may not declare the same label, asserted at every rest (step_stage_check).
+     * A build-version stamp is the wrong answer to the same question: it rejects every parked snapshot whenever
+     * ANY machine changes, and §scheduler's frontier never drops a work item. */
     const char *algorithm;
     const char *const *steps;
 } JSTrampStepDef;
+
+/* ONE DECLARATION OF A MACHINE'S STAGES — the enum and the labels, from one list, so neither can move without
+   the other. A machine writes:
+       #define REX_STAGES(X) \
+           X(REX_REQUIRE,  "22.2.6.2 step 2 (RequireInternalSlot)") \
+           X(REX_TOSTRING, "22.2.6.2 step 3 (S is ToString(string))")
+       enum { REX_STAGES(JS_STEP_STAGE_ENUM) };
+       static const char *const js_regexp_exec_steps[] = { REX_STAGES(JS_STEP_STAGE_LABEL) NULL };
+   and the step gate refuses a `.steps` array that is anything else — a hand-written list of strings beside a
+   hand-written enum is exactly the pair that drifts. See JSTrampStepDef.steps for why the label, not the index,
+   is what a parked machine is holding. */
+#define JS_STEP_STAGE_ENUM(name, label)  name,
+#define JS_STEP_STAGE_LABEL(name, label) label,
 
 typedef struct JSStepHdr {
     const JSTrampStepDef *def;
