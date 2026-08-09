@@ -83228,6 +83228,20 @@ static int js_regexp_exec_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         s->hdr.stage = 1;
     }
     if (s->hdr.stage == 1) {
+        /* 22.2.6.2 OVER UNKNOWN INPUT, answered HERE because the ToString below owes C a real string and can
+           only crash on a concolic — which is what `/token=(\w+)/.exec(document.cookie)` did, and that is what
+           reading a cookie looks like in every real bundle. Matching a pattern against input this engine was
+           never given has no knowable result, so the operator produces an unknown DERIVED from the source: the
+           `m ? m[1] : ...` after it then FORKS both arms instead of aborting the document, and the group read
+           off it stays tied to the source a later sink solves for. */
+        if (g_concolic.builtin && g_concolic.is && g_concolic.is(step_arg(&s->hdr, 0))) {
+            JSValue c = g_concolic.builtin(ctx, step_arg(&s->hdr, 0), "RegExp.exec");
+            if (!JS_IsUninitialized(c)) {
+                JS_FreeValue(ctx, cb_result);
+                s->result = c;
+                return 0;
+            }
+        }
         /* 22.2.6.2 step 3: S is ? ToString(string), and it precedes every step of RegExpBuiltinExec. */
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str_val, out_cb, out_argc);
         cb_result = JS_UNDEFINED;

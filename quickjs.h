@@ -1477,6 +1477,14 @@ typedef struct JSConcolicHooks {
        it is what lets `obj[x] = v`, `delete obj[x]`, `x in obj` and every key-taking builtin work at all.
        JS_UNINITIALIZED = not concolic. */
     JSValue (*key_name)(JSContext *ctx, JSValueConst key);
+    /* A BUILTIN WHOSE OPERAND IS UNKNOWN produces an unknown DERIVED FROM IT, labelled with the operation the
+       spec was performing ("RegExp.exec"). The same rule as .arith and .to_str, for the operations that are
+       neither arithmetic nor a coercion: the operator answers, because the conversion boundary underneath owes
+       C a real string and can only crash. Without it `/token=(\w+)/.exec(document.cookie)` — which is what
+       reading a cookie LOOKS like in a real bundle — aborted the whole document.
+       The result keeps the source's identity, so a later branch still forks and a later sink still solves for
+       the original source. JS_UNINITIALIZED when the operand is not concolic. */
+    JSValue (*builtin)(JSContext *ctx, JSValueConst v, const char *op);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
