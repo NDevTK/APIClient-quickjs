@@ -20181,8 +20181,7 @@ typedef struct JSArrayFind {
     JSValue obj, func, this_arg, val, result;
     int64_t len, k, end;
     int dir, mode;
-    uint8_t cb_pending;     /* 1 = the next step's cb_result is the CALLBACK's, 2 = it is the ELEMENT READ's */
-    JSValue cb_args[5];      /* [thisArg, fn, val, index, receiver] */
+    JSValue cb_args[5];      /* [thisArg, fn, val, index, O] */
 } JSArrayFind;
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
@@ -23221,7 +23220,6 @@ typedef struct JSArraySort {
     int64_t wb;                     /* the WRITEBACK cursor: which index is being put back. It is also what
                                        tells the teardown which slots the writeback has not consumed yet. */
     int present;                    /* HasProperty(O, k) for that index — sort skips holes */
-    uint8_t elem_ph;                /* 0 = the ask is due, 1 = the read is due */
     JSValue coerced;                /* the string a ToString delivered, until the slot adopts it (owned) */
     JSValue cmpres;                 /* the comparator's RESULT, held across its own ToNumber (owned). 23.1.3.30
                                        SortCompare step 3.a is `ToNumber(? Call(comparator, …))` and the operand
@@ -23229,7 +23227,6 @@ typedef struct JSArraySort {
                                        valueOf/@@toPrimitive — which is a suspension point like any other and
                                        therefore cannot live in a C local across it. */
     JSValue copy;                   /* toSorted's ArrayCreate(len), until it becomes the thing being sorted (owned) */
-    JSValue el;                     /* an element held across its read while that copy is being built (owned) */
     JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
 } JSArraySort;
 static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2],
@@ -72317,10 +72314,75 @@ static JSValue js_array_every_vfini(JSContext *ctx, void *st, bool take_result)
 #define special_reduce       0
 #define special_reduceRight  1
 
+/* reduce / reduceRight and their TypedArray twins: ONE fold over FOUR algorithms, so ONE stage list expanded
+   once per algorithm with that algorithm's own step text — see ACB_STAGES for why the list is shared and the
+   labels are not.
+   THE SEED SCAN IS ITS OWN PAIR OF STAGES. Step 8's "find the first present element" reads exactly as step 9's
+   walk does, but they are DIFFERENT steps of the algorithm, and a flow parked on a Proxy `has` trap in one is
+   not parked where the other is. `elem_ph` said only "the ask" or "the read" and could not tell them apart. */
+#define ARED_STAGES(X, RECV, LEN, CHECK, SEED_HAS, SEED_GET, HAS, GET, CALL) \
+    X(ARED_RECV,     RECV) \
+    X(ARED_LEN,      LEN) \
+    X(ARED_CHECK,    CHECK) \
+    X(ARED_SEED_HAS, SEED_HAS) \
+    X(ARED_SEED_GET, SEED_GET) \
+    X(ARED_HAS,      HAS) \
+    X(ARED_GET,      GET) \
+    X(ARED_CALL,     CALL)
+enum { ARED_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0, 0, 0, 0) };
+
+static const char *const js_array_reduce_steps[] = {
+    ARED_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.24 step 1 (O is ToObject(this value))",
+        "23.1.3.24 step 2 (len is LengthOfArrayLike(O))",
+        "23.1.3.24 steps 3-8.a (IsCallable(callbackfn); the len 0 TypeError; k is 0; accumulator is initialValue)",
+        "23.1.3.24 step 8.b.ii (kPresent is HasProperty(O, Pk))",
+        "23.1.3.24 step 8.b.iii.1 (accumulator is Get(O, Pk))",
+        "23.1.3.24 step 9.b (kPresent is HasProperty(O, Pk))",
+        "23.1.3.24 step 9.c.i (kValue is Get(O, Pk))",
+        "23.1.3.24 step 9.c.ii (accumulator is Call(callbackfn, undefined, <<accumulator, kValue, k, O>>))")
+    NULL };
+static const char *const js_array_reduceR_steps[] = {
+    ARED_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.25 step 1 (O is ToObject(this value))",
+        "23.1.3.25 step 2 (len is LengthOfArrayLike(O))",
+        "23.1.3.25 steps 3-8.a (IsCallable(callbackfn); the len 0 TypeError; k is len - 1; accumulator is initialValue)",
+        "23.1.3.25 step 8.b.ii (kPresent is HasProperty(O, Pk))",
+        "23.1.3.25 step 8.b.iii.1 (accumulator is Get(O, Pk))",
+        "23.1.3.25 step 9.b (kPresent is HasProperty(O, Pk))",
+        "23.1.3.25 step 9.c.i (kValue is Get(O, Pk))",
+        "23.1.3.25 step 9.c.ii (accumulator is Call(callbackfn, undefined, <<accumulator, kValue, k, O>>))")
+    NULL };
+/* The TypedArray twins have no HasProperty step at all — their seed and their walk each read unconditionally —
+   so the two ask stages name the ToString the read is keyed by, which is what the walk performs there and is
+   distinct from the read stage beside it. */
+static const char *const js_ta_reduce_steps[] = {
+    ARED_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.23 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.23 step 3 (len is TypedArrayLength(taRecord))",
+        "23.2.3.23 steps 4-8.a (IsCallable(callbackfn); the len 0 TypeError; k is 0; accumulator is initialValue)",
+        "23.2.3.23 step 9.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.23 step 9.b (accumulator is Get(O, Pk))",
+        "23.2.3.23 step 10.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.23 step 10.b (kValue is Get(O, Pk))",
+        "23.2.3.23 step 10.c (accumulator is Call(callbackfn, undefined, <<accumulator, kValue, k, O>>))")
+    NULL };
+static const char *const js_ta_reduceR_steps[] = {
+    ARED_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.24 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.24 step 3 (len is TypedArrayLength(taRecord))",
+        "23.2.3.24 steps 4-8.a (IsCallable(callbackfn); the len 0 TypeError; k is len - 1; accumulator is initialValue)",
+        "23.2.3.24 step 9.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.24 step 9.b (accumulator is Get(O, Pk))",
+        "23.2.3.24 step 10.a (Pk is ToString(k) — a TypedArray has no HasProperty step)",
+        "23.2.3.24 step 10.b (kValue is Get(O, Pk))",
+        "23.2.3.24 step 10.c (accumulator is Call(callbackfn, undefined, <<accumulator, kValue, k, O>>))")
+    NULL };
+
 static int js_array_reduce_recv(JSContext *ctx, JSArrayReduce *s)
 {
     s->obj = JS_UNDEFINED; s->acc = JS_UNDEFINED; s->val = JS_UNDEFINED;
-    s->len = 0; s->k = 0; s->special = s->hdr.arg; s->pending = 0;
+    s->len = 0; s->k = 0; s->special = s->hdr.arg;
     if (s->special & special_TA) {
         s->obj = js_dup(s->hdr.this_val);
         s->len = js_typed_array_get_length_unsafe(ctx, s->obj);
@@ -72328,93 +72390,6 @@ static int js_array_reduce_recv(JSContext *ctx, JSArrayReduce *s)
     }
     s->obj = JS_ToObject(ctx, s->hdr.this_val);
     if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-    return 0;
-}
-
-/* Seed the accumulator: argv[1] if given, else the first present element (spec: empty + no seed -> TypeError). */
-/* The SEED scan when no initial value was passed: the first PRESENT element becomes the accumulator. It reads
-   elements exactly as the walk below does — an ask and a read, each the page's code — so it is resumable in the
-   same way. The argc>1 arm never suspends, which is what makes re-entering here land in the loop. */
-static int js_array_reduce_seed(JSContext *ctx, JSArrayReduce *s, JSValue in, JSValue **out_cb, int *out_argc)
-{
-    int special = s->special;
-    int64_t k1;
-    int r;
-
-    s->func = step_arg(&s->hdr, 0);
-    if (check_function(ctx, s->func)) { JS_FreeValue(ctx, in); return -1; }
-    if (s->hdr.argc > 1) {
-        JS_FreeValue(ctx, in);
-        s->acc = js_dup(s->hdr.argv[1]);
-        return 0;
-    }
-    for (;;) {
-        if (s->k >= s->len) { JS_FreeValue(ctx, in); JS_ThrowTypeError(ctx, "empty array"); return -1; }
-        k1 = (special & special_reduceRight) ? s->len - s->k - 1 : s->k;
-        if (s->elem_ph == 0) {
-            if (special & special_TA) {
-                s->present = 1;   /* a typed array has no holes to ask about */
-            } else {
-                r = step_hasidx_run(ctx, &s->hdr, s->obj, k1, in, &s->present, out_cb, out_argc);
-                in = JS_UNDEFINED;
-                if (r) return r < 0 ? -1 : r;
-            }
-            s->elem_ph = 1;
-        }
-        if (!s->present) { s->k++; s->elem_ph = 0; continue; }
-        r = step_getidx_run(ctx, &s->hdr, s->obj, k1, in, &s->acc, out_cb, out_argc);
-        in = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->elem_ph = 0;
-        s->k++;
-        return 0;
-    }
-}
-
-/* One coroutine step: adopt the previous callback's result as the accumulator, then advance to the next present
-   element and fill out_args with (acc, value, index, obj). 1 = CALL, 0 = DONE (s->acc is the result), -1 = EXC. */
-static int js_array_reduce_step(JSContext *ctx, JSArrayReduce *s, JSValue acc1, JSValueConst out_args[4],
-                                JSValue **out_cb, int *out_argc)
-{
-    int r;
-    /* the scan cursor stays within the array; pending is 0/1 (at most one callback in flight). */
-    DCHECK(s->k >= -1 && s->k <= s->len && (s->pending == 0 || s->pending == 1), "s->k >= -1 && s->k <= s->len && (s->pending == 0 || s->pending == 1)");
-    if (s->pending) {
-        s->pending = 0;
-        JS_FreeValue(ctx, s->acc);
-        s->acc = acc1;                 /* the callback's result IS the next accumulator (owned) */
-        acc1 = JS_UNDEFINED;           /* …so it must not be freed again by the sub-sequences below */
-        JS_FreeValue(ctx, s->val);
-        s->val = JS_UNDEFINED;
-    }
-    /* the ask and the read are each the page's code; JS_TryGetPropertyInt64 / JS_GetPropertyInt64 reached both
-       from C, driving an index accessor or a Proxy trap to completion beside a callback that parked correctly. */
-    while (s->k < s->len) {
-        int64_t k1 = (s->special & special_reduceRight) ? s->len - s->k - 1 : s->k;
-        if (s->elem_ph == 0) {
-            if (s->special & special_TA) {
-                s->present = 1;
-            } else {
-                r = step_hasidx_run(ctx, &s->hdr, s->obj, k1, acc1, &s->present, out_cb, out_argc);
-                acc1 = JS_UNDEFINED;
-                if (r) return r < 0 ? -1 : r;
-            }
-            s->elem_ph = 1;
-        }
-        if (!s->present) { s->k++; s->elem_ph = 0; continue; }
-        r = step_getidx_run(ctx, &s->hdr, s->obj, k1, acc1, &s->val, out_cb, out_argc);
-        acc1 = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->elem_ph = 0;
-        s->k++;
-        s->pending = 1;
-        out_args[0] = s->acc;
-        out_args[1] = s->val;
-        out_args[2] = js_int64(k1);
-        out_args[3] = s->obj;
-        return 1;
-    }
-    JS_FreeValue(ctx, acc1);
     return 0;
 }
 
@@ -72435,40 +72410,137 @@ static void js_array_reduce_end(JSContext *ctx, JSArrayReduce *s, bool take_acc)
     tramp_step_visit_free(ctx, s);
 }
 
+/* THE INDEX THIS CURSOR NAMES. `k` counts 0..len in both directions so the walk is one loop; reduceRight reads
+   the receiver from the other end. */
+static inline int64_t js_array_reduce_index(const JSArrayReduce *s)
+{
+    return (s->special & special_reduceRight) ? s->len - s->k - 1 : s->k;
+}
+
 /* reduce/reduceRight (+ TypedArray twins) as a STEP builtin. js_array_reduce_recv/seed/step/end and
    the C function was nothing but a JS_Call driver loop over them — the second, non-suspending driver. Deleted, so
-   the machine has ONE driver and tramp_can_call_array_reduce has nothing left to choose against. */
+   the machine has ONE driver and tramp_can_call_array_reduce has nothing left to choose against.
+   THE WALK IS STAGES. The ask, the read and the callback are three different numbered steps and each is the
+   page's code, so each is where the machine rests — and the seed scan's ask and read are two MORE, belonging to
+   a different step of the same algorithm. A wrapper that forwarded `r == 6 || r == 7` used to sit between this
+   and its driver; it is gone with the phases, so a request this walk gains cannot be mis-delivered. */
 static int js_array_reduce_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayReduce *s = st;
+    int64_t k1;
     int r;
-    if (s->hdr.stage == 0) {
+
+    if (s->hdr.stage == ARED_RECV) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         if (js_array_reduce_recv(ctx, s))
             return -1;
-        s->hdr.stage = (s->hdr.arg & special_TA) ? 2 : 1;   /* a TypedArray's length needs no read */
+        s->hdr.stage = (s->hdr.arg & special_TA) ? ARED_CHECK : ARED_LEN;   /* a TypedArray's length needs no read */
     }
-    if (s->hdr.stage == 1) {   /* LengthOfArrayLike, re-entered until it finishes */
+    if (s->hdr.stage == ARED_LEN) {   /* LengthOfArrayLike, re-entered until it finishes */
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = ARED_CHECK;
     }
-    if (s->hdr.stage == 2) {
-        r = js_array_reduce_seed(ctx, s, cb_result, out_cb, out_argc);
+    if (s->hdr.stage == ARED_CHECK) {
+        JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 3;
+        s->func = step_arg(&s->hdr, 0);
+        if (check_function(ctx, s->func))
+            return -1;
+        if (s->hdr.argc > 1) {
+            s->acc = js_dup(s->hdr.argv[1]);   /* initialValue is PRESENT — `undefined` counts */
+            s->hdr.stage = ARED_HAS;
+        } else {
+            s->hdr.stage = ARED_SEED_HAS;
+        }
     }
-    r = js_array_reduce_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
-    if (r < 0) return -1;
-    if (r == 6 || r == 7) return r;   /* the element's keyed operation: the driver performs it and re-enters */
-    if (r == 0) return 0;
-    s->cb_args[0] = JS_UNDEFINED;            /* reduce's callback gets this = undefined */
-    s->cb_args[1] = s->func;
-    *out_cb = s->cb_args; *out_argc = 4;     /* [acc, val, index, obj] */
-    return 3;
+
+    for (;;) {
+        DCHECK(s->k >= 0 && s->k <= s->len, "the fold's cursor ran past the receiver's length");
+        switch (s->hdr.stage) {
+        case ARED_SEED_HAS:
+            /* steps 4 and 8.c are the SAME TypeError from here: no initialValue and no present element to take
+               one from, which for len 0 is the first thing this stage discovers. */
+            if (s->k >= s->len) {
+                JS_FreeValue(ctx, cb_result);
+                JS_ThrowTypeError(ctx, "empty array");
+                return -1;
+            }
+            k1 = js_array_reduce_index(s);
+            if (s->special & special_TA) {
+                JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+                s->present = 1;
+            } else {
+                r = step_hasidx_run(ctx, &s->hdr, s->obj, k1, cb_result, &s->present, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            if (!s->present) { s->k++; continue; }
+            s->hdr.stage = ARED_SEED_GET;
+            continue;
+
+        case ARED_SEED_GET:
+            r = step_getidx_run(ctx, &s->hdr, s->obj, js_array_reduce_index(s), cb_result, &s->acc,
+                                out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->k++;
+            s->hdr.stage = ARED_HAS;
+            continue;
+
+        case ARED_HAS:
+            if (s->k >= s->len) {
+                JS_FreeValue(ctx, cb_result);
+                return 0;
+            }
+            k1 = js_array_reduce_index(s);
+            /* the ask and the read are each the page's code; JS_TryGetPropertyInt64 / JS_GetPropertyInt64
+               reached both from C, driving an index accessor or a Proxy trap to completion beside a callback
+               that parked correctly. */
+            if (s->special & special_TA) {
+                JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+                s->present = 1;
+            } else {
+                r = step_hasidx_run(ctx, &s->hdr, s->obj, k1, cb_result, &s->present, out_cb, out_argc);
+                cb_result = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            if (!s->present) { s->k++; continue; }
+            s->hdr.stage = ARED_GET;
+            continue;
+
+        case ARED_GET:
+            k1 = js_array_reduce_index(s);
+            r = step_getidx_run(ctx, &s->hdr, s->obj, k1, cb_result, &s->val, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->k++;
+            s->hdr.stage = ARED_CALL;
+            s->cb_args[0] = JS_UNDEFINED;      /* reduce's callback gets this = undefined */
+            s->cb_args[1] = s->func;
+            s->cb_args[2] = s->acc;
+            s->cb_args[3] = s->val;
+            s->cb_args[4] = js_int64(k1);
+            s->cb_args[5] = s->obj;
+            *out_cb = s->cb_args; *out_argc = 4;
+            return JS_STEP_CALL;
+
+        case ARED_CALL:
+            JS_FreeValue(ctx, s->acc);
+            s->acc = cb_result;                /* the callback's result IS the next accumulator (owned) */
+            cb_result = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->val);
+            s->val = JS_UNDEFINED;
+            s->hdr.stage = ARED_HAS;
+            continue;
+
+        default:
+            DFAIL("an Array fold resumed at a stage its algorithm does not have");
+            return -1;
+        }
+    }
 }
 
 static JSValue js_array_reduce_vfini(JSContext *ctx, void *st, bool take_result)
@@ -72648,6 +72720,67 @@ static void js_array_find_end(JSContext *ctx, JSArrayFind *s, bool take_result)
     tramp_step_visit_free(ctx, s);
 }
 
+/* find / findIndex / findLast / findLastIndex and their TypedArray twins: EIGHT algorithms whose whole body is
+   23.1.3.12.1 FindViaPredicate, so the three stages inside the walk name ITS steps and only the receiver and
+   length stages name the caller's. ONE stage list, expanded once per algorithm — see ACB_STAGES. */
+#define AFIND_STAGES(X, RECV, LEN, WALK) \
+    X(AFIND_RECV, RECV) \
+    X(AFIND_LEN,  LEN)  \
+    WALK(X)
+/* THE WALK IS FindViaPredicate's, identical for all eight but for the direction, so it is a sub-list rather than
+   three arguments repeated eight times — the gate reads the array's own declaration, so each array is spelled
+   out and only the part that is genuinely one fact is shared. */
+#define AFIND_WALK_ASC(X) \
+    X(AFIND_SEED, "23.1.3.12.1 steps 1-2 (IsCallable(predicate); indices in ASCENDING order)") \
+    X(AFIND_GET,  "23.1.3.12.1 step 4.c (kValue is Get(O, Pk))") \
+    X(AFIND_CALL, "23.1.3.12.1 step 4.d (testResult is ToBoolean(Call(predicate, thisArg, <<kValue, k, O>>)))")
+#define AFIND_WALK_DESC(X) \
+    X(AFIND_SEED, "23.1.3.12.1 steps 1-3 (IsCallable(predicate); indices in DESCENDING order)") \
+    X(AFIND_GET,  "23.1.3.12.1 step 4.c (kValue is Get(O, Pk))") \
+    X(AFIND_CALL, "23.1.3.12.1 step 4.d (testResult is ToBoolean(Call(predicate, thisArg, <<kValue, k, O>>)))")
+enum { AFIND_STAGES(JS_STEP_STAGE_ENUM, 0, 0, AFIND_WALK_ASC) };
+
+static const char *const js_array_find_steps[] = {
+    AFIND_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.9 step 1 (O is ToObject(this value))",
+        "23.1.3.9 step 2 (len is LengthOfArrayLike(O))", AFIND_WALK_ASC)
+    NULL };
+static const char *const js_array_findIndex_steps[] = {
+    AFIND_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.10 step 1 (O is ToObject(this value))",
+        "23.1.3.10 step 2 (len is LengthOfArrayLike(O))", AFIND_WALK_ASC)
+    NULL };
+static const char *const js_array_findLast_steps[] = {
+    AFIND_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.11 step 1 (O is ToObject(this value))",
+        "23.1.3.11 step 2 (len is LengthOfArrayLike(O))", AFIND_WALK_DESC)
+    NULL };
+static const char *const js_array_findLastIndex_steps[] = {
+    AFIND_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.12 step 1 (O is ToObject(this value))",
+        "23.1.3.12 step 2 (len is LengthOfArrayLike(O))", AFIND_WALK_DESC)
+    NULL };
+static const char *const js_ta_find_steps[] = {
+    AFIND_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.11 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.11 step 3 (len is TypedArrayLength(taRecord))", AFIND_WALK_ASC)
+    NULL };
+static const char *const js_ta_findIndex_steps[] = {
+    AFIND_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.12 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.12 step 3 (len is TypedArrayLength(taRecord))", AFIND_WALK_ASC)
+    NULL };
+static const char *const js_ta_findLast_steps[] = {
+    AFIND_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.13 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.13 step 3 (len is TypedArrayLength(taRecord))", AFIND_WALK_DESC)
+    NULL };
+static const char *const js_ta_findLastIndex_steps[] = {
+    AFIND_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.14 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
+        "23.2.3.14 step 3 (len is TypedArrayLength(taRecord))", AFIND_WALK_DESC)
+    NULL };
+
 static int js_array_find_recv(JSContext *ctx, JSArrayFind *s)
 {
     if (s->hdr.arg & FIND_TA) {
@@ -72682,66 +72815,74 @@ static int js_array_find_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 {
     JSArrayFind *s = st;
     bool is_index;
+    int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == AFIND_RECV) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         if (js_array_find_recv(ctx, s))
             return -1;
-        s->hdr.stage = (s->hdr.arg & FIND_TA) ? 2 : 1;   /* a TypedArray's length needs no read */
+        s->hdr.stage = (s->hdr.arg & FIND_TA) ? AFIND_SEED : AFIND_LEN;   /* a TypedArray's length needs no read */
     }
-    if (s->hdr.stage == 1) {   /* LengthOfArrayLike, re-entered until it finishes */
-        int lr = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
+    if (s->hdr.stage == AFIND_LEN) {   /* LengthOfArrayLike, re-entered until it finishes */
+        r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
-        if (lr) return lr < 0 ? -1 : lr;
-        s->hdr.stage = 2;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = AFIND_SEED;
     }
-    if (s->hdr.stage == 2) {
-        s->hdr.stage = 3;
+    if (s->hdr.stage == AFIND_SEED) {
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
         if (js_array_find_seed(ctx, s))
             return -1;
+        s->hdr.stage = AFIND_GET;
     }
     is_index = (s->mode == ArrayFindIndex || s->mode == ArrayFindLastIndex);
 
-    if (s->cb_pending == 2) {
-        /* 23.1.3.9 step 5.b's `? Get(O, Pk)` landed. It was JS_GetPropertyValue from C — an accessor or a Proxy
-           `get` trap on the receiver, which is the page's code, so a looping getter preempted with no flow base
-           even though the CALLBACK beside it was already routed. */
-        int rg = step_getidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->val, out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (rg) return rg < 0 ? -1 : rg;
-        s->cb_pending = 0;
-        goto have_elem;
-    }
-    if (s->cb_pending) {
-        bool truthy = JS_ToBoolFree(ctx, cb_result);
-        s->cb_pending = 0;
-        if (truthy) {
-            s->result = is_index ? js_int64(s->k) : s->val;
-            if (!is_index) s->val = JS_UNDEFINED;   /* ownership moved into result */
-            return 0;
+    for (;;) {
+        switch (s->hdr.stage) {
+        case AFIND_GET:
+            if (s->k == s->end) {
+                JS_FreeValue(ctx, cb_result);
+                s->result = is_index ? js_int32(-1) : JS_UNDEFINED;   /* step 5's Record */
+                return 0;
+            }
+            /* step 4.c's `? Get(O, Pk)` was JS_GetPropertyValue from C — an accessor or a Proxy `get` trap on
+               the receiver, which is the page's code, so a looping getter preempted with no flow base even
+               though the CALLBACK beside it was already routed. */
+            r = step_getidx_run(ctx, &s->hdr, s->obj, s->k, cb_result, &s->val, out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            s->hdr.stage = AFIND_CALL;
+            s->cb_args[0] = s->this_arg;
+            s->cb_args[1] = s->func;
+            s->cb_args[2] = s->val;
+            s->cb_args[3] = js_int64(s->k);
+            /* step 4.d's third argument is O — the ToObject of the this value, which for
+               `Array.prototype.find.call("ab", f)` is the String OBJECT and not the primitive the receiver slot
+               holds. This passed hdr.this_val, which is the same object only when ToObject was a no-op. */
+            s->cb_args[4] = s->obj;
+            *out_cb = s->cb_args; *out_argc = 3;
+            return JS_STEP_CALL;
+
+        case AFIND_CALL:
+            if (JS_ToBoolFree(ctx, cb_result)) {
+                cb_result = JS_UNDEFINED;
+                s->result = is_index ? js_int64(s->k) : s->val;
+                if (!is_index) s->val = JS_UNDEFINED;   /* ownership moved into result */
+                return 0;
+            }
+            cb_result = JS_UNDEFINED;
+            JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
+            s->k += s->dir;
+            s->hdr.stage = AFIND_GET;
+            continue;
+
+        default:
+            DFAIL("a FindViaPredicate walk resumed at a stage its algorithm does not have");
+            return -1;
         }
-        JS_FreeValue(ctx, s->val); s->val = JS_UNDEFINED;
-        s->k += s->dir;
     }
-    for (; s->k != s->end; s->k += s->dir) {
-        int rg;
-        s->cb_pending = 2;
-        rg = step_getidx_run(ctx, &s->hdr, s->obj, s->k, JS_UNDEFINED, &s->val, out_cb, out_argc);
-        if (rg) return rg < 0 ? -1 : rg;
-        s->cb_pending = 0;
-    have_elem:
-        s->cb_args[0] = s->this_arg;
-        s->cb_args[1] = s->func;
-        s->cb_args[2] = s->val;
-        s->cb_args[3] = js_int64(s->k);
-        s->cb_args[4] = s->hdr.this_val;
-        s->cb_pending = 1;
-        *out_cb = s->cb_args; *out_argc = 3;
-        return 3;
-    }
-    s->result = is_index ? js_int32(-1) : JS_UNDEFINED;
-    return 0;
 }
 
 static JSValue js_array_find_fini(JSContext *ctx, void *st, bool take_result)
@@ -72926,14 +73067,30 @@ static void js_array_tostring_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* One NAMED definition per builtin, referenced by its JS_CFUNC_STEP_DEF registration through the id above — the same shape as
    JS_CFUNC_MAGIC_DEF naming its C function, so the registration line tells you what runs. An index into a side
    table would be a second list to keep in sync and a magic number that silently repoints when a row is inserted. */
-static const JSTrampStepDef js_array_find_def          = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFind , .visit = js_array_find_visit };
-static const JSTrampStepDef js_array_findIndex_def     = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex , .visit = js_array_find_visit };
-static const JSTrampStepDef js_array_findLast_def      = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast , .visit = js_array_find_visit };
-static const JSTrampStepDef js_array_findLastIndex_def = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex , .visit = js_array_find_visit };
-static const JSTrampStepDef js_ta_find_def             = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFind | FIND_TA , .visit = js_array_find_visit };
-static const JSTrampStepDef js_ta_findIndex_def        = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex | FIND_TA , .visit = js_array_find_visit };
-static const JSTrampStepDef js_ta_findLast_def         = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast | FIND_TA , .visit = js_array_find_visit };
-static const JSTrampStepDef js_ta_findLastIndex_def    = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex | FIND_TA , .visit = js_array_find_visit };
+static const JSTrampStepDef js_array_find_def          = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFind , .visit = js_array_find_visit,
+                                                        .algorithm = "23.1.3.9 Array.prototype.find",
+                                                        .steps = js_array_find_steps };
+static const JSTrampStepDef js_array_findIndex_def     = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex , .visit = js_array_find_visit,
+                                                        .algorithm = "23.1.3.10 Array.prototype.findIndex",
+                                                        .steps = js_array_findIndex_steps };
+static const JSTrampStepDef js_array_findLast_def      = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast , .visit = js_array_find_visit,
+                                                        .algorithm = "23.1.3.11 Array.prototype.findLast",
+                                                        .steps = js_array_findLast_steps };
+static const JSTrampStepDef js_array_findLastIndex_def = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex , .visit = js_array_find_visit,
+                                                        .algorithm = "23.1.3.12 Array.prototype.findLastIndex",
+                                                        .steps = js_array_findLastIndex_steps };
+static const JSTrampStepDef js_ta_find_def             = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFind | FIND_TA , .visit = js_array_find_visit,
+                                                        .algorithm = "23.2.3.11 %TypedArray%.prototype.find",
+                                                        .steps = js_ta_find_steps };
+static const JSTrampStepDef js_ta_findIndex_def        = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindIndex | FIND_TA , .visit = js_array_find_visit,
+                                                        .algorithm = "23.2.3.12 %TypedArray%.prototype.findIndex",
+                                                        .steps = js_ta_findIndex_steps };
+static const JSTrampStepDef js_ta_findLast_def         = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLast | FIND_TA , .visit = js_array_find_visit,
+                                                        .algorithm = "23.2.3.13 %TypedArray%.prototype.findLast",
+                                                        .steps = js_ta_findLast_steps };
+static const JSTrampStepDef js_ta_findLastIndex_def    = { sizeof(JSArrayFind), js_array_find_step, js_array_find_fini, ArrayFindLastIndex | FIND_TA , .visit = js_array_find_visit,
+                                                        .algorithm = "23.2.3.14 %TypedArray%.prototype.findLastIndex",
+                                                        .steps = js_ta_findLastIndex_steps };
 static const JSTrampStepDef js_re_replace_def          = { sizeof(JSReRep), js_re_rep_vstep, js_re_rep_fini, 0, .visit = js_re_rep_visit };
 static int js_re_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_match_fini(JSContext *ctx, void *st, bool take_result);
@@ -72999,10 +73156,24 @@ static const JSTrampStepDef js_ta_forEach_def      = { sizeof(JSArrayEvery), js_
 static const JSTrampStepDef js_ta_map_def          = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_map | special_TA, .visit = js_array_every_visit,
                                                      .algorithm = "23.2.3.22 %TypedArray%.prototype.map",
                                                      .steps = js_ta_map_steps };
-static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 0, .visit = js_ta_sort_visit };
-static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1, .visit = js_ta_sort_visit };
-static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0, .visit = js_array_sort_visit };
-static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1, .visit = js_array_sort_visit };
+/* Declared where the machine is; the definitions below name them, and a definition sits with its
+   siblings rather than with the algorithm it belongs to. */
+static const char *const js_ta_sort_steps[];
+static const char *const js_ta_toSorted_steps[];
+static const JSTrampStepDef js_ta_sort_def       = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 0, .visit = js_ta_sort_visit,
+                                                   .algorithm = "23.2.3.29 %TypedArray%.prototype.sort",
+                                                   .steps = js_ta_sort_steps };
+static const JSTrampStepDef js_ta_toSorted_def   = { sizeof(JSTASort), js_ta_sort_vstep, js_ta_sort_vfini, 1, .visit = js_ta_sort_visit,
+                                                   .algorithm = "23.2.3.33 %TypedArray%.prototype.toSorted",
+                                                   .steps = js_ta_toSorted_steps };
+static const char *const js_array_sort_steps[];
+static const char *const js_array_toSorted_steps[];
+static const JSTrampStepDef js_array_sort_def    = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 0, .visit = js_array_sort_visit,
+                                                    .algorithm = "23.1.3.30 Array.prototype.sort",
+                                                    .steps = js_array_sort_steps };
+static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_array_sort_vstep, js_array_sort_vfini, 1, .visit = js_array_sort_visit,
+                                                    .algorithm = "23.1.3.34 Array.prototype.toSorted",
+                                                    .steps = js_array_toSorted_steps };
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0, .visit = js_json_reviver_visit };
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0, .visit = js_for_in_visit };
 static int check_iterator(JSContext *ctx, JSValueConst obj);
@@ -73836,10 +74007,18 @@ static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_fu
 static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1, .visit = js_function_apply_visit };
 static const JSTrampStepDef js_reflect_construct_def = { sizeof(JSFuncApply), js_reflect_construct_step, js_function_apply_fini, 0, .visit = js_function_apply_visit };
 static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0, .visit = js_array_tostring_visit };
-static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce, .visit = js_array_reduce_visit };
-static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight, .visit = js_array_reduce_visit };
-static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA, .visit = js_array_reduce_visit };
-static const JSTrampStepDef js_ta_reduceR_def    = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight | special_TA, .visit = js_array_reduce_visit };
+static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce, .visit = js_array_reduce_visit,
+                                                    .algorithm = "23.1.3.24 Array.prototype.reduce",
+                                                    .steps = js_array_reduce_steps };
+static const JSTrampStepDef js_array_reduceR_def = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight, .visit = js_array_reduce_visit,
+                                                    .algorithm = "23.1.3.25 Array.prototype.reduceRight",
+                                                    .steps = js_array_reduceR_steps };
+static const JSTrampStepDef js_ta_reduce_def     = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce | special_TA, .visit = js_array_reduce_visit,
+                                                    .algorithm = "23.2.3.23 %TypedArray%.prototype.reduce",
+                                                    .steps = js_ta_reduce_steps };
+static const JSTrampStepDef js_ta_reduceR_def    = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduceRight | special_TA, .visit = js_array_reduce_visit,
+                                                    .algorithm = "23.2.3.24 %TypedArray%.prototype.reduceRight",
+                                                    .steps = js_ta_reduceR_steps };
 static const JSTrampStepDef js_ta_filter_def       = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_filter | special_TA, .visit = js_array_every_visit,
                                                      .algorithm = "23.2.3.10 %TypedArray%.prototype.filter",
                                                      .steps = js_ta_filter_steps };
@@ -77210,6 +77389,48 @@ exception:
     return 0;
 }
 
+/* sort and toSorted are ONE machine over two algorithms, so ONE stage list expanded twice with each one's own
+   step text — see ACB_STAGES. THE STAGES WERE 0,1,2,10,11,6,3,7,8,9 in that execution order: the out-of-sequence
+   numbering JSTrampStepDef.steps describes as the workaround for a drift the single declaration makes
+   impossible. They are in spec order now, and each rests at a step.
+   THE TWO WRITE-BACK STAGES WERE ONE STEP. `sort` wrote the sorted elements in one loop and the undefineds the
+   collect had held back in a second, both performing step 8.a — two stages naming one step, which is exactly the
+   rest point step_stage_check refuses to let a resume guess at. One loop, one cursor, one step. */
+#define ASORT_STAGES(X, CHECK, LEN, CREATE, HAS, GET, MERGE, WRITE, DELETE) \
+    X(ASORT_CHECK,  CHECK) \
+    X(ASORT_LEN,    LEN)   \
+    X(ASORT_CREATE, CREATE)\
+    X(ASORT_HAS,    HAS)   \
+    X(ASORT_GET,    GET)   \
+    X(ASORT_MERGE,  MERGE) \
+    X(ASORT_WRITE,  WRITE) \
+    X(ASORT_DELETE, DELETE)
+enum { ASORT_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0, 0, 0, 0) };
+static const char *const js_array_sort_steps[] = {
+    ASORT_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.30 steps 1-2 (the comparator check; obj is ToObject(this value))",
+        "23.1.3.30 step 3 (len is LengthOfArrayLike(obj))",
+        "23.1.3.30 step 4 (SortCompare is a new Abstract Closure — sort creates no result object)",
+        "23.1.3.30.1 step 3.b.i (kRead is HasProperty(obj, Pk) — sort gathers with SKIP-HOLES)",
+        "23.1.3.30.1 step 3.d.i (kValue is Get(obj, Pk))",
+        "23.1.3.30.2 step 3.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))"
+            " / steps 4-5 (the default ordering's ToString(x), ToString(y))",
+        "23.1.3.30 step 8.a (Set(obj, ToString(j), sortedList[j], true))",
+        "23.1.3.30 step 10.a (DeletePropertyOrThrow(obj, ToString(j)) for the holes the gather skipped))")
+    NULL };
+static const char *const js_array_toSorted_steps[] = {
+    ASORT_STAGES(JS_STEP_STAGE_LABEL,
+        "23.1.3.34 steps 1-2 (the comparator check; O is ToObject(this value))",
+        "23.1.3.34 step 3 (len is LengthOfArrayLike(O))",
+        "23.1.3.34 steps 4-5 (A is ArrayCreate(len); SortCompare is a new Abstract Closure)",
+        "23.1.3.34 step 6 (the holes argument is READ-THROUGH-HOLES, so 23.1.3.30.1 step 3.b is not performed)",
+        "23.1.3.30.1 step 3.d.i (kValue is Get(O, Pk))",
+        "23.1.3.30.2 step 3.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))"
+            " / steps 4-5 (the default ordering's ToString(x), ToString(y))",
+        "23.1.3.34 step 8.a (CreateDataPropertyOrThrow(A, ToString(j), sortedList[j]))",
+        "23.1.3.34 step 8 (read-through-holes gathered every index, so there is nothing past j = len to delete)")
+    NULL };
+
 /* read the present, non-undefined elements into s->array (undefined -> the end, holes -> after that), alloc tmp,
    set up the first merge block. Returns 0 ok / -1 exception (safe to tear down). */
 /* The receiver half. `method` is hdr.argv[0] — owned by the header for the machine's whole life, which is why
@@ -77220,7 +77441,7 @@ static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
     s->obj = JS_UNDEFINED; s->method = step_arg(&s->hdr, 0); s->array = NULL; s->tmp = NULL;
     s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0;
     s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0; s->wb = 0;
-    s->coerced = JS_UNDEFINED; s->copy = JS_UNDEFINED; s->el = JS_UNDEFINED; s->cmpres = JS_UNDEFINED;
+    s->coerced = JS_UNDEFINED; s->copy = JS_UNDEFINED; s->cmpres = JS_UNDEFINED;
     for (i = 0; i < 4; i++) s->cb_args[i] = JS_UNDEFINED;
     s->obj = JS_ToObject(ctx, s->hdr.this_val);
     if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
@@ -77233,25 +77454,36 @@ static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
    or a Proxy trap — and JS_TryGetPropertyInt64 reached both from C, so a loop in either preempted with no flow
    base before a single comparison had happened. s->n IS the write cursor, which is what makes an abandon
    mid-collect free exactly what was gathered. */
+/* 23.1.3.30.1 SortIndexedProperties, whose `holes` argument IS the only difference between the two callers:
+   skip-holes asks step 3.b.i first, read-through-holes asserts the read is unconditional and goes straight to
+   step 3.c. toSorted used to build a DENSE COPY with its own walk and then re-gather from that copy — two reads
+   of one algorithm's one read, and a whole stage pair for the second of them. One walk with the argument the
+   standard gives it is what SortIndexedProperties is. */
 static int js_array_sort_collect(JSContext *ctx, JSArraySort *s, JSValue in, JSValue **out_cb, int *out_argc)
 {
     int r;
-    while (s->col_i < s->len) {
-        if (s->elem_ph == 0) {
-            r = step_hasidx_run(ctx, &s->hdr, s->obj, s->col_i, in, &s->present, out_cb, out_argc);
-            in = JS_UNDEFINED;
-            if (r) return r < 0 ? -1 : r;
-            s->elem_ph = 1;
+    for (;;) {
+        if (s->hdr.stage == ASORT_HAS) {
+            if (s->col_i >= s->len)
+                break;
+            if (s->hdr.arg) {
+                s->present = 1;   /* read-through-holes: step 3.b is not performed at all */
+            } else {
+                r = step_hasidx_run(ctx, &s->hdr, s->obj, s->col_i, in, &s->present, out_cb, out_argc);
+                in = JS_UNDEFINED;
+                if (r) return r < 0 ? -1 : r;
+            }
+            if (!s->present) { s->col_i++; continue; }
+            s->hdr.stage = ASORT_GET;
         }
-        if (!s->present) { s->col_i++; s->elem_ph = 0; continue; }
         {
             JSValue v;
             r = step_getidx_run(ctx, &s->hdr, s->obj, s->col_i, in, &v, out_cb, out_argc);
             in = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
-            s->elem_ph = 0;
+            s->hdr.stage = ASORT_HAS;
             if (JS_IsUndefined(v)) {
-                s->undefined_count++;
+                s->undefined_count++;   /* SortCompare puts undefined last, so they need no slot */
             } else {
                 s->array[s->n].val = v; s->array[s->n].str = NULL; s->array[s->n].pos = s->col_i; s->n++;
             }
@@ -77386,7 +77618,7 @@ static void sort_slot_release(JSContext *ctx, ValueSlot *v)
    receiver and the DeletePropertyOrThrow of the trailing holes — from fini, a TEARDOWN path. A teardown cannot
    suspend, so a `set` or `deleteProperty` trap with a loop in it had no flow base there; and it could not raise
    the exception a rejecting trap produces either, because fini's result is the machine's value, not a status.
-   Those steps are stages 7-9 of js_array_sort_vstep now, and fini only releases.
+   Those steps are the write-back and delete stages of js_array_sort_vstep now, and fini only releases.
    It also skipped the Set for any element whose sorted position equalled its original one (`pos == w`). Step 8
    has no such case: `[1,2,3]` behind a Proxy fired NO `set` trap at all where the spec fires three, and a sort
    that permutes nothing on a FROZEN array succeeded silently where the spec throws. `pos` survives only as the
@@ -77399,22 +77631,19 @@ static void sort_slot_release(JSContext *ctx, ValueSlot *v)
    with slack growth, its own undefined/hole ordering, its own writeback — duplicating js_array_sort_init /
    _step / _end, which the trampoline already drives. Sort is now that one machine (STEPDEF_ARRAY_SORT), and with
    the default-comparison branch in js_array_sort_step there is no case left for a C body to serve. */
-/* sort and toSorted are ONE machine: same comparator drive, same merge, same writeback. The only difference is
-   WHAT is sorted — the receiver, or a dense copy of it — so it is the prologue that branches on hdr.arg, not a
-   second machine. (toSorted does not use Array[@@species]; it always yields a base Array.) The prologue is in
-   three stages because LengthOfArrayLike sits in the middle of it and its ToLength can run user code. */
-/* DELETED: js_array_sort_copy. It built toSorted's copy with a C JS_TryGetPropertyInt64 loop, so an element
-   accessor with a loop in it had no flow base; and the HasProperty half of that helper is not in the algorithm
-   at all — 23.1.3.34 step 6 passes read-through-holes to SortIndexedProperties, whose step 3.b then asserts the
-   read is unconditional and 3.c makes it a plain `? Get(obj, Pk)`. On
-   `new Proxy([3,1,2], {has: () => false})` that produced [undefined,undefined,undefined] where the spec sorts
-   the real elements. The walk is stage 10 of js_array_sort_vstep now. */
+/* sort and toSorted are ONE machine: same gather, same merge, same write-back. The only differences are the
+   `holes` argument to SortIndexedProperties, and WHERE the sorted list lands — the receiver, or the Array that
+   step 4 created — so it is hdr.arg that branches, not a second machine. (toSorted does not use
+   Array[@@species]; it always yields a base Array.) */
+/* DELETED: js_array_sort_copy, and after it the dense-copy WALK that replaced it. Both built toSorted a copy to
+   re-gather from, which is one algorithm's one read performed twice; 23.1.3.34 step 6 passes read-through-holes
+   to SortIndexedProperties and that is the whole of the difference, so it is an argument to the gather. */
 
 static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArraySort *s = st;
     int r;
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ASORT_CHECK) {
         JSValueConst method = step_arg(&s->hdr, 0);
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
@@ -77422,65 +77651,36 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
             return -1;   /* spec: a non-callable comparator throws BEFORE anything is read */
         if (js_array_sort_recv(ctx, s))
             return -1;
-        s->hdr.stage = 1;
+        s->hdr.stage = ASORT_LEN;
     }
-    if (s->hdr.stage == 1) {   /* LengthOfArrayLike, re-entered until it finishes */
+    if (s->hdr.stage == ASORT_LEN) {   /* LengthOfArrayLike, re-entered until it finishes */
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = ASORT_CREATE;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == ASORT_CREATE) {
         if (s->hdr.arg) {
-            /* 23.1.3.34 step 4: ArrayCreate(len). toSorted sorts a COPY, so the receiver is never written, and
-               the copy is DENSE because read-through-holes gathers every index — what was a hole becomes an
-               undefined the sort orders like any other. */
-            JSValue *arrp;
-            uint32_t count32;
+            /* 23.1.3.34 step 4: ArrayCreate(len). toSorted never writes the receiver, and the destination is a
+               fresh Array its step 8 fills with CreateDataPropertyOrThrow. */
             s->copy = js_allocate_fast_array(ctx, s->len);
             if (JS_IsException(s->copy)) { s->copy = JS_UNDEFINED; return -1; }
-            if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
-                int64_t i;
-                for (i = 0; i < s->len; i++)
-                    arr_dense_put(ctx, s->copy, i, js_dup(arrp[i]));
-            } else {
-                s->col_i = 0;
-                s->hdr.stage = 10;
-            }
-        }
-        if (s->hdr.stage == 2) s->hdr.stage = 11;
-    }
-    /* step 6 with read-through-holes: SortIndexedProperties step 3.b asserts the read is unconditional, so this
-       is a plain `? Get(O, Pk)` at every index — no HasProperty, unlike the skip-holes collect below. */
-    while (s->hdr.stage == 10) {
-        if (s->col_i >= s->len) { s->hdr.stage = 11; break; }
-        r = step_getidx_run(ctx, &s->hdr, s->obj, s->col_i, cb_result, &s->el, out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        arr_dense_put(ctx, s->copy, s->col_i, s->el);
-        s->el = JS_UNDEFINED;
-        s->col_i++;
-    }
-    if (s->hdr.stage == 11) {
-        if (s->hdr.arg) {
-            JS_FreeValue(ctx, s->obj);
-            s->obj = s->copy;   /* the sort, the writeback and the result are the copy from here on */
-            s->copy = JS_UNDEFINED;
         }
         if (s->len > 0) {
             s->array = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
             if (!s->array) return -1;
         }
         s->col_i = 0; s->n = 0;
-        s->hdr.stage = 6;
+        s->hdr.stage = ASORT_HAS;
     }
-    if (s->hdr.stage == 6) {   /* the collect, re-entered while an index's ask or read runs the page's code */
+    if (s->hdr.stage == ASORT_HAS || s->hdr.stage == ASORT_GET) {
+        /* the gather, re-entered while an index's ask or read runs the page's code */
         r = js_array_sort_collect(ctx, s, cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 3;
+        s->hdr.stage = ASORT_MERGE;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == ASORT_MERGE) {
         r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
         cb_result = JS_UNDEFINED;
         if (r < 0) return -1;
@@ -77489,33 +77689,41 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
             s->cb_args[0] = JS_UNDEFINED;            /* the comparator gets this = undefined */
             s->cb_args[1] = s->method;
             *out_cb = s->cb_args; *out_argc = 2;
-            return 3;
+            return JS_STEP_CALL;
+        }
+        if (s->hdr.arg) {
+            /* the sorted list goes into A from here on, and A is what the machine yields */
+            JS_FreeValue(ctx, s->obj);
+            s->obj = s->copy;
+            s->copy = JS_UNDEFINED;
         }
         s->wb = 0;
-        s->hdr.stage = 7;
+        s->hdr.stage = ASORT_WRITE;
     }
-    /* 23.1.3.30 steps 8-9: SortIndexedProperties has produced the sorted list, and putting it back is the
-       page's code — a Set on an accessor or a `set` trap, a DeletePropertyOrThrow on a `deleteProperty` trap.
-       The element is BORROWED across its write and released once it lands, so s->wb is exactly how far the
-       teardown must not free. (toSorted's receiver is its own dense copy, so the same walk reaches no page code
-       there and its delete loop is empty — one writeback, not two.) */
-    while (s->hdr.stage == 7) {
-        if (s->wb >= s->n) { s->hdr.stage = 8; break; }
-        r = step_setidx_run(ctx, &s->hdr, s->obj, s->wb, s->array[s->wb].val, cb_result, out_cb, out_argc);
+    /* 23.1.3.30 step 8 / 23.1.3.34 step 8: putting the sorted list back is the page's code — a Set on an
+       accessor or a `set` trap for sort, a `defineProperty` trap for a subclassed... no: toSorted's A is a plain
+       Array, so only sort can reach the page here. The undefineds the gather held back are the tail of the SAME
+       step, so they are the same loop: the sorted slots first, then j = n .. n + undefinedCount. The element is
+       BORROWED across its write and released once it lands, so s->wb is exactly how far the teardown must not
+       free. */
+    while (s->hdr.stage == ASORT_WRITE) {
+        if (s->wb >= s->n + s->undefined_count) { s->hdr.stage = ASORT_DELETE; break; }
+        /* toSorted's step 8.a is CreateDataPropertyOrThrow, not Set: A is EMPTY when this runs, so a Set would
+           consult Array.prototype and fire a setter defined there, which the algorithm does not. */
+        if (s->hdr.arg)
+            r = step_defidx_run(ctx, &s->hdr, s->obj, s->wb,
+                                s->wb < s->n ? s->array[s->wb].val : JS_UNDEFINED, cb_result, out_cb, out_argc);
+        else
+            r = step_setidx_run(ctx, &s->hdr, s->obj, s->wb,
+                                s->wb < s->n ? s->array[s->wb].val : JS_UNDEFINED, cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        sort_slot_release(ctx, &s->array[s->wb]);
+        if (s->wb < s->n)
+            sort_slot_release(ctx, &s->array[s->wb]);
         s->wb++;
     }
-    /* the undefineds the collect held back, in the one place the sort order puts them */
-    while (s->hdr.stage == 8) {
-        if (s->wb >= s->n + s->undefined_count) { s->hdr.stage = 9; break; }
-        r = step_setidx_run(ctx, &s->hdr, s->obj, s->wb, JS_UNDEFINED, cb_result, out_cb, out_argc);
-        cb_result = JS_UNDEFINED;
-        if (r) return r < 0 ? -1 : r;
-        s->wb++;
-    }
-    /* step 9: the holes the collect skipped are deleted off the end */
+    /* step 10: the holes the gather skipped are deleted off the end. read-through-holes gathered every index, so
+       toSorted's j has already reached len and this loop does nothing. */
     for (;;) {
         if (s->wb >= s->len) {
             JS_FreeValue(ctx, cb_result);
@@ -77541,8 +77749,7 @@ static void js_array_sort_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->obj);
     v->val(ctx, &s->coerced);   /* a ToString that landed just before a suspension */
     v->val(ctx, &s->cmpres);    /* a comparator result held across its own ToNumber */
-    v->val(ctx, &s->copy);      /* toSorted's result while the copy walk is in flight */
-    v->val(ctx, &s->el);
+    v->val(ctx, &s->copy);      /* toSorted's result, until the gather is over and it becomes the sorted list */
     v->slots(ctx, &s->array, s->len, s->wb, s->n);
     v->buf(ctx, (void **)&s->tmp, (size_t)s->n * sizeof(ValueSlot));
 }
@@ -98077,7 +98284,31 @@ static int js_ta_sort_put(JSContext *ctx, JSValueConst obj, int64_t j, JSValueCo
     return 0;
 }
 
-enum { TAS_MERGE = 3, TAS_WRITEBACK = 7 };
+/* %TypedArray%'s sort and toSorted are ONE machine over two algorithms, so ONE stage list expanded twice with
+   each one's own step text — see ACB_STAGES. Its prologue spans a RANGE and says so: the comparator check, the
+   validate, the create and SortIndexedProperties' whole read of the List are steps in which nothing the page
+   wrote can run, so there is nothing in them to rest at. The MERGE is the one place there is. */
+#define TAS_STAGES(X, PROLOGUE, MERGE, WRITEBACK) \
+    X(TAS_PROLOGUE,  PROLOGUE) \
+    X(TAS_MERGE,     MERGE) \
+    X(TAS_WRITEBACK, WRITEBACK)
+enum { TAS_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_ta_sort_steps[] = {
+    TAS_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.29 steps 1-4 and 23.1.3.30.1 steps 1-3 (the comparator check; ValidateTypedArray; the whole "
+        "List is read before any comparison — no user code in any of it)",
+        "23.2.4.7 step 2.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))",
+        "23.2.3.29 step 9.a (Set(obj, ToString(j), sortedList[j], true) — a typed-array element store runs no "
+        "user code, so the write-back is one pass)")
+    NULL };
+static const char *const js_ta_toSorted_steps[] = {
+    TAS_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.33 steps 1-5 and 23.1.3.30.1 steps 1-3 (the comparator check; ValidateTypedArray; A is "
+        "TypedArrayCreateSameType(O, <<len>>); the whole List is read — no user code in any of it)",
+        "23.2.4.7 step 2.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))",
+        "23.2.3.33 step 9.a (Set(A, ToString(j), sortedList[j], true) — a typed-array element store runs no "
+        "user code, so the write-back is one pass)")
+    NULL };
 
 static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -98085,7 +98316,7 @@ static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue
     JSValueConst method = step_arg(&s->hdr, 0);
     int rc;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == TAS_PROLOGUE) {
         JSObject *p;
         JSValue (*getfun)(JSContext *, const void *);
         int elt_size;
