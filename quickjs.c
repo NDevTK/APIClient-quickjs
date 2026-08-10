@@ -21230,7 +21230,9 @@ enum { GS_START = 0, GS_WALK, GS_NAMED_GET, GS_NAMED_STR };
    back-edge. (Kind 15 was CONT_STR_REPLACE, back when a hand-written driver ran this walk.) */
 typedef struct JSStrReplace {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
-    uint8_t mode;            /* 0 = string walk, 1 = call a USER @@replace, 2 = finished, 3 = delegate to the built-in @@replace machine */
+    uint8_t mode;            /* 0 = the string walk (and its prologue), 1 = call a USER @@replace,
+                                3 = delegate to the built-in @@replace machine. It says WHAT THIS STATE OWNS —
+                                the visit reads it — and nothing else; where the machine IS is the stage. */
     void *inner;             /* mode 3: the delegated machine — its own header carries its def */
     uint8_t functional;      /* mode 0: 1 = callable replacer (step-code 3), 0 = GetSubstitution in the same walk */
     JSValue rep_val;         /* mode 0 non-functional: the ToString'd replacement (owned) */
@@ -21243,7 +21245,6 @@ typedef struct JSStrReplace {
     int pos;
     uint8_t is_first;
     uint8_t is_replaceAll;
-    uint8_t cb_pending;     /* 1 = the value delivered to the next step is the replacer's result */
     JSGetSubst gs;          /* the non-functional walk's substitution; never suspends here (no `groups`) */
     JSValue flags_val;      /* replaceAll's `Get(searchValue, "flags")` result, held across ITS ToString — both
                                are the page's code, so they are separate stages and the value cannot live in a
@@ -64929,13 +64930,34 @@ static JSValue js_parse_num_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* Object.defineProperty and Reflect.defineProperty are one machine over two algorithms whose four steps are the
+   same operations; they differ only in whether step 4 is DefinePropertyOrThrow or the bare [[DefineOwnProperty]]
+   whose boolean IS the answer. ONE stage list expanded once per algorithm — see AFIND_STAGES. */
+#define DEFPROP_STAGES(X, KEY, DESC, DEFINE) \
+    X(DEFPROP_KEY,    KEY)  \
+    X(DEFPROP_DESC,   DESC) \
+    X(DEFPROP_DEFINE, DEFINE)
+enum { DEFPROP_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_obj_defprop_steps[] = {
+    DEFPROP_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.4 steps 1-2 (O is an Object; key is ToPropertyKey(P))",
+        "20.1.2.4 step 3 (desc is ToPropertyDescriptor(Attributes))",
+        "20.1.2.4 step 4 (DefinePropertyOrThrow(O, key, desc))")
+    NULL };
+static const char *const js_reflect_defprop_steps[] = {
+    DEFPROP_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.3 steps 1-2 (target is an Object; key is ToPropertyKey(propertyKey))",
+        "28.1.3 step 3 (desc is ToPropertyDescriptor(attributes))",
+        "28.1.3 step 4 (target.[[DefineOwnProperty]](key, desc))")
+    NULL };
+
 static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSObjDefProp *s = st;
     JSValueConst obj = step_arg(&s->hdr, 0);
     int ret, flags, r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DEFPROP_KEY) {
         if (s->hdr.str_phase == STR_PH_START) {
             s->result = JS_UNDEFINED;
             s->atom = JS_ATOM_NULL;
@@ -64950,24 +64972,23 @@ static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->atom, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 1;
+        s->hdr.stage = DEFPROP_DESC;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == DEFPROP_DESC) {
         /* ToPropertyDescriptor, one keyed operation at a time. It used to be a JS_DefinePropertyDesc call from
            here, which read all twelve of them from C. */
         r = js_desc_cursor_run(ctx, &s->cur, step_arg(&s->hdr, 2), cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
-    }
-    if (s->hdr.stage == 2) {
-        /* the DEFINE itself. On a Proxy target this is the `defineProperty` trap and 10.5.6's invariant on its
-           result — the page's code, which JS_DefineProperty ran from C. It is a request now, carrying the whole
-           descriptor rather than CreateDataProperty's fixed shape, and its THROW flag says which of the two
-           forms the caller wants: Object.defineProperty performs DefinePropertyOrThrow, Reflect.defineProperty
-           the bare [[DefineOwnProperty]] whose boolean IS its answer. */
-        JS_FreeValue(ctx, cb_result);
-        s->hdr.stage = 3;
+        /* the DEFINE itself, issued from the tail of the descriptor stage rather than from a stage of its own:
+           a stage between the two would rest at no step (it can only ever be passed through), and a stage that
+           rests nowhere is what naming them exists to remove. On a Proxy target this is the `defineProperty`
+           trap and 10.5.6's invariant on its result — the page's code, which JS_DefineProperty ran from C. It
+           is a request now, carrying the whole descriptor rather than CreateDataProperty's fixed shape, and its
+           THROW flag says which of the two forms the caller wants: Object.defineProperty performs
+           DefinePropertyOrThrow, Reflect.defineProperty the bare [[DefineOwnProperty]] whose boolean IS its
+           answer. */
+        s->hdr.stage = DEFPROP_DEFINE;
         s->cb[0] = js_dup(obj);
         s->cb[1] = js_dup(s->cur.value);
         s->hdr.desc_get = s->cur.getter;   /* borrowed: the cursor holds them across the request */
@@ -64981,7 +65002,8 @@ static int js_obj_defprop_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         *out_cb = s->cb; *out_argc = (int)s->atom;
         return 10;   /* DEFINE */
     }
-    /* stage 3: undefined for the throwing form, the boolean for the bare one. */
+    /* the define answered: undefined for the throwing form, the boolean for the bare one. */
+    DCHECK(s->hdr.stage == DEFPROP_DEFINE, "defineProperty resumed in no stage");
     if (JS_IsException(cb_result)) return -1;
     ret = s->hdr.arg ? JS_ToBool(ctx, cb_result) : 0;
     JS_FreeValue(ctx, cb_result);
@@ -65025,12 +65047,20 @@ typedef struct JSHasOwnEnum {
     JSAtom key;          /* the key being asked about (owned) */
     JSDescFacts facts;   /* the descriptor, as the bits the step tests (owned) */
 } JSHasOwnEnum;
+/* Steps 4-5 read the descriptor the request delivered as FACTS, which runs none of the page's code, so the
+   machine ends in the stage that rests at step 3. */
+#define PROPISENUM_STAGES(X) \
+    X(PROPISENUM_KEY,  "20.1.3.4 steps 1-2 (P is ToPropertyKey(V); O is ToObject(this value))") \
+    X(PROPISENUM_DESC, "20.1.3.4 step 3 (desc is O.[[GetOwnProperty]](P))")
+enum { PROPISENUM_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_prop_is_enum_steps[] = { PROPISENUM_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_has_own_enum_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSHasOwnEnum *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == PROPISENUM_KEY) {
         if (s->hdr.str_phase == STR_PH_START) {
             s->result = JS_UNDEFINED;
             s->obj = JS_UNDEFINED;
@@ -65042,13 +65072,13 @@ static int js_has_own_enum_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         if (r) return r < 0 ? -1 : r;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);              /* step 2, AFTER the coercion */
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = PROPISENUM_DESC;
         s->hdr.desc_facts = &s->facts;
         s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the state holds it across the request */
         *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->key;
         return 12;
     }
-    DCHECK(s->hdr.stage == 1, "the own-enumerable probe resumed in no stage");
+    DCHECK(s->hdr.stage == PROPISENUM_DESC, "the own-enumerable probe resumed in no stage");
     if (JS_IsException(cb_result)) return -1;
     JS_FreeValue(ctx, cb_result);
     s->result = js_bool(s->facts.flags >= 0 && (s->facts.flags & JS_PROP_ENUMERABLE));
@@ -65088,12 +65118,30 @@ typedef struct JSObjDefAccessor {
     JSAtom atom;          /* the coerced key (owned) */
     JSValue cb[2];        /* [target, value] for the DEFINE request (owned) */
 } JSObjDefAccessor;
+/* TWO algorithms, one machine, differing only in which accessor field step 3's descriptor carries. Steps 1-3 run
+   none of the page's code, so they share the stage that rests at step 4's ToPropertyKey; step 6 is `return
+   undefined`. ONE stage list expanded once per algorithm — see AFIND_STAGES. */
+#define DEFACC_STAGES(X, KEY, DEFINE) \
+    X(DEFACC_KEY,    KEY) \
+    X(DEFACC_DEFINE, DEFINE)
+enum { DEFACC_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_obj_defgetter_steps[] = {
+    DEFACC_STAGES(JS_STEP_STAGE_LABEL,
+        "B.2.2.2 steps 1-4 (O is ToObject(this value); IsCallable(getter); desc; key is ToPropertyKey(P))",
+        "B.2.2.2 step 5 (DefinePropertyOrThrow(O, key, desc))")
+    NULL };
+static const char *const js_obj_defsetter_steps[] = {
+    DEFACC_STAGES(JS_STEP_STAGE_LABEL,
+        "B.2.2.3 steps 1-4 (O is ToObject(this value); IsCallable(setter); desc; key is ToPropertyKey(P))",
+        "B.2.2.3 step 5 (DefinePropertyOrThrow(O, key, desc))")
+    NULL };
+
 static int js_obj_defaccessor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSObjDefAccessor *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DEFACC_KEY) {
         if (s->hdr.str_phase == STR_PH_START) {
             s->result = JS_UNDEFINED;
             s->obj = JS_UNDEFINED;
@@ -65108,16 +65156,14 @@ static int js_obj_defaccessor_step(JSContext *ctx, void *st, JSValue cb_result, 
         r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->atom, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 1;
-    }
-    if (s->hdr.stage == 1) {
-        JSValueConst value = step_arg(&s->hdr, 1);
-        JS_FreeValue(ctx, cb_result);
-        s->hdr.stage = 2;
+        /* step 5, issued from the tail of the stage that finished step 4: a stage between them would rest at no
+           step at all, which is exactly what naming them exists to remove. */
+        s->hdr.stage = DEFACC_DEFINE;
         s->cb[0] = js_dup(s->obj);
         s->cb[1] = JS_UNDEFINED;                       /* an accessor descriptor has no [[Value]] */
-        s->hdr.desc_get = s->hdr.arg ? JS_UNDEFINED : value;   /* borrowed: the caller's argument outlives this */
-        s->hdr.desc_set = s->hdr.arg ? value : JS_UNDEFINED;
+        /* borrowed: the caller's argument outlives this */
+        s->hdr.desc_get = s->hdr.arg ? JS_UNDEFINED : step_arg(&s->hdr, 1);
+        s->hdr.desc_set = s->hdr.arg ? step_arg(&s->hdr, 1) : JS_UNDEFINED;
         s->hdr.desc_flags = JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY
                           | JS_PROP_HAS_ENUMERABLE | JS_PROP_ENUMERABLE
                           | JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE
@@ -65126,6 +65172,7 @@ static int js_obj_defaccessor_step(JSContext *ctx, void *st, JSValue cb_result, 
         return 10;   /* DEFINE */
     }
     /* step 6: undefined, whatever the define answered — the THROW flag has already turned a refusal into one. */
+    DCHECK(s->hdr.stage == DEFACC_DEFINE, "__defineGetter__/__defineSetter__ resumed in no stage");
     if (JS_IsException(cb_result)) return -1;
     JS_FreeValue(ctx, cb_result);
     s->result = JS_UNDEFINED;
@@ -73300,8 +73347,15 @@ static const JSTrampStepDef js_str_matchAll_def =
 static const JSTrampStepDef js_str_search_def =
     { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search, .visit = js_str_match_visit,
       .algorithm = "22.1.3.21 String.prototype.search", .steps = js_str_search_steps };
-static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0, .visit = js_str_replace_visit };
-static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1, .visit = js_str_replace_visit };
+/* Declared where the machine is; a definition sits with its siblings rather than with the algorithm it names. */
+static const char *const js_str_replace_steps[];
+static const char *const js_str_replaceAll_steps[];
+static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0, .visit = js_str_replace_visit,
+                                                     .algorithm = "22.1.3.19 String.prototype.replace",
+                                                     .steps = js_str_replace_steps };
+static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1, .visit = js_str_replace_visit,
+                                                     .algorithm = "22.1.3.20 String.prototype.replaceAll",
+                                                     .steps = js_str_replaceAll_steps };
 static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every, .visit = js_array_every_visit,
                                                      .algorithm = "23.1.3.6 Array.prototype.every",
                                                      .steps = js_array_every_steps };
@@ -73897,11 +73951,21 @@ static const JSTrampStepDef js_regexp_set_input_def = { sizeof(JSReSetInput), js
 static const JSTrampStepDef js_regexp_flags_def   = { sizeof(JSRegExpFlags), js_regexp_flags_step, js_regexp_flags_fini, 0, .visit = js_regexp_flags_visit };
 static const JSTrampStepDef js_proto_get_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_GET, .visit = js_proto_accessor_visit };
 static const JSTrampStepDef js_proto_set_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_SET, .visit = js_proto_accessor_visit };
-static const JSTrampStepDef js_prop_is_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, 0, .visit = js_has_own_enum_visit };
-static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0, .visit = js_obj_defprop_visit };
-static const JSTrampStepDef js_obj_defgetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 0, .visit = js_obj_defaccessor_visit };
-static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 1, .visit = js_obj_defaccessor_visit };
-static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1, .visit = js_obj_defprop_visit };
+static const JSTrampStepDef js_prop_is_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, 0, .visit = js_has_own_enum_visit,
+                                                     .algorithm = "20.1.3.4 Object.prototype.propertyIsEnumerable",
+                                                     .steps = js_prop_is_enum_steps };
+static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 0, .visit = js_obj_defprop_visit,
+                                                     .algorithm = "20.1.2.4 Object.defineProperty",
+                                                     .steps = js_obj_defprop_steps };
+static const JSTrampStepDef js_obj_defgetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 0, .visit = js_obj_defaccessor_visit,
+                                                     .algorithm = "B.2.2.2 Object.prototype.__defineGetter__",
+                                                     .steps = js_obj_defgetter_steps };
+static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 1, .visit = js_obj_defaccessor_visit,
+                                                     .algorithm = "B.2.2.3 Object.prototype.__defineSetter__",
+                                                     .steps = js_obj_defsetter_steps };
+static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1, .visit = js_obj_defprop_visit,
+                                                     .algorithm = "28.1.3 Reflect.defineProperty",
+                                                     .steps = js_reflect_defprop_steps };
 static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result);
 static const JSTrampStepDef js_ownkeys_names_def  = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_STRING_MASK, .visit = js_ownkeys_visit,
@@ -74250,56 +74314,95 @@ static const JSTrampStepDef js_ta_filter_def       = { sizeof(JSArrayEvery), js_
 typedef struct JSPromiseResolveM {
     JSStepHdr hdr;         /* MUST be first */
     JSValue result;        /* owned: the promise this returns */
-    JSValue cb_args[3];    /* [this=undefined, resolve|reject, value] */
+    JSValue resolver;      /* owned: the capability's resolve|reject, held across its Call */
+    JSValue cb[3];         /* the CAPABILITY request's [C], then the CALL's [this, resolver, x] */
+    uint8_t call_phase;
 } JSPromiseResolveM;
 _Static_assert(offsetof(JSPromiseResolveM, hdr) == 0, "JSStepHdr must be first in JSPromiseResolveM");
+
+/* WHICH STEP OF 27.2.4.7 / 27.2.4.6 EACH STAGE RESTS AT. ONE walk, TWO algorithms the standard numbers
+   differently — resolve delegates its whole body to 27.2.4.7.1 PromiseResolve and reject writes the capability
+   steps out itself — so one stage list is expanded once per algorithm with that algorithm's own step text.
+   Reject PASSES THROUGH the first stage without resting: its `constructor` read belongs to PromiseResolve's
+   already-a-promise shortcut, which reject has no equivalent of, so that stage names reject's step 1 instead of
+   pretending reject performs a read it never makes. */
+#define PRES_STAGES(X, HEAD, CAP, CALL) \
+    X(PRES_HEAD, HEAD) \
+    X(PRES_CAP,  CAP)  \
+    X(PRES_CALL, CALL)
+enum { PRES_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_promise_resolve_steps[] = {
+    PRES_STAGES(JS_STEP_STAGE_LABEL,
+        "27.2.4.7 steps 2-3 -> 27.2.4.7.1 step 1 (C is an Object; xConstructor is Get(x, \"constructor\"))",
+        "27.2.4.7.1 step 2 (promiseCapability is NewPromiseCapability(C))",
+        "27.2.4.7.1 step 3 (Call(promiseCapability.[[Resolve]], undefined, <<x>>))")
+    NULL };
+static const char *const js_promise_reject_steps[] = {
+    PRES_STAGES(JS_STEP_STAGE_LABEL,
+        "27.2.4.6 step 1 (C is the this value)",
+        "27.2.4.6 step 2 (promiseCapability is NewPromiseCapability(C))",
+        "27.2.4.6 step 3 (Call(promiseCapability.[[Reject]], undefined, <<r>>))")
+    NULL };
 
 static int js_promise_resolve_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPromiseResolveM *s = st;
     bool is_reject = (s->hdr.arg != 0);
-    if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
-        if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-        if (!is_reject && JS_GetOpaque(step_arg(&s->hdr, 0), JS_CLASS_PROMISE)) {
-            /* 27.2.4.7 step 2: `Get(x, "constructor")`, which a Proxy or an accessor makes user code. */
-            s->hdr.stage = 1;
-            s->cb_args[0] = js_dup(step_arg(&s->hdr, 0));
-            *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_constructor;
-            return 6;   /* GETPROP */
+    int r;
+
+    if (s->hdr.stage == PRES_HEAD) {
+        if (s->hdr.get_phase == GET_PH_START) {
+            /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+            s->result = JS_UNDEFINED; s->resolver = JS_UNDEFINED;
+            /* resolve's step 2; for reject the same value is what NewPromiseCabability's IsConstructor rejects. */
+            if (!JS_IsObject(s->hdr.this_val)) {
+                JS_FreeValue(ctx, cb_result);
+                JS_ThrowTypeErrorNotAnObject(ctx);
+                return -1;
+            }
         }
-        s->hdr.stage = 2;
-        s->cb_args[0] = js_dup(s->hdr.this_val);
-        *out_cb = s->cb_args; *out_argc = 0;
-        return 16;   /* CAPABILITY */
+        if (!is_reject && JS_GetOpaque(step_arg(&s->hdr, 0), JS_CLASS_PROMISE)) {
+            /* PromiseResolve step 1.a: `Get(x, "constructor")`, which a Proxy or an accessor makes user code. */
+            JSValue xctor;
+            r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 0), JS_ATOM_constructor, cb_result, &xctor,
+                                 out_cb, out_argc);
+            cb_result = JS_UNDEFINED;
+            if (r) return r < 0 ? -1 : r;
+            /* step 1.b: if it IS this C, x already is the promise to return. */
+            if (js_same_value(ctx, xctor, s->hdr.this_val)) {
+                JS_FreeValue(ctx, xctor);
+                s->result = js_dup(step_arg(&s->hdr, 0));
+                return 0;
+            }
+            JS_FreeValue(ctx, xctor);
+        }
+        s->hdr.stage = PRES_CAP;
     }
-    if (s->hdr.stage == 1) {
-        /* cb_result = x.constructor. Step 2.b: if it IS this C, x already is the promise to return. */
-        bool same = js_same_value(ctx, cb_result, s->hdr.this_val);
-        JS_FreeValue(ctx, cb_result);
-        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
-        if (same) { s->result = js_dup(step_arg(&s->hdr, 0)); return 0; }
-        s->hdr.stage = 2;
-        s->cb_args[0] = js_dup(s->hdr.this_val);
-        *out_cb = s->cb_args; *out_argc = 0;
-        return 16;   /* CAPABILITY */
-    }
-    if (s->hdr.stage == 2) {
-        /* the capability is on the header. Call its resolve/reject with the value — user code for a subclass that
-           wraps them, which is why it is a request and not a JS_Call from here. */
-        JS_FreeValue(ctx, cb_result);
-        JS_FreeValue(ctx, s->cb_args[0]);
-        s->hdr.stage = 3;
+    if (s->hdr.stage == PRES_CAP) {
+        /* a SUBCLASS constructor is the page's code, so the machine RESTS in this step: it issues the request
+           while the header carries no capability and is re-entered at the same stage once one is there. */
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (JS_IsUndefined(s->hdr.cap_promise)) {
+            s->cb[0] = js_dup(s->hdr.this_val);
+            *out_cb = s->cb; *out_argc = 0;
+            return 16;   /* CAPABILITY */
+        }
+        JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
         s->result = s->hdr.cap_promise; s->hdr.cap_promise = JS_UNDEFINED;
-        s->cb_args[0] = JS_UNDEFINED;                                   /* this */
-        s->cb_args[1] = s->hdr.cap_funcs[is_reject]; s->hdr.cap_funcs[is_reject] = JS_UNDEFINED;
+        s->resolver = s->hdr.cap_funcs[is_reject]; s->hdr.cap_funcs[is_reject] = JS_UNDEFINED;
         JS_FreeValue(ctx, s->hdr.cap_funcs[!is_reject]); s->hdr.cap_funcs[!is_reject] = JS_UNDEFINED;
-        s->cb_args[2] = js_dup(step_arg(&s->hdr, 0));
-        *out_cb = s->cb_args; *out_argc = 1;
-        return 3;   /* CALL */
+        s->hdr.stage = PRES_CALL;
     }
-    /* stage 3: resolve/reject returned; its result is discarded and the promise is the answer. */
-    JS_FreeValue(ctx, cb_result);
+    {
+        /* a subclass that wraps its resolving functions makes this the page's code too, which is why it is a
+           request and not a JS_Call from here. The Call's own result is discarded; the promise is the answer. */
+        JSValueConst arg = step_arg(&s->hdr, 0);
+        JSValue ignored = JS_UNDEFINED;
+        r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb), s->resolver, JS_UNDEFINED,
+                          1, &arg, cb_result, &ignored, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        JS_FreeValue(ctx, ignored);
+    }
     return 0;
 }
 
@@ -75402,10 +75505,10 @@ static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result
 static void js_promise_resolve_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSPromiseResolveM *s = st;
+    int k;
     v->val(ctx, &s->result);
-    v->val(ctx, &s->cb_args[0]);
-    v->val(ctx, &s->cb_args[1]);
-    v->val(ctx, &s->cb_args[2]);
+    v->val(ctx, &s->resolver);
+    for (k = 0; k < 3; k++) v->val(ctx, &s->cb[k]);
 }
 
 static JSValue js_promise_resolve_fini(JSContext *ctx, void *st, bool take_result)
@@ -75419,10 +75522,12 @@ static JSValue js_promise_resolve_fini(JSContext *ctx, void *st, bool take_resul
 }
 
 static const JSTrampStepDef js_promise_resolve_def = {
-    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 0, .visit = js_promise_resolve_visit
+    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 0, .visit = js_promise_resolve_visit,
+    .algorithm = "27.2.4.7 Promise.resolve", .steps = js_promise_resolve_steps
 };
 static const JSTrampStepDef js_promise_reject_def = {
-    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 1, .visit = js_promise_resolve_visit
+    sizeof(JSPromiseResolveM), js_promise_resolve_step, js_promise_resolve_fini, 1, .visit = js_promise_resolve_visit,
+    .algorithm = "27.2.4.6 Promise.reject", .steps = js_promise_reject_steps
 };
 
 /* Promise.prototype.catch (27.2.5.1) as a STEP MACHINE. It is `Invoke(promise, "then", «undefined, onRejected»)`
@@ -81608,42 +81713,99 @@ static void js_getsubst_free(JSContext *ctx, JSGetSubst *gs)
 
 
 
+/* 22.1.3.19 String.prototype.replace and 22.1.3.20 .replaceAll — ONE machine, `arg` selecting which, so ONE
+   stage list expanded once per algorithm with that algorithm's own step text (see RES_STAGES for the shape).
+   REPLACE'S ARRAY IS SHORTER: only replaceAll performs IsRegExp and the `flags` read, so those three rest
+   points are a SEPARATE list appended after the eight they share, and a rest in one of them under `replace` is
+   a stage past the end of its array — which step_stage_check names on its own.
+   The stage NUMBERS are not the order the blocks appear in below; the label is the identity. */
+#define STRREP_STAGES(X, RECV, REPLACER, DISPATCH, STR, SEARCH, REP, CALL, CALLSTR) \
+    X(SRP_RECV,     RECV) \
+    X(SRP_REPLACER, REPLACER) \
+    X(SRP_DISPATCH, DISPATCH) \
+    X(SRP_STR,      STR) \
+    X(SRP_SEARCH,   SEARCH) \
+    X(SRP_REP,      REP) \
+    X(SRP_CALL,     CALL) \
+    X(SRP_CALLSTR,  CALLSTR)
+/* The three only replaceAll reaches. */
+#define STRREP_ALL_STAGES(X, ISREGEXP, FLAGS, FLAGSTR) \
+    X(SRP_ISREGEXP, ISREGEXP) \
+    X(SRP_FLAGS,    FLAGS) \
+    X(SRP_FLAGSTR,  FLAGSTR)
+enum { STRREP_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0, 0, 0, 0)
+       STRREP_ALL_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_str_replace_steps[] = {
+    STRREP_STAGES(JS_STEP_STAGE_LABEL,
+        "22.1.3.19 step 1 (O is RequireObjectCoercible(this)) and step 2's `searchValue is an Object` test",
+        "22.1.3.19 step 2.a (replacer is GetMethod(searchValue, @@replace))",
+        "22.1.3.19 step 2.b.i (return Call(replacer, searchValue, «O, replaceValue»))",
+        "22.1.3.19 step 3 (string is ToString(O))",
+        "22.1.3.19 step 4 (searchString is ToString(searchValue))",
+        "22.1.3.19 steps 5-6.a (functionalReplace is IsCallable(replaceValue); if not, ToString it)",
+        "22.1.3.19 step 12.a (Call(replaceValue, undefined, «searchString, position, string»))",
+        "22.1.3.19 step 12.a (ToString of what that Call returned)")
+    NULL };
+static const char *const js_str_replaceAll_steps[] = {
+    STRREP_STAGES(JS_STEP_STAGE_LABEL,
+        "22.1.3.20 step 1 (O is RequireObjectCoercible(this)) and step 2's `searchValue is an Object` test",
+        "22.1.3.20 step 2.c (replacer is GetMethod(searchValue, @@replace))",
+        "22.1.3.20 step 2.d.i (return Call(replacer, searchValue, «O, replaceValue»))",
+        "22.1.3.20 step 3 (string is ToString(O))",
+        "22.1.3.20 step 4 (searchString is ToString(searchValue))",
+        "22.1.3.20 steps 5-6.a (functionalReplace is IsCallable(replaceValue); if not, ToString it)",
+        "22.1.3.20 step 14.b.i (Call(replaceValue, undefined, «searchString, p, string»))",
+        "22.1.3.20 step 14.b.i (ToString of what that Call returned)")
+    STRREP_ALL_STAGES(JS_STEP_STAGE_LABEL,
+        "22.1.3.20 step 2.a (isRegExp is IsRegExp(searchValue) — its Get(searchValue, @@match))",
+        "22.1.3.20 steps 2.b.i-ii (flags is Get(searchValue, \"flags\"); RequireObjectCoercible(flags))",
+        "22.1.3.20 step 2.b.iii (whether ToString(flags) contains \"g\")")
+    NULL };
+
 /* 0 = DONE (s->result is the answer), 3 = CALL the replacer on the tramp, 5 = ToString on its result, -1 = error.
    Mirrors the C loop exactly, split at the points where it re-enters JS — of which there are TWO, not one.
    22.1.3.19 states the replacer step as `? ToString(? Call(replaceValue, undefined, «searched, position,
-   string»))`: converting the CALL to a request left the ToString a JS_ToString from C, so a replacer returning
-   an object with a toString still ran that toString below the live flow. cb_pending now says WHICH of the two
-   is outstanding, because both suspend and the walk has to resume into the right one. */
+   string»))`, so the CALL and the ToString of what it returned are two rest points of one step and the walk has
+   to resume into the right one. They are two STAGES: `cb_pending` said the same thing privately, which is the
+   numbering this conversion removes — a private cursor beside the stage is a suspension point the algorithm
+   cannot name, and a park between the call and the coercion could only report itself as "somewhere in the
+   walk". */
 static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_result,
                                JSValue **out_cb, int *out_argc)
 {
     JSString *sp = JS_VALUE_GET_STRING(s->str);
     JSString *searchp = JS_VALUE_GET_STRING(s->search_str);
+    JSValue repl = JS_UNDEFINED;
+    int r;
 
-    if (s->cb_pending) {
-        /* the replacer returned: ToString its result AS A REQUEST, then splice it in at the recorded position */
-        JSValue repl = JS_UNDEFINED;
-        int r;
-        if (s->cb_pending == 1) {
-            s->cb_pending = 2;
-            /* step_tostring_run dups the operand into the header when it has to hold it across the coercion,
-               so this reference can be released either way. */
-            r = step_tostring_run(ctx, &s->hdr, cb_result, JS_UNDEFINED, &repl, out_cb, out_argc);
-            JS_FreeValue(ctx, cb_result);
-        } else {
-            DCHECK(s->cb_pending == 2, "the replace walk resumed with an unknown outstanding request");
-            r = step_tostring_run(ctx, &s->hdr, JS_UNDEFINED, cb_result, &repl, out_cb, out_argc);
-        }
-        if (r)
-            return r < 0 ? -1 : r;
-        s->cb_pending = 0;
-        string_buffer_concat(&s->b, sp, s->endOfLastMatch, s->pos);
-        string_buffer_concat_value_free(&s->b, repl);
-        s->endOfLastMatch = s->pos + searchp->len;
-        s->is_first = 0;
-        if (!s->is_replaceAll)
-            goto finish;
+    if (s->hdr.stage == SRP_CALL) {
+        /* the replacer returned: ToString its result AS A REQUEST, then splice it in at the recorded position.
+           step_tostring_run dups the operand into the header when it has to hold it across the coercion, so
+           this reference can be released either way — and the stage moves BEFORE the request, because the
+           coercion answers at SRP_CALLSTR's call site and not at this one. */
+        s->hdr.stage = SRP_CALLSTR;
+        r = step_tostring_run(ctx, &s->hdr, cb_result, JS_UNDEFINED, &repl, out_cb, out_argc);
+        JS_FreeValue(ctx, cb_result);
+        if (r) return r < 0 ? -1 : r;
+        goto have_replacement;
     }
+    if (s->hdr.stage == SRP_CALLSTR) {
+        r = step_tostring_run(ctx, &s->hdr, JS_UNDEFINED, cb_result, &repl, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        goto have_replacement;
+    }
+    /* the walk is ENTERED, not resumed: the prologue's last stage falls straight into the search below, and the
+       driver hands a fresh entry nothing to deliver. */
+    DCHECK(JS_IsUndefined(cb_result), "the replace walk was entered with an undelivered request answer");
+    goto search;
+ have_replacement:
+    string_buffer_concat(&s->b, sp, s->endOfLastMatch, s->pos);
+    string_buffer_concat_value_free(&s->b, repl);
+    s->endOfLastMatch = s->pos + searchp->len;
+    s->is_first = 0;
+    if (!s->is_replaceAll)
+        goto finish;
+ search:
     for (;;) {
         if (unlikely(searchp->len == 0)) {
             if (s->is_first)
@@ -81665,34 +81827,27 @@ static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_resul
             break;
         }
         if (!s->functional) {
-            /* same walk, different substitution SOURCE: GetSubstitution instead of a callback, spliced here and
-               on to the next match. Not a separate no-callback body. */
-            JSValue repl = JS_UNDEFINED;
-            int gsr;
+            /* same walk, different substitution SOURCE: GetSubstitution (22.1.3.19 step 13.c) instead of the
+               callback, spliced by the SAME three lines the callback's answer is — one splice, not two copies
+               of it. Not a separate no-callback body. */
             s->gs.stage = GS_START;
             s->gs.position = s->pos;
             /* No captures and no `groups`: `$<name>` is inert and `$1` has nothing to read, so this walk has
                no page-observable operation in it and cannot park. Same ONE implementation as @@replace's; the
                DCHECK is what says the difference is structural and not a second driver. */
-            gsr = step_getsubst_run(ctx, &s->hdr, &s->gs, s->search_str, s->str, JS_UNDEFINED,
-                                    JS_UNDEFINED, s->rep_val, JS_UNDEFINED, &repl, out_cb, out_argc);
-            DCHECK(gsr <= 0, "String.prototype.replace's substitution asked to suspend, which needs a `groups` "
-                             "object it is never given");
-            if (gsr < 0)
+            r = step_getsubst_run(ctx, &s->hdr, &s->gs, s->search_str, s->str, JS_UNDEFINED,
+                                  JS_UNDEFINED, s->rep_val, JS_UNDEFINED, &repl, out_cb, out_argc);
+            DCHECK(r <= 0, "String.prototype.replace's substitution asked to suspend, which needs a `groups` "
+                           "object it is never given");
+            if (r < 0)
                 return -1;
-            string_buffer_concat(&s->b, sp, s->endOfLastMatch, s->pos);
-            string_buffer_concat_value_free(&s->b, repl);
-            s->endOfLastMatch = s->pos + searchp->len;
-            s->is_first = 0;
-            if (!s->is_replaceAll)
-                goto finish;
-            continue;
+            goto have_replacement;
         }
         s->cb_args[0] = JS_UNDEFINED;                /* thisArgument */
         s->cb_args[2] = s->search_str;               /* borrowed: matched */
         s->cb_args[3] = js_int32(s->pos);            /* position */
         s->cb_args[4] = s->str;                      /* borrowed: the whole string */
-        s->cb_pending = 1;
+        s->hdr.stage = SRP_CALL;
         return 3;
     }
 finish:
@@ -81718,14 +81873,13 @@ finish:
    straight out of C, so an accessor, a Proxy trap or a toString containing a loop had no flow base and aborted.
    They are stages now, in the spec's order — which is also observable: the flags read precedes the @@replace
    read, and only replaceAll performs the IsRegExp check at all. */
-enum { SR_MATCH = 20, SR_FLAGS, SR_FLAGS_STR, SR_REPLACER };
 
 static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSStrReplace *s = st;
     JSValueConst searchValue = step_arg(&s->hdr, 0);
     int rr;
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == SRP_RECV) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         if (JS_IsUndefined(s->hdr.this_val) || JS_IsNull(s->hdr.this_val)) {
@@ -81733,21 +81887,23 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
             return -1;
         }
         s->is_replaceAll = s->hdr.arg;
-        s->hdr.stage = SR_MATCH;
         if (!JS_IsObject(searchValue))
             goto plain_walk;          /* step 2 does not apply to a primitive: it reads nothing */
         if (!s->is_replaceAll)
             goto have_gflag;          /* only replaceAll performs IsRegExp and the 'g' requirement */
+        /* the stage moves only on the path that reaches it: `replace`'s array ends at SRP_CALLSTR, so naming
+           one of replaceAll's three even in passing would put it in a stage its algorithm does not have. */
+        s->hdr.stage = SRP_ISREGEXP;
         rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_Symbol_match, JS_UNDEFINED,
                               &cb_result, out_cb, out_argc);
         if (rr) return rr < 0 ? -1 : rr;
     }
-    if (s->hdr.stage == SR_MATCH) {
+    if (s->hdr.stage == SRP_ISREGEXP) {
         JSValue m = JS_UNDEFINED;
         rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_Symbol_match, cb_result, &m, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (rr) return rr < 0 ? -1 : rr;
-        s->hdr.stage = SR_FLAGS;
+        s->hdr.stage = SRP_FLAGS;
         /* IsRegExp steps 2-4: a DEFINED @@match decides by ToBoolean, otherwise the [[RegExpMatcher]] slot does */
         if (JS_IsUndefined(m) ? js_get_regexp(ctx, searchValue, false) == NULL : !JS_ToBoolFree(ctx, m))
             goto have_gflag;
@@ -81755,7 +81911,7 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
                               &cb_result, out_cb, out_argc);
         if (rr) return rr < 0 ? -1 : rr;
     }
-    if (s->hdr.stage == SR_FLAGS) {
+    if (s->hdr.stage == SRP_FLAGS) {
         JSValue flags = JS_UNDEFINED;
         rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_flags, cb_result, &flags, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -81766,11 +81922,11 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
             return -1;
         }
         s->flags_val = flags;         /* held across its own ToString, which is a separate suspension point */
-        s->hdr.stage = SR_FLAGS_STR;
+        s->hdr.stage = SRP_FLAGSTR;
         rr = step_tostring_run(ctx, &s->hdr, s->flags_val, JS_UNDEFINED, &cb_result, out_cb, out_argc);
         if (rr) return rr < 0 ? -1 : rr;
     }
-    if (s->hdr.stage == SR_FLAGS_STR) {
+    if (s->hdr.stage == SRP_FLAGSTR) {
         JSValue fs = JS_UNDEFINED;
         int has_g;
         rr = step_tostring_run(ctx, &s->hdr, s->flags_val, cb_result, &fs, out_cb, out_argc);
@@ -81785,12 +81941,12 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
             return -1;
         }
     have_gflag:
-        s->hdr.stage = SR_REPLACER;
+        s->hdr.stage = SRP_REPLACER;
         rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_Symbol_replace, JS_UNDEFINED,
                               &cb_result, out_cb, out_argc);
         if (rr) return rr < 0 ? -1 : rr;
     }
-    if (s->hdr.stage == SR_REPLACER) {
+    if (s->hdr.stage == SRP_REPLACER) {
         JSValue replacer = JS_UNDEFINED;
         rr = step_getprop_run(ctx, &s->hdr, searchValue, JS_ATOM_Symbol_replace, cb_result, &replacer,
                               out_cb, out_argc);
@@ -81812,8 +81968,8 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
                 if (!inner) return -1;
                 s->inner = inner;
                 s->mode = 3;
-                s->hdr.stage = 1;
-                goto have_mode;
+                s->hdr.stage = SRP_DISPATCH;
+                goto dispatch;
             }
             /* a USER-DEFINED @@replace: an ordinary callable, invoked on the tramp like any other call */
             s->mode = 1;
@@ -81821,8 +81977,9 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
             s->cb_args[1] = replacer;                         /* owned */
             s->cb_args[2] = js_dup(s->hdr.this_val);          /* the subject */
             s->cb_args[3] = js_dup(step_arg(&s->hdr, 1));
-            s->hdr.stage = 1;
-            goto have_mode;
+            s->hdr.stage = SRP_DISPATCH;
+            *out_cb = s->cb_args; *out_argc = 2;
+            return 3;
         }
         JS_FreeValue(ctx, replacer);
     plain_walk:
@@ -81831,24 +81988,30 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         s->functional = JS_IsFunction(ctx, step_arg(&s->hdr, 1));
         if (s->functional)
             s->cb_args[1] = js_dup(step_arg(&s->hdr, 1));
-        s->mode = 4;
-        s->hdr.stage = 10;
+        /* MODE 0 FROM HERE, not from the end of the prologue. The replacer this just dup'd into cb_args[1] is
+           declared by mode 0's visit and by no other, so the transient mode that used to stand between them was
+           a window in which the machine owned a reference its own declaration did not name: a searchValue whose
+           `toString` throws tore the state down through a visit that never saw cb_args[1], and the replacer
+           leaked. The accumulator's own `b.ctx` already says it has not been built yet, which is what makes
+           mode 0 correct this early. */
+        s->mode = 0;
+        s->hdr.stage = SRP_STR;
     }
-    /* 22.1.3.19 steps 3, 5 and 8: ToString on the receiver, the search value and — when it is not callable —
-       the replacement. Each is the page's code, so each is its own stage. */
-    if (s->hdr.stage == 10) {
+    /* steps 3, 4 and 6.a: ToString on the receiver, the search value and — when it is not callable — the
+       replacement. Each is the page's code, so each is its own stage. */
+    if (s->hdr.stage == SRP_STR) {
         rr = step_tostring_run(ctx, &s->hdr, s->hdr.this_val, cb_result, &s->str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (rr) return rr < 0 ? -1 : rr;
-        s->hdr.stage = 11;
+        s->hdr.stage = SRP_SEARCH;
     }
-    if (s->hdr.stage == 11) {
+    if (s->hdr.stage == SRP_SEARCH) {
         rr = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->search_str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (rr) return rr < 0 ? -1 : rr;
-        s->hdr.stage = 12;
+        s->hdr.stage = SRP_REP;
     }
-    if (s->hdr.stage == 12) {
+    if (s->hdr.stage == SRP_REP) {
         if (!s->functional) {
             rr = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->rep_val, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
@@ -81856,26 +82019,22 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         }
         string_buffer_init(ctx, &s->b, 0);
         s->is_first = 1;
-        s->mode = 0;
         s->gs.pending = JS_UNDEFINED; s->gs.name_atom = JS_ATOM_NULL; s->gs.active = 0;
-        s->hdr.stage = 1;
+        /* the stage stays at SRP_REP: the walk below is ENTERED from here, and the two stages it rests at are
+           its own. */
     }
- have_mode:
-    if (s->mode == 3)   /* delegated: the built-in @@replace machine IS the walk */
-        return ((JSStepHdr *)s->inner)->def->step(ctx, s->inner, cb_result, out_cb, out_argc);
-    if (s->mode == 2)
+ dispatch:
+    if (s->hdr.stage == SRP_DISPATCH) {
+        /* step 2.b.i (2.d.i). A DELEGATED built-in @@replace is a machine on the chain, and the outer rests at
+           this one step for as long as it runs; a user-defined one is an ordinary call whose result IS the
+           answer. */
+        if (s->mode == 3)
+            return ((JSStepHdr *)s->inner)->def->step(ctx, s->inner, cb_result, out_cb, out_argc);
+        DCHECK(s->mode == 1, "str.replace rested at the @@replace dispatch with no replacer to run");
+        s->result = cb_result;
         return 0;
-    if (s->mode == 1) {
-        if (s->cb_pending) {          /* @@replace returned: its result IS the answer */
-            s->result = cb_result;
-            s->cb_pending = 0;
-            return 0;
-        }
-        s->cb_pending = 1;
-        *out_cb = s->cb_args; *out_argc = 2;
-        return 3;
     }
-    {   /* mode 0: the string-search walk, one match per step. The walk sets its OWN request buffer for a
+    {   /* the string-search walk, one match per step. The walk sets its OWN request buffer for a
            ToString (step-code 5); only the replacer CALL uses the machine's cb_args. */
         int r = js_str_replace_step(ctx, s, cb_result, out_cb, out_argc);
         if (r == 3) { *out_cb = s->cb_args; *out_argc = 3; }
@@ -93120,94 +93279,106 @@ static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_va
    CALL are both user code. JS_SpeciesConstructor and JS_Invoke performed all four from C. */
 typedef struct JSPromiseFinally {
     JSStepHdr hdr;         /* MUST be first */
-    JSValue ctor;          /* owned: the species constructor, captured into the two closures */
-    JSValue result;        /* owned: then's return, which IS finally's */
-    JSValue cb_args[4];    /* [this=promise, then, onFinally-wrapper, onFinally-wrapper] */
+    JSValue ctor;          /* owned: C, captured into the two closures */
+    JSValue result;        /* owned: the Invoke's return, which IS finally's */
+    JSValue method;        /* owned: the `then` read off the promise */
+    JSValue fin[2];        /* owned: thenFinally and catchFinally */
+    JSValue cb[4];         /* the CALL request's [this, func, thenFinally, catchFinally] */
+    uint8_t call_phase;
 } JSPromiseFinally;
 _Static_assert(offsetof(JSPromiseFinally, hdr) == 0, "JSStepHdr must be first in JSPromiseFinally");
+
+/* WHICH STEP OF 27.2.5.3 EACH STAGE RESTS AT. Six private stages, three of which were 7.3.22 hand-inlined and
+   two of which were the two halves of one Invoke with the machine parked one stage past each — the same shape
+   .then carried, and the same fix: SpeciesConstructor is ONE step performed by the engine's own sub-sequence,
+   and each remaining stage rests at the operation it is inside.
+   AND THE DEFAULT WAS WRONG. The inlined copy left `ctor` UNDEFINED for SpeciesConstructor's default rather
+   than %Promise%, and that undefined was captured into both reaction closures as their [[Constructor]] — so
+   step 6's PromiseResolve(C, result) ran with C undefined and threw a TypeError from inside the reaction, for
+   any promise whose `constructor` is absent or whose @@species is nullish. 7.3.22 step 3 returns
+   defaultConstructor, which is what the sub-sequence gives it. */
+#define PFIN_STAGES(X) \
+    X(PFIN_OBJ,      "27.2.5.3 step 2 (promise is an Object)") \
+    X(PFIN_SPECIES,  "27.2.5.3 step 3 (C is SpeciesConstructor(promise, %Promise%))") \
+    X(PFIN_GET_THEN, "27.2.5.3 step 7 -> 7.3.20 Invoke step 2 (func is GetV(promise, \"then\"))") \
+    X(PFIN_THEN,     "27.2.5.3 step 7 -> 7.3.20 Invoke step 3 (Call(func, promise, <<thenFinally, catchFinally>>))")
+enum { PFIN_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_promise_finally_steps[] = { PFIN_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_promise_finally_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPromiseFinally *s = st;
-    /* THE STAGE DISPATCH IS A LOOP, not a recursion. Two stages finish by deciding the NEXT stage should run
-       immediately — SpeciesConstructor's default when `constructor` is undefined, and again when @@species is —
-       and they said so by tail-calling this function with a fresh UNDEFINED. Depth two, so nothing was at risk;
-       what it cost was a self-edge in engine/check_recursion.sh's graph for a control-flow decision that has a
-       `continue`. */
-    for (;;) {
-    if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
+    int r;
+
+    if (s->hdr.stage == PFIN_OBJ) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
+        s->ctor = JS_UNDEFINED; s->result = JS_UNDEFINED; s->method = JS_UNDEFINED;
+        s->fin[0] = JS_UNDEFINED; s->fin[1] = JS_UNDEFINED;
         if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-        s->hdr.stage = 1;
-        s->cb_args[0] = js_dup(s->hdr.this_val);
-        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_constructor;
-        return 6;   /* GETPROP: SpeciesConstructor step 2 */
+        s->hdr.stage = PFIN_SPECIES;
     }
-    if (s->hdr.stage == 1) {
-        /* cb_result = O.constructor. Steps 3-4: undefined is the default; a non-object is a TypeError. */
-        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
-        if (JS_IsUndefined(cb_result)) { s->ctor = JS_UNDEFINED; s->hdr.stage = 3; cb_result = JS_UNDEFINED; continue; }
-        if (!JS_IsObject(cb_result)) { JS_FreeValue(ctx, cb_result); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-        s->hdr.stage = 2;
-        s->cb_args[0] = cb_result;   /* the constructor, held for the @@species read (owned) */
-        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_Symbol_species;
-        return 6;   /* GETPROP: SpeciesConstructor step 5 */
-    }
-    if (s->hdr.stage == 2) {
-        /* cb_result = C[@@species]. Steps 6-8: nullish is the default; a non-constructor is a TypeError. */
-        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
-        if (JS_IsUndefined(cb_result) || JS_IsNull(cb_result)) { JS_FreeValue(ctx, cb_result); s->ctor = JS_UNDEFINED; }
-        else if (!JS_IsConstructor(ctx, cb_result)) {
-            JS_ThrowTypeErrorNotAConstructor(ctx, cb_result);
-            JS_FreeValue(ctx, cb_result);
-            return -1;
-        } else s->ctor = cb_result;
-        s->hdr.stage = 3;
+    if (s->hdr.stage == PFIN_SPECIES) {
+        r = step_speciesctor_run(ctx, &s->hdr, s->hdr.this_val, ctx->promise_ctor, cb_result, &s->ctor,
+                                 out_cb, out_argc);
         cb_result = JS_UNDEFINED;
-        continue;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = PFIN_GET_THEN;
     }
-    if (s->hdr.stage == 3) {
-        /* the species constructor is in hand: build the two reaction closures, then read `then`. */
-        JSValueConst onFinally = step_arg(&s->hdr, 0);
-        s->hdr.stage = 4;
-        if (!JS_IsFunction(ctx, onFinally)) {
-            s->cb_args[2] = js_dup(onFinally);
-            s->cb_args[3] = js_dup(onFinally);
-        } else {
-            JSValueConst func_data[2];
-            int i;
-            func_data[0] = s->ctor;
-            func_data[1] = onFinally;
-            for (i = 0; i < 2; i++) {
-                s->cb_args[2 + i] = JS_NewCFunctionData(ctx, js_promise_then_finally_func, 1, i, 2, func_data);
-                if (JS_IsException(s->cb_args[2 + i])) { s->cb_args[2 + i] = JS_UNDEFINED; return -1; }
-                promise_closure_set_step(s->cb_args[2 + i], &js_promise_then_finally_def);   /* onFinally parks on the tramp */
+    if (s->hdr.stage == PFIN_GET_THEN) {
+        if (s->hdr.get_phase == GET_PH_START) {
+            /* steps 4-6: the assert, and the two closures — a non-callable onFinally is passed through as BOTH
+               handlers. No user code, so no stage of their own; built here because the read below is where the
+               machine first parks and a state must be complete before it can. */
+            JSValueConst onFinally = step_arg(&s->hdr, 0);
+            if (!JS_IsFunction(ctx, onFinally)) {
+                s->fin[0] = js_dup(onFinally);
+                s->fin[1] = js_dup(onFinally);
+            } else {
+                JSValueConst func_data[2];
+                int i;
+                func_data[0] = s->ctor;
+                func_data[1] = onFinally;
+                for (i = 0; i < 2; i++) {
+                    s->fin[i] = JS_NewCFunctionData(ctx, js_promise_then_finally_func, 1, i, 2, func_data);
+                    if (JS_IsException(s->fin[i])) {
+                        s->fin[i] = JS_UNDEFINED;
+                        JS_FreeValue(ctx, cb_result);
+                        return -1;
+                    }
+                    promise_closure_set_step(s->fin[i], &js_promise_then_finally_def);   /* onFinally parks on the tramp */
+                }
             }
         }
-        s->cb_args[0] = js_dup(s->hdr.this_val);
-        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_then;
-        return 6;   /* GETPROP: Invoke's GetV(promise, "then") */
+        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_then, cb_result, &s->method,
+                             out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = PFIN_THEN;
     }
-    if (s->hdr.stage == 4) {
-        s->hdr.stage = 5;
-        s->cb_args[1] = cb_result;             /* the method (owned); the closures are already at [2],[3] */
-        *out_cb = s->cb_args; *out_argc = 2;
-        return 3;   /* CALL */
+    {
+        JSValueConst args[2];
+        args[0] = s->fin[0];
+        args[1] = s->fin[1];
+        r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb), s->method, s->hdr.this_val,
+                          2, args, cb_result, &s->result, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
     }
-    s->result = cb_result;
     return 0;
-    }
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The species constructor captured into the two wrappers, and
-   the whole [promise, then, wrapper, wrapper] request buffer. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). C, the two closures capturing it, the `then` read off the
+   promise, and the call buffer while the request is in flight. */
 static void js_promise_finally_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSPromiseFinally *s = st;
     int k;
     v->val(ctx, &s->result);
     v->val(ctx, &s->ctor);
-    for (k = 0; k < 4; k++) v->val(ctx, &s->cb_args[k]);
+    v->val(ctx, &s->method);
+    v->val(ctx, &s->fin[0]);
+    v->val(ctx, &s->fin[1]);
+    for (k = 0; k < 4; k++) v->val(ctx, &s->cb[k]);
 }
 
 static JSValue js_promise_finally_fini(JSContext *ctx, void *st, bool take_result)
@@ -93221,7 +93392,8 @@ static JSValue js_promise_finally_fini(JSContext *ctx, void *st, bool take_resul
 }
 
 static const JSTrampStepDef js_promise_finally_def = {
-    sizeof(JSPromiseFinally), js_promise_finally_step, js_promise_finally_fini, 0, .visit = js_promise_finally_visit
+    sizeof(JSPromiseFinally), js_promise_finally_step, js_promise_finally_fini, 0, .visit = js_promise_finally_visit,
+    .algorithm = "27.2.5.3 Promise.prototype.finally", .steps = js_promise_finally_steps
 };
 
 static const JSCFunctionListEntry js_promise_funcs[] = {
