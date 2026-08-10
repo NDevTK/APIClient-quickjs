@@ -41745,6 +41745,16 @@ typedef struct JSAsyncAwait {
 } JSAsyncAwait;
 _Static_assert(offsetof(JSAsyncAwait, hdr) == 0, "JSStepHdr must be first in JSAsyncAwait");
 
+/* WHICH STEP OF 27.7.5.3 EACH STAGE RESTS AT. The second stage names a RANGE because the machine rests inside
+   the only page-visible operation in it: PromiseResolve reads `constructor` off an already-promise argument, and
+   the three steps after it — two CreateBuiltinFunction and PerformPromiseThen — invoke nothing. */
+#define AWA_STAGES(X) \
+    X(AWA_CTX,     "27.7.5.3 step 1 (asyncContext is the running execution context)") \
+    X(AWA_RESOLVE, "27.7.5.3 steps 2-7 (promise is PromiseResolve(%Promise%, value); PerformPromiseThen " \
+                   "attaches onFulfilled and onRejected)")
+enum { AWA_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_async_await_steps[] = { AWA_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_async_await_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSAsyncAwait *m = st;
@@ -41755,15 +41765,15 @@ static int js_async_await_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     int r;
 
     DCHECK(s != NULL, "an async Await ran with no async-function state on its handle");
-    if (m->hdr.stage == 0) {
+    if (m->hdr.stage == AWA_CTX) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         m->result = JS_UNDEFINED;
         m->cb[0] = JS_UNDEFINED; m->cb[1] = JS_UNDEFINED;
         m->cb[2] = JS_UNDEFINED; m->cb[3] = JS_UNDEFINED;
         m->pr_phase = PRR_START;
-        m->hdr.stage = 1;
+        m->hdr.stage = AWA_RESOLVE;
     }
-    DCHECK(m->hdr.stage == 1, "an async Await resumed in an unknown stage");
+    DCHECK(m->hdr.stage == AWA_RESOLVE, "an async Await resumed in an unknown stage");
     if (JS_IsException(cb_result))
         return -1;   /* a poisoned `constructor`: an uncatchable failure of the await plumbing, as it was in C */
     r = step_promiseresolve_run(ctx, &m->hdr, &m->pr_phase, step_arg(&m->hdr, 0), &promise, m->cb,
@@ -41798,7 +41808,8 @@ static JSValue js_async_await_fini(JSContext *ctx, void *st, bool take_result)
 
 static const JSTrampStepDef js_async_await_def = {
     sizeof(JSAsyncAwait), js_async_await_step, js_async_await_fini, 0,
-    .catches_abrupt = 1, .visit = js_async_await_visit };
+    .catches_abrupt = 1, .visit = js_async_await_visit,
+    .algorithm = "27.7.5.3 Await", .steps = js_async_await_steps };
 
 static JSValue js_async_await_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
                                       JSValueConst *argv, int magic, JSValueConst *func_data)
@@ -42246,7 +42257,28 @@ typedef struct JSAgenAwaitRet {
 } JSAgenAwaitRet;
 _Static_assert(offsetof(JSAgenAwaitRet, hdr) == 0, "JSStepHdr must be first in JSAgenAwaitRet");
 
-enum { AR_RESOLVE = 1 };
+/* WHICH STEP OF EACH ALGORITHM EACH STAGE RESTS AT. ONE walk, TWO algorithms: arg 0 is the awaited RETURN that
+   drains the queue and arg 1 is the generator body's own await, and the standard numbers them separately — so
+   one stage list is expanded once per algorithm with that algorithm's own step text.
+   The prose over the definitions said "27.6.3.2 AsyncGeneratorAwaitReturn" and "27.6.3.8 AsyncGeneratorAwait".
+   27.6.3.2 is AsyncGeneratorStart and 27.6.3.8 is AsyncGeneratorYield; AwaitReturn is 27.6.3.9, and the second
+   of the two is not an operation of its own at all — an async generator body's await IS 27.7.5.3 Await. */
+#define AR_STAGES(X, HEAD, RESOLVE) \
+    X(AR_HEAD,    HEAD) \
+    X(AR_RESOLVE, RESOLVE)
+enum { AR_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_agen_await_ret_steps[] = {
+    AR_STAGES(JS_STEP_STAGE_LABEL,
+        "27.6.3.9 steps 1-6 (queue is the [[AsyncGeneratorQueue]]; completion is its first request's)",
+        "27.6.3.9 steps 7-15 (promiseCompletion is PromiseResolve(%Promise%, completion.[[Value]]); "
+        "PerformPromiseThen attaches onFulfilled and onRejected)")
+    NULL };
+static const char *const js_agen_await_steps[] = {
+    AR_STAGES(JS_STEP_STAGE_LABEL,
+        "27.7.5.3 step 1 (asyncContext is the running execution context)",
+        "27.7.5.3 steps 2-7 (promise is PromiseResolve(%Promise%, value); PerformPromiseThen attaches "
+        "onFulfilled and onRejected)")
+    NULL };
 
 static int js_agen_await_ret_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -42258,7 +42290,7 @@ static int js_agen_await_ret_step(JSContext *ctx, void *st, JSValue cb_result, J
     int r, res;
 
     DCHECK(s != NULL, "AsyncGeneratorAwaitReturn ran on something that is not an async generator");
-    if (m->hdr.stage == 0) {
+    if (m->hdr.stage == AR_HEAD) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         m->result = JS_UNDEFINED;
         m->cb[0] = JS_UNDEFINED; m->cb[1] = JS_UNDEFINED;
@@ -42268,7 +42300,7 @@ static int js_agen_await_ret_step(JSContext *ctx, void *st, JSValue cb_result, J
     }
     DCHECK(m->hdr.stage == AR_RESOLVE, "AsyncGeneratorAwaitReturn resumed in an unknown stage");
     if (JS_IsException(cb_result)) {
-        /* step 7: PromiseResolve completed abruptly — a poisoned `constructor` — and that abrupt is what the
+        /* step 8: PromiseResolve completed abruptly — a poisoned `constructor` — and that abrupt is what the
            queue is settled with, so a REJECTED native promise carries it into the same attach below. Rejecting
            reads nothing, which is why this one stays a C call. */
         JSValue err = JS_GetException(ctx);
@@ -42313,14 +42345,16 @@ static JSValue js_agen_await_ret_fini(JSContext *ctx, void *st, bool take_result
     return r;
 }
 
-/* arg 0 = 27.6.3.2 AsyncGeneratorAwaitReturn (the RESUME-NEXT resolving functions),
-   arg 1 = 27.6.3.8 AsyncGeneratorAwait (the generator's own). */
+/* arg 0 = 27.6.3.9 AsyncGeneratorAwaitReturn (the RESUME-NEXT resolving functions),
+   arg 1 = 27.7.5.3 Await, performed by the generator's own body. */
 static const JSTrampStepDef js_agen_await_ret_def = {
     sizeof(JSAgenAwaitRet), js_agen_await_ret_step, js_agen_await_ret_fini, 0,
-    .catches_abrupt = 1   /* step 7: an abrupt PromiseResolve is this algorithm's VALUE, not a raise */, .visit = js_agen_await_ret_visit };
+    .catches_abrupt = 1   /* step 8: an abrupt PromiseResolve is this algorithm's VALUE, not a raise */, .visit = js_agen_await_ret_visit,
+    .algorithm = "27.6.3.9 AsyncGeneratorAwaitReturn", .steps = js_agen_await_ret_steps };
 static const JSTrampStepDef js_agen_await_def = {
     sizeof(JSAgenAwaitRet), js_agen_await_ret_step, js_agen_await_ret_fini, 1,
-    .catches_abrupt = 1, .visit = js_agen_await_ret_visit };
+    .catches_abrupt = 1, .visit = js_agen_await_ret_visit,
+    .algorithm = "27.7.5.3 Await (an async generator body's)", .steps = js_agen_await_steps };
 
 static JSValue js_agen_await_ret_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
                                          JSValueConst *argv, int magic, JSValueConst *func_data)
@@ -88822,7 +88856,7 @@ static int js_proxy_construct_step(JSContext *ctx, void *st, JSValue cb_result, 
     int i, n;
 
     DCHECK(pd != NULL, "the Proxy [[Construct]] machine was entered on a target that is not a Proxy");
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == PXC_ST_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
