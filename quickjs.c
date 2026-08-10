@@ -71247,12 +71247,27 @@ static int64_t arr_clamp_idx(int64_t v, int64_t len)
     return v;
 }
 
+#define ACW_STAGES(X) \
+    X(ACW_TOOBJECT, "23.1.3.4 step 1 (O is ToObject(this value))") \
+    X(ACW_LENGTH,   "23.1.3.4 step 2 (len is LengthOfArrayLike(O))") \
+    X(ACW_TARGET,   "23.1.3.4 steps 3-5 (relativeTarget is ToIntegerOrInfinity(target), clamped into to)") \
+    X(ACW_START,    "23.1.3.4 steps 6-8 (relativeStart is ToIntegerOrInfinity(start), clamped into from)") \
+    X(ACW_END,      "23.1.3.4 steps 9-13 (an undefined end is len and coerces nothing; otherwise " \
+                    "ToIntegerOrInfinity(end), clamped into final — then count, and step 14's direction)") \
+    X(ACW_HAS,      "23.1.3.4 step 15.c (fromPresent is HasProperty(O, fromKey))") \
+    X(ACW_GET,      "23.1.3.4 step 15.d.i (fromValue is Get(O, fromKey))") \
+    X(ACW_PUT,      "23.1.3.4 step 15.d.ii / 15.e (Set(O, toKey, fromValue, true), or " \
+                    "DeletePropertyOrThrow(O, toKey) when the source slot is absent)") \
+    X(ACW_DONE,     "23.1.3.4 step 16 (the copy is finished; return O)")
+enum { ACW_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_copyWithin_steps[] = { ACW_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayCopyWithin *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ACW_TOOBJECT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->el = JS_UNDEFINED;
@@ -71260,30 +71275,30 @@ static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result,
         s->dir = 1; s->present = 0;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = ACW_LENGTH;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == ACW_LENGTH) {
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         s->final = s->len;
-        s->hdr.stage = 2;
+        s->hdr.stage = ACW_TARGET;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == ACW_TARGET) {
         r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->to, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         s->to = arr_clamp_idx(s->to, s->len);
-        s->hdr.stage = 3;
+        s->hdr.stage = ACW_START;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == ACW_START) {
         r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->from, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         s->from = arr_clamp_idx(s->from, s->len);
-        s->hdr.stage = 4;
+        s->hdr.stage = ACW_END;
     }
-    if (s->hdr.stage == 4) {
+    if (s->hdr.stage == ACW_END) {
         /* an ABSENT or undefined end is the default and coerces nothing */
         if (s->hdr.argc > 2 && !JS_IsUndefined(step_arg(&s->hdr, 2))) {
             r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[2], cb_result, &s->final, out_cb, out_argc);
@@ -71295,30 +71310,30 @@ static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result,
         /* step 14: overlapping ranges are walked BACKWARDS so a copy never reads a slot it has already written */
         s->dir = (s->from < s->to && s->to < s->from + s->count) ? -1 : 1;
         s->i = 0;
-        s->hdr.stage = 5;
+        s->hdr.stage = ACW_HAS;
     }
     for (;;) {
         int64_t from, to;
-        if (s->hdr.stage == 8) break;
+        if (s->hdr.stage == ACW_DONE) break;
         from = (s->dir < 0) ? s->from + s->count - s->i - 1 : s->from + s->i;
         to   = (s->dir < 0) ? s->to   + s->count - s->i - 1 : s->to   + s->i;
-        if (s->hdr.stage == 5) {
-            if (s->i >= s->count) { s->hdr.stage = 8; break; }
+        if (s->hdr.stage == ACW_HAS) {
+            if (s->i >= s->count) { s->hdr.stage = ACW_DONE; break; }
             /* HasProperty(O, fromKey) — step 14.c. A Proxy `has` trap is the page's code. */
             r = step_hasidx_run(ctx, &s->hdr, s->obj, from, cb_result, &s->present, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
-            s->hdr.stage = 6;
+            s->hdr.stage = ACW_GET;
         }
-        if (s->hdr.stage == 6) {
+        if (s->hdr.stage == ACW_GET) {
             if (s->present) {
                 r = step_getidx_run(ctx, &s->hdr, s->obj, from, cb_result, &s->el, out_cb, out_argc);
                 cb_result = JS_UNDEFINED;
                 if (r) return r < 0 ? -1 : r;
             }
-            s->hdr.stage = 7;
+            s->hdr.stage = ACW_PUT;
         }
-        if (s->hdr.stage == 7) {
+        if (s->hdr.stage == ACW_PUT) {
             if (s->present) {
                 /* Set(O, toKey, fromVal, true) — step 14.d.i */
                 r = step_setidx_run(ctx, &s->hdr, s->obj, to, s->el, cb_result, out_cb, out_argc);
@@ -71332,7 +71347,7 @@ static int js_array_copywithin_step(JSContext *ctx, void *st, JSValue cb_result,
                 if (r) return r < 0 ? -1 : r;
             }
             s->i++;
-            s->hdr.stage = 5;
+            s->hdr.stage = ACW_HAS;
         }
     }
     JS_FreeValue(ctx, cb_result);
@@ -73167,6 +73182,43 @@ static bool js_internal_array_includes(JSContext *ctx, JSValueConst arr, JSValue
     return false;
 }
 
+/* indexOf, lastIndexOf and includes are ONE walk over three algorithms whose steps differ only in direction and
+   in whether a hole is visited — so ONE stage list expanded once per algorithm with that algorithm's own step
+   numbers. `includes` never asks HasProperty (a hole IS undefined to it), which is why its label for that stage
+   names the step it skips to instead. */
+#define ASRCH_STAGES(X, TOOBJ, LEN, FROM, HAS, GET) \
+    X(ASRCH_TOOBJECT,  TOOBJ) \
+    X(ASRCH_LENGTH,    LEN) \
+    X(ASRCH_FROMINDEX, FROM) \
+    X(ASRCH_DENSE,     "the dense prefix: SameValueZero or IsStrictlyEqual over a fast array's own slots, which " \
+                       "reaches none of the page's code and is therefore one step, not one per element") \
+    X(ASRCH_HAS,       HAS) \
+    X(ASRCH_SKIP,      "the index advance after an absent element, which runs nothing") \
+    X(ASRCH_GET,       GET)
+enum { ASRCH_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0) };
+static const char *const js_array_indexOf_steps[] = {
+    ASRCH_STAGES(JS_STEP_STAGE_LABEL,
+                 "23.1.3.17 step 1 (O is ToObject(this value))",
+                 "23.1.3.17 step 2 (len is LengthOfArrayLike(O))",
+                 "23.1.3.17 steps 4-7 (n is ToIntegerOrInfinity(fromIndex), resolved into k)",
+                 "23.1.3.17 step 8.a (kPresent is HasProperty(O, ToString(k)))",
+                 "23.1.3.17 step 8.b.i (elementK is Get(O, ToString(k)))") NULL };
+static const char *const js_array_lastIndexOf_steps[] = {
+    ASRCH_STAGES(JS_STEP_STAGE_LABEL,
+                 "23.1.3.20 step 1 (O is ToObject(this value))",
+                 "23.1.3.20 step 2 (len is LengthOfArrayLike(O))",
+                 "23.1.3.20 steps 4-6 (n is ToIntegerOrInfinity(fromIndex), resolved into k)",
+                 "23.1.3.20 step 7.a (kPresent is HasProperty(O, ToString(k)))",
+                 "23.1.3.20 step 7.b.i (elementK is Get(O, ToString(k)))") NULL };
+static const char *const js_array_includes_steps[] = {
+    ASRCH_STAGES(JS_STEP_STAGE_LABEL,
+                 "23.1.3.16 step 1 (O is ToObject(this value))",
+                 "23.1.3.16 step 2 (len is LengthOfArrayLike(O))",
+                 "23.1.3.16 steps 4-7 (n is ToIntegerOrInfinity(fromIndex), resolved into k)",
+                 "23.1.3.16 step 8 (includes asks no HasProperty — a hole IS undefined to SameValueZero — so "
+                 "this stage falls straight through to the element read)",
+                 "23.1.3.16 step 8.a (elementK is Get(O, ToString(k)))") NULL };
+
 static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArraySearch *s = st;
@@ -73177,20 +73229,20 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     uint32_t count;
     int r, eq = (mode == SEARCH_INCLUDES) ? JS_EQ_SAME_VALUE_ZERO : JS_EQ_STRICT;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ASRCH_TOOBJECT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
         s->result = JS_UNDEFINED;
-        s->hdr.stage = 1;
+        s->hdr.stage = ASRCH_LENGTH;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == ASRCH_LENGTH) {
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = ASRCH_FROMINDEX;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == ASRCH_FROMINDEX) {
         if (s->len > 0) {
             /* JS_ToInt64Clamp's arithmetic, with its ToInt64Sat half now a step */
             int64_t lo = (mode == SEARCH_LASTINDEXOF) ? -1 : 0;
@@ -73206,9 +73258,9 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
                 s->n = (mode == SEARCH_LASTINDEXOF) ? s->len - 1 : 0;
             }
         }
-        s->hdr.stage = 3;
+        s->hdr.stage = ASRCH_DENSE;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == ASRCH_DENSE) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->val = JS_UNDEFINED;
         /* The DENSE prefix. js_strict_eq2 over a fast array's own slots runs none of the page's code, so this is
@@ -73226,32 +73278,32 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
                         if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
             }
         }
-        s->hdr.stage = 4;
+        s->hdr.stage = ASRCH_HAS;
     }
     /* The routed loop: HasProperty and Get are each the page's code — an index accessor or a Proxy trap — and
        JS_TryGetPropertyInt64 / JS_GetPropertyInt64 reached both from C, driving them to completion. */
     for (;;) {
-        if (s->hdr.stage == 4) {
+        if (s->hdr.stage == ASRCH_HAS) {
             if (s->len <= 0 || (back ? s->n < 0 : s->n >= s->len))
                 break;
             if (mode == SEARCH_INCLUDES) {
-                s->hdr.stage = 6;          /* includes visits holes as undefined; it never asks */
+                s->hdr.stage = ASRCH_GET;          /* includes visits holes as undefined; it never asks */
             } else {
                 r = step_hasidx_run(ctx, &s->hdr, s->obj, s->n, cb_result, &s->present, out_cb, out_argc);
                 cb_result = JS_UNDEFINED;
                 if (r) return r < 0 ? -1 : r;
-                s->hdr.stage = 5;
+                s->hdr.stage = ASRCH_SKIP;
             }
         }
-        if (s->hdr.stage == 5) {
+        if (s->hdr.stage == ASRCH_SKIP) {
             if (!s->present) {
                 if (back) s->n--; else s->n++;
-                s->hdr.stage = 4;
+                s->hdr.stage = ASRCH_HAS;
                 continue;
             }
-            s->hdr.stage = 6;
+            s->hdr.stage = ASRCH_GET;
         }
-        DCHECK(s->hdr.stage == 6, "array search machine: unknown stage");
+        DCHECK(s->hdr.stage == ASRCH_GET, "array search machine: unknown stage");
         r = step_getidx_run(ctx, &s->hdr, s->obj, s->n, cb_result, &s->val, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -73261,7 +73313,7 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
             if (hit) goto found;
         }
         if (back) s->n--; else s->n++;
-        s->hdr.stage = 4;
+        s->hdr.stage = ASRCH_HAS;
     }
     JS_FreeValue(ctx, cb_result);
     s->result = (mode == SEARCH_INCLUDES) ? js_bool(false) : js_int64(-1);
@@ -74155,7 +74207,9 @@ static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_arra
 static const char *const js_array_fill_steps[];
 static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0, .visit = js_array_fill_visit,
                         .algorithm = "23.1.3.7 Array.prototype.fill", .steps = js_array_fill_steps };
-static const JSTrampStepDef js_array_copyWithin_def = { sizeof(JSArrayCopyWithin), js_array_copywithin_step, js_array_copywithin_fini, 0, .visit = js_array_copywithin_visit };
+static const char *const js_array_copyWithin_steps[];
+static const JSTrampStepDef js_array_copyWithin_def = { sizeof(JSArrayCopyWithin), js_array_copywithin_step, js_array_copywithin_fini, 0, .visit = js_array_copywithin_visit,
+                        .algorithm = "23.1.3.4 Array.prototype.copyWithin", .steps = js_array_copyWithin_steps };
 static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 /* 21.2.1.1 BigInt(value): its ONLY user code is step 2's ToPrimitive on the argument — everything after runs on a
    primitive. It is callable AND a constructor (which throws), which is what the constructor_or_func body
@@ -74380,8 +74434,11 @@ static void js_array_pop_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_push_visit(JSContext *ctx, void *st, JSStepVisit *v);
-static const JSTrampStepDef js_array_pop_def     = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  0, .visit = js_array_pop_visit };
-static const JSTrampStepDef js_array_shift_def   = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  1, .visit = js_array_pop_visit };
+static const char *const js_array_pop_steps[];
+static const JSTrampStepDef js_array_pop_def     = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  0, .visit = js_array_pop_visit,
+                        .algorithm = "23.1.3.22 Array.prototype.pop", .steps = js_array_pop_steps };
+static const JSTrampStepDef js_array_shift_def   = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  1, .visit = js_array_pop_visit,
+                        .algorithm = "23.1.3.25 Array.prototype.shift", .steps = js_array_pop_steps };
 static const char *const js_array_push_steps[];
 static const JSTrampStepDef js_array_push_def    = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 0, .visit = js_array_push_visit,
                         .algorithm = "23.1.3.23 Array.prototype.push", .steps = js_array_push_steps };
@@ -74475,9 +74532,15 @@ static const JSTrampStepDef js_symbol_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
       { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL,
       .visit = js_primargs_visit };
-static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF, .visit = js_array_search_visit };
-static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF, .visit = js_array_search_visit };
-static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES, .visit = js_array_search_visit };
+static const char *const js_array_indexOf_steps[];
+static const char *const js_array_lastIndexOf_steps[];
+static const char *const js_array_includes_steps[];
+static const JSTrampStepDef js_array_indexOf_def     = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INDEXOF, .visit = js_array_search_visit,
+                        .algorithm = "23.1.3.17 Array.prototype.indexOf", .steps = js_array_indexOf_steps };
+static const JSTrampStepDef js_array_lastIndexOf_def = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_LASTINDEXOF, .visit = js_array_search_visit,
+                        .algorithm = "23.1.3.20 Array.prototype.lastIndexOf", .steps = js_array_lastIndexOf_steps };
+static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), js_array_search_step, js_array_search_fini, SEARCH_INCLUDES, .visit = js_array_search_visit,
+                        .algorithm = "23.1.3.16 Array.prototype.includes", .steps = js_array_includes_steps };
 static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result);
 static void js_string_raw_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -77431,6 +77494,22 @@ static int js_array_private_pop(JSContext *ctx, JSValueConst arr)
    dense array, so that branch has no observable step in it at all.
    Stages: 0 ToObject, 1 length, 2 the element Get, 3 the shift, 4 the Delete, 5 Set(O,"length",newLen). */
 
+/* pop and shift are ONE machine: shift is pop with the elements above index 0 moved down, and every other step
+   is the same. ONE stage list naming both sections; which of the two a parked flow is in is what the
+   definition's `algorithm` says. */
+#define APOP_STAGES(X) \
+    X(APOP_TOOBJECT,  "23.1.3.22 pop / 23.1.3.25 shift step 1 (O is ToObject(this value))") \
+    X(APOP_LENGTH,    "23.1.3.22 / 23.1.3.25 step 2 (len is LengthOfArrayLike(O)); a zero length goes straight " \
+                      "to the length set") \
+    X(APOP_GET,       "23.1.3.22 step 4.b / 23.1.3.25 step 4 (value is Get(O, ToString(len - 1)) or Get(O, " \
+                      "\"0\")))") \
+    X(APOP_SHIFTDOWN, "23.1.3.25 step 6 (shift only: each element above index 0 moves down one — HasProperty, " \
+                      "then Get and Set or DeletePropertyOrThrow)") \
+    X(APOP_DELETE,    "23.1.3.22 step 4.c / 23.1.3.25 step 7 (DeletePropertyOrThrow(O, ToString(newLen)))") \
+    X(APOP_SETLEN,    "23.1.3.22 step 4.d / 23.1.3.25 step 8 (Set(O, \"length\", newLen, true))")
+enum { APOP_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_pop_steps[] = { APOP_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayPop *s = st;
@@ -77439,21 +77518,21 @@ static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     uint32_t count32;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == APOP_TOOBJECT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->res = JS_UNDEFINED;
         s->len = 0; s->newLen = 0; s->cs_i = 0; s->present = 0;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = APOP_LENGTH;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == APOP_LENGTH) {
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         s->newLen = 0;
-        s->hdr.stage = 5;
+        s->hdr.stage = APOP_SETLEN;
         if (s->len > 0) {
             s->newLen = s->len - 1;
             if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
@@ -77466,29 +77545,29 @@ static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 }
                 p->u.array.count--;
             } else {
-                s->hdr.stage = 2;
+                s->hdr.stage = APOP_GET;
             }
         }
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == APOP_GET) {
         r = step_getidx_run(ctx, &s->hdr, s->obj, shift ? 0 : s->newLen, cb_result, &s->res, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         s->cs_i = 0;
         s->hdr.stage = shift ? 3 : 4;
     }
-    if (s->hdr.stage == 3) {   /* shift: everything above index 0 moves down one */
+    if (s->hdr.stage == APOP_SHIFTDOWN) {   /* shift: everything above index 0 moves down one */
         r = step_copysub_run(ctx, &s->hdr, s->obj, 0, 1, s->len - 1, +1,
                              &s->cs_i, &s->present, cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 4;
+        s->hdr.stage = APOP_DELETE;
     }
-    if (s->hdr.stage == 4) {
+    if (s->hdr.stage == APOP_DELETE) {
         r = step_delidx_run(ctx, &s->hdr, s->obj, s->newLen, cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 5;
+        s->hdr.stage = APOP_SETLEN;
     }
     r = step_setprop_run(ctx, &s->hdr, s->obj, JS_ATOM_length, js_int64(s->newLen), cb_result, out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
