@@ -1544,6 +1544,11 @@ JS_EXTERN void     JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired);
    cannot name: a step state is plain js_malloc'd bytes, so it lands in the residual the @HEAP line calls
    `unattributed` with nothing to say what it is. Reported beside that residual for exactly that reason. */
 JS_EXTERN int      JS_StepMachineCount(JSRuntime *rt);
+/* LIVE HEAP CALL FRAMES — the trampoline's own stack (TrampFrame + its frame buffer), which is the OTHER thing
+   JS_ComputeMemoryUsage cannot name and by far the larger of the two: a parked flow IS a suspended chain, so a
+   frontier of parked flows holds one of these per suspended call. Reported beside `unattributed` so a run can
+   tell a deep-but-live frontier from a chain nothing unwound. */
+JS_EXTERN int      JS_TrampFrameCount(JSRuntime *rt);
 
 
 /* DRIVE-TO-COMPLETION detector: total sites where a coroutine body ran to completion instead of suspend/resume on

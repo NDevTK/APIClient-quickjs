@@ -20825,13 +20825,38 @@ typedef struct TrampFrame {
     uint8_t cont_kind;   /* CONT_NONE / CONT_STEP / … */
 } TrampFrame;
 
+/* THE HEAP CALL STACK'S OWN CENSUS — one constructor, one destructor, and a count between them.
+ *
+ * Every trampolined call allocates one of these plus its frame buffer, and BOTH are invisible to
+ * JS_ComputeMemoryUsage: they are not GC objects, not properties, not strings, so they land in the residual the
+ * @HEAP line calls `unattributed` with nothing to say what is in it. That residual is where this engine's memory
+ * actually is — a frontier of parked flows is a frontier of suspended CHAINS — and a leak-shaped growth in it
+ * could not be told from a deep-but-live frontier by any number the engine reported.
+ *
+ * The destructor exists for the same reason tramp_step_state_free does: the frees were fourteen bare
+ * `js_free_rt(rt, tf)` calls, so "was this chain unwound" was a question about fourteen sites. It is one now, and
+ * the count is what answers it. */
+static int g_tramp_frames_live;   /* runtime-wide: one interpreter, one heap call stack */
+
 static TrampFrame *tramp_frame_new(JSRuntime *rt)
 {
     TrampFrame *tf = js_malloc_rt(rt, sizeof(TrampFrame));
-    if (likely(tf != NULL))
+    if (likely(tf != NULL)) {
         tf->owns_func = 0;   /* the ONE field whose default has to be right at birth; the rest each site assigns */
+        g_tramp_frames_live++;
+    }
     return tf;
 }
+
+static void tramp_frame_free(JSRuntime *rt, TrampFrame *tf)
+{
+    DCHECK(g_tramp_frames_live > 0, "a heap call frame was freed that the census never saw allocated — either it "
+                                    "came from somewhere other than tramp_frame_new, or it is being freed twice");
+    g_tramp_frames_live--;
+    js_free_rt(rt, tf);
+}
+
+int JS_TrampFrameCount(JSRuntime *rt) { (void)rt; return g_tramp_frames_live; }
 
 /* THE HEAP FRAME CHAIN THE RUNNING STEP CALL SITS ON. The driver sets it around its one invocation of a step
    function and restores it after, so a machine that has to know what ENCLOSES it can look. The Error stack
@@ -26190,7 +26215,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     pc = sf->cur_pc;
                     sf->cur_sp = NULL;   /* running again */
                     rt->current_stack_frame = sf;
-                    js_free_rt(rt, dtf);
+                    tramp_frame_free(rt, dtf);
                     cont_st = ystt;
                     ret_val = JS_UNDEFINED;
                     goto do_step_step;
@@ -26938,7 +26963,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf = tramp_frame_new(rt);
                 if (unlikely(!ntf)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
-                if (unlikely(!nlb)) { js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!nlb)) { tramp_frame_free(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
                 ntf->up = tf_top;
                 ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
                 ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
@@ -27804,7 +27829,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf = tramp_frame_new(rt);
                 if (unlikely(!ntf)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
-                if (unlikely(!nlb)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); js_free_rt(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!nlb)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; JS_FreeValue(ctx, cthis); JS_FreeValue(ctx, con_super_ref); js_free_rt(rt, cs); tramp_frame_free(rt, ntf); JS_ThrowOutOfMemory(ctx); goto exception; }
                 ntf->up = tf_top;
                 ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
                 ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
@@ -28030,7 +28055,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ntf = tramp_frame_new(rt);
                 if (unlikely(!ntf)) { if (atab) free_arg_list(ctx, atab, alen); JS_ThrowOutOfMemory(ctx); goto exception; }
                 nlb = js_malloc_rt(rt, asize ? asize : sizeof(JSValue));
-                if (unlikely(!nlb)) { js_free_rt(rt, ntf); if (atab) free_arg_list(ctx, atab, alen); JS_ThrowOutOfMemory(ctx); goto exception; }
+                if (unlikely(!nlb)) { tramp_frame_free(rt, ntf); if (atab) free_arg_list(ctx, atab, alen); JS_ThrowOutOfMemory(ctx); goto exception; }
                 ntf->up = tf_top;
                 ntf->caller_sf = sf; ntf->caller_b = b; ntf->caller_ctx = ctx;
                 ntf->caller_local_buf = local_buf; ntf->caller_stack_buf = stack_buf;
@@ -29192,7 +29217,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         g_flow_control.fork(ctx, cl);
                         gen_state->tramp_top = NULL;   /* the parent's chain is live in tf_top, never stashed */
                         sf->cur_sp = NULL;             /* running again */
-                        js_free_rt(rt, ftf);
+                        tramp_frame_free(rt, ftf);
                         h->fork_arm = harm; h->fork_phase = FORK_PH_ANSWERED;
                         /* §scheduler's VALUE YIELD: a fork is the event that changes the ranking, because the
                            sibling created a moment ago may outrank this flow immediately. The same clause the
@@ -33499,7 +33524,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 argc = atf->caller_argc; argv = atf->caller_argv;
                 arg_allocated_size = atf->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = atf->caller_sp;
-                js_free_rt(rt, atf);
+                tramp_frame_free(rt, atf);
                 if (unlikely(post == ASYNC_POST_FAIL)) {
                     /* uncatchable error: the requester can never be reached again, so it goes the way every
                        abandoned requester goes rather than leaking with the promise. */
@@ -33939,7 +33964,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 argc = gtf->caller_argc; argv = gtf->caller_argv;
                 arg_allocated_size = gtf->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = gtf->caller_sp;
-                js_free_rt(rt, gtf);
+                tramp_frame_free(rt, gtf);
                 JS_FreeValue(ctx, ghold);   /* direct/close: drop the body-run ref; for-of/iternext: UNDEFINED (iterator on stack) */
                 if (gmode == 3) {   /* OP_iterator_close: .return() ran (finally); result DISCARDED, sp = caller_sp (iterator popped) */
                     JS_FreeValue(ctx, value);
@@ -34132,7 +34157,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 argc = atf2->caller_argc; argv = atf2->caller_argv;
                 arg_allocated_size = atf2->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = atf2->caller_sp;
-                js_free_rt(rt, atf2);
+                tramp_frame_free(rt, atf2);
                 JS_FreeValue(ctx, afn);
                 if (unlikely(JS_IsException(obj))) { js_async_generator_free(rt, s); goto exception; }
                 s->generator = JS_VALUE_GET_OBJ(obj);
@@ -34310,7 +34335,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 argc = dtf3->caller_argc; argv = dtf3->caller_argv;
                 arg_allocated_size = dtf3->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = dtf3->caller_sp;
-                js_free_rt(rt, dtf3);
+                tramp_frame_free(rt, dtf3);
                 {
                     JSAsyncPost apost;
                     int pr = js_async_generator_post(ctx, agen_s, agret, &apost);
@@ -34512,7 +34537,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 argc = gtf->caller_argc; argv = gtf->caller_argv;
                 arg_allocated_size = gtf->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = gtf->caller_sp;
-                js_free_rt(rt, gtf);
+                tramp_frame_free(rt, gtf);
                 JS_FreeValue(ctx, gfunc);
                 if (unlikely(JS_IsException(obj))) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception; }
                 JS_SetOpaqueInternal(obj, s);   /* the object now owns the suspended generator state */
@@ -34567,7 +34592,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = rtf->caller_arg_allocated_size;
                 pc = sf->cur_pc; sp = rtf->caller_sp;
                 cfirst = rtf->call_first; cargc = rtf->call_argc; itail = rtf->is_tail;
-                js_free_rt(rt, rtf);
+                tramp_frame_free(rt, rtf);
                 dlv_cs = rcs; dlv_ck = rck; dlv_cfirst = cfirst; dlv_cargc = cargc; dlv_itail = itail;
                 dlv_forof = rfof;
                 /* THE call-result delivery. Given (requester, kind, operand shape, tail-ness) it hands ret_val
@@ -39806,7 +39831,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         argc = gtf->caller_argc; argv = gtf->caller_argv;
         arg_allocated_size = gtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = gtf->caller_sp;
-        js_free_rt(rt, gtf);
+        tramp_frame_free(rt, gtf);
         if (pa_throw) {
             /* Promise.all(gen): a throw from the consumed generator REJECTS the aggregate promise and yields it to
                the caller (js_promise_all's fail_reject), never propagates. sp is now the caller's stack with the
@@ -39870,7 +39895,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         argc = ctf2->caller_argc; argv = ctf2->caller_argv;
         arg_allocated_size = ctf2->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = ctf2->caller_sp;
-        js_free_rt(rt, ctf2);
+        tramp_frame_free(rt, ctf2);
         if (gen_unwind_seq_kind != CONT_NONE) {
             void *asq = gen_unwind_seq_req; uint8_t ask = gen_unwind_seq_kind;
             gen_unwind_seq_req = NULL; gen_unwind_seq_kind = CONT_NONE;
@@ -39900,7 +39925,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         argc = rtf->caller_argc; argv = rtf->caller_argv;
         arg_allocated_size = rtf->caller_arg_allocated_size;
         pc = sf->cur_pc; sp = rtf->caller_sp;
-        js_free_rt(rt, rtf);
+        tramp_frame_free(rt, rtf);
     step_unwind_redispatch:
         /* THE requester dispatch, entered a second time when a step machine's own chain ended in a requester only
            one of these arms can answer for. The frame is already popped; every arm below reads only xcs/xck and
@@ -41331,7 +41356,11 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
         /* live end: the deepest (i==0) is running -> cur_sp; a mid-call frame -> the sp it called its callee at */
         JSValue *live_end = (i == 0) ? osf->cur_sp : oa[i - 1]->caller_sp;
 
-        TrampFrame *ct = js_malloc(ctx, sizeof(TrampFrame));
+        /* THROUGH THE ONE CONSTRUCTOR, like every other frame. This was a bare js_malloc of the struct — the
+           second allocator the heap call stack was not supposed to have — while the frames it produced were
+           freed by tramp_frame_free with all the others, so the census went NEGATIVE on the first cloned chain
+           and said so at its own DCHECK. A fork BUILDS a chain exactly as a call does. */
+        TrampFrame *ct = tramp_frame_new(ctx->rt);
         if (!ct) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }   /* OOM: partial leak on the abort path */
         ca[i] = ct;
         *ct = *otf;   /* scalars + BORROWED values (cur_func/this_val/new_target stay borrowed); fix pointers below */
