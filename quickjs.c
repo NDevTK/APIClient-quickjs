@@ -19794,6 +19794,39 @@ int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, int cb_cap, JSVal
     return 0;
 }
 
+/* A [[Construct]] AS A REQUEST — the same sub-sequence over the CONSTRUCT operand shape. See quickjs-step.h.
+   The only difference from the call above is the buffer: [ctor, args...] with no receiver slot, because a
+   construct MAKES the receiver. That shape is the driver's, not this function's — do_step_step's
+   JS_STEP_CONSTRUCT arm reads cb[0] as the constructor and &cb[1] as the arguments — which is why the two
+   cannot share one helper with a flag. */
+int step_construct_run(JSContext *ctx, uint8_t *phase, JSValue *cb, int cb_cap, JSValueConst ctor,
+                       int argc, JSValueConst *argv, JSValue in, JSValue *pout,
+                       JSValue **out_cb, int *out_argc)
+{
+    int i;
+
+    DCHECK(cb_cap >= 1 + argc, "a host construct request has more arguments than its buffer has slots");
+
+    if (*phase == 0) {
+        JS_FreeValue(ctx, in);
+        cb[0] = js_dup(ctor);
+        for (i = 0; i < argc; i++)
+            cb[1 + i] = js_dup(argv[i]);
+        *out_cb = cb;
+        *out_argc = argc;
+        *phase = 1;
+        return JS_STEP_CONSTRUCT;
+    }
+    DCHECK(*phase == 1, "a host construct request resumed in a phase it never parked in");
+    *phase = 0;
+    for (i = 0; i < 1 + argc; i++) {
+        JS_FreeValue(ctx, cb[i]);
+        cb[i] = JS_UNDEFINED;
+    }
+    *pout = in;
+    return 0;
+}
+
 
 /* the same sub-sequence delivering 7.1.20 ToLength, which is ToIntegerOrInfinity CLAMPED to [0, 2**53-1]. A
    saturating ToInt64 cannot stand in for it — a negative index must become 0, not stay negative — so it gets its
@@ -28915,7 +28948,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tp_slot = 0;
                     goto do_toprim_tramp;
                 }
-                if (st == 4) {
+                if (st == JS_STEP_CONSTRUCT) {
                     /* CONSTRUCT: *out_cb is [ctor, args...]. A builtin whose spec step is a real Construct —
                        ArraySpeciesCreate / TypedArrayCreateFromConstructor — used to reach JS_CallConstructor from
                        C, which drives a bytecode constructor to completion. With JSConstruct's outer continuation

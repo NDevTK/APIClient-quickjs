@@ -330,6 +330,13 @@ JS_EXTERN JSValueConst JS_StepClosureData(const JSStepHdr *h, int i);
 #define JS_STEP_ABRUPT (-1)  /* it threw; the completion value is live in the context */
 #define JS_STEP_REQUEST  6   /* it parked on a sub-sequence's request and will be re-entered with the answer */
 #define JS_STEP_CALL     3   /* it parked on a CALL of the page's code (step_call_run); same re-entry contract */
+/* IT PARKED ON A [[Construct]] OF THE PAGE'S CODE (step_construct_run); same re-entry contract as a CALL.
+   The code existed and was spelled `4` at every site, which is a request nobody outside quickjs.c could name
+   and therefore one no HOST machine could make — and the first host algorithm that needs one is not exotic:
+   DOM §4.9's "create an element" step 5.1.4.1 CONSTRUCTS the page's custom element class, synchronously,
+   inside document.createElement. A number with no name is also how a driver's dispatch and a machine's return
+   drift apart, which is the same reason the stage labels are a declaration rather than an integer. */
+#define JS_STEP_CONSTRUCT 4
 /* "I HAVE MORE WORK; PREEMPT ME IF YOU WANT." The bytecode half of this is a loop back-edge asking the flow
    control whether to yield; a machine that walks a structure of the PAGE'S SIZE — a DOM subtree, a token list,
    a document to serialise, a parse — needs the same, because otherwise it runs to completion inside one opcode
@@ -383,6 +390,21 @@ JS_EXTERN int step_todouble_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JS
 JS_EXTERN int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, int cb_cap, JSValueConst func,
                             JSValueConst this_val, int argc, JSValueConst *argv, JSValue in, JSValue *pout,
                             JSValue **out_cb, int *out_argc);
+
+/* A [[Construct]] AS A REQUEST — step_call_run's sibling, and the operation a browser component needs to run a
+   page's CLASS. `document.createElement('x-app')` performs DOM §4.9 step 5.1.4.1's "constructing C with no
+   arguments" SYNCHRONOUSLY, and that constructor is the page's code with loops, awaits and DOM mutations in
+   it; JS_CallConstructor from C is the drive-to-completion the engine aborts on, and the class's own `super()`
+   would reach a C entry with no flow base under it.
+   Same contract as the call request in every respect but the buffer SHAPE, which is what the driver's
+   JS_STEP_CONSTRUCT arm reads: `cb` is 1 + argc slots, [ctor, args...] — there is no receiver, because a
+   construct makes one. NEW TARGET is the constructor itself, which is what every algorithm that states
+   "Construct(C)" means; a machine needing a distinct one sets `h->ctor_ntgt` (Reflect.construct's operand).
+     0 = *pout is the constructed object, JS_STEP_CONSTRUCT = the caller must return that step code, and a
+   throw ABANDONS the machine unless its definition declares that it catches an abrupt request result. */
+JS_EXTERN int step_construct_run(JSContext *ctx, uint8_t *phase, JSValue *cb, int cb_cap, JSValueConst ctor,
+                                 int argc, JSValueConst *argv, JSValue in, JSValue *pout,
+                                 JSValue **out_cb, int *out_argc);
 
 /* PASS THE BUFFER THROUGH THIS, and pass it the ARRAY. The capacity is then the array's own size rather than a
    number written beside it that a later argument can outgrow — which is exactly how a two-argument call into a
