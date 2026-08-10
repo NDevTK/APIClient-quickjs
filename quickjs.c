@@ -88689,16 +88689,16 @@ static JSValue JS_ThrowTypeErrorRevokedProxy(JSContext *ctx)
     return JS_ThrowTypeError(ctx, "revoked proxy");
 }
 
-/* PROXY [[Call]] — 10.5.12, as ONE machine, for the reason a Promise resolving function is one: step 3 is
+/* PROXY [[Call]] — 10.5.12, as ONE machine, for the reason a Promise resolving function is one: step 5 is
    `GetMethod(handler, "apply")`, which is the PAGE'S CODE. It is an ordinary [[Get]], so the handler may be an
    accessor-bearing object or ANOTHER PROXY with a `get` trap, and the operator site read it with JS_GetProperty
    from C — an activation with no flow base. `new Proxy(f, new Proxy({}, {get(){…}}))()` aborted at
    js_proxy_get's DFAIL, and a handler with a plain `get apply(){ for(;;){} }` accessor ran that loop off the
    tramp without even that much notice.
    As a machine the trap read is a request like any other, so every handler shape suspends. Two more things
-   follow from it rather than being arranged: the TRAPLESS forward (step 4) is a CALL request against the
+   follow from it rather than being arranged: the TRAPLESS forward (step 6) is a CALL request against the
    target, which the driver re-dispatches — so a proxy wrapping a proxy wrapping a function re-enters this
-   machine per hop and needs no walk of its own; and the trap CALL (step 6) is an ordinary dispatch, so a trap
+   machine per hop and needs no walk of its own; and the trap CALL (step 8) is an ordinary dispatch, so a trap
    that is a bound function, a C function, a step machine or another proxy is answered by the one convergence
    point instead of by a recognizer asking whether it had a bytecode body. */
 typedef struct JSProxyCall {
@@ -88710,6 +88710,18 @@ typedef struct JSProxyCall {
 
 static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab);
 
+/* THE TWO ARMS COMPLETE AT DIFFERENT STEPS, so they are different stages: a machine parked in the trapless
+   forward is inside step 6 and one parked in the trap call is inside step 8, and one stage for both would name
+   whichever of them was written down. [[Construct]]'s twin already had to split them, because its step 10 applies
+   to one arm and not the other. */
+#define PXCALL_STAGES(X) \
+    X(PXCALL_ENTRY,   "10.5.12 steps 1-4 (handler is O.[[ProxyHandler]] and is not null; target is O.[[ProxyTarget]])") \
+    X(PXCALL_GETTRAP, "10.5.12 step 5 (trap is GetMethod(handler, \"apply\"))") \
+    X(PXCALL_FORWARD, "10.5.12 step 6 (Call(target, thisArgument, argumentsList))") \
+    X(PXCALL_TRAP,    "10.5.12 step 8 (Call(trap, handler, <<target, thisArgument, argArray>>))")
+enum { PXCALL_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_proxy_call_steps[] = { PXCALL_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_proxy_call_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSProxyCall *s = st;
@@ -88717,7 +88729,7 @@ static int js_proxy_call_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     int i, n;
 
     DCHECK(pd != NULL, "the Proxy [[Call]] machine was entered on a callee that is not a Proxy");
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == PXCALL_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -88725,16 +88737,16 @@ static int js_proxy_call_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         /* A proxy whose target is not callable HAS no [[Call]] — the TypeError is the caller's and precedes
            every step, which is why it is asked before the handler read rather than after it. */
         if (!pd->is_func) { JS_ThrowTypeErrorNotAFunction(ctx); return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = PXCALL_GETTRAP;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == PXCALL_GETTRAP) {
         JSValue trap;
         int r = step_getprop_run(ctx, &s->hdr, pd->handler, JS_ATOM_apply, cb_result, &trap, out_cb, out_argc);
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
         if (JS_IsUndefined(trap) || JS_IsNull(trap)) {
-            /* step 4: Call(target, thisArgument, argumentsList). */
+            /* step 6: Call(target, thisArgument, argumentsList). */
             JS_FreeValue(ctx, trap);
+            s->hdr.stage = PXCALL_FORWARD;
             n = s->hdr.argc;
             s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(n + 2));
             if (unlikely(!s->cb)) return -1;
@@ -88745,7 +88757,7 @@ static int js_proxy_call_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             *out_cb = s->cb; *out_argc = n;
             return 3;   /* CALL */
         }
-        /* 7.3.11 GetMethod step 4: a present trap that is not callable is a TypeError HERE, before step 5's
+        /* 7.3.11 GetMethod step 4: a present trap that is not callable is a TypeError HERE, before step 7's
            CreateArrayFromList. */
         if (!JS_IsFunction(ctx, trap)) {
             JS_FreeValue(ctx, trap);
@@ -88763,23 +88775,26 @@ static int js_proxy_call_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             s->cb[2] = js_dup(pd->target);
             s->cb[3] = js_dup(s->hdr.this_val);
             s->cb[4] = arr;
+            s->hdr.stage = PXCALL_TRAP;
             *out_cb = s->cb; *out_argc = 3;
             return 3;   /* CALL: trap(target, thisArg, argArray) */
         }
     }
     /* [[Call]] has NO result invariant — unlike [[Get]] and [[Construct]], 10.5.12 returns the trap's value
-       unexamined — so this stage is the completion and nothing else. */
+       unexamined — so both arms complete here and nothing else happens. */
+    DCHECK(s->hdr.stage == PXCALL_FORWARD || s->hdr.stage == PXCALL_TRAP, "Proxy [[Call]]: unknown stage");
     s->result = cb_result;
     return 0;
 }
 
-/* PROXY [[Construct]] — 10.5.13, the [[Call]] machine's twin and for the identical reason: step 3 is
+/* PROXY [[Construct]] — 10.5.13, the [[Call]] machine's twin and for the identical reason: step 6 is
    `GetMethod(handler, "construct")`, the page's [[Get]]. `new (new Proxy(f, new Proxy({}, {get(){…}})))()`
    aborted at js_proxy_get's DFAIL from js_tramp_proxy_construct's C read.
-   Step 9's must-return-an-Object check is the one thing this owes that [[Call]] does not, and as a machine it is
-   simply the completion stage — which is what deletes CONT_PROXY_CONSTRUCT and the JSProxyCtor that carried an
-   outer sequence across it. The trapless arm (step 5) is a CONSTRUCT request against the target, so a proxy
-   wrapping a proxy re-enters this machine per hop; step 9 does not apply to it, because Construct already
+   Step 10's must-return-an-Object check is the one thing this owes that [[Call]] does not, and it RIDES the
+   trap's own stage: the check is on the trap's RESULT, so the stage the machine is parked in while the trap runs
+   is the stage that performs it — which is what deletes CONT_PROXY_CONSTRUCT and the JSProxyCtor that carried an
+   outer sequence across it. The trapless arm (step 7) is a CONSTRUCT request against the target, so a proxy
+   wrapping a proxy re-enters this machine per hop; step 10 does not apply to it, because Construct already
    guarantees an object, which is why the two arms complete at different stages. */
 typedef struct JSProxyConstruct {
     JSStepHdr hdr;      /* MUST be first; hdr.func_obj IS the proxy, hdr.this_val the NEW TARGET */
@@ -88788,8 +88803,15 @@ typedef struct JSProxyConstruct {
     int ncb;
 } JSProxyConstruct;
 
-/* the two completions, which differ only in whether step 9's check applies */
-enum { PXC_ST_TRAP = 2, PXC_ST_FORWARD = 3 };
+/* the two completions differ in whether step 10's check applies, which is why they are two stages rather than
+   one: they rest at different steps of the algorithm. */
+#define PXCTOR_STAGES(X) \
+    X(PXC_ST_ENTRY,   "10.5.13 steps 1-5 (handler is O.[[ProxyHandler]] and is not null; target is a constructor)") \
+    X(PXC_ST_GETTRAP, "10.5.13 step 6 (trap is GetMethod(handler, \"construct\"))") \
+    X(PXC_ST_TRAP,    "10.5.13 steps 9-10 (newObj is Call(trap, handler, <<target, argArray, newTarget>>), and newObj must be an Object)") \
+    X(PXC_ST_FORWARD, "10.5.13 step 7 (Construct(target, argumentsList, newTarget))")
+enum { PXCTOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_proxy_construct_steps[] = { PXCTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx);
 
@@ -88807,15 +88829,15 @@ static int js_proxy_construct_step(JSContext *ctx, void *st, JSValue cb_result, 
         if (pd->is_revoked) { JS_ThrowTypeErrorRevokedProxy(ctx); return -1; }
         /* a proxy whose target is not a constructor HAS no [[Construct]]: the TypeError precedes every step */
         if (!JS_IsConstructor(ctx, pd->target)) { JS_ThrowTypeErrorNotAConstructor(ctx, pd->target); return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = PXC_ST_GETTRAP;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == PXC_ST_GETTRAP) {
         JSValue trap;
         int r = step_getprop_run(ctx, &s->hdr, pd->handler, JS_ATOM_construct, cb_result, &trap, out_cb, out_argc);
         if (r) return r < 0 ? -1 : r;
         n = s->hdr.argc;
         if (JS_IsUndefined(trap) || JS_IsNull(trap)) {
-            /* step 5: Construct(target, argumentsList, newTarget). */
+            /* step 7: Construct(target, argumentsList, newTarget). */
             JS_FreeValue(ctx, trap);
             s->cb = js_malloc(ctx, sizeof(JSValue) * (size_t)(n + 1));
             if (unlikely(!s->cb)) return -1;
@@ -88827,7 +88849,7 @@ static int js_proxy_construct_step(JSContext *ctx, void *st, JSValue cb_result, 
             *out_cb = s->cb; *out_argc = n;
             return 4;   /* CONSTRUCT */
         }
-        if (!JS_IsFunction(ctx, trap)) {   /* 7.3.11 GetMethod step 4 */
+        if (!JS_IsFunction(ctx, trap)) {   /* 7.3.11 GetMethod step 4, before step 8's CreateArrayFromList */
             JS_FreeValue(ctx, trap);
             JS_ThrowTypeErrorNotAFunction(ctx);
             return -1;
@@ -88849,7 +88871,7 @@ static int js_proxy_construct_step(JSContext *ctx, void *st, JSValue cb_result, 
         }
     }
     if (s->hdr.stage == PXC_ST_TRAP && JS_VALUE_GET_TAG(cb_result) != JS_TAG_OBJECT) {
-        /* step 9. It applies to the TRAP's value only — the forward arm's Construct answers with an object by
+        /* step 10. It applies to the TRAP's value only — the forward arm's Construct answers with an object by
            construction, and running the check there would be asserting something the callee already owes. */
         JS_FreeValue(ctx, cb_result);
         JS_ThrowTypeErrorNotAnObject(ctx);
@@ -88880,11 +88902,13 @@ static JSValue js_proxy_construct_fini(JSContext *ctx, void *st, bool take_resul
 
 static const JSTrampStepDef js_proxy_construct_def = {
     sizeof(JSProxyConstruct), js_proxy_construct_step, js_proxy_construct_fini, 0,
-    .visit = js_proxy_construct_visit
+    .visit = js_proxy_construct_visit,
+    .algorithm = "10.5.13 [[Construct]] ( argumentsList, newTarget ) of a Proxy exotic object",
+    .steps = js_proxy_construct_steps
 };
 
 /* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Its result and its own request block, whose LENGTH depends on
-   which of the two shapes step 1 chose — which is why the count rides the state. */
+   which of the two shapes step 5's trap chose — which is why the count rides the state. */
 static void js_proxy_call_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSProxyCall *s = st;
@@ -88903,7 +88927,9 @@ static JSValue js_proxy_call_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 static const JSTrampStepDef js_proxy_call_def = {
-    sizeof(JSProxyCall), js_proxy_call_step, js_proxy_call_fini, 0, .visit = js_proxy_call_visit
+    sizeof(JSProxyCall), js_proxy_call_step, js_proxy_call_fini, 0, .visit = js_proxy_call_visit,
+    .algorithm = "10.5.12 [[Call]] ( thisArgument, argumentsList ) of a Proxy exotic object",
+    .steps = js_proxy_call_steps
 };
 
 static JSProxyData *get_proxy_method(JSContext *ctx, JSValue *pmethod,
