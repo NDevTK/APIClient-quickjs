@@ -20836,7 +20836,10 @@ typedef struct TrampFrame {
  * The destructor exists for the same reason tramp_step_state_free does: the frees were fourteen bare
  * `js_free_rt(rt, tf)` calls, so "was this chain unwound" was a question about fourteen sites. It is one now, and
  * the count is what answers it. */
-static int g_tramp_frames_live;   /* runtime-wide: one interpreter, one heap call stack */
+/* PER THREAD, like g_step_chain and for the same reason: the heap call stack IS the interpreter loop's stack,
+   and run-test262 runs its corpus on several threads at once. A process-wide counter is then one number for
+   several stacks — its DCHECK fires on a race rather than on a defect, which is exactly what it did. */
+static _Thread_local int g_tramp_frames_live;
 
 static TrampFrame *tramp_frame_new(JSRuntime *rt)
 {
