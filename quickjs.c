@@ -74023,7 +74023,10 @@ static const char *const js_json_str_steps[];
 static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0, .visit = js_json_str_visit,
                        .algorithm = "25.5.2 JSON.stringify",
                        .steps = js_json_str_steps };
-static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0, .visit = js_ta_slice_visit };
+static const char *const js_ta_slice_steps[];
+static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0, .visit = js_ta_slice_visit,
+        .algorithm = "23.2.3.27 %TypedArray%.prototype.slice",
+        .steps = js_ta_slice_steps };
 static const char *const js_str_concat_steps[];
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0, .visit = js_str_concat_visit,
                                                    .algorithm = "22.1.3.5 String.prototype.concat",
@@ -74058,9 +74061,18 @@ static const JSTrampStepDef js_ta_includes_def    = { sizeof(JSTACoerce), js_ta_
 static const JSTrampStepDef js_ta_subarray_def    = { sizeof(JSTASubarray), js_ta_subarray_step, js_ta_subarray_fini, 0, .visit = js_ta_subarray_visit,
                         .algorithm = "23.2.3.30 %TypedArray%.prototype.subarray",
                         .steps = js_ta_subarray_steps };
-static const JSTrampStepDef js_ab_ctor_def       = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_ARRAY_BUFFER, .visit = js_ab_ctor_visit };
-static const JSTrampStepDef js_sab_ctor_def      = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_SHARED_ARRAY_BUFFER, .visit = js_ab_ctor_visit };
-static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_dataview_ctor_step, js_dataview_ctor_fini, 0, .visit = js_dataview_ctor_visit };
+static const char *const js_ab_ctor_steps[];
+static const JSTrampStepDef js_ab_ctor_def       = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_ARRAY_BUFFER, .visit = js_ab_ctor_visit,
+        .algorithm = "25.1.4.1 ArrayBuffer ( length [ , options ] )",
+        .steps = js_ab_ctor_steps };
+static const char *const js_sab_ctor_steps[];
+static const JSTrampStepDef js_sab_ctor_def      = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_SHARED_ARRAY_BUFFER, .visit = js_ab_ctor_visit,
+        .algorithm = "25.2.3.1 SharedArrayBuffer ( length [ , options ] )",
+        .steps = js_sab_ctor_steps };
+static const char *const js_dataview_ctor_steps[];
+static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_dataview_ctor_step, js_dataview_ctor_fini, 0, .visit = js_dataview_ctor_visit,
+        .algorithm = "25.3.2.1 DataView ( buffer [ , byteOffset [ , byteLength ] ] )",
+        .steps = js_dataview_ctor_steps };
 static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit,
                        .algorithm = "25.1.6.7 ArrayBuffer.prototype.slice",
                        .steps = js_ab_slice_steps };
@@ -74474,8 +74486,14 @@ static const JSTrampStepDef js_str_html_defs[STRRECV_HTML_COUNT] = {
              .algorithm = "B.2.3.14 String.prototype.sup", .steps = js_str_sup_steps },
 };
 #undef STR_HTML_DEF
-static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT, .visit = js_ta_idx_visit };
-static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET, .visit = js_ta_idx_visit };
+static const char *const js_ta_at_steps[];
+static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT, .visit = js_ta_idx_visit,
+        .algorithm = "23.2.3.1 %TypedArray%.prototype.at",
+        .steps = js_ta_at_steps };
+static const char *const js_ta_set_steps[];
+static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_SET, .visit = js_ta_idx_visit,
+        .algorithm = "23.2.3.26 %TypedArray%.prototype.set",
+        .steps = js_ta_set_steps };
 /* Declared where the machine is; the definition names it here. */
 static const char *const js_json_raw_steps[];
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0, .visit = js_json_raw_visit,
@@ -98260,6 +98278,33 @@ JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len)
                                         true);
 }
 
+/* TWO constructors, one machine. GetArrayBufferMaxByteLengthOption is named rather than numbered because it is
+   the operation the two steps belong to; its Get and its ToIndex are the page's code and each is a stage. ONE
+   stage list expanded once per algorithm; see AFIND_STAGES. */
+#define ABCTOR_STAGES(X, NEWTGT, LEN, OPT, OPTLEN, ALLOC) \
+    X(ABCTOR_NEWTGT, NEWTGT) \
+    X(ABCTOR_LEN,    LEN)    \
+    X(ABCTOR_OPT,    OPT)    \
+    X(ABCTOR_OPTLEN, OPTLEN) \
+    X(ABCTOR_ALLOC,  ALLOC)
+enum { ABCTOR_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0) };
+static const char *const js_ab_ctor_steps[] = {
+    ABCTOR_STAGES(JS_STEP_STAGE_LABEL,
+        "25.1.4.1 step 1 (NewTarget is not undefined)",
+        "25.1.4.1 step 2 (byteLength is ToIndex(length))",
+        "25.1.4.1 step 3 via GetArrayBufferMaxByteLengthOption step 2 (Get(options, \"maxByteLength\"))",
+        "25.1.4.1 step 3 via GetArrayBufferMaxByteLengthOption step 4 (ToIndex(maxByteLength))",
+        "25.1.4.1 step 4 (AllocateArrayBuffer's OrdinaryCreateFromConstructor)")
+    NULL };
+static const char *const js_sab_ctor_steps[] = {
+    ABCTOR_STAGES(JS_STEP_STAGE_LABEL,
+        "25.2.3.1 step 1 (NewTarget is not undefined)",
+        "25.2.3.1 step 2 (byteLength is ToIndex(length))",
+        "25.2.3.1 step 3 via GetArrayBufferMaxByteLengthOption step 2 (Get(options, \"maxByteLength\"))",
+        "25.2.3.1 step 3 via GetArrayBufferMaxByteLengthOption step 4 (ToIndex(maxByteLength))",
+        "25.2.3.1 step 4 (AllocateSharedArrayBuffer's OrdinaryCreateFromConstructor)")
+    NULL };
+
 static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSABCtor *s = st;
@@ -98268,7 +98313,7 @@ static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     int64_t i;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ABCTOR_NEWTGT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED; s->prim = JS_UNDEFINED;
@@ -98276,9 +98321,9 @@ static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         /* step 1: a plain call reaches the machine with new_target UNDEFINED */
         if (JS_IsUndefined(s->hdr.this_val))
             return JS_ThrowTypeError(ctx, "must be called with new"), -1;
-        s->hdr.stage = 1;
+        s->hdr.stage = ABCTOR_LEN;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == ABCTOR_LEN) {
         /* step 2's ToIndex(length) */
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 0), HINT_NUMBER, cb_result, &s->prim,
                             out_cb, out_argc);
@@ -98286,18 +98331,18 @@ static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         if (r) return r < 0 ? -1 : r;
         if (JS_ToIndex(ctx, &s->len, s->prim)) return -1;   /* a primitive: this invokes nothing */
         /* GetArrayBufferMaxByteLengthOption step 1: a non-object options bag has no read at all */
-        s->hdr.stage = (s->hdr.argc > 1 && JS_IsObject(step_arg(&s->hdr, 1))) ? 2 : 4;
+        s->hdr.stage = (s->hdr.argc > 1 && JS_IsObject(step_arg(&s->hdr, 1))) ? ABCTOR_OPT : ABCTOR_ALLOC;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == ABCTOR_OPT) {
         JS_FreeValue(ctx, s->prim); s->prim = JS_UNDEFINED;
         r = step_getprop_run(ctx, &s->hdr, step_arg(&s->hdr, 1), JS_ATOM_maxByteLength, cb_result, &s->prim,
                              out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         /* step 3: an absent option leaves the buffer fixed-length */
-        s->hdr.stage = JS_IsUndefined(s->prim) ? 4 : 3;
+        s->hdr.stage = JS_IsUndefined(s->prim) ? ABCTOR_ALLOC : ABCTOR_OPTLEN;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == ABCTOR_OPTLEN) {
         JSValue v = s->prim;
         s->prim = JS_UNDEFINED;
         r = step_toprim_run(ctx, &s->hdr, v, HINT_NUMBER, cb_result, &s->prim, out_cb, out_argc);
@@ -98311,9 +98356,9 @@ static int js_ab_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             return JS_ThrowRangeError(ctx, "invalid array buffer max length"), -1;
         s->max_len = i;
         s->has_max = 1;
-        s->hdr.stage = 4;
+        s->hdr.stage = ABCTOR_ALLOC;
     }
-    DCHECK(s->hdr.stage == 4, "the ArrayBuffer constructor reached an unknown stage");
+    DCHECK(s->hdr.stage == ABCTOR_ALLOC, "the ArrayBuffer constructor reached an unknown stage");
     r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, class_id, cb_result, &obj, out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
     s->result = js_array_buffer_init(ctx, obj, s->len, s->has_max ? &s->max_len : NULL, class_id,
@@ -99760,6 +99805,18 @@ static bool ta_slice_toprim(JSTASlice *s, int i, JSValue **out_cb, int *out_argc
     return true;
 }
 
+/* 7.3.22 SpeciesConstructor's two reads share ONE stage here because step_speciesctor_run carries its own
+   cursor across them — the sub-sequence pattern JSStepHdr's len_phase names — and the CONSTRUCT is the stage
+   after it. */
+#define TASLICE_STAGES(X) \
+    X(TASLICE_VALIDATE, "23.2.3.27 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); srcArrayLength)") \
+    X(TASLICE_START,    "23.2.3.27 steps 4-7 (relativeStart is ToIntegerOrInfinity(start); k)") \
+    X(TASLICE_END,      "23.2.3.27 steps 8-12 (relativeEnd is ToIntegerOrInfinity(end); final; count)") \
+    X(TASLICE_SPECIES,  "23.2.3.27 step 13 via 7.3.22 (C is Get(O, \"constructor\"), then S is Get(C, @@species))") \
+    X(TASLICE_CREATE,   "23.2.3.27 steps 13-14 (A is Construct(ctor, <<count>>); the elements are copied)")
+enum { TASLICE_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_ta_slice_steps[] = { TASLICE_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSTASlice *s = st;
@@ -99768,7 +99825,7 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     JSValue val;
 
     switch (s->hdr.stage) {
-    case 0:   /* ValidateTypedArray + capture the pre-coercion length, then coerce `start` */
+    case TASLICE_VALIDATE:   /* ValidateTypedArray + capture the pre-coercion length, then coerce `start` */
         JS_FreeValue(ctx, cb_result);
         p = get_typed_array(ctx, s->hdr.this_val);
         if (!p) return -1;
@@ -99778,16 +99835,16 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         s->src = js_dup(s->hdr.this_val);
         s->arr = JS_UNDEFINED;
         s->cb_args[0] = JS_UNDEFINED;
-        s->hdr.stage = 1;
+        s->hdr.stage = TASLICE_START;
         if (ta_slice_toprim(s, 0, out_cb, out_argc)) return 5;
         cb_result = js_dup(step_arg(&s->hdr, 0));
         /* fall through */
-    case 1:   /* cb_result is `start` as a primitive */
+    case TASLICE_START:   /* cb_result is `start` as a primitive */
         { int r = JS_ToInt32Clamp(ctx, &s->start, cb_result, 0, s->len, s->len);
           JS_FreeValue(ctx, cb_result);
           if (r) return -1; }
         s->final = s->len;
-        s->hdr.stage = 2;
+        s->hdr.stage = TASLICE_END;
         if (s->hdr.argc > 1 && !JS_IsUndefined(s->hdr.argv[1])) {
             if (ta_slice_toprim(s, 1, out_cb, out_argc)) return 5;
             cb_result = js_dup(s->hdr.argv[1]);
@@ -99795,18 +99852,18 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             cb_result = JS_UNINITIALIZED;   /* absent end: `final` stays at the length */
         }
         /* fall through */
-    case 2:   /* cb_result is `end` as a primitive, or UNINITIALIZED when there was none */
+    case TASLICE_END:   /* cb_result is `end` as a primitive, or UNINITIALIZED when there was none */
         if (JS_VALUE_GET_TAG(cb_result) != JS_TAG_UNINITIALIZED) {
             int r = JS_ToInt32Clamp(ctx, &s->final, cb_result, 0, s->len, s->len);
             JS_FreeValue(ctx, cb_result);
             if (r) return -1;
         }
-        s->hdr.stage = 3;
+        s->hdr.stage = TASLICE_SPECIES;
         s->count = max_int(s->final - s->start, 0);
         s->cb_args[1] = js_int32(s->count);
         cb_result = JS_UNDEFINED;
         /* fall through */
-    case 3:
+    case TASLICE_SPECIES:
         /* SpeciesConstructor reads .constructor and @@species IN THIS ORDER, after the indices and before the
            length is computed into the argument — keep the observable reads where the spec puts them. BOTH are the
            page's [[Get]]s, so they are requests: JS_SpeciesConstructor ran them from C, and a getter with a loop
@@ -99815,7 +99872,7 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
           int r = step_speciesctor_run(ctx, &s->hdr, s->hdr.this_val, JS_UNDEFINED, cb_result, &ctor,
                                        out_cb, out_argc);
           if (r) return r < 0 ? -1 : r;
-          s->hdr.stage = 4;
+          s->hdr.stage = TASLICE_CREATE;
           if (JS_IsUndefined(ctor)) {
               /* no species: the default constructor for this element type, which is C — nothing to suspend, so
                  it is created here and the machine goes straight to the copy. */
@@ -99830,6 +99887,7 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         break;
     }
 
+    DCHECK(s->hdr.stage == TASLICE_CREATE, "%TypedArray%.prototype.slice resumed in no stage");
     if (!s->created) {
         if (!s->asked) {
             /* The FIRST entry carries JS_UNDEFINED, not UNINITIALIZED — do_step_tramp seeds the driver with
@@ -99903,6 +99961,35 @@ static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* TWO algorithms, one machine, and their stage sets DIVERGE after the shared prefix: `at` has one stage left
+   after the index and `set` has five, so each names its own tail rather than one list carrying labels the other
+   algorithm has no step for. The SET tail's constants continue from the shared prefix, which is what keeps the
+   two spellings' shared stages the same numbers. */
+#define TAIDX_STAGES(X, VALIDATE, INDEX, TAIL) \
+    X(TAIDX_VALIDATE, VALIDATE) \
+    X(TAIDX_INDEX,    INDEX)    \
+    TAIL(X)
+#define TAIDX_TAIL_AT(X) \
+    X(TAIDX_READ, "23.2.3.1 steps 5-8 (k is relativeIndex or len + relativeIndex; Get(O, ToString(k)))")
+#define TAIDX_TAIL_SET(X) \
+    X(TAIDX_SRC,   "23.2.3.26 steps 5-6 (source is ToObject(source); a typed-array source is set whole)") \
+    X(TAIDX_LEN,   "23.2.3.26.1 step 3 (srcLength is LengthOfArrayLike(src))") \
+    X(TAIDX_NEXT,  "23.2.3.26.1 step 6 (the next index k of the source)") \
+    X(TAIDX_VALUE, "23.2.3.26.1 step 6.c via 10.4.5.16 step 1 (value is ToBigInt or ToNumber)") \
+    X(TAIDX_GET,   "23.2.3.26.1 step 6.b (value is Get(src, Pk))")
+enum { TAIDX_STAGES(JS_STEP_STAGE_ENUM, 0, 0, TAIDX_TAIL_AT) };
+enum { TAIDX_SET_TAIL_BASE = TAIDX_INDEX, TAIDX_TAIL_SET(JS_STEP_STAGE_ENUM) };
+static const char *const js_ta_at_steps[] = {
+    TAIDX_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.1 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))",
+        "23.2.3.1 step 4 (relativeIndex is ToIntegerOrInfinity(index))", TAIDX_TAIL_AT)
+    NULL };
+static const char *const js_ta_set_steps[] = {
+    TAIDX_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.26 steps 1-2 (target has [[TypedArrayName]]; its buffer is mutable)",
+        "23.2.3.26 step 3 (targetOffset is ToIntegerOrInfinity(offset))", TAIDX_TAIL_SET)
+    NULL };
+
 static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSTAIdx *s = st;
@@ -99910,7 +99997,7 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
     int64_t idx;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == TAIDX_VALIDATE) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
         s->src = JS_UNDEFINED; s->el = JS_UNDEFINED;
@@ -99923,30 +100010,32 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
             JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
             return -1;
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = TAIDX_INDEX;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == TAIDX_INDEX) {
         JSValueConst v = (s->hdr.arg == TAIDX_AT) ? step_arg(&s->hdr, 0) : step_arg(&s->hdr, 1);
         r = step_toint64_run(ctx, &s->hdr, v, cb_result, &s->idx, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        /* the two spellings' third stage is a different step of a different algorithm, which is why they
+           declare different tails; the constant is the one this mode's own list names. */
+        s->hdr.stage = (s->hdr.arg == TAIDX_AT) ? (uint16_t)TAIDX_READ : (uint16_t)TAIDX_SRC;
     }
     /* The two modes DIVERGE here, and `cb_result` is still live: set's stages 3 and 5 consume it. Freeing it
        once for both before the split handed those stages a value that had already been released — harmless only
        because the values that reach them happen to be numbers. Each mode owns the result it was resumed with. */
     if (s->hdr.arg == TAIDX_SET) {
         int64_t dst_len;
-        if (s->hdr.stage == 2) {
+        if (s->hdr.stage == TAIDX_SRC) {
             int h;
             s->src = JS_ToObject(ctx, step_arg(&s->hdr, 0));
             if (JS_IsException(s->src)) { s->src = JS_UNDEFINED; return -1; }
             h = js_typed_array_set_ta(ctx, s->hdr.this_val, s->src, s->idx, &s->len);
             if (h < 0) return -1;
             if (h) { s->result = JS_UNDEFINED; return 0; }   /* a typed-array source needs no steps at all */
-            s->hdr.stage = 3;
+            s->hdr.stage = TAIDX_LEN;
         }
-        if (s->hdr.stage == 3) {   /* LengthOfArrayLike on the source, re-entered until it finishes */
+        if (s->hdr.stage == TAIDX_LEN) {   /* LengthOfArrayLike on the source, re-entered until it finishes */
             int r2 = step_length_run(ctx, &s->hdr, s->src, cb_result, &s->src_len, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r2) return r2 < 0 ? -1 : r2;
@@ -99956,21 +100045,21 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
                 JS_ThrowRangeError(ctx, "invalid array length");
                 return -1;
             }
-            s->hdr.stage = 4;
+            s->hdr.stage = TAIDX_NEXT;
         }
         for (;;) {
-            if (s->hdr.stage == 6) {
+            if (s->hdr.stage == TAIDX_GET) {
                 /* 23.2.3.26.1 step 6.b's `? Get(src, Pk)`, re-entered until it finishes. The source is an
                    ARRAY-LIKE, so the read is an accessor or a Proxy `get` trap — the page's code, which
                    JS_GetPropertyUint32 ran from C with no flow base. */
                 int r3 = step_getidx_run(ctx, &s->hdr, s->src, s->i, cb_result, &s->el, out_cb, out_argc);
                 cb_result = JS_UNDEFINED;
                 if (r3) return r3 < 0 ? -1 : r3;
-                s->hdr.stage = 4;
+                s->hdr.stage = TAIDX_NEXT;
                 goto ta_have_element;
             }
-            if (s->hdr.stage == 5) {          /* the element's primitive arrived */
-                s->hdr.stage = 4;
+            if (s->hdr.stage == TAIDX_VALUE) {          /* the element's primitive arrived */
+                s->hdr.stage = TAIDX_NEXT;
                 JS_FreeValue(ctx, s->el);     /* the OBJECT the primitive came from; cb_coerce only borrowed it */
                 s->el = JS_UNDEFINED;
                 if (JS_SetPropertyUint32(ctx, s->hdr.this_val, s->idx + s->i, cb_result) < 0) return -1;
@@ -99981,10 +100070,10 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
             if (s->i >= s->src_len) { s->result = JS_UNDEFINED; return 0; }
             {
                 int r3;
-                s->hdr.stage = 6;
+                s->hdr.stage = TAIDX_GET;
                 r3 = step_getidx_run(ctx, &s->hdr, s->src, s->i, JS_UNDEFINED, &s->el, out_cb, out_argc);
                 if (r3) return r3 < 0 ? -1 : r3;
-                s->hdr.stage = 4;
+                s->hdr.stage = TAIDX_NEXT;
             }
         ta_have_element:
             /* TypedArraySetElement (10.4.5.16) is TWO steps and only the SECOND one is conditional: the value is
@@ -99996,7 +100085,7 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
                out-of-bounds index is not an error there -- which is exactly the spec's shape, so the guard is
                not needed for the store either. */
             if (JS_VALUE_GET_TAG(s->el) == JS_TAG_OBJECT) {
-                s->hdr.stage = 5;
+                s->hdr.stage = TAIDX_VALUE;
                 s->hdr.cb_coerce[0] = s->el;   /* borrowed: the state holds it */
                 *out_cb = s->hdr.cb_coerce; *out_argc = HINT_NUMBER;
                 return 5;
@@ -100013,6 +100102,7 @@ static int js_ta_idx_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
 
     JS_FreeValue(ctx, cb_result);
 
+    DCHECK(s->hdr.stage == TAIDX_READ, "%TypedArray%.prototype.at resumed in no stage");
     /* the coercion above can RESIZE or detach the backing buffer, so the bound is re-checked against the live
        count — the length captured before it only decides what a negative index counts back from. */
     p = get_typed_array(ctx, s->hdr.this_val);
@@ -100978,6 +101068,17 @@ static void js_typed_array_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/* Steps 4-7 sit BETWEEN the two coercions and run none of the page's code, which is why they share the stage
+   that rests at step 3. */
+#define DVCTOR_STAGES(X) \
+    X(DVCTOR_NEWTGT, "25.3.2.1 steps 1-2 (NewTarget is not undefined; buffer has [[ArrayBufferData]])") \
+    X(DVCTOR_OFFSET, "25.3.2.1 step 3 (offset is ToIndex(byteOffset))") \
+    X(DVCTOR_BOUNDS, "25.3.2.1 steps 4-7 (buffer is not detached; offset is within bufferByteLength)") \
+    X(DVCTOR_LEN,    "25.3.2.1 step 9.a (viewByteLength is ToIndex(byteLength))") \
+    X(DVCTOR_CREATE, "25.3.2.1 step 10 (O is OrdinaryCreateFromConstructor(NewTarget, \"%DataView.prototype%\"))")
+enum { DVCTOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_dataview_ctor_steps[] = { DVCTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDataViewCtor *s = st;
@@ -100987,7 +101088,7 @@ static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JS
     JSObject *p;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DVCTOR_NEWTGT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED; s->prim = JS_UNDEFINED;
@@ -100998,18 +101099,18 @@ static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JS
             return JS_ThrowTypeError(ctx, "must be called with new"), -1;
         /* step 2: the receiver must be an ArrayBuffer before any argument is touched */
         if (!js_get_array_buffer(ctx, buffer)) return -1;
-        s->hdr.stage = (s->hdr.argc > 1) ? 1 : 2;
+        s->hdr.stage = (s->hdr.argc > 1) ? DVCTOR_OFFSET : DVCTOR_BOUNDS;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == DVCTOR_OFFSET) {
         /* step 3's ToIndex(byteOffset) */
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 1), HINT_NUMBER, cb_result, &s->prim,
                             out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         if (JS_ToIndex(ctx, &s->offset, s->prim)) return -1;   /* a primitive: this invokes nothing */
-        s->hdr.stage = 2;
+        s->hdr.stage = DVCTOR_BOUNDS;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == DVCTOR_BOUNDS) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* steps 4-6 sit BETWEEN the two coercions, so a detached or too-short buffer is rejected before
            byteLength's valueOf ever runs */
@@ -101019,14 +101120,14 @@ static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JS
         if (s->offset > abuf->byte_length) { JS_ThrowRangeError(ctx, "invalid byteOffset"); return -1; }
         s->len = abuf->byte_length - s->offset;
         if (s->hdr.argc > 2 && !JS_IsUndefined(step_arg(&s->hdr, 2))) {
-            s->hdr.stage = 3;
+            s->hdr.stage = DVCTOR_LEN;
         } else {
             s->recompute_len = 1;
             s->track_rab = array_buffer_is_resizable(abuf);
-            s->hdr.stage = 4;
+            s->hdr.stage = DVCTOR_CREATE;
         }
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == DVCTOR_LEN) {
         /* step 8's ToIndex(byteLength) */
         uint64_t l;
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 2), HINT_NUMBER, cb_result, &s->prim,
@@ -101036,9 +101137,9 @@ static int js_dataview_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JS
         if (JS_ToIndex(ctx, &l, s->prim)) return -1;           /* a primitive: this invokes nothing */
         if (l > s->len) { JS_ThrowRangeError(ctx, "invalid byteLength"); return -1; }
         s->len = l;
-        s->hdr.stage = 4;
+        s->hdr.stage = DVCTOR_CREATE;
     }
-    DCHECK(s->hdr.stage == 4, "the DataView constructor reached an unknown stage");
+    DCHECK(s->hdr.stage == DVCTOR_CREATE, "the DataView constructor reached an unknown stage");
     r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, JS_CLASS_DATAVIEW, cb_result, &s->result,
                                   out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
