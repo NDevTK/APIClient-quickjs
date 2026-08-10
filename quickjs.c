@@ -96636,7 +96636,20 @@ typedef struct JSWrappedCall {
     JSValue retval;     /* the target's result, held across the wrap of it (owned) */
     JSWrapSeq w;
 } JSWrappedCall;
-enum { WC_ST_WRAP = 1, WC_ST_CALLED, WC_ST_RETWRAP };
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). ShadowRealm is not
+   in the published edition - every other number in this file is ES2025 - so each of these four algorithms is
+   NAMED and its steps are the proposal's own, exactly as the ArrayBuffer-base64 machines are (B64OP_STAGES). */
+#define WCALL_STAGES(X) \
+    X(WC_ST_ENTRY,   "proposal-shadowrealm 3.2.6 [[Call]] of a wrapped function, entered: the request buffer " \
+                     "is built and holds the target") \
+    X(WC_ST_WRAP,    "proposal-shadowrealm 3.2.6 [[Call]] steps 4-7 (targetRealm is GetFunctionRealm(target); " \
+                     "GetWrappedValue of every argument, then of thisArgument, in that order)") \
+    X(WC_ST_CALLED,  "proposal-shadowrealm 3.2.6 [[Call]] step 8 (Call(target, wrappedThisArgument, " \
+                     "wrappedArgs); its abrupt completion becomes step 10's TypeError)") \
+    X(WC_ST_RETWRAP, "proposal-shadowrealm 3.2.6 [[Call]] step 9 (GetWrappedValue of the result, back into the " \
+                     "caller's realm)")
+enum { WCALL_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_wrapped_function_call_steps[] = { WCALL_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 /* step 10: an abrupt completion of the target's call is a TypeError, whatever it threw. */
 static int js_wrapped_call_abrupt(JSContext *ctx, JSContext *err_realm)
@@ -96659,7 +96672,7 @@ static int js_wrapped_function_call_step(JSContext *ctx, void *st, JSValue cb_re
     DCHECK(fp->class_id == JS_CLASS_WRAPPED_FUNCTION && wd != NULL,
            "the wrapped-function [[Call]] machine was entered on a callee that is not one");
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == WC_ST_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -96745,7 +96758,9 @@ static const JSTrampStepDef js_wrapped_function_call_def = {
     sizeof(JSWrappedCall), js_wrapped_function_call_step, js_wrapped_function_call_fini, 0,
     /* every request this machine makes has an abrupt completion the ALGORITHM converts — step 8's call and
        WrappedFunctionCreate's three reads all become a TypeError — so the throw comes back as a value. */
-    .catches_abrupt = 1, .visit = js_wrapped_function_call_visit
+    .catches_abrupt = 1, .visit = js_wrapped_function_call_visit,
+    .algorithm = "[[Call]] of a wrapped function (proposal-shadowrealm 3.2.6)",
+    .steps = js_wrapped_function_call_steps
 };
 
 /* 3.1.1 step 1: `ShadowRealm()` without new is a TypeError, before anything is created. */
@@ -96814,7 +96829,18 @@ typedef struct JSShadowEval {
     JSValue retval;     /* the program's completion value, held across the wrap of it (owned) */
     JSWrapSeq w;
 } JSShadowEval;
-enum { SE_ST_RAN = 1, SE_ST_WRAP };
+/* ONE list expanded twice; not in the published edition, so named rather than numbered - see WCALL_STAGES. */
+#define SEVAL_STAGES(X) \
+    X(SE_ST_ENTRY, "proposal-shadowrealm 3.3.1 ShadowRealm.prototype.evaluate steps 1-4 (the receiver has a " \
+                   "[[ShadowRealm]]; sourceText must be a String) - and the dispatch of 3.2.1 " \
+                   "PerformShadowRealmEval's compile") \
+    X(SE_ST_RAN,   "proposal-shadowrealm 3.2.1 PerformShadowRealmEval steps 7-17 (the program is compiled in " \
+                   "the eval realm and CALLED there; a parse failure is step 8's SyntaxError of the CALLER's " \
+                   "realm and any other abrupt completion is step 17's TypeError)") \
+    X(SE_ST_WRAP,  "proposal-shadowrealm 3.2.1 PerformShadowRealmEval step 18 (GetWrappedValue of the " \
+                   "completion value, into the caller's realm)")
+enum { SEVAL_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_shadow_realm_evaluate_steps[] = { SEVAL_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_shadow_realm_evaluate_step(JSContext *ctx, void *st, JSValue cb_result,
                                          JSValue **out_cb, int *out_argc)
@@ -96827,7 +96853,7 @@ static int js_shadow_realm_evaluate_step(JSContext *ctx, void *st, JSValue cb_re
     if (!sd)
         return -1;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == SE_ST_ENTRY) {
         JSValueConst src = step_arg(&s->hdr, 0);
         int pr;
 
@@ -96916,7 +96942,9 @@ static JSValue js_shadow_realm_evaluate_fini(JSContext *ctx, void *st, bool take
 static const JSTrampStepDef js_shadow_realm_evaluate_def = {
     sizeof(JSShadowEval), js_shadow_realm_evaluate_step, js_shadow_realm_evaluate_fini, 0,
     /* steps 17 and 18 both convert an abrupt completion, so a throw comes back to the machine as a value. */
-    .catches_abrupt = 1, .visit = js_shadow_realm_evaluate_visit
+    .catches_abrupt = 1, .visit = js_shadow_realm_evaluate_visit,
+    .algorithm = "3.3.1 ShadowRealm.prototype.evaluate (proposal-shadowrealm)",
+    .steps = js_shadow_realm_evaluate_steps
 };
 
 /* 3.2.2's ExportGetter, as its own step machine. It is a promise reaction, so it is a closure
@@ -96930,7 +96958,17 @@ typedef struct JSExportGetter {
     JSAtom name;        /* [[ExportNameString]] as a key, held across both reads (owned) */
     JSWrapSeq w;
 } JSExportGetter;
-enum { EG_ST_HAS = 1, EG_ST_GET, EG_ST_WRAP };
+/* ONE list expanded twice; not in the published edition, so named rather than numbered - see WCALL_STAGES. */
+#define EXPGET_STAGES(X) \
+    X(EG_ST_ENTRY, "proposal-shadowrealm 3.2.2's ExportGetter, entered: [[ExportNameString]] becomes the key " \
+                   "both reads use") \
+    X(EG_ST_HAS,   "proposal-shadowrealm 3.2.2's ExportGetter steps 4-5 (HasProperty(exports, string); a " \
+                   "missing export is a TypeError of the realm this closure was created in)") \
+    X(EG_ST_GET,   "proposal-shadowrealm 3.2.2's ExportGetter step 6 (value is Get(exports, string))") \
+    X(EG_ST_WRAP,  "proposal-shadowrealm 3.2.2's ExportGetter step 8 (GetWrappedValue of it, into the realm " \
+                   "this closure was created in)")
+enum { EXPGET_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_export_getter_steps[] = { EXPGET_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_export_getter_step(JSContext *ctx, void *st, JSValue cb_result,
                                  JSValue **out_cb, int *out_argc)
@@ -96944,7 +96982,7 @@ static int js_export_getter_step(JSContext *ctx, void *st, JSValue cb_result,
 
     DCHECK(cr != NULL && cr->data_len == 1, "the ExportGetter closure lost its [[ExportNameString]]");
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == EG_ST_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -97007,7 +97045,8 @@ static JSValue js_export_getter_fini(JSContext *ctx, void *st, bool take_result)
 
 static const JSTrampStepDef js_export_getter_def = {
     sizeof(JSExportGetter), js_export_getter_step, js_export_getter_fini, 0,
-    .visit = js_export_getter_visit
+    .visit = js_export_getter_visit,
+    .algorithm = "3.2.2's ExportGetter (proposal-shadowrealm)", .steps = js_export_getter_steps
 };
 
 /* The C body of the ExportGetter closure. It is NOT a second implementation: a closure's step_def is
@@ -97025,6 +97064,16 @@ static JSValue js_export_getter_body(JSContext *ctx, JSValueConst this_val, int 
 
 /* 3.3.2 ShadowRealm.prototype.importValue + 3.2.2 ShadowRealmImportValue. The specifier's ToString is the
    page's code, so it is a request; everything after it is promise plumbing plus the ExportGetter above. */
+/* ONE list expanded twice; not in the published edition, so named rather than numbered - see WCALL_STAGES. */
+#define SIMPORT_STAGES(X) \
+    X(SI_ST_ENTRY, "proposal-shadowrealm 3.3.2 ShadowRealm.prototype.importValue steps 1-3 (the receiver has " \
+                   "a [[ShadowRealm]]) - and the dispatch of step 3's ToString(specifier)") \
+    X(SI_ST_SPEC,  "proposal-shadowrealm 3.3.2 ShadowRealm.prototype.importValue steps 3-5 (specifierString " \
+                   "arrives; exportName must be a String) - and 3.2.2 ShadowRealmImportValue steps 1-9, whose " \
+                   "load is a JOB on the eval realm and whose PerformPromiseThen runs no page code")
+enum { SIMPORT_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_shadow_realm_importvalue_steps[] = { SIMPORT_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 typedef struct JSShadowImport {
     JSStepHdr hdr;      /* MUST be first — argv[0] = specifier, argv[1] = exportName */
     JSValue result;     /* the outer capability's promise (owned) */
@@ -97047,19 +97096,19 @@ static int js_shadow_realm_importvalue_step(JSContext *ctx, void *st, JSValue cb
     if (!sd)
         return -1;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == SI_ST_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
         s->spec = JS_UNDEFINED;
-        s->hdr.stage = 1;
+        s->hdr.stage = SI_ST_SPEC;
         /* step 3: ToString(specifier) — a `toString` method is the page's code. */
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), JS_UNDEFINED, &s->spec,
                               out_cb, out_argc);
         if (r)
             return r < 0 ? -1 : r;
     } else {
-        DCHECK(s->hdr.stage == 1, "ShadowRealm.prototype.importValue resumed in no stage");
+        DCHECK(s->hdr.stage == SI_ST_SPEC, "ShadowRealm.prototype.importValue resumed in no stage");
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->spec, out_cb, out_argc);
         if (r)
             return r < 0 ? -1 : r;
@@ -97142,7 +97191,9 @@ static JSValue js_shadow_realm_importvalue_fini(JSContext *ctx, void *st, bool t
 
 static const JSTrampStepDef js_shadow_realm_importvalue_def = {
     sizeof(JSShadowImport), js_shadow_realm_importvalue_step, js_shadow_realm_importvalue_fini, 0,
-    .visit = js_shadow_realm_importvalue_visit
+    .visit = js_shadow_realm_importvalue_visit,
+    .algorithm = "3.3.2 ShadowRealm.prototype.importValue (proposal-shadowrealm)",
+    .steps = js_shadow_realm_importvalue_steps
 };
 
 static const JSCFunctionListEntry js_shadow_realm_proto_funcs[] = {
