@@ -289,6 +289,20 @@ typedef struct JSStepHdr {
        way a property write does. The DONE path otherwise always leaves exactly one value on the operand stack, and
        an opcode's COMPILED stack has no slot for it (unlike a call site, whose callee slot is the result slot). */
     uint8_t discard_result;
+    /* AN OUTCOME FORK — see step_fork_run. `fork_over` and `fork_op` are the request's operands and are
+       BORROWED, exactly as desc_get/desc_set are: the machine holds the operand (it is one of its own
+       arguments or a value on its state) and the driver READS AND RESETS them before it does anything else,
+       so a request cannot leak into the next one and a SNAPSHOT taken at the fork carries neither.
+       `fork_arm` is the answer and `fork_phase` says whether one is outstanding — 0 is "ask", and it is 0 in
+       the sibling's snapshot ON PURPOSE: the sibling re-enters at the same point, ASKS AGAIN, and its own
+       decision vector replays the arm it was forked for. That is what makes a parked and resumed sibling take
+       the same arm in the next session as in this one; an arm baked into the clone would be a second, weaker
+       answer to a question the vector already answers. */
+    JSValueConst fork_over;
+    const char  *fork_op;
+    int          fork_n;
+    int          fork_arm;
+    uint8_t      fork_phase;
     /* the key a GETPROP sub-sequence is holding across its suspension. It is OWNED here because the driver
        BORROWS the atom the request carries, and released by the shared teardown so an abandon mid-read cannot
        leak it. JS_ATOM_NULL is zero, so a js_mallocz'd state already reads as "no read in flight". */
@@ -325,6 +339,9 @@ JS_EXTERN JSValueConst JS_StepClosureData(const JSStepHdr *h, int i);
    is re-entered immediately, which costs one predicted call per iteration. That is cheap enough to ask at every
    step of a walk, which is where it belongs. */
 #define JS_STEP_YIELD   22
+/* "MY COMPLETION IS ONE OF N FEASIBLE OUTCOMES — FORK HERE." Returned by step_fork_run; the driver decides the
+   arm and snapshots the flow for the others. Never returned by a machine directly — see step_fork_run. */
+#define JS_STEP_FORK    23
 
 /* The machine's own arguments, borrowed. Out-of-range reads undefined, which is what the IDL's optional
    arguments mean at this level. */
@@ -464,6 +481,29 @@ JS_EXTERN int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, J
    Returns 12 (the caller returns it), 0 once *pout is set, or -1. */
 JS_EXTERN int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
                                   JSValue *pout, JSValue **out_cb, int *out_argc);
+
+/* AN OUTCOME FORK AS A REQUEST — the primitive that lets a step machine fork, and the one operation for which
+   there was previously no answer but an abort.
+ *
+ * A bytecode branch forks because the interpreter has everything a fork needs at an OP_if: a condition, a pc
+ * to resume the sibling at, a frame to snapshot. A C builtin whose result DEPENDS ON UNKNOWN INPUT has the
+ * same decision and none of those things — `JSON.parse(text)` over unknown text completes with a value or with
+ * a SyntaxError, both feasible, and a builtin that picks one has DELETED the other arm, which is exactly the
+ * arm a `catch` reaches and a sink lives behind. So the machine declares the fork instead, and the driver
+ * snapshots the whole flow AT the machine (the machine's own state included, cloned through its `visit`) so
+ * the sibling RESUMES here with the other outcome. It is a snapshot, never a replay.
+ *
+ * `over` is the unknown operand the outcome depends on and `op` names the operation; together they are the
+ * constraint key, which the SOLVER builds — the engine states the question, never the policy. `n` is how many
+ * completions the machine declares feasible; which one means "threw" is a fact about the algorithm and stays
+ * the machine's own, with ONE rule on the numbering: OUTCOME 0 IS THE ONE A RUN WITH NO FORKING POLICY TAKES.
+ * A machine therefore numbers its ordinary completion first, because the @S candidate re-fire runs ONE
+ * concrete path and must not be diverted down an exceptional arm on its way to the sink.
+ *
+ * Returns JS_STEP_FORK (the caller returns it — the state must be complete-or-empty at that point, since the
+ * SIBLING'S SNAPSHOT IS TAKEN THERE), or 0 once *parm is this flow's outcome. Both a park and a cross-session
+ * resume land back on the ask, which re-derives the same arm from the flow's decision vector. */
+JS_EXTERN int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int *parm);
 
 /* ToString AS A REQUEST — the coercion nearly every Web IDL argument actually is. `DOMString type`,
    `DOMString name`, `DOMString selector`: each is ToString on whatever the page passed, so

@@ -19433,6 +19433,33 @@ static int step_ta_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst exempl
     }
 }
 
+/* THE OUTCOME FORK — see quickjs-step.h for what it is for. The two phases are "ask" and "answered", and
+   which of them the SIBLING's snapshot carries is the whole of the design: it carries ASK, so the sibling
+   re-enters here, asks again, and reads its arm out of its own decision vector. */
+enum { FORK_PH_ASK = 0, FORK_PH_ANSWERED };
+
+int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int *parm)
+{
+    (void)ctx;
+    if (h->fork_phase == FORK_PH_ASK) {
+        DCHECK(n >= 2, "a step machine declared an outcome fork with fewer than two feasible completions — a "
+                       "single completion is not a fork, it is the answer");
+        DCHECK(h->fork_op == NULL, "an outcome fork was asked for while another one's operands were still on "
+                                   "this machine's header");
+        h->fork_over = over;   /* BORROWED for the length of the request; the driver reads and resets it */
+        h->fork_op = op;
+        h->fork_n = n;
+        return JS_STEP_FORK;
+    }
+    DCHECK(h->fork_phase == FORK_PH_ANSWERED, "a step machine's outcome fork resumed in no phase");
+    DCHECK(h->fork_arm >= 0 && h->fork_arm < n,
+           "the outcome fork answered with a completion this machine did not declare");
+    *parm = h->fork_arm;
+    h->fork_phase = FORK_PH_ASK;   /* a machine may fork again — an iteration over unknown input does, per step */
+    h->fork_arm = 0;
+    return 0;
+}
+
 /* ToString on a value that may run user code. The object case is a TOPRIMITIVE step; whatever comes back is a
    primitive, so the ToString that finishes it runs nothing. 0 = *pout is the string, 5 = the caller must return
    that step code and will be re-entered here, -1 = threw. */
@@ -28311,6 +28338,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+/* THE ANCHOR FRAME A STEP MACHINE IS SUSPENDED IN. A machine being stepped lives in an interpreter LOCAL
+   (cont_st), which no snapshot can reach; the heap-frame chain can. So both of a machine's suspensions — the
+   back-edge PARK and the outcome FORK — put it in a bodyless TrampFrame first, and clone_deep_flow's
+   CONT_STEP_YIELD arm clones it through the machine's own `visit` for either. Written once because the two
+   differ only in what happens next: the park pushes it and unwinds, the fork stashes it, snapshots, and takes
+   it straight back off. The frame carries nothing but the machine — no bytecode, no locals, sf zeroed. */
+#define STEP_ANCHOR_NEW(tfv) do {                                                                       \
+        (tfv) = tramp_frame_new(rt);                                                                    \
+        if (unlikely(!(tfv))) { tramp_step_chain_free(ctx, stt); JS_ThrowOutOfMemory(ctx); goto exception; } \
+        memset(&(tfv)->sf, 0, sizeof((tfv)->sf));                                                       \
+        (tfv)->b = NULL; (tfv)->local_buf = NULL; (tfv)->ctx = ctx; (tfv)->local_slots = 0;              \
+        (tfv)->seq_req = NULL; (tfv)->seq_req_kind = CONT_NONE;                                          \
+        (tfv)->up = tf_top;                                                                              \
+        (tfv)->caller_sf = sf; (tfv)->caller_b = b; (tfv)->caller_ctx = ctx;                             \
+        (tfv)->caller_local_buf = local_buf; (tfv)->caller_stack_buf = stack_buf;                        \
+        (tfv)->caller_var_buf = var_buf; (tfv)->caller_arg_buf = arg_buf;                                \
+        (tfv)->caller_this = this_obj; (tfv)->caller_new_target = new_target;                            \
+        (tfv)->caller_var_refs = var_refs;                                                               \
+        (tfv)->caller_argc = argc; (tfv)->caller_argv = argv;                                            \
+        (tfv)->caller_arg_allocated_size = arg_allocated_size;                                           \
+        (tfv)->caller_sp = sp;                                                                           \
+        (tfv)->call_first = 0; (tfv)->call_argc = 0; (tfv)->is_tail = 0;                                 \
+        (tfv)->async_data = NULL; (tfv)->gen_data = NULL;                                                \
+        (tfv)->gen_magic = 0; (tfv)->gen_tailcall = 0;                                                   \
+        (tfv)->forof_off = 0;                                                                            \
+        (tfv)->async_promise = JS_UNDEFINED;                                                             \
+        (tfv)->close_saved_exc = JS_UNINITIALIZED;                                                       \
+    } while (0)
+
         do_step_tramp:
             /* ONE generic entry for every builtin DEFINED as a step machine. Nothing here names a builtin: the
                callee carries its own size/step/fini, so this path never grows an entry per builtin. */
@@ -28835,33 +28891,71 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         DFAIL("a step machine yielded in an activation that is not the flow base — give that "
                               "driver a resume-as-flow path, never drive it to completion");
                     FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
-                    {
-                        /* the ANCHOR. do_preempt stashes tf_top into the base, so a machine that is on the chain
-                           is parked by the ordinary back-edge path with nothing special about it. */
-                        TrampFrame *ytf = tramp_frame_new(rt);
-                        if (unlikely(!ytf)) { tramp_step_chain_free(ctx, stt); JS_ThrowOutOfMemory(ctx); goto exception; }
-                        memset(&ytf->sf, 0, sizeof(ytf->sf));
-                        ytf->b = NULL; ytf->local_buf = NULL; ytf->ctx = ctx; ytf->local_slots = 0;
-                        ytf->seq_req = NULL; ytf->seq_req_kind = CONT_NONE;
-                        ytf->up = tf_top;
-                        ytf->caller_sf = sf; ytf->caller_b = b; ytf->caller_ctx = ctx;
-                        ytf->caller_local_buf = local_buf; ytf->caller_stack_buf = stack_buf;
-                        ytf->caller_var_buf = var_buf; ytf->caller_arg_buf = arg_buf;
-                        ytf->caller_this = this_obj; ytf->caller_new_target = new_target;
-                        ytf->caller_var_refs = var_refs;
-                        ytf->caller_argc = argc; ytf->caller_argv = argv;
-                        ytf->caller_arg_allocated_size = arg_allocated_size;
-                        ytf->caller_sp = sp;
-                        ytf->call_first = 0; ytf->call_argc = 0; ytf->is_tail = 0;
-                        ytf->async_data = NULL; ytf->gen_data = NULL;
-                        ytf->gen_magic = 0; ytf->gen_tailcall = 0;
-                        ytf->forof_off = 0;
-                        ytf->async_promise = JS_UNDEFINED;
-                        ytf->close_saved_exc = JS_UNINITIALIZED;
-                        ytf->cont_state = stt; ytf->cont_kind = CONT_STEP_YIELD;
-                        tf_top = ytf;
-                        goto do_preempt;
+                    goto do_step_park;
+                }
+                if (st == JS_STEP_FORK) {
+                    /* AN OUTCOME FORK. The machine's completion depends on UNKNOWN input and is one of N
+                       feasible ones. It cannot pick — picking DELETES the other arm — and neither can this
+                       driver: the arm belongs to the flow's DECISION VECTOR, which is why a sibling parked
+                       today and resumed next session takes the same one.
+                       What this does is the half the machine cannot: it SNAPSHOTS the flow AT the machine, so
+                       the sibling RESUMES here holding the other outcome. Nothing is replayed. */
+                    JSValueConst fover = h->fork_over;
+                    const char *fop = h->fork_op;
+                    int fn = h->fork_n, harm;
+                    /* read + reset BEFORE the snapshot, like every other request input — a clone taken with the
+                       operands still on it would carry a borrowed pointer into a flow it does not belong to. */
+                    h->fork_over = JS_UNDEFINED; h->fork_op = NULL; h->fork_n = 0;
+                    DCHECK(h->fork_phase == FORK_PH_ASK,
+                           "an outcome fork was decided while an answer to a previous one was still outstanding");
+                    harm = g_flow_control.outcome ? g_flow_control.outcome(ctx, fover, fop, fn) : -1;
+                    if (harm < 0)
+                        harm = 0;   /* no forking policy (the @S candidate re-fire): ONE concrete path down the
+                                       machine's outcome 0, which is what that numbering means — exactly as a
+                                       declined `branch` leaves the interpreter taking the ordinary arm */
+                    if (harm & 0x100) {
+                        TrampFrame *ftf;
+                        JSValue *cl;
+                        harm &= 0xff;
+                        if (gen_state == NULL)
+                            DFAIL("an outcome fork in a NON-coroutine activation (gen_state NULL): its C entry "
+                                  "never became a flow base — route that caller onto the tramp chain");
+                        if (gen_state != g_flow_base_gen)
+                            DFAIL("an outcome fork inside a coroutine activation that is not the flow base — "
+                                  "give that resume path a resume-as-flow driver; a sibling snapshotted here "
+                                  "would be rebuilt against the wrong base");
+                        DCHECK(g_flow_control.fork != NULL,
+                               "a forking outcome policy with no fork hook to build the sibling from its clone");
+                        STEP_ANCHOR_NEW(ftf);
+                        ftf->cont_state = stt; ftf->cont_kind = CONT_STEP_YIELD;
+                        /* the CURRENT frame's resume point, exactly as do_preempt records it. The sibling's
+                           chain is rebuilt from here and re-enters the machine; WHERE in its algorithm the
+                           machine is, is the machine's own state, and its ASK is what it re-enters on. */
+                        sf->cur_pc = pc; sf->cur_sp = sp;
+                        gen_state->tramp_top = ftf;
+                        cl = JS_FlowClone(ctx, (JSValue *)gen_state);
+                        CHECK(cl != NULL, "the outcome fork could not snapshot the flow — the other completion "
+                                          "would be dropped, and the frontier never drops a work item");
+                        g_flow_control.fork(ctx, cl);
+                        gen_state->tramp_top = NULL;   /* the parent's chain is live in tf_top, never stashed */
+                        sf->cur_sp = NULL;             /* running again */
+                        js_free_rt(rt, ftf);
+                        h->fork_arm = harm; h->fork_phase = FORK_PH_ANSWERED;
+                        /* §scheduler's VALUE YIELD: a fork is the event that changes the ranking, because the
+                           sibling created a moment ago may outrank this flow immediately. The same clause the
+                           bytecode branch parks under, counted the same way — the point was reached and it
+                           parked, so engagement stays an honest ratio. The answer is already on the header, so
+                           the resume delivers it without asking anything twice. */
+                        if (g_flow_control.preempt != NULL && g_flow_control.preempt(JS_PREEMPT_FORK)) {
+                            FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                            FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                            goto do_step_park;
+                        }
+                    } else {
+                        h->fork_arm = harm; h->fork_phase = FORK_PH_ANSWERED;
                     }
+                    ret_val = JS_UNDEFINED;
+                    goto do_step_step;
                 }
                 if (st == 17) {
                     /* DELEGATE: the machine hands the driver an inner machine (h->delegate) and stops being the
@@ -28880,6 +28974,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argc = cbn; tramp_first = -2; tramp_is_tail = 0;
                 cd_outer = stt; cd_outer_kind = CONT_STEP;
                 goto do_cont_dispatch;
+
+            do_step_park:
+                /* PARK THE MACHINE. do_preempt stashes tf_top into the base, so a machine that is on the chain
+                   is parked by the ordinary back-edge path with nothing special about it. */
+                {
+                    TrampFrame *ytf;
+                    STEP_ANCHOR_NEW(ytf);
+                    ytf->cont_state = stt; ytf->cont_kind = CONT_STEP_YIELD;
+                    tf_top = ytf;
+                    goto do_preempt;
+                }
 
             step_abandon:
                 /* an INLINE call/construct threw (a C callee, so nothing suspended): the machine that asked can
@@ -43276,6 +43381,12 @@ typedef struct JSJsonReviver {
     JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
     JSValue *ek_cb; int ek_argc;    /* the key walk's request buffer, relayed to the driver unchanged */
     JSValue text_str;               /* 25.5.1 step 1's ? ToString(text), held across the parse (owned) */
+    /* THE UNKNOWN TEXT THIS RUN IS THE PARSE ARM OF (owned), JS_UNDEFINED for an ordinary JSON.parse. Held
+       because the whole algorithm's completion is DERIVED FROM IT: the value 25.5.1 produces here is what the
+       real codec made of this source's EXAMPLE, and the value the page receives is that example carried by an
+       unknown with this source's identity — so a later branch still forks and a later sink still solves for
+       `location.hash` rather than for a string that happened to be lying around. */
+    JSValue unknown;
 } JSJsonReviver;
 
 typedef struct JSOpCode {
@@ -88765,7 +88876,13 @@ static void js_json_parse_abandon(JSContext *ctx, JSJsonReviver *s)
    this file guards its own.
    Steps 2-8 are one stage because they are one operation to this engine — the parse — and it is the stage that
    YIELDS, so a resume falls straight back into json_parse_step at the character it stopped on. */
+/* THE FIRST STAGE IS A REST POINT AND THAT IS WHY IT IS A STAGE. `text` may be UNKNOWN EXTERNAL INPUT, and
+   over such a text 25.5.1 has two feasible completions — step 8's value and step 2's SyntaxError — so the
+   machine rests here on an OUTCOME FORK while the substrate decides which one this flow is and snapshots a
+   sibling for the other. Every ordinary JSON.parse passes straight through it without resting, exactly as a
+   string argument passes through JP_TOSTRING without one. */
 #define JSONPARSE_STAGES(X) \
+    X(JP_UNKNOWN,  "25.5.1 step 1 (text is unknown external input: parse and throw are both feasible)") \
     X(JP_TOSTRING, "25.5.1 step 1 (jsonString is ToString(text))") \
     X(JP_PARSE,    "25.5.1 steps 2-8 (jsonString is parsed as a JSON text; unfiltered is its value)") \
     X(JP_WALK,     "25.5.1 step 9.d (InternalizeJSONProperty(root, rootName, reviver))")
@@ -88776,20 +88893,108 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
 static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok);
 static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
+/* CAN A JSON TEXT BEGIN WITH THIS CHARACTER? 25.5.1's grammar is `JSONText : JSONValue` with insignificant
+   whitespace either side, so the first character is whitespace or the first character of a value. 0 means the
+   domain guarantees nothing about it, and then every completion stays open.
+   The EMPTY string is not a JSON text either, which is what lets a DECLARED PREFIX answer for the whole domain
+   rather than only for the values that carry it: `location.hash` is "" or "#" followed by the fragment, and
+   neither of those is a JSON text. */
+static bool json_text_may_start_with(int c)
+{
+    if (c == 0)
+        return true;
+    switch (c) {
+    case ' ': case '\t': case '\n': case '\r':      /* 25.5.1's insignificant whitespace */
+    case '{': case '[': case '"': case '-':
+    case '0': case '1': case '2': case '3': case '4':
+    case '5': case '6': case '7': case '8': case '9':
+    case 't': case 'f': case 'n':                   /* true / false / null */
+        return true;
+    }
+    return false;
+}
+
+/* 25.5.1 step 2's SyntaxError over a text this engine does not have. It is a REAL throw — the page's own
+   `catch` runs and everything behind it is reached, which is the whole reason this completion is an arm rather
+   than a value. The message invents no position, because there is no text to have one in. */
+static int js_json_throw_unknown(JSContext *ctx)
+{
+    JS_ThrowSyntaxError(ctx, "unexpected token in JSON");
+    return -1;
+}
+
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSJsonReviver *s = st;
     int r;
-    if (s->hdr.stage == JP_TOSTRING) {
-        if (s->hdr.str_phase == STR_PH_START) {
-            /* EVERY owned field before the first thing that can throw: the failure path tears the state down
-               through fini, which frees exactly what the state holds. */
-            JS_FreeValue(ctx, cb_result);
-            cb_result = JS_UNDEFINED;
-            s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
-            s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
-            s->parsing = 0;
+    if (s->hdr.stage == JP_UNKNOWN) {
+        JSValueConst text = step_arg(&s->hdr, 0);
+        /* THE ASK COMES BEFORE THIS MACHINE OWNS ANYTHING, and that ordering is what makes the sibling's
+           snapshot correct rather than merely working: the clone taken at the fork holds the all-zero state
+           tramp_step_state_new produced, so the sibling re-enters at this exact ask and answers it from its
+           OWN decision vector. A state half-built at the fork would be two flows sharing one parse. */
+        if (g_concolic.is && g_concolic.is(text)) {
+            int arm;
+            DCHECK(s->pr == NULL && s->stack == NULL && s->text == NULL && !s->parsing,
+                   "JSON.parse reached its outcome fork with state already built — the sibling's snapshot has "
+                   "to be taken before the machine owns anything");
+            if (!json_text_may_start_with(g_concolic.lead ? g_concolic.lead(text) : 0)) {
+                /* THE PARSE ARM IS INFEASIBLE and is pruned rather than forked. The component that owns this
+                   source declares what the browser's delivery guarantees — a fragment is empty or begins with
+                   `#` — and neither an empty text nor one beginning with `#` is a JSON text, so 25.5.1 step 2
+                   throws for EVERY value the domain permits. That is V8's answer to `JSON.parse(location.hash)`
+                   and it is reached here the same way V8 reaches it: by the grammar, not by a special case. */
+                JS_FreeValue(ctx, cb_result);
+                return js_json_throw_unknown(ctx);
+            }
+            /* TWO COMPLETIONS: 0 is step 8's value and 1 is step 2's SyntaxError. The value comes first
+               because outcome 0 is what a run with no forking policy takes, and a candidate re-fire on its way
+               to a sink must not be diverted into a throw it did not choose. */
+            r = step_fork_run(ctx, &s->hdr, text, "JSON.parse", 2, &arm);
+            if (r) { JS_FreeValue(ctx, cb_result); return r; }
+            if (arm) {
+                /* the THROW completion, raised for real so the page's own `catch` runs and whatever is behind
+                   it is reached — which is the whole reason this is an arm and not a value. */
+                JS_FreeValue(ctx, cb_result);
+                return js_json_throw_unknown(ctx);
+            }
         }
+        /* EVERY owned field before the first thing that can throw: the failure path tears the state down
+           through fini, which frees exactly what the state holds. */
+        JS_FreeValue(ctx, cb_result);
+        cb_result = JS_UNDEFINED;
+        s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
+        s->unknown = JS_UNDEFINED;
+        s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
+        s->parsing = 0;
+        s->hdr.stage = JP_TOSTRING;
+        if (g_concolic.is && g_concolic.is(text)) {
+            /* THE PARSE COMPLETION, over a text this engine does not have. What it DOES have is the source's
+               EXAMPLE — the concrete fragment this document was loaded with — and §solver's rule is that an
+               example propagates by RUNNING THE REAL OPERATION on it, so the example becomes this machine's
+               text and the ordinary parse (and the ordinary reviver walk) runs on it. The value handed back to
+               the page is that result carried by an unknown derived from `text`; fini does that in one place.
+               With no example there is nothing concrete to parse, and the completion is an unknown with no
+               example — which is honest, not a stub: the domain is "some JSON value" and nothing narrows it. */
+            JSValue example = g_concolic.example ? g_concolic.example(ctx, text) : JS_UNDEFINED;
+            s->unknown = js_dup(text);
+            if (JS_IsString(example)) {
+                s->text_str = example;
+                s->hdr.stage = JP_PARSE;
+                if (js_json_parse_begin(ctx, s))
+                    return -1;
+            } else {
+                JS_FreeValue(ctx, example);
+                if (JS_IsFunction(ctx, step_arg(&s->hdr, 1)))
+                    DFAIL("JSON.parse over unknown text WITH a reviver and no example to parse — 25.5.1 step 9 "
+                          "calls the reviver once per node of a structure this arm does not have, so its calls "
+                          "and their side effects would silently not happen; build the unknown-structure walk");
+                s->early = 1;   /* nothing to parse and no walk: the completion is the derived unknown */
+                return 0;
+            }
+        }
+    }
+    if (s->hdr.stage == JP_TOSTRING) {
         /* 25.5.1 step 1: `? ToString(text)`. JS_ToCStringLen ran it from C, so `JSON.parse({toString(){…}})` had
            its toString driven with no flow base. */
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->text_str, out_cb, out_argc);
@@ -88811,6 +89016,25 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (r < 0) {
             s->parsing = 0;
             free_token(&s->jps, &s->jps.token);
+            if (!JS_IsUndefined(s->unknown)) {
+                /* THE EXAMPLE CONTRADICTS THE ARM THIS FLOW IS. This flow is the PARSE completion of an
+                   unknown text; the concrete example the source carries happens not to be a JSON text, which
+                   says something about the example and nothing about the arm — §solver's rule is exactly that:
+                   the example marks the real arm primary and the arm it contradicts DROPS it rather than the
+                   arm. So the completion stays a parse, with an unknown that has no example. The throw
+                   belonged to the model run and is taken out of the context, never left for the next code that
+                   asks for a pending exception. */
+                DCHECK(JS_HasException(ctx), "the JSON parse failed and left no completion value behind");
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                if (!s->early)
+                    DFAIL("JSON.parse over unknown text WITH a reviver whose example is not a JSON text — the "
+                          "parse arm has no structure for 25.5.1 step 9 to walk, so the reviver's calls and "
+                          "their side effects would silently not happen; build the unknown-structure walk");
+                JS_FreeValue(ctx, s->text_str);
+                s->text_str = JS_UNDEFINED;
+                s->result = JS_UNDEFINED;
+                return 0;
+            }
             return -1;
         }
         if (js_json_parse_finish(ctx, s))
@@ -88849,7 +89073,12 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSJsonReviver *s = st;
+    /* TAKEN BEFORE EITHER TEARDOWN, because both of them free the state and one of them frees this field
+       through the ownership declaration. The derivation below is the last thing 25.5.1 does on this arm and it
+       needs the source that named it. */
+    JSValue unknown = s->unknown;
     JSValue r;
+    s->unknown = JS_UNDEFINED;
     if (s->parsing)
         js_json_parse_abandon(ctx, s);
     JS_FreeValue(ctx, s->text_str);
@@ -88859,11 +89088,24 @@ static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
         r = take_result ? s->result : JS_UNDEFINED;
         if (!take_result) JS_FreeValue(ctx, s->result);
         js_free(ctx, s);
-        return r;
+    } else {
+        r = js_json_reviver_end(ctx, s, take_result);
+        js_free(ctx, s);
+        if (!take_result) { JS_FreeValue(ctx, r); r = JS_UNDEFINED; }
     }
-    r = js_json_reviver_end(ctx, s, take_result);
-    js_free(ctx, s);
-    if (!take_result) { JS_FreeValue(ctx, r); return JS_UNDEFINED; }
+    if (!JS_IsUndefined(unknown)) {
+        /* THE COMPLETION OF THE PARSE ARM IS AN UNKNOWN DERIVED FROM THE TEXT, carrying whatever the REAL
+           codec made of that source's example. Not the bare parsed value: the page is holding something it
+           read out of `location.hash`, so a branch on it must still fork and a sink fed from it must still
+           solve for that source. Not a bare unknown either — that would throw away the one concrete thing the
+           engine ran the real operation to get. */
+        DCHECK(g_concolic.builtin != NULL,
+               "JSON.parse took its unknown-text arm in a host with no derivation hook — the completion has "
+               "nothing to carry the source's identity, so the value would leave here as a bare parse result");
+        if (take_result)
+            r = js_concolic_derive(ctx, unknown, "JSON.parse", r);
+        JS_FreeValue(ctx, unknown);
+    }
     return r;
 }
 
@@ -89072,6 +89314,7 @@ static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->root);
     v->val(ctx, &s->result);
     v->val(ctx, &s->text_str);
+    v->val(ctx, &s->unknown);
 }
 
 static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok) {

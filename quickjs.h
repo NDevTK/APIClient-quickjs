@@ -1275,6 +1275,23 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
                 the substrate for the WFQ to interleave flows by value instead of running each to completion. */
 typedef struct JSFlowControlHooks {
     int  (*branch)(JSContext *ctx, JSValueConst cond);
+    /* A NATIVE OPERATION WHOSE COMPLETION IS ONE OF N FEASIBLE OUTCOMES — the same decision `branch` makes,
+       asked from where there is no OP_if to make it at.
+       `branch` needs a bytecode branch: a condition on the operand stack, an `if_pc` to resume a sibling at, a
+       frame to snapshot. A C builtin has none of those, and its completion over UNKNOWN input is still a
+       decision the flow must not take on its own: `JSON.parse(x)` on unknown text either yields a value or
+       throws a SyntaxError, both feasible, and picking one DELETES the other arm. That is why this engine
+       ABORTED at those builtins rather than answer — an abort is the honest state for a missing fork, a
+       fabricated value is not.
+       `over` is the unknown operand the outcome depends on and `op` names the operation ("JSON.parse"), which
+       is everything the constraint key needs: the solver builds it from the operand's own source identity
+       exactly as it builds a comparison's, so no grammar and no policy crosses into the engine. `n` is how
+       many completions the machine declares feasible.
+       Returns the outcome THIS flow takes (0..n-1), ORed with 0x100 when a sibling was prepared for another —
+       the same protocol `branch` uses, so the fork is one mechanism and not two. -1 means there is no decision
+       to make (no forking policy installed: the @S candidate re-fire runs ONE concrete path), which the caller
+       reads as outcome 0, the same way a declined `branch` falls through to the ordinary ToBool. */
+    int  (*outcome)(JSContext *ctx, JSValueConst over, const char *op, int n);
     void (*fork)(JSContext *ctx, JSValue *clone);       /* BASE-activation fork: build the hot sibling from a frame clone.
                                                            (The deleted `replay` hook re-ran a nested/deep flow from its
                                                            start — BANNED, not byte-identical; that fork now DFAILs until a
@@ -1490,6 +1507,16 @@ typedef struct JSConcolicHooks {
        propagates — the engine runs the real op on the concrete, never a rule that predicts what it would have
        produced. Returns JS_UNDEFINED when the operand carries no example yet. */
     JSValue (*example)(JSContext *ctx, JSValueConst v);
+    /* THE FIRST CHARACTER THE BROWSER'S DELIVERY OF THIS SOURCE GUARANTEES, or 0 when it guarantees none.
+       This is DOMAIN, not example: `location.hash` is either the empty string or `#` followed by the fragment
+       — the component that owns the source declares that prefix — so a builtin can rule an outcome INFEASIBLE
+       without knowing the value. §solver states the case it exists for: the leading `#` makes
+       `JSON.parse(location.hash)`'s success arm infeasible so it throws exactly as V8 does, and forking a
+       success arm there would fabricate a completion no value of the source can produce. It is a
+       feasible-refinement, which is sound-only: it prunes an arm the DOMAIN already contradicts, never one the
+       domain permits. A DERIVED value (`location.hash.slice(1)`) has its own identity and no declared
+       delivery, so it answers 0 and both arms stay — which is the correct answer for it. */
+    int (*lead)(JSValueConst v);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
