@@ -23299,7 +23299,7 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result);
 static void js_array_sort_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
-/* 23.2.3.29 %TypedArray%.prototype.sort and 23.2.3.34 toSorted, as ONE machine.
+/* 23.2.3.29 %TypedArray%.prototype.sort and 23.2.3.33 toSorted, as ONE machine.
 
    js_typed_array_sort drove cutils' rqsort with js_TA_cmp_generic, which called the comparator with JS_Call: the
    sort's whole state was the C stack, so the comparator could not suspend at any depth — a DRIVE-TO-COMPLETION,
@@ -23691,7 +23691,9 @@ typedef struct JSIterWrapReturn {
     JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue iter;     /* the WRAPPED iterator (owned) */
     JSValue result;   /* DONE (owned) */
+    JSValue method;   /* its `return`, held across the Call (owned) */
     JSValue cb[2];    /* [iterator, its `return`] — the CALL request */
+    uint8_t call_phase;
 } JSIterWrapReturn;
 
 typedef struct JSDateToJSON {
@@ -24807,7 +24809,7 @@ enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT,
        STRRECV_PADSTART, STRRECV_PADEND, STRRECV_LOCALECOMPARE,
        STRRECV_TOLOWER, STRRECV_TOUPPER,
-       /* B.2.2 CreateHTML, one mode per tag: `arg` is STRRECV_HTML_BASE + the method's magic, so the thirteen
+       /* B.2.3 CreateHTML, one mode per tag: `arg` is STRRECV_HTML_BASE + the method's magic, so the thirteen
           share one machine and one body the way they shared one C function. */
        STRRECV_HTML_BASE };
 #define STRRECV_HTML_COUNT 13
@@ -66827,7 +66829,7 @@ static const char * const js_regexp_flag_names[8] = {
 };
 static const char js_regexp_flag_chars[8] = { 'd', 'g', 'i', 'm', 's', 'u', 'v', 'y' };
 
-/* 22.2.6.13 RegExp.prototype.toString: `? ToString(? Get(R, "source"))` then the same for "flags". Both Gets
+/* 22.2.6.17 RegExp.prototype.toString: `? ToString(? Get(R, "source"))` then the same for "flags". Both Gets
    are accessors — the page's code on a subclass or a Proxy, and `flags` is now itself a step machine — and both
    ToStrings can be a user `toString`. js_regexp_toString did all four from C, which is what the step getter's
    backstop DFAIL named the moment `flags` stopped being a plain C body. */
@@ -71429,6 +71431,45 @@ static bool ta_coerce_wants(JSTACoerce *s, int i)
     return h->argc > 2 && !JS_IsUndefined(step_arg(h, 2));
 }
 
+/* THREE spellings, one machine: ArrayBuffer.prototype.slice, its immutable variant (which has no species step at
+   all) and SharedArrayBuffer's. Steps 6-14's two bound coercions are one stage carrying an `i` cursor — each
+   argument's conversion completes before the next begins, which is what makes `slice(Symbol(), {valueOf(){…}})`
+   throw before the second valueOf runs — and 7.3.22 SpeciesConstructor's two reads are stages of their own,
+   because each is the page's code. ONE stage list expanded once per algorithm; see AFIND_STAGES. */
+#define ABSLICE_STAGES(X, ENTRY, BOUNDS, CTOR, SPECIES, NEW) \
+    X(ABSLICE_ENTRY,   ENTRY)   \
+    X(ABSLICE_BOUNDS,  BOUNDS)  \
+    X(ABSLICE_CTOR,    CTOR)    \
+    X(ABSLICE_SPECIES, SPECIES) \
+    X(ABSLICE_NEW,     NEW)
+enum { ABSLICE_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0) };
+static const char *const js_ab_slice_steps[] = {
+    ABSLICE_STAGES(JS_STEP_STAGE_LABEL,
+        "25.1.6.7 steps 1-5 (O has [[ArrayBufferData]], is not detached; len is O.[[ArrayBufferByteLength]])",
+        "25.1.6.7 steps 6-14 (start and end are ToIntegerOrInfinity; newLen)",
+        "25.1.6.7 step 15 via 7.3.22 step 1 (C is Get(O, \"constructor\"))",
+        "25.1.6.7 step 15 via 7.3.22 step 3 (S is Get(C, @@species))",
+        "25.1.6.7 step 16 (new is Construct(ctor, <<newLen>>))")
+    NULL };
+/* sliceToImmutable never reaches the species stages — it has no step for them — so its two labels say so rather
+   than naming steps of an algorithm it does not perform. */
+static const char *const js_ab_sliceImm_steps[] = {
+    ABSLICE_STAGES(JS_STEP_STAGE_LABEL,
+        "25.1.6.8 steps 1-4 (O has [[ArrayBufferData]], is not detached; len is O.[[ArrayBufferByteLength]])",
+        "25.1.6.8 steps 5-12 (start and end are ToIntegerOrInfinity; newLen)",
+        "25.1.6.8 has no SpeciesConstructor: C is never read",
+        "25.1.6.8 has no SpeciesConstructor: @@species is never read",
+        "25.1.6.8 step 13 (new is an immutable ArrayBuffer of newLen bytes)")
+    NULL };
+static const char *const js_sab_slice_steps[] = {
+    ABSLICE_STAGES(JS_STEP_STAGE_LABEL,
+        "25.2.5.2 steps 1-4 (O has [[ArrayBufferData]] and is shared; len is O.[[ArrayBufferByteLength]])",
+        "25.2.5.2 steps 5-13 (start and end are ToIntegerOrInfinity; newLen)",
+        "25.2.5.2 step 14 via 7.3.22 step 1 (C is Get(O, \"constructor\"))",
+        "25.2.5.2 step 14 via 7.3.22 step 3 (S is Get(C, @@species))",
+        "25.2.5.2 step 15 (new is Construct(ctor, <<newLen>>))")
+    NULL };
+
 static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSABSlice *s = st;
@@ -71436,7 +71477,7 @@ static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     int magic = s->hdr.arg, class_id = magic >> 1;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ABSLICE_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED; s->ctor = JS_UNDEFINED;
@@ -71448,9 +71489,9 @@ static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         if (abuf->detached) { JS_ThrowTypeErrorDetachedArrayBuffer(ctx); return -1; }
         if (abuf->immutable) { JS_ThrowTypeErrorImmutableArrayBuffer(ctx); return -1; }
         s->len = abuf->byte_length;
-        s->hdr.stage = 1;
+        s->hdr.stage = ABSLICE_BOUNDS;
     }
-    while (s->hdr.stage == 1) {
+    while (s->hdr.stage == ABSLICE_BOUNDS) {
         int64_t v;
         if (s->i >= 2) break;
         /* `start` always, `end` only when it is not undefined */
@@ -71466,23 +71507,24 @@ static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         if (s->i == 0) s->start = v; else s->new_len = v;
         s->i++;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == ABSLICE_BOUNDS) {
         int64_t end = JS_IsUndefined(step_arg(&s->hdr, 1)) ? s->len : s->new_len;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->new_len = max_int64(end - s->start, 0);
         /* sliceToImmutable has no SpeciesConstructor step at all */
-        s->hdr.stage = (magic & 1) ? 4 : 2;
+        if (magic & 1) goto construct;
+        s->hdr.stage = ABSLICE_CTOR;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == ABSLICE_CTOR) {
         r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_constructor, cb_result, &s->ctor,
                              out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        if (JS_IsUndefined(s->ctor)) s->hdr.stage = 4;
-        else if (!JS_IsObject(s->ctor)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-        else s->hdr.stage = 3;
+        if (JS_IsUndefined(s->ctor)) goto construct;   /* 7.3.22 step 2: the intrinsic */
+        if (!JS_IsObject(s->ctor)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        s->hdr.stage = ABSLICE_SPECIES;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == ABSLICE_SPECIES) {
         JSValue sp = JS_UNDEFINED;
         r = step_getprop_run(ctx, &s->hdr, s->ctor, JS_ATOM_Symbol_species, cb_result, &sp, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -71493,9 +71535,9 @@ static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             JS_ThrowTypeError(ctx, "not a constructor");
             return -1;
         }
-        s->hdr.stage = 4;
-    }
-    if (s->hdr.stage == 4) {
+    construct:
+        /* the CONSTRUCT is issued from the tail of whichever stage decided the constructor: a stage of its own
+           would be entered and left inside one step() call, and so would rest at no step at all. */
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         if (JS_IsUndefined(s->ctor)) {
             JSValue nb = js_array_buffer_constructor2(ctx, s->new_len, NULL, class_id);
@@ -71504,11 +71546,11 @@ static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         }
         s->cargs[0] = js_dup(s->ctor);
         s->cargs[1] = js_int64(s->new_len);
-        s->hdr.stage = 5;
+        s->hdr.stage = ABSLICE_NEW;
         *out_cb = s->cargs; *out_argc = 1;
         return 4;
     }
-    DCHECK(s->hdr.stage == 5, "ArrayBuffer.prototype.slice: unknown stage");
+    DCHECK(s->hdr.stage == ABSLICE_NEW, "ArrayBuffer.prototype.slice: unknown stage");
     s->result = js_array_buffer_slice_build(ctx, s->hdr.this_val, cb_result, s->start, s->new_len, magic);
     return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
 }
@@ -71535,12 +71577,23 @@ static JSValue js_ab_slice_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* 7.3.22 SpeciesConstructor's two reads are stages of their own because each is the page's code; the CONSTRUCT
+   is a third. The bounds share one stage with an `i` cursor, for the reason the coercion prologue's do. */
+#define TASUB_STAGES(X) \
+    X(TASUB_VALIDATE, "23.2.3.30 steps 1-3 (O has [[TypedArrayName]]; buffer is O.[[ViewedArrayBuffer]]; srcLength)") \
+    X(TASUB_BOUNDS,   "23.2.3.30 steps 4-16 (start and end are ToIntegerOrInfinity; the argumentsList)") \
+    X(TASUB_CTOR,     "23.2.3.30 step 17 via 7.3.22 step 1 (C is Get(O, \"constructor\"))") \
+    X(TASUB_SPECIES,  "23.2.3.30 step 17 via 7.3.22 step 3 (S is Get(C, @@species))") \
+    X(TASUB_NEW,      "23.2.3.30 step 17 (TypedArraySpeciesCreate's Construct(ctor, argumentsList))")
+enum { TASUB_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_ta_subarray_steps[] = { TASUB_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSTASubarray *s = st;
     int r, k;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == TASUB_VALIDATE) {
         JSObject *p;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
@@ -71552,9 +71605,9 @@ static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (!p) return -1;
         s->len = p->u.array.count;
         s->class_id = p->class_id;
-        s->hdr.stage = 1;
+        s->hdr.stage = TASUB_BOUNDS;
     }
-    while (s->hdr.stage == 1) {
+    while (s->hdr.stage == TASUB_BOUNDS) {
         if (s->i >= 2) break;
         /* `begin` always, `end` only when it is not undefined — the same rule the C body applied */
         if (s->i == 1 && JS_IsUndefined(step_arg(&s->hdr, 1))) { s->i++; continue; }
@@ -71564,7 +71617,7 @@ static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (r) return r < 0 ? -1 : r;
         s->i++;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == TASUB_BOUNDS) {
         JSObject *p = get_typed_array(ctx, s->hdr.this_val);
         JSTypedArray *ta;
         int start, final, count, shift, offset;
@@ -71590,19 +71643,19 @@ static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
            argumentsList is « buffer, beginByteOffset » — TWO entries. A third undefined is observable: a custom
            @@species sees an extra argument and `arguments.length` 3. */
         s->nargs = (ta->track_rab && JS_IsUndefined(step_arg(&s->hdr, 1))) ? 2 : 3;
-        s->hdr.stage = 2;
+        s->hdr.stage = TASUB_CTOR;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == TASUB_CTOR) {
         /* SpeciesConstructor step 1: Get(O, "constructor") */
         r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_constructor, cb_result, &s->ctor,
                              out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        if (JS_IsUndefined(s->ctor)) { s->hdr.stage = 4; }      /* step 2: the intrinsic */
-        else if (!JS_IsObject(s->ctor)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-        else s->hdr.stage = 3;
+        if (JS_IsUndefined(s->ctor)) goto construct;            /* step 2: the intrinsic */
+        if (!JS_IsObject(s->ctor)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+        s->hdr.stage = TASUB_SPECIES;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == TASUB_SPECIES) {
         /* SpeciesConstructor step 4: Get(C, @@species) */
         JSValue sp = JS_UNDEFINED;
         r = step_getprop_run(ctx, &s->hdr, s->ctor, JS_ATOM_Symbol_species, cb_result, &sp, out_cb, out_argc);
@@ -71614,9 +71667,9 @@ static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             JS_ThrowTypeError(ctx, "not a constructor");
             return -1;
         }
-        s->hdr.stage = 4;
-    }
-    if (s->hdr.stage == 4) {
+    construct:
+        /* issued from the tail of whichever stage decided the constructor, for the reason slice's is: a stage
+           between them is entered and left inside one step() call, so it rests at no step. */
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         if (JS_IsUndefined(s->ctor)) {
             /* no species: create by CLASS, which constructs nothing of the page's */
@@ -71625,11 +71678,11 @@ static int js_ta_subarray_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
         }
         s->cargs[0] = js_dup(s->ctor);
-        s->hdr.stage = 5;
+        s->hdr.stage = TASUB_NEW;
         *out_cb = s->cargs; *out_argc = s->nargs;
         return 4;
     }
-    DCHECK(s->hdr.stage == 5, "TypedArray.prototype.subarray: unknown stage");
+    DCHECK(s->hdr.stage == TASUB_NEW, "TypedArray.prototype.subarray: unknown stage");
     /* TypedArrayCreateFromConstructor's tail: the result must BE a typed array, and with one argument it must be
        long enough. Neither check runs user code. */
     s->result = cb_result;
@@ -73677,7 +73730,7 @@ static int js_iter_helper_return_step(JSContext *ctx, void *st, JSValue cb_resul
     }
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). 7.4.9 IteratorClose calls the iterator's own `return`, and a helper closes its inner before its source. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). 7.4.11 IteratorClose calls the iterator's own `return`, and a helper closes its inner before its source. */
 static void js_iter_helper_return_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSIterHelperReturn *s = st;
@@ -73889,19 +73942,39 @@ static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, in
 /* 21.2.1.1 BigInt(value): its ONLY user code is step 2's ToPrimitive on the argument — everything after runs on a
    primitive. It is callable AND a constructor (which throws), which is what the constructor_or_func body
    prototype is for. */
-static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0, .visit = js_ta_with_visit };
-static const JSTrampStepDef js_ta_fill_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_FILL, .visit = js_ta_coerce_visit };
-static const JSTrampStepDef js_ta_copyWithin_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_COPYWITHIN, .visit = js_ta_coerce_visit };
-static const JSTrampStepDef js_ta_indexOf_def     = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_indexOf), .visit = js_ta_coerce_visit };
-static const JSTrampStepDef js_ta_lastIndexOf_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_lastIndexOf), .visit = js_ta_coerce_visit };
-static const JSTrampStepDef js_ta_includes_def    = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_includes), .visit = js_ta_coerce_visit };
-static const JSTrampStepDef js_ta_subarray_def    = { sizeof(JSTASubarray), js_ta_subarray_step, js_ta_subarray_fini, 0, .visit = js_ta_subarray_visit };
+static const JSTrampStepDef js_ta_with_def = { sizeof(JSTAWith), js_ta_with_step, js_ta_with_fini, 0, .visit = js_ta_with_visit,
+                 .algorithm = "23.2.3.36 %TypedArray%.prototype.with",
+                 .steps = js_ta_with_steps };
+static const JSTrampStepDef js_ta_fill_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_FILL, .visit = js_ta_coerce_visit,
+                 .algorithm = "23.2.3.9 %TypedArray%.prototype.fill",
+                 .steps = js_ta_fill_steps };
+static const JSTrampStepDef js_ta_copyWithin_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_COPYWITHIN, .visit = js_ta_coerce_visit,
+                       .algorithm = "23.2.3.6 %TypedArray%.prototype.copyWithin",
+                       .steps = js_ta_copyWithin_steps };
+static const JSTrampStepDef js_ta_indexOf_def     = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_indexOf), .visit = js_ta_coerce_visit,
+                        .algorithm = "23.2.3.17 %TypedArray%.prototype.indexOf",
+                        .steps = js_ta_indexOf_steps };
+static const JSTrampStepDef js_ta_lastIndexOf_def = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_lastIndexOf), .visit = js_ta_coerce_visit,
+                        .algorithm = "23.2.3.20 %TypedArray%.prototype.lastIndexOf",
+                        .steps = js_ta_lastIndexOf_steps };
+static const JSTrampStepDef js_ta_includes_def    = { sizeof(JSTACoerce), js_ta_coerce_step, js_ta_coerce_fini, TAPRO_SEARCH_ARG(special_includes), .visit = js_ta_coerce_visit,
+                        .algorithm = "23.2.3.16 %TypedArray%.prototype.includes",
+                        .steps = js_ta_includes_steps };
+static const JSTrampStepDef js_ta_subarray_def    = { sizeof(JSTASubarray), js_ta_subarray_step, js_ta_subarray_fini, 0, .visit = js_ta_subarray_visit,
+                        .algorithm = "23.2.3.30 %TypedArray%.prototype.subarray",
+                        .steps = js_ta_subarray_steps };
 static const JSTrampStepDef js_ab_ctor_def       = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_ARRAY_BUFFER, .visit = js_ab_ctor_visit };
 static const JSTrampStepDef js_sab_ctor_def      = { sizeof(JSABCtor), js_ab_ctor_step, js_ab_ctor_fini, JS_CLASS_SHARED_ARRAY_BUFFER, .visit = js_ab_ctor_visit };
 static const JSTrampStepDef js_dataview_ctor_def = { sizeof(JSDataViewCtor), js_dataview_ctor_step, js_dataview_ctor_fini, 0, .visit = js_dataview_ctor_visit };
-static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit };
-static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1, .visit = js_ab_slice_visit };
-static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit };
+static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit,
+                       .algorithm = "25.1.6.7 ArrayBuffer.prototype.slice",
+                       .steps = js_ab_slice_steps };
+static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1, .visit = js_ab_slice_visit,
+                       .algorithm = "25.1.6.8 ArrayBuffer.prototype.sliceToImmutable",
+                       .steps = js_ab_sliceImm_steps };
+static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit,
+                       .algorithm = "25.2.5.2 SharedArrayBuffer.prototype.slice",
+                       .steps = js_sab_slice_steps };
 static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static void js_error_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -73986,10 +74059,12 @@ static void js_iter_concat_return_visit(JSContext *ctx, void *st, JSStepVisit *v
 static const JSTrampStepDef js_iter_concat_return_def =
     { sizeof(JSIterConcatReturn), js_iter_concat_return_step, js_iter_concat_return_fini, 0, .visit = js_iter_concat_return_visit };
 static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static const char *const js_iter_wrap_return_steps[];
 static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iter_wrap_return_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_wrap_return_def =
-    { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0, .visit = js_iter_wrap_return_visit };
+    { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0, .visit = js_iter_wrap_return_visit,
+      .algorithm = "27.1.3.2.1.1.2 %WrapForValidIteratorPrototype%.return", .steps = js_iter_wrap_return_steps };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 , .visit = js_date_tojson_visit };
 static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 , .visit = js_date_toprim_visit };
 /* the captured half of an Atomics operation: the length ValidateAtomicAccess reads at step 1, held across the
@@ -74223,7 +74298,7 @@ static const JSTrampStepDef js_str_slice_def      = { sizeof(JSStrRecv), js_str_
                                                     .algorithm = "22.1.3.22 String.prototype.slice",
                                                     .steps = js_str_slice_steps };
 static const JSTrampStepDef js_str_substr_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTR, .visit = js_str_recv_visit,
-                                                    .algorithm = "B.2.2.1 String.prototype.substr",
+                                                    .algorithm = "B.2.3.1 String.prototype.substr",
                                                     .steps = js_str_substr_steps };
 static const JSTrampStepDef js_str_repeat_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_REPEAT, .visit = js_str_recv_visit,
                                                     .algorithm = "22.1.3.18 String.prototype.repeat",
@@ -74248,43 +74323,43 @@ static const JSTrampStepDef js_str_toUpper_def    = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_html_defs[STRRECV_HTML_COUNT] = {
     [0] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 0,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.2 String.prototype.anchor", .steps = js_str_anchor_steps },
+             .algorithm = "B.2.3.2 String.prototype.anchor", .steps = js_str_anchor_steps },
     [1] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 1,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.3 String.prototype.big", .steps = js_str_big_steps },
+             .algorithm = "B.2.3.3 String.prototype.big", .steps = js_str_big_steps },
     [2] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 2,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.4 String.prototype.blink", .steps = js_str_blink_steps },
+             .algorithm = "B.2.3.4 String.prototype.blink", .steps = js_str_blink_steps },
     [3] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 3,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.5 String.prototype.bold", .steps = js_str_bold_steps },
+             .algorithm = "B.2.3.5 String.prototype.bold", .steps = js_str_bold_steps },
     [4] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 4,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.6 String.prototype.fixed", .steps = js_str_fixed_steps },
+             .algorithm = "B.2.3.6 String.prototype.fixed", .steps = js_str_fixed_steps },
     [5] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 5,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.7 String.prototype.fontcolor", .steps = js_str_fontcolor_steps },
+             .algorithm = "B.2.3.7 String.prototype.fontcolor", .steps = js_str_fontcolor_steps },
     [6] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 6,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.8 String.prototype.fontsize", .steps = js_str_fontsize_steps },
+             .algorithm = "B.2.3.8 String.prototype.fontsize", .steps = js_str_fontsize_steps },
     [7] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 7,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.9 String.prototype.italics", .steps = js_str_italics_steps },
+             .algorithm = "B.2.3.9 String.prototype.italics", .steps = js_str_italics_steps },
     [8] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 8,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.10 String.prototype.link", .steps = js_str_link_steps },
+             .algorithm = "B.2.3.10 String.prototype.link", .steps = js_str_link_steps },
     [9] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 9,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.11 String.prototype.small", .steps = js_str_small_steps },
+             .algorithm = "B.2.3.11 String.prototype.small", .steps = js_str_small_steps },
     [10] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 10,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.12 String.prototype.strike", .steps = js_str_strike_steps },
+             .algorithm = "B.2.3.12 String.prototype.strike", .steps = js_str_strike_steps },
     [11] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 11,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.13 String.prototype.sub", .steps = js_str_sub_steps },
+             .algorithm = "B.2.3.13 String.prototype.sub", .steps = js_str_sub_steps },
     [12] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 12,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.2.14 String.prototype.sup", .steps = js_str_sup_steps },
+             .algorithm = "B.2.3.14 String.prototype.sup", .steps = js_str_sup_steps },
 };
 #undef STR_HTML_DEF
 static const JSTrampStepDef js_ta_at_def          = { sizeof(JSTAIdx), js_ta_idx_step, js_ta_idx_fini, TAIDX_AT, .visit = js_ta_idx_visit };
@@ -74297,13 +74372,19 @@ static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json
 static const JSTrampStepDef js_proto_chain_def    = { sizeof(JSProtoChain), js_proto_chain_step, js_proto_chain_fini, 0, .visit = js_proto_chain_visit,
                         .algorithm = "20.1.3.3 Object.prototype.isPrototypeOf",
                         .steps = js_proto_chain_steps };
-static const JSTrampStepDef js_regexp_tostring_def = { sizeof(JSRegExpToString), js_regexp_tostring_step, js_regexp_tostring_fini, 0, .visit = js_regexp_tostring_visit };
+static const char *const js_regexp_tostring_steps[];
+static const JSTrampStepDef js_regexp_tostring_def = { sizeof(JSRegExpToString), js_regexp_tostring_step, js_regexp_tostring_fini, 0, .visit = js_regexp_tostring_visit,
+                                                    .algorithm = "22.2.6.17 RegExp.prototype.toString",
+                                                    .steps = js_regexp_tostring_steps };
 static const char *const js_re_str_iter_steps[];
 static const JSTrampStepDef js_re_str_iter_def    = { sizeof(JSReStrIter), js_re_str_iter_step, js_re_str_iter_fini, 0, .visit = js_re_str_iter_visit,
                                                     .algorithm = "22.2.9.2.1 %RegExpStringIteratorPrototype%.next",
                                                     .steps = js_re_str_iter_steps };
 static const JSTrampStepDef js_regexp_set_input_def = { sizeof(JSReSetInput), js_regexp_set_input_step, js_regexp_set_input_fini, 0, .visit = js_regexp_set_input_visit };
-static const JSTrampStepDef js_regexp_flags_def   = { sizeof(JSRegExpFlags), js_regexp_flags_step, js_regexp_flags_fini, 0, .visit = js_regexp_flags_visit };
+static const char *const js_regexp_flags_steps[];
+static const JSTrampStepDef js_regexp_flags_def   = { sizeof(JSRegExpFlags), js_regexp_flags_step, js_regexp_flags_fini, 0, .visit = js_regexp_flags_visit,
+                                                    .algorithm = "22.2.6.4 get RegExp.prototype.flags",
+                                                    .steps = js_regexp_flags_steps };
 static const JSTrampStepDef js_proto_get_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_GET, .visit = js_proto_accessor_visit,
                         .algorithm = "B.2.2.1.1 get Object.prototype.__proto__",
                         .steps = js_proto_get_steps };
@@ -78787,45 +78868,54 @@ static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;   /* JS_GetOpaque2 already threw RequireInternalSlot's TypeError */
 }
 
-/* 27.1.4.2.2, as a step machine so both of its user-code sites suspend. Two fidelity bugs went with the old body:
-   it forwarded its own ARGUMENTS to `return` (the spec calls it with none) and it required the result to be an
-   Object (step 7 returns the call's result verbatim — only .next's IteratorNext imposes that check). */
+/* WHICH STEP OF 27.1.3.2.1.1.2 EACH STAGE RESTS AT. The prose here said 27.1.4.2.2, which is a step of
+   Iterator.prototype.drop; %WrapForValidIteratorPrototype% is a sub-clause of Iterator.from, and `return` is its
+   second member. Two fidelity bugs went with the old C body: it forwarded its own ARGUMENTS to `return` (the
+   spec calls it with none) and it required the result to be an Object (step 7 returns the call's result
+   verbatim — only .next's IteratorNext imposes that check).
+   The Call was an ISSUE stage and a CONSUME stage, so the machine parked one past the operation it was in. */
+#define IWR_STAGES(X) \
+    X(IWR_SLOT,   "27.1.3.2.1.1.2 steps 1-4 (RequireInternalSlot(O, [[Iterated]]); iterator is its [[Iterator]])") \
+    X(IWR_METHOD, "27.1.3.2.1.1.2 step 5 (returnMethod is GetMethod(iterator, \"return\"))") \
+    X(IWR_CALL,   "27.1.3.2.1.1.2 step 7 (Call(returnMethod, iterator))")
+enum { IWR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_iter_wrap_return_steps[] = { IWR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSIterWrapReturn *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == IWR_SLOT) {
         JSIteratorWrapData *it;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
-        s->iter = JS_UNDEFINED; s->result = JS_UNDEFINED;
+        s->iter = JS_UNDEFINED; s->result = JS_UNDEFINED; s->method = JS_UNDEFINED;
         s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
         it = JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_ITERATOR_WRAP);
         if (!it) return -1;
         s->iter = js_dup(it->wrapped_iter);
-        s->hdr.stage = 1;
+        s->hdr.stage = IWR_METHOD;
     }
-    if (s->hdr.stage == 1) {
-        r = step_getprop_run(ctx, &s->hdr, s->iter, JS_ATOM_return, cb_result, &s->cb[1], out_cb, out_argc);
+    if (s->hdr.stage == IWR_METHOD) {
+        r = step_getprop_run(ctx, &s->hdr, s->iter, JS_ATOM_return, cb_result, &s->method, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         /* GetMethod: undefined or null means there is nothing to forward to (step 6). */
-        if (JS_IsUndefined(s->cb[1]) || JS_IsNull(s->cb[1])) {
+        if (JS_IsUndefined(s->method) || JS_IsNull(s->method)) {
             s->result = js_create_iterator_result(ctx, JS_UNDEFINED, true);
             return JS_IsException(s->result) ? -1 : 0;
         }
-        if (!JS_IsFunction(ctx, s->cb[1])) {
+        if (!JS_IsFunction(ctx, s->method)) {
             JS_ThrowTypeError(ctx, "not a function");
             return -1;
         }
-        s->cb[0] = js_dup(s->iter);
-        s->hdr.stage = 2;
-        *out_cb = s->cb; *out_argc = 0;
-        return 3;
+        s->hdr.stage = IWR_CALL;
     }
-    DCHECK(s->hdr.stage == 2, "WrapForValidIterator.return: unknown stage");
-    s->result = cb_result;
+    DCHECK(s->hdr.stage == IWR_CALL, "WrapForValidIterator.return: unknown stage");
+    r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb), s->method, s->iter, 0, NULL,
+                      cb_result, &s->result, out_cb, out_argc);
+    if (r) return r < 0 ? -1 : r;
     return 0;
 }
 
@@ -78837,6 +78927,7 @@ static void js_iter_wrap_return_visit(JSContext *ctx, void *st, JSStepVisit *v)
     int i;
     v->val(ctx, &s->result);
     v->val(ctx, &s->iter);
+    v->val(ctx, &s->method);
     for (i = 0; i < 2; i++) v->val(ctx, &s->cb[i]);
 }
 
@@ -81066,10 +81157,10 @@ static const char *const js_str_slice_steps[] = {
     NULL };
 static const char *const js_str_substr_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.1 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "B.2.2.1 step 4 (intStart is ToIntegerOrInfinity(start))",
-        "B.2.2.1 step 8 (intLength is size when length is undefined, else ToIntegerOrInfinity(length))",
-        "B.2.2.1 steps 3, 5-7, 9-12 (size; intStart relative to size when negative; intEnd; the substring)")
+        "B.2.3.1 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
+        "B.2.3.1 step 4 (intStart is ToIntegerOrInfinity(start))",
+        "B.2.3.1 step 8 (intLength is size when length is undefined, else ToIntegerOrInfinity(length))",
+        "B.2.3.1 steps 3, 5-7, 9-12 (size; intStart relative to size when negative; intEnd; the substring)")
     NULL };
 static const char *const js_str_repeat_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
@@ -81115,94 +81206,94 @@ static const char *const js_str_toUpper_steps[] = {
     NULL };
 static const char *const js_str_anchor_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.2 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.2 step 1, CreateHTML step 4.a (V is ToString(value) — the \"name\" attribute)",
+        "B.2.3.2 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.2 step 1, CreateHTML step 4.a (V is ToString(value) — the \"name\" attribute)",
         SRV_NO_ARG1,
-        "B.2.2.2 step 1, CreateHTML steps 3-8 (<a> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.2 step 1, CreateHTML steps 3-8 (<a> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_big_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.3 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.3 — no step: CreateHTML step 4 does not run for <big>, which takes no attribute",
+        "B.2.3.3 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.3 — no step: CreateHTML step 4 does not run for <big>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.3 step 1, CreateHTML steps 3-8 (<big> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.3 step 1, CreateHTML steps 3-8 (<big> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_blink_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.4 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.4 — no step: CreateHTML step 4 does not run for <blink>, which takes no attribute",
+        "B.2.3.4 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.4 — no step: CreateHTML step 4 does not run for <blink>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.4 step 1, CreateHTML steps 3-8 (<blink> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.4 step 1, CreateHTML steps 3-8 (<blink> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_bold_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.5 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.5 — no step: CreateHTML step 4 does not run for <b>, which takes no attribute",
+        "B.2.3.5 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.5 — no step: CreateHTML step 4 does not run for <b>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.5 step 1, CreateHTML steps 3-8 (<b> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.5 step 1, CreateHTML steps 3-8 (<b> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_fixed_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.6 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.6 — no step: CreateHTML step 4 does not run for <tt>, which takes no attribute",
+        "B.2.3.6 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.6 — no step: CreateHTML step 4 does not run for <tt>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.6 step 1, CreateHTML steps 3-8 (<tt> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.6 step 1, CreateHTML steps 3-8 (<tt> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_fontcolor_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.7 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.7 step 1, CreateHTML step 4.a (V is ToString(value) — the \"color\" attribute)",
+        "B.2.3.7 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.7 step 1, CreateHTML step 4.a (V is ToString(value) — the \"color\" attribute)",
         SRV_NO_ARG1,
-        "B.2.2.7 step 1, CreateHTML steps 3-8 (<font> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.7 step 1, CreateHTML steps 3-8 (<font> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_fontsize_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.8 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.8 step 1, CreateHTML step 4.a (V is ToString(value) — the \"size\" attribute)",
+        "B.2.3.8 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.8 step 1, CreateHTML step 4.a (V is ToString(value) — the \"size\" attribute)",
         SRV_NO_ARG1,
-        "B.2.2.8 step 1, CreateHTML steps 3-8 (<font> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.8 step 1, CreateHTML steps 3-8 (<font> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_italics_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.9 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.9 — no step: CreateHTML step 4 does not run for <i>, which takes no attribute",
+        "B.2.3.9 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.9 — no step: CreateHTML step 4 does not run for <i>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.9 step 1, CreateHTML steps 3-8 (<i> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.9 step 1, CreateHTML steps 3-8 (<i> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_link_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.10 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.10 step 1, CreateHTML step 4.a (V is ToString(value) — the \"href\" attribute)",
+        "B.2.3.10 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.10 step 1, CreateHTML step 4.a (V is ToString(value) — the \"href\" attribute)",
         SRV_NO_ARG1,
-        "B.2.2.10 step 1, CreateHTML steps 3-8 (<a> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.10 step 1, CreateHTML steps 3-8 (<a> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_small_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.11 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.11 — no step: CreateHTML step 4 does not run for <small>, which takes no attribute",
+        "B.2.3.11 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.11 — no step: CreateHTML step 4 does not run for <small>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.11 step 1, CreateHTML steps 3-8 (<small> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.11 step 1, CreateHTML steps 3-8 (<small> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_strike_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.12 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.12 — no step: CreateHTML step 4 does not run for <strike>, which takes no attribute",
+        "B.2.3.12 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.12 — no step: CreateHTML step 4 does not run for <strike>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.12 step 1, CreateHTML steps 3-8 (<strike> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.12 step 1, CreateHTML steps 3-8 (<strike> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_sub_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.13 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.13 — no step: CreateHTML step 4 does not run for <sub>, which takes no attribute",
+        "B.2.3.13 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.13 — no step: CreateHTML step 4 does not run for <sub>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.13 step 1, CreateHTML steps 3-8 (<sub> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.13 step 1, CreateHTML steps 3-8 (<sub> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_sup_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.14 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.2.14 — no step: CreateHTML step 4 does not run for <sup>, which takes no attribute",
+        "B.2.3.14 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
+        "B.2.3.14 — no step: CreateHTML step 4 does not run for <sup>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.2.14 step 1, CreateHTML steps 3-8 (<sup> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.3.14 step 1, CreateHTML steps 3-8 (<sup> around S, with the attribute quoted and its quotation marks escaped)")
     NULL };
 
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -81338,7 +81429,7 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
     }
     if (mode == STRRECV_SLICE || mode == STRRECV_SUBSTR) {
-        /* 22.1.3.22 slice / B.2.2.1 substr: the SAME two coercions as substring in the same order, differing only
+        /* 22.1.3.22 slice / B.2.3.1 substr: the SAME two coercions as substring in the same order, differing only
            in how the pair is clamped — slice takes [start, end) with a negative index relative to the end, substr
            takes [start, start+length). The C bodies did both JS_ToInt32Clamp calls from a C entry, which is where
            `"abc".slice({valueOf(){ while(x){} }})` preempted with no flow base. */
@@ -83180,7 +83271,7 @@ enum {
     magic_string_sup,
 };
 
-/* B.2.2.2.1 CreateHTML from step 3 on: the receiver's RequireObjectCoercible + ToString (steps 1-2) and the
+/* B.2.3.2.1 CreateHTML from step 3 on: the receiver's RequireObjectCoercible + ToString (steps 1-2) and the
    attribute value's ToString (step 4.a) are the page's code and are performed by js_str_recv_step as requests.
    `valuev` is the ALREADY-COERCED attribute string, or UNINITIALIZED for a tag that takes none. */
 static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst strv, JSValueConst valuev, int magic)
@@ -84459,12 +84550,32 @@ static JSValue js_regexp_get_flag(JSContext *ctx, JSValueConst this_val, int mas
     return js_bool(flags & mask);
 }
 
+/* 22.2.6.4 get RegExp.prototype.flags, AS THE SPEC NUMBERS IT. Its eight reads are eight SEPARATE steps of the
+   algorithm, in a fixed order the page can observe, so they are eight stages and not one walk with a private
+   cursor — a flow parked on the `unicode` getter names that getter, and the ToBoolean beside each read invokes
+   nothing, which is why each stage carries its `if` with it.
+   The stage IS the index: js_regexp_flag_names[stage - 1] is the flag this stage reads, so the list below and
+   that table cannot disagree without the DCHECK in the loop saying so. */
+#define REFL_STAGES(X) \
+    X(REFL_RECV,        "22.2.6.4 steps 1-3 (R is the this value; the not-an-Object TypeError; codeUnits)") \
+    X(REFL_HASINDICES,  "22.2.6.4 steps 4-5 (hasIndices is ToBoolean(Get(R, \"hasIndices\")); append \"d\")") \
+    X(REFL_GLOBAL,      "22.2.6.4 steps 6-7 (global is ToBoolean(Get(R, \"global\")); append \"g\")") \
+    X(REFL_IGNORECASE,  "22.2.6.4 steps 8-9 (ignoreCase is ToBoolean(Get(R, \"ignoreCase\")); append \"i\")") \
+    X(REFL_MULTILINE,   "22.2.6.4 steps 10-11 (multiline is ToBoolean(Get(R, \"multiline\")); append \"m\")") \
+    X(REFL_DOTALL,      "22.2.6.4 steps 12-13 (dotAll is ToBoolean(Get(R, \"dotAll\")); append \"s\")") \
+    X(REFL_UNICODE,     "22.2.6.4 steps 14-15 (unicode is ToBoolean(Get(R, \"unicode\")); append \"u\")") \
+    X(REFL_UNICODESETS, "22.2.6.4 steps 16-17 (unicodeSets is ToBoolean(Get(R, \"unicodeSets\")); append \"v\")") \
+    X(REFL_STICKY,      "22.2.6.4 steps 18-19 (sticky is ToBoolean(Get(R, \"sticky\")); append \"y\")") \
+    X(REFL_RESULT,      "22.2.6.4 step 20 (the String whose code units are codeUnits)")
+enum { REFL_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_regexp_flags_steps[] = { REFL_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_regexp_flags_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSRegExpFlags *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == REFL_RECV) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED;
@@ -84474,10 +84585,11 @@ static int js_regexp_flags_step(JSContext *ctx, void *st, JSValue cb_result, JSV
             JS_ThrowTypeErrorNotAnObject(ctx);
             return -1;
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = REFL_HASINDICES;
     }
-    while (s->hdr.stage <= 8) {
-        int i = s->hdr.stage - 1, b;
+    while (s->hdr.stage < REFL_RESULT) {
+        int i = s->hdr.stage - REFL_HASINDICES, b;
+        DCHECK(i >= 0 && i < 8, "the flags getter rested at a stage that names no flag");
         JSValue got = JS_UNDEFINED;
         JSAtom a = JS_NewAtom(ctx, js_regexp_flag_names[i]);
         if (unlikely(a == JS_ATOM_NULL)) { JS_FreeValue(ctx, cb_result); return -1; }
@@ -84514,12 +84626,25 @@ static JSValue js_regexp_flags_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* 22.2.6.17 RegExp.prototype.toString, AS THE SPEC NUMBERS IT. Two stages may not name one step, so the Get and
+   the ToString that consumes it each say which half they are — the machine rests at both, and a resume that
+   could not tell them apart would re-read the value it just got. */
+#define RETS_STAGES(X) \
+    X(RETS_RECV,    "22.2.6.17 steps 1-2 (R is the this value; the not-an-Object TypeError)") \
+    X(RETS_SOURCE,  "22.2.6.17 step 3 (Get(R, \"source\"))") \
+    X(RETS_PATTERN, "22.2.6.17 step 3 (pattern is ToString of it)") \
+    X(RETS_FLAGS,   "22.2.6.17 step 4 (Get(R, \"flags\"))") \
+    X(RETS_FLAGSTR, "22.2.6.17 step 4 (flags is ToString of it)") \
+    X(RETS_RESULT,  "22.2.6.17 steps 5-6 (the string-concatenation of \"/\", pattern, \"/\" and flags)")
+enum { RETS_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_regexp_tostring_steps[] = { RETS_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_regexp_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSRegExpToString *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == RETS_RECV) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED;
@@ -84529,39 +84654,39 @@ static int js_regexp_tostring_step(JSContext *ctx, void *st, JSValue cb_result, 
             JS_ThrowTypeErrorNotAnObject(ctx);
             return -1;
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = RETS_SOURCE;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == RETS_SOURCE) {
         r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_source, cb_result, &s->pattern,
                              out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = RETS_PATTERN;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == RETS_PATTERN) {
         JSValue str = JS_UNDEFINED;
         r = step_tostring_run(ctx, &s->hdr, s->pattern, cb_result, &str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         JS_FreeValue(ctx, s->pattern);
         s->pattern = str;
-        s->hdr.stage = 3;
+        s->hdr.stage = RETS_FLAGS;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == RETS_FLAGS) {
         r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_flags, cb_result, &s->flags,
                              out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 4;
+        s->hdr.stage = RETS_FLAGSTR;
     }
-    if (s->hdr.stage == 4) {
+    if (s->hdr.stage == RETS_FLAGSTR) {
         JSValue str = JS_UNDEFINED;
         r = step_tostring_run(ctx, &s->hdr, s->flags, cb_result, &str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         JS_FreeValue(ctx, s->flags);
         s->flags = str;
-        s->hdr.stage = 5;
+        s->hdr.stage = RETS_RESULT;
     }
     JS_FreeValue(ctx, cb_result);
     {   /* step 5: assembling the three pieces invokes nothing. */
@@ -94054,7 +94179,7 @@ static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_res
         if (JS_IsException(s->thunk)) { s->thunk = JS_UNDEFINED; JS_FreeValue(ctx, cb_result); return -1; }
     }
     {
-        /* step 9's Call. A user thenable's `then` can loop, so this parks like every other. */
+        /* the Invoke's Call. A user thenable's `then` can loop, so this parks like every other. */
         JSValueConst arg = s->thunk;
         r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb), s->method, s->promise,
                           1, &arg, cb_result, &s->result, out_cb, out_argc);
@@ -94064,9 +94189,9 @@ static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_res
     return 0;
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Step 3's result until step 6 consumes it, F.[[Constructor]],
-   the promise step 6 produced, the `then` read off it, the closure step 8 built, and the call buffer while a
-   request is in flight. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). onFinally's result until PromiseResolve consumes it, the
+   captured C, the promise PromiseResolve produced, the `then` read off it, the thunk, and the call buffer while
+   a request is in flight. */
 static void js_promise_then_finally_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSPromiseThenFinally *s = st;
@@ -94093,7 +94218,7 @@ static JSValue js_promise_then_finally_fini(JSContext *ctx, void *st, bool take_
 static const JSTrampStepDef js_promise_then_finally_def = {
     sizeof(JSPromiseThenFinally), js_promise_then_finally_step, js_promise_then_finally_fini, 0,
     .visit = js_promise_then_finally_visit,
-    .algorithm = "27.2.5.3.1 Then Finally Functions / 27.2.5.3.2 Catch Finally Functions",
+    .algorithm = "27.2.5.3 step 6.a thenFinallyClosure / step 6.c catchFinallyClosure",
     .steps = js_promise_then_finally_steps
 };
 
