@@ -87129,10 +87129,18 @@ static void js_json_parse_abandon(JSContext *ctx, JSJsonReviver *s)
    DFS invariant below cannot fall behind the phases the walk actually uses. */
 #define JR_PHASE_MAX 6
 
-/* stage 0 is the PROLOGUE, JP_TOSTRING the coercion it waits on, JP_PARSE the parse itself (the stage that
-   yields), JP_WALK the reviver walk. A resumption must never land on 0, whose first act is to free cb_result —
-   see the base64 machine, where it did. */
-enum { JP_TOSTRING = 1, JP_PARSE, JP_WALK };
+/* THE STAGES OF 25.5.1. The prologue no longer has a stage of its own: it built the state and moved straight on,
+   so it rested at no step and a resumption landing there would have freed cb_result (which is what the base64
+   machine did). Its state-building is guarded by str_phase instead, exactly as every other coercing prologue in
+   this file guards its own.
+   Steps 2-8 are one stage because they are one operation to this engine — the parse — and it is the stage that
+   YIELDS, so a resume falls straight back into json_parse_step at the character it stopped on. */
+#define JSONPARSE_STAGES(X) \
+    X(JP_TOSTRING, "25.5.1 step 1 (jsonString is ToString(text))") \
+    X(JP_PARSE,    "25.5.1 steps 2-8 (jsonString is parsed as a JSON text; unfiltered is its value)") \
+    X(JP_WALK,     "25.5.1 step 9.d (InternalizeJSONProperty(root, rootName, reviver))")
+enum { JSONPARSE_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_json_parse_steps[] = { JSONPARSE_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
 static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok);
@@ -87142,15 +87150,16 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
 {
     JSJsonReviver *s = st;
     int r;
-    if (s->hdr.stage == 0) {
-        s->hdr.stage = JP_TOSTRING;
-        JS_FreeValue(ctx, cb_result);
-        cb_result = JS_UNDEFINED;
-        s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
-        s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
-        s->parsing = 0;
-    }
     if (s->hdr.stage == JP_TOSTRING) {
+        if (s->hdr.str_phase == STR_PH_START) {
+            /* EVERY owned field before the first thing that can throw: the failure path tears the state down
+               through fini, which frees exactly what the state holds. */
+            JS_FreeValue(ctx, cb_result);
+            cb_result = JS_UNDEFINED;
+            s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
+            s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
+            s->parsing = 0;
+        }
         /* 25.5.1 step 1: `? ToString(text)`. JS_ToCStringLen ran it from C, so `JSON.parse({toString(){…}})` had
            its toString driven with no flow base. */
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->text_str, out_cb, out_argc);
