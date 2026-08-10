@@ -64688,6 +64688,14 @@ typedef struct JSProgEval {
     JSValue result;
 } JSProgEval;
 
+/* 19.2.1 is one line — `Return ? PerformEval(x, false, false)` — and the whole of the page's program runs
+   inside it, so the machine rests at that one step for as long as the program does. */
+#define PROGEVAL_STAGES(X) \
+    X(PROGEVAL_PERFORM, "19.2.1 step 1 (PerformEval(x, false, false)), which is 19.2.1.1 — the parse, and " \
+                        "then the whole of the evaluated program")
+enum { PROGEVAL_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_global_eval_steps[] = { PROGEVAL_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_global_eval_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSProgEval *s = st;
@@ -67758,13 +67766,21 @@ static JSValue js_creatector_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* Stages: 0 assemble [newThis, f, args…] and CALL, 1 the result. */
+/* 20.2.3.3's four steps hold ONE thing that reaches the page: the Call. So two stages — the entry, where the
+   argument list is assembled out of operands nobody can observe, and the Call this machine is parked on. */
+#define FCALL_STAGES(X) \
+    X(FCALL_ASSEMBLE, "20.2.3.3 steps 1-3 (func is the this value; PrepareForTailCall) and step 4's argument " \
+                      "list, which is the caller's own arguments past thisArg") \
+    X(FCALL_CALL,     "20.2.3.3 step 4 (Call(func, thisArg, args))")
+enum { FCALL_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_function_call_steps[] = { FCALL_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_function_call_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSFuncCall *s = st;
     int i, n;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == FCALL_ASSEMBLE) {
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;
         n = s->hdr.argc > 0 ? s->hdr.argc - 1 : 0;
@@ -67775,11 +67791,11 @@ static int js_function_call_step(JSContext *ctx, void *st, JSValue cb_result, JS
         s->cb[1] = js_dup(s->hdr.this_val);        /* the function; a non-callable throws at the dispatch */
         for (i = 0; i < n; i++)
             s->cb[2 + i] = js_dup(s->hdr.argv[1 + i]);
-        s->hdr.stage = 1;
+        s->hdr.stage = FCALL_CALL;
         *out_cb = s->cb; *out_argc = n;
         return 3;
     }
-    DCHECK(s->hdr.stage == 1, "Function.prototype.call: unknown stage");
+    DCHECK(s->hdr.stage == FCALL_CALL, "Function.prototype.call: unknown stage");
     s->result = cb_result;
     return 0;
 }
@@ -67809,7 +67825,33 @@ static JSValue js_function_call_fini(JSContext *ctx, void *st, bool take_result)
    and build_arg_list performs both from C, so an array-like whose getter loops preempted in an activation with no
    flow base. It is the existing sub-sequences here: step_length_run for `? ToLength(? Get(src,"length"))` and
    step_getidx_run per element, the same two the array walks already share.
-   Stages: 0 validate, 1 the length, 2 the elements, 3 the CALL, 4 its result. */
+   ONE WALK, THREE ALGORITHMS, ONE STAGE LIST expanded once per algorithm with that algorithm's own step
+   numbers: validate, then 7.3.18 CreateListFromArrayLike's length and its per-element Get, then the internal
+   method. Reflect.construct differs only in which internal method ends it, which is why it shares the list and
+   not a hand-copied one. */
+#define FAPPLY_STAGES(X, VALIDATE, TAIL) \
+    X(FAPPLY_VALIDATE, VALIDATE) \
+    X(FAPPLY_LENGTH,   "7.3.18 CreateListFromArrayLike step 2 (len is LengthOfArrayLike(argumentsList): " \
+                       "ToLength(Get(obj, \"length\")))") \
+    X(FAPPLY_ELEMS,    "7.3.18 CreateListFromArrayLike step 5.b (next is Get(obj, ToString(index))), one " \
+                       "element per step") \
+    X(FAPPLY_CALL,     TAIL)
+enum { FAPPLY_STAGES(JS_STEP_STAGE_ENUM, "", "") };
+static const char *const js_function_apply_steps[] = {
+    FAPPLY_STAGES(JS_STEP_STAGE_LABEL,
+                  "20.2.3.1 steps 1-3 (func is the this value; IsCallable; a nullish argArray is an empty "
+                  "list) and 7.3.18 step 1 (obj must be an Object)",
+                  "20.2.3.1 step 6 (Call(func, thisArg, argList))") NULL };
+static const char *const js_reflect_apply_steps[] = {
+    FAPPLY_STAGES(JS_STEP_STAGE_LABEL,
+                  "28.1.1 step 1 (IsCallable(target)) and 7.3.18 step 1 (argumentsList must be an Object)",
+                  "28.1.1 step 4 (Call(target, thisArgument, args))") NULL };
+static const char *const js_reflect_construct_steps[] = {
+    FAPPLY_STAGES(JS_STEP_STAGE_LABEL,
+                  "28.1.2 steps 1-3 (IsConstructor(target); newTarget defaults to target and must itself be a "
+                  "constructor) and 7.3.18 step 1 (argumentsList must be an Object)",
+                  "28.1.2 step 5 (Construct(target, args, newTarget))") NULL };
+
 typedef struct JSFuncApply {
     JSStepHdr hdr;
     JSValue result;       /* DONE (owned) */
@@ -67832,7 +67874,7 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
     JSValue in = cb_result;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == FAPPLY_VALIDATE) {
         JS_FreeValue(ctx, in);
         in = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -67842,16 +67884,16 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
            CreateListFromArrayLike throws on anything that is not an object. */
         if (!refl && (JS_IsUndefined(arr) || JS_IsNull(arr))) {
             s->len = 0;
-            s->hdr.stage = 2;
+            s->hdr.stage = FAPPLY_ELEMS;
         } else {
             if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT) {
                 JS_ThrowTypeError(ctx, "not a object");
                 return -1;
             }
-            s->hdr.stage = 1;
+            s->hdr.stage = FAPPLY_LENGTH;
         }
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == FAPPLY_LENGTH) {
         r = step_length_run(ctx, &s->hdr, arr, in, &s->len, out_cb, out_argc);
         in = JS_UNDEFINED;
         if (r) return r;
@@ -67859,9 +67901,9 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
             JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)", JS_MAX_LOCAL_VARS);
             return -1;
         }
-        s->hdr.stage = 2;
+        s->hdr.stage = FAPPLY_ELEMS;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == FAPPLY_ELEMS) {
         if (!s->cb) {
             int64_t k;
             /* the state owns every slot BEFORE the first element read, which can throw or suspend: a teardown
@@ -67884,11 +67926,11 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
             s->cb[2 + s->i] = el;
             s->i++;
         }
-        s->hdr.stage = 3;
+        s->hdr.stage = FAPPLY_CALL;
         *out_cb = s->cb; *out_argc = (int)s->len;
         return 3;
     }
-    DCHECK(s->hdr.stage == 3, "apply: unknown stage");
+    DCHECK(s->hdr.stage == FAPPLY_CALL, "apply: unknown stage");
     s->result = in;
     return 0;
 }
@@ -67907,7 +67949,7 @@ static int js_reflect_construct_step(JSContext *ctx, void *st, JSValue cb_result
     JSValue in = cb_result;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == FAPPLY_VALIDATE) {
         JS_FreeValue(ctx, in);
         in = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -67924,9 +67966,9 @@ static int js_reflect_construct_step(JSContext *ctx, void *st, JSValue cb_result
             JS_ThrowTypeError(ctx, "not a object");
             return -1;
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = FAPPLY_LENGTH;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == FAPPLY_LENGTH) {
         r = step_length_run(ctx, &s->hdr, arr, in, &s->len, out_cb, out_argc);
         in = JS_UNDEFINED;
         if (r) return r;
@@ -67934,9 +67976,9 @@ static int js_reflect_construct_step(JSContext *ctx, void *st, JSValue cb_result
             JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)", JS_MAX_LOCAL_VARS);
             return -1;
         }
-        s->hdr.stage = 2;
+        s->hdr.stage = FAPPLY_ELEMS;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == FAPPLY_ELEMS) {
         if (!s->cb) {
             int64_t k;
             /* [ctor, args…] — the shape step code 4 reads. Every slot is the state's BEFORE the first element
@@ -67957,12 +67999,12 @@ static int js_reflect_construct_step(JSContext *ctx, void *st, JSValue cb_result
             s->cb[1 + s->i] = el;
             s->i++;
         }
-        s->hdr.stage = 3;
+        s->hdr.stage = FAPPLY_CALL;
         s->hdr.ctor_ntgt = js_dup(ntgt);   /* the request's NEW TARGET operand */
         *out_cb = s->cb; *out_argc = (int)s->len;
         return 4;
     }
-    DCHECK(s->hdr.stage == 3, "Reflect.construct: unknown stage");
+    DCHECK(s->hdr.stage == FAPPLY_CALL, "Reflect.construct: unknown stage");
     s->result = in;
     return 0;
 }
@@ -68476,9 +68518,32 @@ static const JSCFunctionListEntry js_function_proto_funcs[] = {
 };
 
 
-enum { ERRC_PH_CREATE = 0, ERRC_PH_MSG, ERRC_PH_HASCAUSE, ERRC_PH_GETCAUSE,
-       ERRC_PH_ITERM, ERRC_PH_ITEROBJ, ERRC_PH_NEXTM, ERRC_PH_CALLNEXT,
-       ERRC_PH_DONE, ERRC_PH_VALUE, ERRC_PH_FINISH };
+/* ONE MACHINE, THREE CONSTRUCTORS. 20.5.1.1 Error, 20.5.6.1.1 NativeError and 20.5.7.1.1 AggregateError are
+   the same five steps, of which AggregateError adds two more — its step 5 turns `errors` into a List, which is
+   7.4.2's GetIterator and then 7.4.15's IteratorToList, and every one of those is the page's code. The stages
+   are ONE list expanded once per algorithm, so a step cannot move in one and not the others. The first four are
+   shared by all three; the iterator walk is AggregateError's, and the shared arms name the step of ITS
+   numbering they are reached at, because they are literally the same steps. */
+#define ERRCTOR_STAGES(X, WHERE) \
+    X(ERRC_PH_CREATE,   WHERE " step 2 (OrdinaryCreateFromConstructor: Get(newTarget, \"prototype\"))") \
+    X(ERRC_PH_MSG,      WHERE " step 3.a (msg is ToString(message))") \
+    X(ERRC_PH_HASCAUSE, "20.5.8.1 InstallErrorCause step 1 (HasProperty(options, \"cause\")), reached from " \
+                        WHERE " step 4") \
+    X(ERRC_PH_GETCAUSE, "20.5.8.1 InstallErrorCause step 1.a (Get(options, \"cause\"))") \
+    X(ERRC_PH_ITERM,    "7.4.2 GetIterator step 1 (GetMethod(errors, %Symbol.iterator%)), reached from " \
+                        "20.5.7.1.1 step 5") \
+    X(ERRC_PH_ITEROBJ,  "7.4.1 GetIteratorFromMethod step 1 (Call(method, errors))") \
+    X(ERRC_PH_NEXTM,    "7.4.1 GetIteratorFromMethod step 2 (Get(iterator, \"next\"))") \
+    X(ERRC_PH_CALLNEXT, "7.4.4 IteratorStepValue step 2 (Call(nextMethod, iterator)), from 7.4.15 " \
+                        "IteratorToList step 3.a") \
+    X(ERRC_PH_DONE,     "7.4.4 IteratorStepValue step 5 (IteratorComplete: Get(result, \"done\"))") \
+    X(ERRC_PH_VALUE,    "7.4.4 IteratorStepValue step 8 (IteratorValue: Get(result, \"value\"))") \
+    X(ERRC_PH_FINISH,   "20.5.7.1.1 step 6 (define \"errors\" from the collected List), which for " WHERE \
+                        " is step 5 (return O)")
+enum { ERRCTOR_STAGES(JS_STEP_STAGE_ENUM, "") };
+static const char *const js_error_ctor_steps[] = {
+    ERRCTOR_STAGES(JS_STEP_STAGE_LABEL, "20.5.1.1 Error / 20.5.6.1.1 NativeError / 20.5.7.1.1 AggregateError")
+    NULL };
 
 /* which argument carries `message`, and where `options` starts, per kind — the whole of the spec's per-kind
    branching before the tail. */
@@ -68709,7 +68774,14 @@ static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result)
 /* 20.5.3.4, one operation at a time. The two READS and the two ToStrings are the page's code; the stage says
    which of the four an answer belongs to, and `raw` holds a property between its read and its coercion because
    that coercion suspends. */
-enum { ETS_NAME_GET = 0, ETS_NAME_STR, ETS_MSG_GET, ETS_MSG_STR };
+#define ETS_STAGES(X) \
+    X(ETS_NAME_GET, "20.5.3.4 steps 2-3 (O must be an Object; name is Get(O, \"name\"))") \
+    X(ETS_NAME_STR, "20.5.3.4 step 4 (an undefined name is \"Error\"; otherwise ToString(name))") \
+    X(ETS_MSG_GET,  "20.5.3.4 step 5 (msg is Get(O, \"message\"))") \
+    X(ETS_MSG_STR,  "20.5.3.4 steps 6-9 (an undefined msg is \"\"; otherwise ToString(msg), then the two " \
+                    "empty-string tests and the concatenation)")
+enum { ETS_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_error_tostring_steps[] = { ETS_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_error_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -74086,7 +74158,10 @@ static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static void js_error_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* `arg` carries the KIND, which is the only thing that differs between the ten definitions. */
-#define ERRCTOR_DEF(k) { sizeof(JSErrorCtor), js_error_ctor_step, js_error_ctor_fini, (k), .visit = js_error_ctor_visit },
+static const char *const js_error_ctor_steps[];
+#define ERRCTOR_DEF(k) { sizeof(JSErrorCtor), js_error_ctor_step, js_error_ctor_fini, (k), .visit = js_error_ctor_visit, \
+                         .algorithm = "20.5.1.1 Error / 20.5.6.1.1 NativeError / 20.5.7.1.1 AggregateError", \
+                         .steps = js_error_ctor_steps },
 static const JSTrampStepDef js_error_ctor_defs[JS_PLAIN_ERROR + 1] = {
     ERRCTOR_DEF(0) ERRCTOR_DEF(1) ERRCTOR_DEF(2) ERRCTOR_DEF(3) ERRCTOR_DEF(4)
     ERRCTOR_DEF(5) ERRCTOR_DEF(6) ERRCTOR_DEF(7) ERRCTOR_DEF(8) ERRCTOR_DEF(JS_PLAIN_ERROR)
@@ -74337,8 +74412,10 @@ static int js_symbol_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_error_tostring_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_error_tostring_fini(JSContext *ctx, void *st, bool take_result);
 static void js_error_tostring_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const char *const js_error_tostring_steps[];
 static const JSTrampStepDef js_error_tostring_def =
-    { sizeof(JSErrToString), js_error_tostring_step, js_error_tostring_fini, 0 , .visit = js_error_tostring_visit };
+    { sizeof(JSErrToString), js_error_tostring_step, js_error_tostring_fini, 0 , .visit = js_error_tostring_visit,
+      .algorithm = "20.5.3.4 Error.prototype.toString", .steps = js_error_tostring_steps };
 static const JSTrampStepDef js_symbol_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
       { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL,
@@ -74914,17 +74991,32 @@ static const char *const js_num_toprec_steps[];
 static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION, .visit = js_number_fmt_visit,
                         .algorithm = "21.1.3.5 Number.prototype.toPrecision",
                         .steps = js_num_toprec_steps };
-static const JSTrampStepDef js_global_eval_def    = { sizeof(JSProgEval), js_global_eval_step, js_global_eval_fini, 0, .visit = js_global_eval_visit };
+static const char *const js_global_eval_steps[];
+static const JSTrampStepDef js_global_eval_def    = { sizeof(JSProgEval), js_global_eval_step, js_global_eval_fini, 0, .visit = js_global_eval_visit,
+                        .algorithm = "19.2.1 eval",
+                        .steps = js_global_eval_steps };
 static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 , .visit = js_coerce1_visit,
                         .algorithm = "19.2.3 isNaN",
                         .steps = js_isNaN_steps };
 static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 , .visit = js_coerce1_visit,
                         .algorithm = "19.2.2 isFinite",
                         .steps = js_isFinite_steps };
-static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0, .visit = js_function_call_visit };
-static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 0, .visit = js_function_apply_visit };
-static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1, .visit = js_function_apply_visit };
-static const JSTrampStepDef js_reflect_construct_def = { sizeof(JSFuncApply), js_reflect_construct_step, js_function_apply_fini, 0, .visit = js_function_apply_visit };
+static const char *const js_function_call_steps[];
+static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0, .visit = js_function_call_visit,
+                        .algorithm = "20.2.3.3 Function.prototype.call",
+                        .steps = js_function_call_steps };
+static const char *const js_function_apply_steps[];
+static const char *const js_reflect_apply_steps[];
+static const char *const js_reflect_construct_steps[];
+static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 0, .visit = js_function_apply_visit,
+                        .algorithm = "20.2.3.1 Function.prototype.apply",
+                        .steps = js_function_apply_steps };
+static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1, .visit = js_function_apply_visit,
+                        .algorithm = "28.1.1 Reflect.apply",
+                        .steps = js_reflect_apply_steps };
+static const JSTrampStepDef js_reflect_construct_def = { sizeof(JSFuncApply), js_reflect_construct_step, js_function_apply_fini, 0, .visit = js_function_apply_visit,
+                        .algorithm = "28.1.2 Reflect.construct",
+                        .steps = js_reflect_construct_steps };
 static const JSTrampStepDef js_array_tostring_def = { sizeof(JSArrayToString), js_array_tostring_step, js_array_tostring_fini, 0, .visit = js_array_tostring_visit };
 static const JSTrampStepDef js_array_reduce_def  = { sizeof(JSArrayReduce), js_array_reduce_vstep, js_array_reduce_vfini, special_reduce, .visit = js_array_reduce_visit,
                                                     .algorithm = "23.1.3.24 Array.prototype.reduce",
@@ -76250,8 +76342,11 @@ static const JSTrampStepDef js_get_dispose_sync_def;
 static const JSTrampStepDef js_get_dispose_async_def;
 static const JSTrampStepDef js_disposable_use_def;
 static const JSTrampStepDef js_async_disposable_use_def;
+static const char *const js_u8_tobase64_steps[];
 static const JSTrampStepDef js_u8_tobase64_def;
+static const char *const js_u8_frombase64_steps[];
 static const JSTrampStepDef js_u8_frombase64_def;
+static const char *const js_u8_setfrombase64_steps[];
 static const JSTrampStepDef js_u8_setfrombase64_def;
 static const JSTrampStepDef js_iter_dispose_def;
 static const JSTrampStepDef js_async_iter_dispose_def;
@@ -100736,7 +100831,17 @@ static JSValue js_ta_view_finish(JSContext *ctx, JSValue obj, JSTAViewPlan *pl);
    reaches step 6.c.ii, whose ToIndex runs first and whose allocation is last. One order was implemented for
    both, so `Reflect.construct(Int32Array, [buffer, poisoned, 0], ctorWithThrowingPrototype)` reported the
    byteOffset's throw where the spec reports the prototype getter's. */
-enum { TAC_START = 0, TAC_PROTO_EARLY, TAC_OFFSET, TAC_LENGTH, TAC_PROTO };
+/* The view constructor's stages. AllocateTypedArray's prototype read happens EARLY for an object first argument
+   and LATE for the element-count form — the spec orders it either side of the coercions — which is why the two
+   reads are two stages rather than one stage asked twice. */
+#define TACTOR_STAGES(X) \
+    X(TAC_START,       "23.2.5.1 steps 1-6.a (NewTarget is not undefined; firstArgument)") \
+    X(TAC_PROTO_EARLY, "23.2.5.1 step 6.b.i via 23.2.5.1.1 step 1 (proto is GetPrototypeFromConstructor(newTarget))") \
+    X(TAC_OFFSET,      "23.2.5.1.5 step 2 (offset is ToIndex(byteOffset))") \
+    X(TAC_LENGTH,      "23.2.5.1.5 step 5 (newLength is ToIndex(length))") \
+    X(TAC_PROTO,       "23.2.5.1 steps 5 and 6.c.iii via 23.2.5.1.1 (AllocateTypedArray, then the initialization)")
+enum { TACTOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_ta_ctor_steps[] = { TACTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -100875,7 +100980,9 @@ static JSValue js_ta_ctor_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-#define TACTOR_DEF(k) { sizeof(JSTACtor), js_ta_ctor_step, js_ta_ctor_fini, JS_CLASS_UINT8C_ARRAY + (k), .visit = js_ta_ctor_visit }
+#define TACTOR_DEF(k) { sizeof(JSTACtor), js_ta_ctor_step, js_ta_ctor_fini, JS_CLASS_UINT8C_ARRAY + (k), \
+                        .visit = js_ta_ctor_visit, .algorithm = "23.2.5.1 %TypedArray% ( ...args )", \
+                        .steps = js_ta_ctor_steps }
 /* one per element type; `arg` carries the class id the body switches on. No STEPDEF id: the dispatch names the
    definition by pointer, the way a DELEGATE does. */
 static const JSTrampStepDef js_ta_ctor_defs[JS_TYPED_ARRAY_COUNT] = {
@@ -104336,12 +104443,42 @@ _Static_assert(offsetof(JSB64Op, hdr) == 0, "JSStepHdr must be first in JSB64Op"
 enum { B64OP_TO = 0, B64OP_FROM, B64OP_SET_FROM };
 static JSValue js_b64op_finish(JSContext *ctx, JSB64Op *s);
 static JSValue js_make_read_written(JSContext *ctx, size_t read, size_t written);
-/* stage 0 is the PROLOGUE and nothing else: it starts at 1 so a resumption after a parked read cannot land
-   on it. It did — B64ST_ALPHABET was 0, so the re-entry re-ran the prologue, whose first act is to FREE
+/* The VALIDATE stage is the prologue, and it is a stage of its own so a resumption after a parked read cannot
+   land on it. It did once — B64ST_ALPHABET was 0, so the re-entry re-ran the prologue, whose first act is to FREE
    cb_result, and the option's value was destroyed before the sub-sequence could be handed it. Every option
    silently read as undefined and took its fallback; the two-phase DCHECK cannot see this, because the read
    WAS answered at the site that parked it, just with a value that had been thrown away. */
-enum { B64ST_ALPHABET = 1, B64ST_SECOND, B64ST_DONE };
+/* THREE algorithms, one machine. The standard has no section number for them yet — the ArrayBuffer-base64
+   proposal is not numbered in the published edition — so the algorithm is named and its steps are the
+   proposal's own. A number invented here would be a claim about the standard rather than a reference to it.
+   ONE stage list expanded once per algorithm; see AFIND_STAGES. */
+#define B64OP_STAGES(X, VALIDATE, ALPHABET, SECOND, DONE) \
+    X(B64ST_VALIDATE, VALIDATE) \
+    X(B64ST_ALPHABET, ALPHABET) \
+    X(B64ST_SECOND,   SECOND)   \
+    X(B64ST_DONE,     DONE)
+enum { B64OP_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0) };
+static const char *const js_u8_tobase64_steps[] = {
+    B64OP_STAGES(JS_STEP_STAGE_LABEL,
+        "Uint8Array.prototype.toBase64 steps 1-3 (ValidateUint8Array(O); opts is GetOptionsObject(options))",
+        "Uint8Array.prototype.toBase64 step 4 (alphabet is GetOption(opts, \"alphabet\", string))",
+        "Uint8Array.prototype.toBase64 step 5 (omitPadding is ToBoolean(Get(opts, \"omitPadding\")))",
+        "Uint8Array.prototype.toBase64 steps 6-8 (toEncode is GetUint8ArrayBytes(O); the encoded String)")
+    NULL };
+static const char *const js_u8_frombase64_steps[] = {
+    B64OP_STAGES(JS_STEP_STAGE_LABEL,
+        "Uint8Array.fromBase64 steps 1-2 (string is a String; opts is GetOptionsObject(options))",
+        "Uint8Array.fromBase64 step 3 (alphabet is GetOption(opts, \"alphabet\", string))",
+        "Uint8Array.fromBase64 step 4 (lastChunkHandling is GetOption(opts, \"lastChunkHandling\", string))",
+        "Uint8Array.fromBase64 steps 5-7 (FromBase64(string, alphabet, lastChunkHandling); the new Uint8Array)")
+    NULL };
+static const char *const js_u8_setfrombase64_steps[] = {
+    B64OP_STAGES(JS_STEP_STAGE_LABEL,
+        "Uint8Array.prototype.setFromBase64 steps 1-4 (ValidateUint8Array(into); string is a String; opts)",
+        "Uint8Array.prototype.setFromBase64 step 5 (alphabet is GetOption(opts, \"alphabet\", string))",
+        "Uint8Array.prototype.setFromBase64 step 6 (lastChunkHandling is GetOption(opts, \"lastChunkHandling\", string))",
+        "Uint8Array.prototype.setFromBase64 steps 7-11 (the bytes are written into `into`; {read, written})")
+    NULL };
 
 static int js_b64op_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -104349,7 +104486,7 @@ static int js_b64op_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **
     int which = s->hdr.arg;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == B64ST_VALIDATE) {
         JSValueConst opt_arg;
         int optidx = (which == B64OP_TO) ? 0 : 1;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
@@ -104422,11 +104559,17 @@ static JSValue js_b64op_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 static const JSTrampStepDef js_u8_tobase64_def =
-    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_TO, .visit = js_b64op_visit };
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_TO, .visit = js_b64op_visit,
+        .algorithm = "Uint8Array.prototype.toBase64 ( [ options ] )",
+        .steps = js_u8_tobase64_steps };
 static const JSTrampStepDef js_u8_frombase64_def =
-    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_FROM, .visit = js_b64op_visit };
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_FROM, .visit = js_b64op_visit,
+        .algorithm = "Uint8Array.fromBase64 ( string [ , options ] )",
+        .steps = js_u8_frombase64_steps };
 static const JSTrampStepDef js_u8_setfrombase64_def =
-    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_SET_FROM, .visit = js_b64op_visit };
+    { sizeof(JSB64Op), js_b64op_step, js_b64op_fini, B64OP_SET_FROM, .visit = js_b64op_visit,
+        .algorithm = "Uint8Array.prototype.setFromBase64 ( string [ , options ] )",
+        .steps = js_u8_setfrombase64_steps };
 
 /* Everything AFTER the options: the buffer access, the codec and the result. Not one step of it is the page's
    code, which is why it is a plain C tail and only the reads above became requests. One function for all three
