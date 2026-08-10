@@ -69511,59 +69511,122 @@ enum {
     FA_NFIELDS
 };
 
-/* WHERE a resumption continues. The synchronous phases are requests answered by the driver; the AWAIT_ ones are
-   answered by a promise reaction, which is the only place a fresh machine instance takes over from a dead one. */
-enum {
-    FA_PH_ASYNC_METHOD = 0, /* Get(items, @@asyncIterator) */
-    FA_PH_PICK_ASYNC,       /* decide on it, and GetIterator(async) if present */
-    FA_PH_SYNC_METHOD,      /* Get(items, @@iterator) */
-    FA_PH_PICK_SYNC,        /* decide: GetIterator(sync), or the array-like branch */
-    FA_PH_GOT_ITER,         /* the CALL's iterator */
-    FA_PH_GET_NEXT,         /* Get(iterator, "next"), then the async-from-sync wrap */
-    FA_PH_MAKE_A,           /* Construct(C) or ArrayCreate(0) */
-    FA_PH_GOT_A,            /* the CONSTRUCT's result */
-    FA_PH_NEXT_CALL,        /* Call(next, iterator) */
-    FA_PH_AWAIT_RESULT,     /* Await(nextResult) */
-    FA_PH_RESULT_OBJ,       /* it must be an Object */
-    FA_PH_DONE,             /* Get(result, "done") */
-    FA_PH_VALUE,            /* Get(result, "value") */
-    FA_PH_MAP_CALL,         /* Call(mapfn, thisArg, value, k) */
-    FA_PH_AWAIT_MAPPED,     /* Await(mappedValue) */
-    FA_PH_MAPPED_IN,        /* it arrived */
-    FA_PH_DEFINE,           /* CreateDataPropertyOrThrow(A, k, v) */
-    FA_PH_SET_LEN,          /* Set(A, "length", k) */
-    FA_PH_AL_LEN,           /* LengthOfArrayLike(arrayLike) */
-    FA_PH_AL_MAKE_A,        /* Construct(C, len) or ArrayCreate(len) */
-    FA_PH_AL_GOT_A,
-    FA_PH_AL_STEP,          /* the k < len test */
-    FA_PH_AL_GET_K,         /* Get(arrayLike, k) */
-    FA_PH_AL_AWAIT_K,       /* Await(kValue) */
-    FA_PH_AL_MAP_CALL,
-    FA_PH_AL_AWAIT_MAPPED,
-    FA_PH_AL_MAPPED_IN,
-    FA_PH_AL_DEFINE,
-    FA_PH_AL_SET_LEN,
-    FA_PH_AWAIT_CAP,       /* Await: NewPromiseCapability(%Promise%) */
-    FA_PH_AWAIT_RESOLVE,   /* Await: resolve(value), as a CALL */
-    FA_PH_AWAIT_THEN,      /* Await: PerformPromiseThen with this algorithm's two continuations */
-    /* 7.4.14 AsyncIteratorClose, entered by IfAbruptCloseAsyncIterator with a THROW completion in hand. That
-       completion wins over everything the close itself does (step 4), so the close's only job is to RUN — get
-       `return`, call it, await the result — and then reject with the error it was entered with. */
-    FA_PH_CLOSE_ENTER,     /* `in` is the reason; it becomes FA_ERR */
-    FA_PH_CLOSE_GET_RETURN,/* GetMethod(iterator, "return") */
-    FA_PH_CLOSE_PICK,      /* undefined/null/uncallable all end the close; otherwise Call(return, iterator) */
-    FA_PH_CLOSE_AWAIT,     /* step 3.d: Await(innerResult) — its settlement is discarded, but it happens */
-    FA_PH_CLOSE_FINISH,    /* reject with FA_ERR */
-    FA_PH_REJECT,          /* `in` is the reason: IfAbruptRejectPromise, plain */
-    FA_PH_SETTLED          /* the capability's resolve/reject has been called; nothing follows */
-};
+/* WHERE a resumption continues, DECLARED THE WAY A MACHINE'S STAGES ARE (see JSTrampStepDef.steps). This cursor
+   and not the machine's `stage` is Array.fromAsync's real rest point: an Await is answered by a promise
+   reaction, which is a FRESH machine instance taking over from a dead one, so the phase lives in the shared
+   state array and outlives every instance. A private integer there says nothing about where in the algorithm a
+   parked flow is, and across builds it cannot be the identity at all — exactly the argument JSTrampStepDef.steps
+   makes. ONE list expanded twice, so a renumber carries its label with it.
+   The synchronous phases are requests answered by the driver; the AWAIT_ ones are answered by a promise
+   reaction. array-from-async is not in the published edition, so the steps named are the proposal's own and no
+   clause number is invented for it (see B64OP_STAGES); the operations it delegates to — Await, AsyncIteratorClose
+   — are ES2025 and are numbered. */
+#define FA_PHASES(X) \
+    X(FA_PH_ASYNC_METHOD, "proposal-array-from-async fromAsyncClosure step 3.e (usingAsyncIterator is GetMethod(items, " \
+                            "%Symbol.asyncIterator%))") \
+    X(FA_PH_PICK_ASYNC, "proposal-array-from-async fromAsyncClosure step 3.f (usingSyncIterator is decided; an async " \
+                            "iterator method dispatches GetIterator(items, async))") \
+    X(FA_PH_SYNC_METHOD, "proposal-array-from-async fromAsyncClosure step 3.f (usingSyncIterator is GetMethod(items, " \
+                            "%Symbol.iterator%))") \
+    X(FA_PH_PICK_SYNC, "proposal-array-from-async fromAsyncClosure steps 3.f-3.h (a sync iterator method dispatches " \
+                            "GetIterator(items, sync); neither takes the array-like arm)") \
+    X(FA_PH_GOT_ITER, "proposal-array-from-async fromAsyncClosure step 3.h -> 7.4.3 GetIterator step 3 (the " \
+                            "iterator the method call produced)") \
+    X(FA_PH_GET_NEXT, "proposal-array-from-async fromAsyncClosure step 3.h -> 7.4.3 GetIterator step 4 (nextMethod " \
+                            "is Get(iterator, \"next\"); a SYNC iterator is wrapped by CreateAsyncFromSyncIterator here)") \
+    X(FA_PH_MAKE_A, "proposal-array-from-async fromAsyncClosure steps 3.i-3.j (A is Construct(C) when C is a " \
+                            "constructor, else ArrayCreate(0)) - the dispatch") \
+    X(FA_PH_GOT_A, "proposal-array-from-async fromAsyncClosure step 3.i (the constructed A arrives)") \
+    X(FA_PH_NEXT_CALL, "proposal-array-from-async fromAsyncClosure step 3.l.iv (nextResult is " \
+                            "Call(iteratorRecord.[[NextMethod]], iteratorRecord.[[Iterator]]))") \
+    X(FA_PH_AWAIT_RESULT, "proposal-array-from-async fromAsyncClosure step 3.l.vi (nextResult is Await(nextResult))") \
+    X(FA_PH_RESULT_OBJ, "proposal-array-from-async fromAsyncClosure step 3.l.vii (nextResult must be an Object)") \
+    X(FA_PH_DONE, "proposal-array-from-async fromAsyncClosure step 3.l.viii (done is " \
+                            "IteratorComplete(nextResult): Get(nextResult, \"done\"))") \
+    X(FA_PH_VALUE, "proposal-array-from-async fromAsyncClosure step 3.l.x (nextValue is " \
+                            "IteratorValue(nextResult): Get(nextResult, \"value\"))") \
+    X(FA_PH_MAP_CALL, "proposal-array-from-async fromAsyncClosure step 3.l.xi.1 (mappedValue is Call(mapfn, " \
+                            "thisArg, <<nextValue, k>>))") \
+    X(FA_PH_AWAIT_MAPPED, "proposal-array-from-async fromAsyncClosure step 3.l.xi.3 (mappedValue is Await(mappedValue))") \
+    X(FA_PH_MAPPED_IN, "proposal-array-from-async fromAsyncClosure step 3.l.xi.3 (the awaited mappedValue arrives)") \
+    X(FA_PH_DEFINE, "proposal-array-from-async fromAsyncClosure step 3.l.xiii (CreateDataPropertyOrThrow(A, Pk, " \
+                            "mappedValue))") \
+    X(FA_PH_SET_LEN, "proposal-array-from-async fromAsyncClosure step 3.l.ix.1 (Set(A, \"length\", k, true) once " \
+                            "the iterator is done)") \
+    X(FA_PH_AL_LEN, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.iii (len is " \
+                            "LengthOfArrayLike(arrayLike))") \
+    X(FA_PH_AL_MAKE_A, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, steps 3.n.iv-3.n.v (A is " \
+                            "Construct(C, <<len>>) or ArrayCreate(len)) - the dispatch") \
+    X(FA_PH_AL_GOT_A, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.iv (the constructed " \
+                            "A arrives)") \
+    X(FA_PH_AL_STEP, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.vii (the Repeat " \
+                            "while k < len)") \
+    X(FA_PH_AL_GET_K, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.vii.2 (kValue is " \
+                            "Get(arrayLike, Pk))") \
+    X(FA_PH_AL_AWAIT_K, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.vii.3 (kValue is " \
+                            "Await(kValue))") \
+    X(FA_PH_AL_MAP_CALL, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.vii.4.a (mappedValue " \
+                            "is Call(mapfn, thisArg, <<kValue, k>>))") \
+    X(FA_PH_AL_AWAIT_MAPPED, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.vii.4.b (mappedValue " \
+                            "is Await(mappedValue))") \
+    X(FA_PH_AL_MAPPED_IN, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.vii.4.b (the awaited " \
+                            "mappedValue arrives)") \
+    X(FA_PH_AL_DEFINE, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.vii.6 " \
+                            "(CreateDataPropertyOrThrow(A, Pk, mappedValue))") \
+    X(FA_PH_AL_SET_LEN, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.viii (Set(A, " \
+                            "\"length\", len, true))") \
+    X(FA_PH_AWAIT_CAP, "proposal-array-from-async fromAsyncClosure -> 27.7.5.3 Await step 2 (promiseCapability is " \
+                            "NewPromiseCapability(%Promise%))") \
+    X(FA_PH_AWAIT_RESOLVE, "proposal-array-from-async fromAsyncClosure -> 27.7.5.3 Await step 3 " \
+                            "(Call(promiseCapability.[[Resolve]], undefined, <<value>>))") \
+    X(FA_PH_AWAIT_THEN, "proposal-array-from-async fromAsyncClosure -> 27.7.5.3 Await steps 4-7 (PerformPromiseThen " \
+                            "with this algorithm's two continuations)") \
+    X(FA_PH_CLOSE_ENTER, "proposal-array-from-async fromAsyncClosure -> 7.4.14 AsyncIteratorClose, entered by " \
+                            "IfAbruptCloseAsyncIterator: the completion it is entered with wins over everything the close " \
+                            "does") \
+    X(FA_PH_CLOSE_GET_RETURN, "proposal-array-from-async fromAsyncClosure -> 7.4.14 AsyncIteratorClose step 3.a " \
+                            "(innerResult is GetMethod(iterator, \"return\"))") \
+    X(FA_PH_CLOSE_PICK, "proposal-array-from-async fromAsyncClosure -> 7.4.14 AsyncIteratorClose steps 3.b-3.c (an " \
+                            "absent or uncallable return ends the close; otherwise Call(return, iterator))") \
+    X(FA_PH_CLOSE_AWAIT, "proposal-array-from-async fromAsyncClosure -> 7.4.14 AsyncIteratorClose step 3.d " \
+                            "(Await(innerResult); its settlement is discarded, but it happens)") \
+    X(FA_PH_CLOSE_FINISH, "proposal-array-from-async fromAsyncClosure -> 7.4.14 AsyncIteratorClose step 4 (the " \
+                            "completion the close was entered with is re-raised, and it rejects the capability)") \
+    X(FA_PH_REJECT, "proposal-array-from-async fromAsyncClosure IfAbruptRejectPromise: `in` is the reason, and " \
+                            "the capability is rejected with it") \
+    X(FA_PH_SETTLED, "proposal-array-from-async fromAsyncClosure settled: the capability's resolve or reject has " \
+                            "been called and nothing follows")
+enum { FA_PHASES(JS_STEP_STAGE_ENUM) };
+static const char *const js_fromasync_phases[] = { FA_PHASES(JS_STEP_STAGE_LABEL) NULL };
+
+/* The same assertion step_stage_check makes of a machine, made of this cursor: it continues only at a phase the
+   algorithm declares, and no two phases name one step — which is what makes the LABEL, rather than the index,
+   the thing a parked fromAsync is holding. */
+static void fa_phase_check(int phase)
+{
+#if APICLIENT_DEV
+    int n = 0, i, found = -1;
+    while (js_fromasync_phases[n]) n++;
+    if (phase < 0 || phase >= n)
+        DFAIL("Array.fromAsync's closure resumed at a phase its algorithm does not declare — a suspension "
+              "point with no place in the algorithm is one a park, a fork or a cross-session resume cannot name");
+    for (i = 0; i < n; i++)
+        if (!strcmp(js_fromasync_phases[i], js_fromasync_phases[phase])) {
+            if (found >= 0)
+                DFAIL("Array.fromAsync declares one step at two phases, so a closure parked there names a rest "
+                      "point that resolves to two");
+            found = i;
+        }
+#else
+    (void)phase;
+#endif
+}
 
 typedef struct JSFromAsync {
     JSStepHdr hdr;        /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue result;       /* DONE (owned) */
     JSValue st;           /* the shared state array (owned) */
     JSValue cb[4];        /* the operands a CALL/CONSTRUCT request lends the driver */
-    uint8_t phase;        /* the resumption point this instance is answering */
 } JSFromAsync;
 
 static const JSTrampStepDef js_fromasync_def;
@@ -69642,6 +69705,8 @@ static int fa_advance(JSContext *ctx, JSFromAsync *s, JSValue in, JSValue **out_
 {
     JSValueConst st = s->st;
     int phase = (int)fa_get_int(ctx, st, FA_PHASE);
+
+    fa_phase_check(phase);
     JSValue v, a, held, mapfn;
     int64_t k, len;
     int r;
@@ -71913,19 +71978,19 @@ static const char *const js_ab_slice_steps[] = {
    than naming steps of an algorithm it does not perform. */
 static const char *const js_ab_sliceImm_steps[] = {
     ABSLICE_STAGES(JS_STEP_STAGE_LABEL,
-        "25.1.6.8 steps 1-4 (O has [[ArrayBufferData]], is not detached; len is O.[[ArrayBufferByteLength]])",
-        "25.1.6.8 steps 5-12 (start and end are ToIntegerOrInfinity; newLen)",
-        "25.1.6.8 has no SpeciesConstructor: C is never read",
-        "25.1.6.8 has no SpeciesConstructor: @@species is never read",
-        "25.1.6.8 step 13 (new is an immutable ArrayBuffer of newLen bytes)")
+        "proposal-immutable-arraybuffer ArrayBuffer.prototype.sliceToImmutable steps 1-4 (O has [[ArrayBufferData]], is not detached; len is O.[[ArrayBufferByteLength]])",
+        "proposal-immutable-arraybuffer ArrayBuffer.prototype.sliceToImmutable steps 5-12 (start and end are ToIntegerOrInfinity; newLen)",
+        "proposal-immutable-arraybuffer ArrayBuffer.prototype.sliceToImmutable has no SpeciesConstructor: C is never read",
+        "proposal-immutable-arraybuffer ArrayBuffer.prototype.sliceToImmutable has no SpeciesConstructor: @@species is never read",
+        "proposal-immutable-arraybuffer ArrayBuffer.prototype.sliceToImmutable step 13 (new is an immutable ArrayBuffer of newLen bytes)")
     NULL };
 static const char *const js_sab_slice_steps[] = {
     ABSLICE_STAGES(JS_STEP_STAGE_LABEL,
-        "25.2.5.2 steps 1-4 (O has [[ArrayBufferData]] and is shared; len is O.[[ArrayBufferByteLength]])",
-        "25.2.5.2 steps 5-13 (start and end are ToIntegerOrInfinity; newLen)",
-        "25.2.5.2 step 14 via 7.3.22 step 1 (C is Get(O, \"constructor\"))",
-        "25.2.5.2 step 14 via 7.3.22 step 3 (S is Get(C, @@species))",
-        "25.2.5.2 step 15 (new is Construct(ctor, <<newLen>>))")
+        "25.2.5.6 steps 1-4 (O has [[ArrayBufferData]] and is shared; len is O.[[ArrayBufferByteLength]])",
+        "25.2.5.6 steps 5-13 (start and end are ToIntegerOrInfinity; newLen)",
+        "25.2.5.6 step 14 via 7.3.22 step 1 (C is Get(O, \"constructor\"))",
+        "25.2.5.6 step 14 via 7.3.22 step 3 (S is Get(C, @@species))",
+        "25.2.5.6 step 15 (new is Construct(ctor, <<newLen>>))")
     NULL };
 
 static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -74541,10 +74606,10 @@ static const JSTrampStepDef js_ab_slice_def      = { sizeof(JSABSlice), js_ab_sl
                        .algorithm = "25.1.6.7 ArrayBuffer.prototype.slice",
                        .steps = js_ab_slice_steps };
 static const JSTrampStepDef js_ab_sliceImm_def   = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_ARRAY_BUFFER*2 + 1, .visit = js_ab_slice_visit,
-                       .algorithm = "25.1.6.8 ArrayBuffer.prototype.sliceToImmutable",
+                       .algorithm = "ArrayBuffer.prototype.sliceToImmutable (proposal-immutable-arraybuffer)",
                        .steps = js_ab_sliceImm_steps };
 static const JSTrampStepDef js_sab_slice_def     = { sizeof(JSABSlice), js_ab_slice_step, js_ab_slice_fini, JS_CLASS_SHARED_ARRAY_BUFFER*2 + 0, .visit = js_ab_slice_visit,
-                       .algorithm = "25.2.5.2 SharedArrayBuffer.prototype.slice",
+                       .algorithm = "25.2.5.6 SharedArrayBuffer.prototype.slice",
                        .steps = js_sab_slice_steps };
 static int js_error_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result);
@@ -91864,7 +91929,7 @@ static JSValue js_map_get_size(JSContext *ctx, JSValueConst this_val, int magic)
     return js_uint32(s->record_count);
 }
 
-/* 24.1.3.5 Map.prototype.forEach / 24.2.4.6 Set.prototype.forEach. The callback is the page's code and the loop
+/* 24.1.3.5 Map.prototype.forEach / 24.2.4.7 Set.prototype.forEach. The callback is the page's code and the loop
    drove it with JS_Call from C, so a callback containing a loop preempted in an activation with no flow base —
    and between them Map and Set were the whole of their directories' residual drive count.
    The traversal is unchanged, including the part that is not obvious: the record is LOCKED across the call and
@@ -91885,8 +91950,8 @@ static const char *const js_map_foreach_steps[] = {
     NULL };
 static const char *const js_set_foreach_steps[] = {
     MAPFOREACH_STAGES(JS_STEP_STAGE_LABEL,
-        "24.2.4.6 steps 1-6 (S has [[SetData]]; IsCallable(callbackfn); entries; index is 0)",
-        "24.2.4.6 step 7.b.i (Call(callbackfn, thisArg, <<e, e, S>>))")
+        "24.2.4.7 steps 1-6 (S has [[SetData]]; IsCallable(callbackfn); entries; index is 0)",
+        "24.2.4.7 step 7.b.i (Call(callbackfn, thisArg, <<e, e, S>>))")
     NULL };
 
 static int js_map_foreach_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -91979,7 +92044,7 @@ static const JSTrampStepDef js_map_foreach_def = {
 };
 static const JSTrampStepDef js_set_foreach_def = {
     sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, MAGIC_SET, .visit = js_map_foreach_visit,
-    .algorithm = "24.2.4.6 Set.prototype.forEach",
+    .algorithm = "24.2.4.7 Set.prototype.forEach",
     .steps = js_set_foreach_steps
 };
 
