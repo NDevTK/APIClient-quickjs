@@ -68127,8 +68127,7 @@ static int js_function_apply_step(JSContext *ctx, void *st, JSValue cb_result, J
 /* Reflect.construct(target, argumentsList[, newTarget]) — apply's construct twin, and it had no machine either,
    so reached as a VALUE it built its argument list and drove the constructor from C. 28.1.2 is the same shape as
    28.1.1: validate, CreateListFromArrayLike, then the internal method — so it is the same collect, on the same
-   sub-sequences, ending in a CONSTRUCT request instead of a CALL.
-   Stages: 0 validate, 1 the length, 2 the elements, 3 the CONSTRUCT, 4 its result. */
+   sub-sequences, ending in a CONSTRUCT request instead of a CALL. */
 static int js_reflect_construct_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSFuncApply *s = st;
@@ -71366,8 +71365,7 @@ static bool ta_buffer_ctor_ready(JSValueConst *call_argv, int call_argc)
 /* 23.1.2.3 Array.of. Step 4 is `Construct(C, [len])` when `this` is a constructor — a real Construct of whatever
    the page put there, reached from C by JS_CallConstructor. That drives a bytecode constructor to completion, and
    since the Array constructor itself is becoming a step machine it cannot run one at all. The Construct is a step
-   (4) instead, so the object comes back to stage 1 and a loop anywhere in that constructor parks.
-   Stages: 0 request the Construct (or make the plain array and fall straight through), 1 fill the result. */
+   (4) instead, so the object comes back to stage 1 and a loop anywhere in that constructor parks. */
 typedef struct JSArrayOf {
     JSStepHdr hdr;
     JSValue result;   /* the object being filled — also the RESULT (owned) */
@@ -78155,12 +78153,10 @@ static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* 23.1.3.23 push / 23.1.3.34 unshift — one machine, the unshift flag in the declaration. LengthOfArrayLike,
+/* 23.1.3.23 push / 23.1.3.37 unshift — one machine, the unshift flag in the declaration. LengthOfArrayLike,
    unshift's element SHIFT, each inserted write and the final Set(length) are the page's code, and js_array_push
    ran them from C. The dense-array push fast path stays, guarded by everything that makes it unobservable
-   (a plain fast Array with the standard prototype, a writable int `length` that matches the element count).
-   Stages: 0 the fast path / ToObject, 1 length, 2 unshift's shift, 3 the inserted writes,
-   4 Set(O,"length",newLen). */
+   (a plain fast Array with the standard prototype, a writable int `length` that matches the element count). */
 
 /* push and unshift are ONE machine because they are one algorithm with one extra step: unshift moves what is
    already there up by argCount first. ONE stage list, each label naming BOTH sections, because a stage of a
@@ -78299,9 +78295,7 @@ static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result)
    length read, both HasProperty asks, both Gets, and then two writes that are a Set or a
    DeletePropertyOrThrow depending on which side existed. js_array_reverse performed all of them from C.
    The DENSE span stays: js_get_fast_array with count32 == len is the statement that no accessor, no Proxy trap
-   and no prototype lookup is reachable, so those slots swap with no observable step at all.
-   Stages: 0 ToObject, 1 length + the dense span, 2 pair head, 3 Has(l), 4 Get(l), 5 Has(h), 6 Get(h),
-   7 the first write, 8 the second. */
+   and no prototype lookup is reachable, so those slots swap with no observable step at all. */
 
 /* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). 23.1.3.26 states
    the two writes as three ordered PAIRS (steps 5.h, 5.i and 5.j) rather than as one conditional, so each
@@ -78445,8 +78439,7 @@ static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result)
    `new Proxy([1,2],{has:()=>false, get:()=>'V'})` that fired two `has` traps and produced [undefined,undefined]
    where the spec yields ["V","V"]. The step sub-sequence is the plain Get the spec names.
    The FAST-ARRAY span stays: js_get_fast_array is precisely the statement that no accessor, no Proxy trap and no
-   prototype lookup is reachable, so it is the same computation with no observable step.
-   Stages: 0 ToObject, 1 length + allocate + the dense span, 2 the element read. */
+   prototype lookup is reachable, so it is the same computation with no observable step. */
 
 #define ATOREV_STAGES(X) \
     X(ATOREV_TOOBJECT, "23.1.3.33 step 1 (O is ToObject(this value))") \
@@ -78529,12 +78522,7 @@ static JSValue js_array_toreversed_fini(JSContext *ctx, void *st, bool take_resu
    performed all of it from C, so a loop in any of them had no flow base and aborted at its back-edge.
    The FAST-ARRAY paths stay: js_get_fast_array / js_is_fast_array is precisely the statement that no accessor, no
    Proxy trap and no prototype lookup is reachable, so they are the same computation with no observable step — not
-   a second implementation of one.
-   Stages: 0 ToObject, 1 length, 2 start, 3 the second index, 4 ArraySpeciesCreate, 5 copy head, 6 HasProperty,
-   7 Get, 14 the element define, 8 Set(A,"length",n), 9 splice's tail head, 13 the element shift, 10 delete,
-   11 the inserted items, 12 Set(O,"length",newLen). (13 and 14 are out of order because they were added after
-   the rest; a stage is a wire value in a suspended state, and renumbering to tidy the list would silently
-   repoint anything parked at the old one.) */
+   a second implementation of one. */
 
 /* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). TWO algorithms over
    one walk: slice ends at its step 16 and splice keeps going, so the shared prefix is one list and splice's tail
@@ -78780,9 +78768,7 @@ static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result)
    whose `has` says false and whose `get` returns a value, that produced undefined where the spec yields the
    value. The step sub-sequence is the plain Get the spec names.
    The FAST-ARRAY span stays: js_get_fast_array is precisely the statement that no accessor, no Proxy trap and no
-   prototype lookup is reachable, so it is the same computation with no observable step.
-   Stages: 0 ToObject, 1 length, 2 start, 3 skipCount + allocate + the dense span, 4 the head reads,
-   5 the inserted items, 6 the tail reads. */
+   prototype lookup is reachable, so it is the same computation with no observable step. */
 
 /* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). This machine's own
    comments cited steps 14, 15 and 16 for the three walks; 23.1.3.35 numbers them 16, 17 and 18, and a comment
@@ -85435,9 +85421,7 @@ static int js_is_regexp(JSContext *ctx, JSValueConst obj)
    the pattern or the flags, each with a loop in it, had no flow base and aborted at its back-edge.
    It also created the object LAST, after both ToStrings. Step 7's RegExpAlloc — which reads
    `? Get(newTarget, "prototype")` — comes BEFORE RegExpInitialize's coercions in step 8, and
-   `Reflect.construct(RegExp, [p, f], nt)` with accessors on all three observes the difference.
-   Stages: 0 the receiver split, 9 IsRegExp, 1 the same-constructor shortcut, 2 Get "source", 3 Get "flags",
-   4 RegExpAlloc, 5 ToString(P), 6 ToString(F) + the compile. */
+   `Reflect.construct(RegExp, [p, f], nt)` with accessors on all three observes the difference. */
 /* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The IsRegExp stage
    was numbered 9 - out of sequence, appended after the rest - which is the workaround the single declaration
    removes: a parked machine holds its stage's LABEL, so the list is in the standard's order. */
@@ -86692,10 +86676,7 @@ static int step_reexec_run(JSContext *ctx, JSStepHdr *h, JSValueConst r, JSValue
 
 /* 22.2.6.8 RegExp.prototype [ @@match ] ( string ) — a step machine. js_regexp_Symbol_match ran the whole of it
    from C, including an UNBOUNDED RegExpExec loop that calls a patched `exec`, so a loop anywhere in it had no
-   flow base and aborted at its back-edge.
-   Stages: 0 the receiver check, 1 ToString(string), 2 Get "flags", 3 its ToString + the global branch,
-   4 the non-global single exec, 5 the lastIndex reset + ArrayCreate, 6 the exec, 7 Get "0", 8 its ToString +
-   the result write, 9 the empty-match lastIndex read, 10 its write. */
+   flow base and aborted at its back-edge. */
 /* 22.2.6.8 RegExp.prototype [ @@match ], AS THE SPEC NUMBERS IT. Two stages may not name one step, so the Get
    and the ToString that consumes it each say which half they are — the machine rests at both. */
 #define MATCH_STAGES(X) \
@@ -87004,9 +86985,7 @@ static JSValue js_re_str_iter_fini(JSContext *ctx, void *st, bool take_result)
 /* 22.2.6.9 RegExp.prototype [ @@matchAll ] ( string ) — a step machine. js_regexp_Symbol_matchAll ran all of it
    from C: ToString(string), SpeciesConstructor's `constructor` and `@@species` reads, `? Get(R,"flags")` and
    its ToString, `? Construct(C, «R, flags»)`, and the lastIndex read and write. The Construct in particular
-   reached the DFAIL once RegExp itself became a step machine — a C frame cannot drive one.
-   Stages: 0 the receiver check, 1 ToString(string), 2 SpeciesConstructor, 3 Get "flags", 4 its ToString,
-   5 the Construct, 6 its result, 7 Get "lastIndex", then the Set and the iterator. */
+   reached the DFAIL once RegExp itself became a step machine — a C frame cannot drive one. */
 /* 22.2.6.9 RegExp.prototype [ @@matchAll ], AS THE SPEC NUMBERS IT. */
 #define MALL_STAGES(X) \
     X(MALL_RECV,      "22.2.6.9 steps 1-2 (R is the this value; the not-an-Object TypeError)") \
