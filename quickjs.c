@@ -65723,6 +65723,100 @@ done:
    requested per key through step_getprop_run, which is the shared entry that routes an accessor body and a Proxy
    `get` trap onto the tramp chain (and does a data slot inline), so a getter with a loop in it parks like any other
    call instead of driving to completion inside JS_GetOwnPropertyNames2. */
+/* ONE list expanded once PER ALGORITHM, so a renumber carries its label with it (JSTrampStepDef.steps).
+   EIGHT definitions over FIVE algorithms: values, keys and entries are 7.3.23 with three kinds and therefore
+   ONE list; defineProperties and create are both 20.1.2.3.1; getOwnPropertyDescriptors, assign and the object
+   spread each have their own. A definition whose stage cannot occur in its algorithm - the two DEFINE stages
+   exist only for 20.1.2.3.1's second loop - has an array that ENDS before them, so resting there is a stage past
+   the end of ITS algorithm and step_stage_check names it. */
+#define PWALK_STAGES(X, ENTRY, SOURCE, KEYS, KEYHEAD, DESC, GET, PLACE, WRITE) \
+    X(PW_ENTRY,   ENTRY)   \
+    X(PW_SOURCE,  SOURCE)  \
+    X(PW_KEYS,    KEYS)    \
+    X(PW_KEYHEAD, KEYHEAD) \
+    X(PW_DESC,    DESC)    \
+    X(PW_GET,     GET)     \
+    X(PW_PLACE,   PLACE)   \
+    X(PW_WRITE,   WRITE)   \
+    X(PW_SRCDONE, "the source is exhausted: its key snapshot and its coerced object are released before the " \
+                  "next source replaces them. No step of any of these algorithms - a snapshot is this engine's, " \
+                  "and nothing here can suspend")
+#define PWALK_DEFINE_EXTRA(X, DEFINE, DEFINED) \
+    X(PW_DEFINE,  DEFINE) \
+    X(PW_DEFINED, DEFINED)
+enum { PWALK_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0, 0, 0, 0)
+       PWALK_DEFINE_EXTRA(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_enum_own_props_steps[] = {
+    PWALK_STAGES(JS_STEP_STAGE_LABEL,
+        "7.3.23, entered: results is a new empty List (step 2)",
+        "7.3.23 step 1's receiver (O is ToObject of the argument) - and the dispatch of O.[[OwnPropertyKeys]]()",
+        "7.3.23 step 1 (ownKeys arrives and is snapshotted)",
+        "7.3.23 steps 3 and 3.a (Repeat over ownKeys: a Symbol key is skipped) - and the dispatch of step "
+        "3.a.i's O.[[GetOwnProperty]](key)",
+        "7.3.23 steps 3.a.i-3.a.ii.1 (desc arrives; a non-enumerable or absent key is skipped; kind key appends "
+        "the key)",
+        "7.3.23 step 3.a.ii.2.a (value is Get(O, key))",
+        "7.3.23 steps 3.a.ii.2.b-3.a.ii.2.c (the value, or CreateArrayFromList of key and value, is appended)",
+        "7.3.23: unreached - this walk performs no Set")
+    NULL };
+static const char *const js_obj_descs_steps[] = {
+    PWALK_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.9 step 3 (descriptors is OrdinaryObjectCreate(%Object.prototype%))",
+        "20.1.2.9 step 1 (obj is ToObject(O)) - and the dispatch of step 2's obj.[[OwnPropertyKeys]]()",
+        "20.1.2.9 step 2 (ownKeys arrives and is snapshotted)",
+        "20.1.2.9 step 4 (Repeat over ownKeys) - and the dispatch of step 4.a's obj.[[GetOwnProperty]](key)",
+        "20.1.2.9 steps 4.a-4.c (desc arrives; descriptor is FromPropertyDescriptor(desc); "
+        "CreateDataPropertyOrThrow(descriptors, key, descriptor))",
+        "20.1.2.9: unreached - a descriptor walk performs no Get",
+        "20.1.2.9: unreached - the descriptor is placed in the stage that reads it",
+        "20.1.2.9: unreached - this walk performs no Set")
+    NULL };
+static const char *const js_obj_assign_steps[] = {
+    PWALK_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.1 steps 1-2 (to is ToObject(target); one argument returns it)",
+        "20.1.2.1 steps 3-3.a.i (the next nextSource; a nullish one is skipped; from is ToObject(nextSource)) - "
+        "and the dispatch of step 3.a.ii's from.[[OwnPropertyKeys]]()",
+        "20.1.2.1 step 3.a.ii (keys arrives and is snapshotted)",
+        "20.1.2.1 step 3.a.iii (Repeat over keys) - and the dispatch of step 3.a.iii.1's "
+        "from.[[GetOwnProperty]](nextKey)",
+        "20.1.2.1 steps 3.a.iii.1-3.a.iii.2 (desc arrives; a non-enumerable or absent key is skipped)",
+        "20.1.2.1 step 3.a.iii.2.a (propValue is Get(from, nextKey))",
+        "20.1.2.1 step 3.a.iii.2.b, prepared (propValue is parked for the write that follows)",
+        "20.1.2.1 step 3.a.iii.2.b (Set(to, nextKey, propValue, true))")
+    NULL };
+static const char *const js_obj_spread_steps[] = {
+    PWALK_STAGES(JS_STEP_STAGE_LABEL,
+        "7.3.25, entered: target is the object the opcode created and is only borrowed here",
+        "7.3.25 steps 1-2 (a nullish source contributes nothing; from is ToObject(source)) - and the dispatch "
+        "of step 3's from.[[OwnPropertyKeys]]()",
+        "7.3.25 step 3 (keys arrives and is snapshotted)",
+        "7.3.25 steps 4-4.c (Repeat over keys; excludedItems decides `excluded`) - and the dispatch of step "
+        "4.c.i's from.[[GetOwnProperty]](nextKey)",
+        "7.3.25 steps 4.c.i-4.c.ii (desc arrives; a non-enumerable or absent key is skipped)",
+        "7.3.25 step 4.c.ii.1 (propValue is Get(from, nextKey))",
+        "7.3.25 step 4.c.ii.2 (CreateDataPropertyOrThrow(target, nextKey, propValue))",
+        "7.3.25: unreached - a spread's target is fresh, so it performs no Set")
+    NULL };
+static const char *const js_obj_defprops_steps[] = {
+    PWALK_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.3.1, entered: O is validated as an Object before Properties is coerced, and descriptors is a "
+        "new empty List (step 3)",
+        "20.1.2.3.1 step 1 (props is ToObject(Properties)) - and the dispatch of step 2's "
+        "props.[[OwnPropertyKeys]]()",
+        "20.1.2.3.1 step 2 (keys arrives and is snapshotted)",
+        "20.1.2.3.1 step 4 (Repeat over keys) - and the dispatch of step 4.a's "
+        "props.[[GetOwnProperty]](nextKey)",
+        "20.1.2.3.1 steps 4.a-4.b (propDesc arrives; a non-enumerable or absent key is skipped)",
+        "20.1.2.3.1 step 4.b.i (descObj is Get(props, nextKey))",
+        "20.1.2.3.1 steps 4.b.ii-4.b.iii (desc is ToPropertyDescriptor(descObj), itself a sequence of keyed "
+        "reads; the Record is appended)",
+        "20.1.2.3.1: unreached - this walk performs no Set")
+    PWALK_DEFINE_EXTRA(JS_STEP_STAGE_LABEL,
+        "20.1.2.3.1 step 5 (the SECOND loop) - and the dispatch of step 5.a's DefinePropertyOrThrow(O, "
+        "property.[[Key]], property.[[Descriptor]])",
+        "20.1.2.3.1 step 5.a (the define's answer arrives)")
+    NULL };
+
 static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPropWalk *s = st;
@@ -65732,7 +65826,7 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     int defprops = (mode == PROPWALK_DEFPROPS || mode == PROPWALK_OBJCREATE);
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == PW_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds, so a field
            handed over late is a leak and a buffer initialised late is freed with a NULL context. */
@@ -65760,10 +65854,10 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                   : (mode == PROPWALK_SPREAD ? js_dup(step_arg(&s->hdr, 0))
                      : mode == PROPWALK_DESCS ? JS_NewObject(ctx) : JS_NewArray(ctx));
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = PW_SOURCE;
     }
     for (;;) {
-        if (s->hdr.stage == 1) {
+        if (s->hdr.stage == PW_SOURCE) {
             /* open the next SOURCE. assign has argc-1 of them and skips the nullish ones (step 3.a); the others
                have exactly one, argv[0]. */
             JSValueConst src;
@@ -65772,7 +65866,7 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                second source, so the bound is a mode fact, not argc. */
             int src_end = assign ? s->hdr.argc : (mode == PROPWALK_SPREAD || defprops) ? 2 : 1;
             if (s->src_i >= src_end) {
-                if (defprops) { s->hdr.stage = 9; goto defprops_apply; }
+                if (defprops) { s->hdr.stage = PW_DEFINE; goto defprops_apply; }
                 JS_FreeValue(ctx, cb_result); return 0;
             }
             /* 20.1.2.2 step 3: `Object.create(p)` with no Properties defines nothing at all — an ABSENT
@@ -65795,12 +65889,12 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                [[OwnPropertyKeys]] is a REQUEST: on a Proxy it is the `ownKeys` trap, the page's code, and taking
                it with JS_GetOwnPropertyNamesInternal drove that trap from C. */
             JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
-            s->hdr.stage = 7;
+            s->hdr.stage = PW_KEYS;
             s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds it across the request */
             *out_cb = s->hdr.cb_coerce; *out_argc = 0;
             return 11;
         }
-        if (s->hdr.stage == 7) {
+        if (s->hdr.stage == PW_KEYS) {
             /* the key list arrived as an ARRAY. Turning it into the atom snapshot invokes nothing: it is a dense
                array this engine built, of Strings and Symbols the invariant already validated.
                assign and a spread copy SYMBOL keys too; values/entries take only the string ones. */
@@ -65830,11 +65924,11 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             JS_FreeValue(ctx, keys);
             s->len = kept;
             s->i = 0;
-            s->hdr.stage = 2;
+            s->hdr.stage = PW_KEYHEAD;
         }
-        if (s->hdr.stage == 2) {
+        if (s->hdr.stage == PW_KEYHEAD) {
             int res;
-            if (s->i >= s->len) { s->hdr.stage = 4; goto source_done; }
+            if (s->i >= s->len) { s->hdr.stage = PW_SRCDONE; goto source_done; }
             if (mode == PROPWALK_SPREAD) {
                 /* `{a, ...rest}`: the keys already bound by the pattern are excluded. The list is an object
                    the COMPILER built for this destructuring, which no page can reach — so this lookup invokes
@@ -65852,51 +65946,51 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             /* 7.3.23 step 3.a: `desc = ? O.[[GetOwnProperty]](key)` — a REQUEST, because on a Proxy it is the
                `getOwnPropertyDescriptor` trap. JS_GetOwnPropertyFlagsInternal ran that trap from C. */
             JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
-            s->hdr.stage = 8;
+            s->hdr.stage = PW_DESC;
             s->hdr.cb_coerce[0] = s->obj;
             *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->atoms[s->i].atom;
             return 12;
         }
-        if (s->hdr.stage == 8) {
+        if (s->hdr.stage == PW_DESC) {
             /* the descriptor object, or undefined when the property is gone. Reading `enumerable` off it invokes
                nothing — FromPropertyDescriptor built it. */
             JSValue desc = cb_result, en;
             cb_result = JS_UNDEFINED;
             if (JS_IsException(desc)) return -1;
-            if (JS_IsUndefined(desc)) { s->i++; s->hdr.stage = 2; continue; }
+            if (JS_IsUndefined(desc)) { s->i++; s->hdr.stage = PW_KEYHEAD; continue; }
             if (mode == PROPWALK_DESCS) {
                 /* 20.1.2.9 step 4.b-c: the descriptor IS the element, kept for every key regardless of
                    enumerability, and defined on the result. */
                 if (JS_DefinePropertyValue(ctx, s->result, JS_DupAtom(ctx, s->atoms[s->i].atom), desc,
                                            JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                     return -1;
-                s->i++; s->hdr.stage = 2;
+                s->i++; s->hdr.stage = PW_KEYHEAD;
                 continue;
             }
             {
                 int enumerable = js_desc_object_is_enumerable(ctx, desc);
                 JS_FreeValue(ctx, desc);
                 if (enumerable < 0) return -1;
-                if (!enumerable) { s->i++; s->hdr.stage = 2; continue; }
+                if (!enumerable) { s->i++; s->hdr.stage = PW_KEYHEAD; continue; }
             }
             if (mode == PROPWALK_KEYS) {
                 /* 7.3.23 with kind = key: the KEY is the element, and there is no Get at all. */
                 JSValue kv = JS_AtomToValue(ctx, s->atoms[s->i].atom);
                 if (JS_IsException(kv)) return -1;
                 if (JS_CreateDataPropertyUint32(ctx, s->result, s->j++, kv, 0) < 0) return -1;
-                s->i++; s->hdr.stage = 2;
+                s->i++; s->hdr.stage = PW_KEYHEAD;
                 continue;
             }
-            s->hdr.stage = 3;
+            s->hdr.stage = PW_GET;
         }
-        if (s->hdr.stage == 3) {
+        if (s->hdr.stage == PW_GET) {
             r = step_getprop_run(ctx, &s->hdr, s->obj, s->atoms[s->i].atom, cb_result,
                                  &s->el, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
-            s->hdr.stage = 5;
+            s->hdr.stage = PW_PLACE;
         }
-        if (s->hdr.stage == 5 && defprops) {
+        if (s->hdr.stage == PW_PLACE && defprops) {
             /* 20.1.2.3.1 step 4.a.ii: the value IS a descriptor object, and ToPropertyDescriptor reads twelve
                more keyed operations off it. The cursor is resumable, so this stage is re-entered until it says
                the descriptor is complete. */
@@ -65922,10 +66016,10 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             JS_FreeValue(ctx, s->dcur.cb[0]);
             js_desc_cursor_init(&s->dcur);         /* the next key starts a fresh one */
             s->i++;
-            s->hdr.stage = 2;
+            s->hdr.stage = PW_KEYHEAD;
             continue;
         }
-        if (s->hdr.stage == 5) {
+        if (s->hdr.stage == PW_PLACE) {
             JSValue item = s->el;
             s->el = JS_UNDEFINED;   /* the state no longer owns it: every path below consumes it */
             if (assign) {
@@ -65933,7 +66027,7 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                    SETTER or a Proxy `set` trap on the TARGET runs on the chain. The element is parked back on the
                    state because the write suspends and this function's locals do not survive that. */
                 s->el = item;
-                s->hdr.stage = 6;
+                s->hdr.stage = PW_WRITE;
             } else if (mode == PROPWALK_SPREAD) {
                 /* CreateDataPropertyOrThrow on a FRESH object: no setter, no trap, nothing that can suspend. */
                 if (JS_DefinePropertyValue(ctx, s->result, JS_DupAtom(ctx, s->atoms[s->i].atom), item,
@@ -65956,21 +66050,21 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 if (JS_CreateDataPropertyUint32(ctx, s->result, s->j++, item, 0) < 0)
                     return -1;
             }
-            if (s->hdr.stage != 6) {
+            if (s->hdr.stage != PW_WRITE) {
                 s->i++;
-                s->hdr.stage = 2;
+                s->hdr.stage = PW_KEYHEAD;
             }
         }
-        if (s->hdr.stage == 6) {
+        if (s->hdr.stage == PW_WRITE) {
             r = step_setprop_run(ctx, &s->hdr, s->result, s->atoms[s->i].atom, s->el, cb_result,
                                  out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
             JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
             s->i++;
-            s->hdr.stage = 2;
+            s->hdr.stage = PW_KEYHEAD;
         }
-        if (s->hdr.stage == 9) {
+        if (s->hdr.stage == PW_DEFINE) {
         defprops_apply:
             /* 20.1.2.3.1 step 5, the SECOND loop. It is separate because the spec says so — every descriptor is
                validated before any is defined — and because each define is a REQUEST: the target can be a Proxy,
@@ -65985,19 +66079,19 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 s->hdr.desc_get = d->getter;   /* borrowed: the list holds them across the request */
                 s->hdr.desc_set = d->setter;
                 s->hdr.desc_flags = d->flags | JS_PROP_THROW | JS_PROP_DEFINE_PROPERTY;
-                s->hdr.stage = 10;
+                s->hdr.stage = PW_DEFINED;
                 *out_cb = s->cb; *out_argc = (int)s->dk[s->di];
                 return 10;   /* DEFINE */
             }
         }
-        if (s->hdr.stage == 10) {
+        if (s->hdr.stage == PW_DEFINED) {
             if (JS_IsException(cb_result)) return -1;
             JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
             s->di++;
-            s->hdr.stage = 9;
+            s->hdr.stage = PW_DEFINE;
             continue;
         }
-        if (s->hdr.stage == 4) {
+        if (s->hdr.stage == PW_SRCDONE) {
         source_done:
             /* this source is exhausted: release its snapshot before the next one replaces it (the teardown frees
                only what the state currently holds, so overwriting either field without freeing it leaks). */
@@ -66005,7 +66099,7 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             s->atoms = NULL; s->len = 0;
             JS_FreeValue(ctx, s->obj); s->obj = JS_UNDEFINED;
             s->src_i++;
-            s->hdr.stage = 1;
+            s->hdr.stage = PW_SOURCE;
         }
     }
 }
@@ -74912,9 +75006,19 @@ static const JSTrampStepDef js_ta_join_def        = { sizeof(JSArrayJoin), js_ar
                         .algorithm = "23.2.3.18 %TypedArray%.prototype.join", .steps = js_ta_join_steps };
 static const JSTrampStepDef js_ta_tolocale_def    = { sizeof(JSArrayJoin), js_array_join_step, js_array_join_fini, JOIN_TA_LOCALE, .visit = js_array_join_visit,
                         .algorithm = "23.2.3.31 %TypedArray%.prototype.toLocaleString", .steps = js_ta_tolocale_steps };
-static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES, .visit = js_prop_walk_visit };
-static const JSTrampStepDef js_obj_keys_def       = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_KEYS, .visit = js_prop_walk_visit };
-static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DESCS, .visit = js_prop_walk_visit };
+static const char *const js_enum_own_props_steps[];
+static const char *const js_obj_descs_steps[];
+static const char *const js_obj_assign_steps[];
+static const char *const js_obj_spread_steps[];
+static const char *const js_obj_defprops_steps[];
+static const JSTrampStepDef js_obj_values_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_VALUES, .visit = js_prop_walk_visit,
+                        .algorithm = "20.1.2.24 Object.values, which is 7.3.23 EnumerableOwnProperties with kind value",
+                        .steps = js_enum_own_props_steps };
+static const JSTrampStepDef js_obj_keys_def       = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_KEYS, .visit = js_prop_walk_visit,
+                        .algorithm = "20.1.2.19 Object.keys, which is 7.3.23 EnumerableOwnProperties with kind key",
+                        .steps = js_enum_own_props_steps };
+static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DESCS, .visit = js_prop_walk_visit,
+                        .algorithm = "20.1.2.9 Object.getOwnPropertyDescriptors", .steps = js_obj_descs_steps };
 static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result);
 static void js_reflect_prop_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -74935,11 +75039,19 @@ static const JSTrampStepDef js_reflect_has_def    = { sizeof(JSReflectProp), js_
 static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_DELETE, .visit = js_reflect_prop_visit,
                                                      .algorithm = "28.1.4 Reflect.deleteProperty",
                                                      .steps = js_reflect_del_steps };
-static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES, .visit = js_prop_walk_visit };
-static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN, .visit = js_prop_walk_visit };
-static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS, .visit = js_prop_walk_visit };
-static const JSTrampStepDef js_obj_create_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_OBJCREATE, .visit = js_prop_walk_visit };
-static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD, .visit = js_prop_walk_visit };
+static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES, .visit = js_prop_walk_visit,
+                        .algorithm = "20.1.2.5 Object.entries, which is 7.3.23 EnumerableOwnProperties with kind key+value",
+                        .steps = js_enum_own_props_steps };
+static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN, .visit = js_prop_walk_visit,
+                        .algorithm = "20.1.2.1 Object.assign", .steps = js_obj_assign_steps };
+static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS, .visit = js_prop_walk_visit,
+                        .algorithm = "20.1.2.3 Object.defineProperties, which is 20.1.2.3.1 ObjectDefineProperties",
+                        .steps = js_obj_defprops_steps };
+static const JSTrampStepDef js_obj_create_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_OBJCREATE, .visit = js_prop_walk_visit,
+                        .algorithm = "20.1.2.2 Object.create, whose step 3 is 20.1.2.3.1 ObjectDefineProperties",
+                        .steps = js_obj_defprops_steps };
+static const JSTrampStepDef js_obj_spread_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_SPREAD, .visit = js_prop_walk_visit,
+                        .algorithm = "7.3.25 CopyDataProperties, the object spread", .steps = js_obj_spread_steps };
 static const char *const js_array_flat_steps[];
 static const char *const js_array_flatMap_steps[];
 static const JSTrampStepDef js_array_flat_def      = { sizeof(JSArrayFlat), js_array_flat_step, js_array_flat_fini, ARRAYFLAT_FLAT, .visit = js_array_flat_visit,
