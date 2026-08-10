@@ -88929,10 +88929,22 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
     int r;
     if (s->hdr.stage == JP_UNKNOWN) {
         JSValueConst text = step_arg(&s->hdr, 0);
-        /* THE ASK COMES BEFORE THIS MACHINE OWNS ANYTHING, and that ordering is what makes the sibling's
-           snapshot correct rather than merely working: the clone taken at the fork holds the all-zero state
-           tramp_step_state_new produced, so the sibling re-enters at this exact ask and answers it from its
-           OWN decision vector. A state half-built at the fork would be two flows sharing one parse. */
+        if (s->hdr.fork_phase == FORK_PH_ASK) {
+            /* EVERY owned field before the first thing that can throw — and on this stage the first thing that
+               can throw is the fork's own SyntaxError arm, so the emptying runs BEFORE the ask rather than
+               after it. The failure path tears the state down through fini, which frees exactly what the state
+               holds, so a field left unwritten is read as whatever the allocation happened to contain.
+               It is also what the SIBLING's snapshot carries: the clone is taken AT the ask, so this leaves it
+               holding a machine that owns nothing, and the sibling re-enters at that ask and answers it from
+               its OWN decision vector. The sibling re-runs this, which is idempotent because it assigns only
+               empty values and nothing has been assigned yet — asserted below rather than assumed. */
+            JS_FreeValue(ctx, cb_result);
+            cb_result = JS_UNDEFINED;
+            s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
+            s->unknown = JS_UNDEFINED;
+            s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
+            s->parsing = 0;
+        }
         if (g_concolic.is && g_concolic.is(text)) {
             int arm;
             DCHECK(s->pr == NULL && s->stack == NULL && s->text == NULL && !s->parsing,
@@ -88959,14 +88971,6 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
                 return js_json_throw_unknown(ctx);
             }
         }
-        /* EVERY owned field before the first thing that can throw: the failure path tears the state down
-           through fini, which frees exactly what the state holds. */
-        JS_FreeValue(ctx, cb_result);
-        cb_result = JS_UNDEFINED;
-        s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
-        s->unknown = JS_UNDEFINED;
-        s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
-        s->parsing = 0;
         s->hdr.stage = JP_TOSTRING;
         if (g_concolic.is && g_concolic.is(text)) {
             /* THE PARSE COMPLETION, over a text this engine does not have. What it DOES have is the source's
