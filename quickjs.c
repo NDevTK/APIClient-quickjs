@@ -1697,14 +1697,19 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_GLOBAL_ESCAPE, STEPDEF_GLOBAL_UNESCAPE,
     STEPDEF_INSTANCEOF, STEPDEF_ORDINARY_HAS_INSTANCE,
     STEPDEF_TA_SORT, STEPDEF_TA_TOSORTED, STEPDEF_STR_LOCALECOMPARE,
-    /* 21.4.4.20-.28: one id per setter, because a coerce-then-compute definition carries the body's magic AND
-       the mask of arguments the spec coerces, and those differ per setter. */
+    /* ONE id per setter, because a coerce-then-compute definition carries the body's magic AND the mask of
+       arguments the spec coerces, and those differ per setter. The SECTION and the range of steps its coercions
+       occupy ride the same list for the same reason: they differ per setter too, and a second list of them beside
+       this one is the drift the stage declaration exists to prevent. */
 #define DATE_SET_LIST(F) \
-    F(MILLISECONDS, 0x671) F(UTC_MILLISECONDS, 0x670) F(SECONDS, 0x571) F(UTC_SECONDS, 0x570) \
-    F(MINUTES, 0x471) F(UTC_MINUTES, 0x470) F(HOURS, 0x371) F(UTC_HOURS, 0x370) \
-    F(DATE, 0x231) F(UTC_DATE, 0x230) F(MONTH, 0x131) F(UTC_MONTH, 0x130) \
-    F(FULLYEAR, 0x031) F(UTC_FULLYEAR, 0x030)
-#define DATE_SET_ID(N, M) STEPDEF_DATE_SET_##N,
+    F(MILLISECONDS,     0x671, "21.4.4.23", "step 4")   F(UTC_MILLISECONDS, 0x670, "21.4.4.31", "step 4")   \
+    F(SECONDS,          0x571, "21.4.4.26", "steps 4-5") F(UTC_SECONDS,     0x570, "21.4.4.34", "steps 4-5") \
+    F(MINUTES,          0x471, "21.4.4.24", "steps 4-6") F(UTC_MINUTES,     0x470, "21.4.4.32", "steps 4-6") \
+    F(HOURS,            0x371, "21.4.4.22", "steps 4-7") F(UTC_HOURS,       0x370, "21.4.4.30", "steps 4-7") \
+    F(DATE,             0x231, "21.4.4.20", "step 4")   F(UTC_DATE,        0x230, "21.4.4.28", "step 4")    \
+    F(MONTH,            0x131, "21.4.4.25", "steps 4-5") F(UTC_MONTH,       0x130, "21.4.4.33", "steps 4-5") \
+    F(FULLYEAR,         0x031, "21.4.4.21", "steps 4-6") F(UTC_FULLYEAR,    0x030, "21.4.4.29", "steps 4-6")
+#define DATE_SET_ID(N, M, SEC, CO) STEPDEF_DATE_SET_##N,
     DATE_SET_LIST(DATE_SET_ID)
 #undef DATE_SET_ID
     STEPDEF_DATE_SETTIME, STEPDEF_DATE_SETYEAR,
@@ -74023,8 +74028,11 @@ _Static_assert(JS_PLAIN_ERROR == 9, "the error-constructor definition block is w
 static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_iter_next_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_iter_next_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const char *const js_array_iter_next_steps[];
 static const JSTrampStepDef js_array_iter_next_def =
-    { sizeof(JSArrayIterNext), js_array_iter_next_step, js_array_iter_next_fini, 0, .visit = js_array_iter_next_visit };
+    { sizeof(JSArrayIterNext), js_array_iter_next_step, js_array_iter_next_fini, 0, .visit = js_array_iter_next_visit,
+      .algorithm = "23.1.5.1 CreateArrayIterator's closure, resumed by 23.1.5.2.1 %ArrayIteratorPrototype%.next",
+      .steps = js_array_iter_next_steps };
 static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iterator_concat_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -74545,12 +74553,36 @@ static void js_date_set_visit(JSContext *ctx, void *st, JSStepVisit *v);
    `arg` is the same 0xFEL magic the C body took — first field, end field, is_local — plus DATE_SET_MAKEFULLYEAR
    for setYear, whose only difference from setFullYear is B.2.3.1 step 5's MakeFullYear on the coerced value. */
 #define DATE_SET_MAKEFULLYEAR 0x1000
-#define DATE_SET_DEF(magic) \
-    { sizeof(JSDateSet), js_date_set_step, js_date_set_fini, (magic), .visit = js_date_set_visit }
-#define DATE_SET_TABLE(N, M) static const JSTrampStepDef js_date_set_##N##_def = DATE_SET_DEF(M);
+#define DATE_SET_DEF(magic, alg, stagelist) \
+    { sizeof(JSDateSet), js_date_set_step, js_date_set_fini, (magic), .visit = js_date_set_visit, \
+      .algorithm = (alg), .steps = (stagelist) }
+/* EVERY setter is the same two stages of the same shape, so the stage list is expanded once per setter with that
+   setter's own section and its own range of coercion steps — the operands the one list already carries. */
+#define DATESET_STAGES(X, VALIDATE, COERCE) \
+    X(DATESET_VALIDATE, VALIDATE) \
+    X(DATESET_ARGS,     COERCE)
+enum { DATESET_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+#define DATE_SET_STEPS(N, M, SEC, CO) \
+    static const char *const js_date_set_##N##_steps[] = { \
+        DATESET_STAGES(JS_STEP_STAGE_LABEL, \
+            SEC " steps 1-3 (dateObject has [[DateValue]]; t is dateObject.[[DateValue]])", \
+            SEC " " CO " (each present argument is ToNumber, in argument order)") \
+        NULL };
+DATE_SET_LIST(DATE_SET_STEPS)
+#undef DATE_SET_STEPS
+#define DATE_SET_TABLE(N, M, SEC, CO) \
+    static const JSTrampStepDef js_date_set_##N##_def = DATE_SET_DEF(M, SEC " Date.prototype.set" #N, \
+                                                                    js_date_set_##N##_steps);
 DATE_SET_LIST(DATE_SET_TABLE)
 #undef DATE_SET_TABLE
-static const JSTrampStepDef js_date_setYear_def = DATE_SET_DEF(0x011 | DATE_SET_MAKEFULLYEAR);
+static const char *const js_date_setYear_steps[] = {
+    DATESET_STAGES(JS_STEP_STAGE_LABEL,
+        "B.2.3.1 steps 1-3 (dateObject has [[DateValue]]; t is dateObject.[[DateValue]])",
+        "B.2.3.1 steps 4-5 (y is ToNumber(year), then MakeFullYear(y))")
+    NULL };
+static const JSTrampStepDef js_date_setYear_def = DATE_SET_DEF(0x011 | DATE_SET_MAKEFULLYEAR,
+                                                              "B.2.3.1 Date.prototype.setYear",
+                                                              js_date_setYear_steps);
 /* 21.4.4.27 setTime is the one that reads NOTHING from the stored value — step 2 validates the slot and step 3's
    ToNumber is the whole input — so it IS a coerce-then-compute declaration, with the RequireInternalSlot as the
    leading validation the `pre` hook exists for. */
@@ -76462,7 +76494,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_STR_LASTINDEXOF] = &js_str_lastIndexOf_def,
     [STEPDEF_STR_NORMALIZE]   = &js_str_normalize_def,
     [STEPDEF_STR_LOCALECOMPARE] = &js_str_localeCmp_def,
-#define DATE_SET_ENTRY(N, M) [STEPDEF_DATE_SET_##N] = &js_date_set_##N##_def,
+#define DATE_SET_ENTRY(N, M, SEC, CO) [STEPDEF_DATE_SET_##N] = &js_date_set_##N##_def,
     DATE_SET_LIST(DATE_SET_ENTRY)
 #undef DATE_SET_ENTRY
     [STEPDEF_DATE_SETTIME]  = &js_date_setTime_def,
@@ -78763,13 +78795,26 @@ static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool tak
     return r;
 }
 
+/* WHICH STEP OF 23.1.5.1's CLOSURE EACH STAGE RESTS AT. %ArrayIteratorPrototype%.next is one line —
+   GeneratorResume — so the algorithm a parked flow is really in is the abstract closure CreateArrayIterator
+   built, and its step 1.b.* is what each stage names. The typed-array arm reads its length from the buffer
+   witness and runs nothing, which is why it skips the stage that performs LengthOfArrayLike rather than resting
+   in it. */
+#define AIN_STAGES(X) \
+    X(AIN_START,  "23.1.5.1 step 1.b.i (the receiver's [[TypedArrayName]] decides which length applies)") \
+    X(AIN_LENGTH, "23.1.5.1 step 1.b.ii.1 (len is LengthOfArrayLike(array))") \
+    X(AIN_INDEX,  "23.1.5.1 steps 1.b.iii-1.b.v (index against len; the key kind's result is the index)") \
+    X(AIN_GET,    "23.1.5.1 step 1.b.vi.2 (elementValue is Get(array, elementKey))")
+enum { AIN_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_iter_next_steps[] = { AIN_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayIterNext *s = st;
     JSArrayIteratorData *it;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == AIN_START) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->el = JS_UNDEFINED; s->result = JS_UNDEFINED;
@@ -78787,21 +78832,21 @@ static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, 
             if (is_typed_array(p->class_id)) {
                 if (typed_array_is_oob(p)) { JS_ThrowTypeErrorArrayBufferOOB(ctx); return -1; }
                 s->len = p->u.array.count;
-                s->hdr.stage = 2;
+                s->hdr.stage = AIN_INDEX;
             } else {
-                s->hdr.stage = 1;
+                s->hdr.stage = AIN_LENGTH;
             }
         }
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == AIN_LENGTH) {
         /* LengthOfArrayLike: `? ToLength(? Get(O, "length"))`. js_get_length32 used ToUint32 instead, so a
            `length` of -1 read as 4294967295 rather than clamping to 0. */
         r = step_getlen_run(ctx, &s->hdr, s->obj, JS_ATOM_length, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = AIN_INDEX;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == AIN_INDEX) {
         it = JS_GetOpaque(s->hdr.this_val, JS_CLASS_ARRAY_ITERATOR);
         DCHECK(it != NULL, "the array iterator lost its data across its own length read");
         s->idx = it->idx;
@@ -78816,9 +78861,9 @@ static int js_array_iter_next_step(JSContext *ctx, void *st, JSValue cb_result, 
             s->result = js_create_iterator_result(ctx, js_int64(s->idx), false);
             return JS_IsException(s->result) ? -1 : 0;
         }
-        s->hdr.stage = 3;
+        s->hdr.stage = AIN_GET;
     }
-    DCHECK(s->hdr.stage == 3, "%ArrayIteratorPrototype%.next: unknown stage");
+    DCHECK(s->hdr.stage == AIN_GET, "%ArrayIteratorPrototype%.next: unknown stage");
     r = step_getidx_run(ctx, &s->hdr, s->obj, s->idx, cb_result, &s->el, out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
     if (s->kind == JS_ITERATOR_KIND_VALUE) {
@@ -96296,11 +96341,11 @@ static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     int r;
     double a, d;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DATESET_VALIDATE) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
-        /* steps 1-2: RequireInternalSlot and the [[DateValue]] read, both BEFORE the first coercion. `first_field
+        /* steps 1-3: RequireInternalSlot and the [[DateValue]] read, both BEFORE the first coercion. `first_field
            == 0` is B.2.3.1 step 4 / 21.4.4.21 step 4 — the setters that write the YEAR treat a NaN time value as
            +0 instead of returning early. */
         s->res = get_date_fields(ctx, s->hdr.this_val, s->fields, is_local, first_field == 0);
@@ -96309,10 +96354,11 @@ static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         s->n = min_int(s->hdr.argc, end_field - first_field);
         s->i = 0;
         s->nonfinite = false;
-        s->hdr.stage = 1;
+        s->hdr.stage = DATESET_ARGS;
     }
-    /* steps 3-6: every named argument, in argument order, and one beyond the count is not read at all. Each is
-       the page's code, which is the whole reason this is a machine. */
+    /* the coercion steps: every named argument, in argument order, and one beyond the count is not read at all.
+       Each is the page's code, which is the whole reason this is a machine. */
+    DCHECK(s->hdr.stage == DATESET_ARGS, "a Date setter resumed in no stage");
     while (s->i < s->n) {
         r = step_tofloat64_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), cb_result, &a, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
