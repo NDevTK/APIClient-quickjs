@@ -1068,7 +1068,7 @@ typedef struct JSForInIterator {
     uint32_t array_length;
     uint32_t idx;
     /* The candidate key whose "was it deleted?" HasProperty is IN FLIGHT (owned), JS_ATOM_NULL otherwise.
-       14.7.5.10 re-checks each key against the object before yielding it, and that check is the page's code —
+       14.7.5.10.2.1 re-checks each key against the object before yielding it, and that check is the page's code —
        a `has` trap on any Proxy in the prototype chain. The check is a request now, so it SUSPENDS, and the
        candidate has to outlive the C frame that chose it. It rides here because the iterator is what the
        operand stack already holds across the suspension, which is why the continuation needs no state of its
@@ -17949,7 +17949,7 @@ static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
    driven from OP_for_in_start — see js_for_in_step. The C body ran [[GetPrototypeOf]] and the per-link key walk
    from C, so `for (k in proxy)` reached three of the page's traps with no flow base. */
 
-/* Write 14.7.5.10's answer into the two slots OP_for_in_next grows the stack by. Both the "yielded a key" and
+/* Write 14.7.5.10.2.1's answer into the two slots OP_for_in_next grows the stack by. Both the "yielded a key" and
    the "exhausted" endings go through here so the shape cannot drift between them. */
 static void js_for_in_deliver(JSContext *ctx, JSValue *sp, JSAtom prop)
 {
@@ -20662,7 +20662,7 @@ static void js_desc_facts_free(JSContext *ctx, JSDescFacts *f)
 typedef struct JSGetProp {
     JSValue target;      /* the proxy's [[Target]], for the invariant (owned); UNDEFINED for an accessor */
     JSAtom atom;         /* the key (owned) */
-    JSValue value;       /* GP_SET: the value written, which 9.5.9 step 11's invariant is a SameValue against
+    JSValue value;       /* GP_SET: the value written, which 10.5.9 step 11's invariant is a SameValue against
                             (owned). GP_DEFINE: the descriptor's [[Value]]. UNDEFINED for the reads. */
     JSValue getter, setter;  /* GP_DEFINE's remaining descriptor fields (owned), so the invariant that runs on the
                                 trap's result sees the SAME descriptor the trap was given. */
@@ -20780,7 +20780,7 @@ typedef struct JSOpKeyed {
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
 _Static_assert(CONT_ARG_LIST_FWD == 68, "the forward-declared CONT_ARG_LIST drifted");
-#define CONT_ARG_LIST      68  /* gp_outer AND tp_outer = JSArgList: 19.2.3.1 CreateListFromArrayLike, which
+#define CONT_ARG_LIST      68  /* gp_outer AND tp_outer = JSArgList: 7.3.19 CreateListFromArrayLike, which
                                   `f.apply(t, arrayLike)`, `Reflect.apply` and the `f(...arr)` spread all reach.
                                   Step 3 is `? LengthOfArrayLike(obj)` and step 5 is `? Get(obj, index)` PER
                                   ELEMENT — an accessor or a Proxy trap every one of them — and build_arg_list
@@ -21398,7 +21398,7 @@ typedef struct JSReSearch {
     JSValue cbx[3];          /* [this, exec, S] — RegExpExec's call request */
 } JSReSearch;
 
-/* 21.1.3.11 String.prototype.match / .search / .matchAll — ONE body, the @@-method's atom as the magic, exactly
+/* 22.1.3.13 String.prototype.match / 22.1.3.21 .search / 22.1.3.14 .matchAll — ONE body, the @@-method's atom as the magic, exactly
    as the C function was. Every step is the page's code: GetMethod(regexp, @@match) and the Call it makes,
    matchAll's IsRegExp + `flags` read, ToString(this), the RegExp construction, and the final Invoke. */
 typedef struct JSStrMatch {
@@ -21724,7 +21724,7 @@ static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t 
                 return NULL;
             }
             if (nxt && nk == CONT_ARG_LIST_FWD) {
-                /* 19.2.3.1's length coercion was abandoned: the list can never be completed, and it owns nothing
+                /* 7.3.19's length coercion was abandoned: the list can never be completed, and it owns nothing
                    the interpreter has to answer for — its operands are the caller's. */
                 js_arg_list_free(ctx, (JSArgList *)nxt);
                 return NULL;
@@ -21945,7 +21945,7 @@ static void js_arg_list_free(JSContext *ctx, JSArgList *al)
 
 /* Can CreateListFromArrayLike(src) be performed without invoking anything? Only for a FAST array or arguments
    object: `length` is then an own data slot whose value IS u.array.count, and every element is a slot read, so
-   19.2.3.1's Get steps invoke nothing and the C loop is not a fallback to the routed path but the same answer
+   7.3.19's Get steps invoke nothing and the C loop is not a fallback to the routed path but the same answer
    arrived at without a request. Anything else — an accessor `length`, a Proxy anywhere on the chain, a sparse
    array, an ordinary array-like — is the page's code and MUST be routed. */
 static bool arg_list_is_fast(JSContext *ctx, JSValueConst src, uint32_t *plen)
@@ -23219,7 +23219,7 @@ typedef struct JSAsyncFromSync {
                                     It was recoverable by inverting close_on_rejection, which is a coincidence of
                                     that flag's definition and not a contract; re-deriving state instead of
                                     carrying it is the mistake tp_op_byte's stale-pointer segfault taught. */
-    uint8_t close_then_typeerror; /* 27.1.4.2.4 step 7: `.throw()` on a sync iterator with no `throw` closes it
+    uint8_t close_then_typeerror; /* 27.1.6.2.3 step 8: `.throw()` on a sync iterator with no `throw` closes it
                                      under a NORMAL completion (so the close's OWN throw is what rejects — step
                                      7d is an IfAbruptRejectPromise) and only then rejects with a fresh TypeError.
                                      Raising the TypeError first and closing abruptly instead discarded the
@@ -23686,11 +23686,11 @@ typedef struct JSIterConcatReturn {
     uint8_t held;
 } JSIterConcatReturn;
 
-/* 27.1.4.2.2 %WrapForValidIteratorPrototype%.return: RequireInternalSlot, then `? GetMethod(iterator, "return")`
+/* 27.1.3.2.1.1.2 %WrapForValidIteratorPrototype%.return: RequireInternalSlot, then `? GetMethod(iterator, "return")`
    and `? Call(returnMethod, iterator)` — BOTH the page's code on an accessor, a Proxy, or a plain method with a
    loop in it. js_iterator_wrap_next ran them with JS_GetProperty and JS_IteratorNext2 -> JS_Call from a C entry,
    so closing an `Iterator.from(plainObject)` wrapper aborted at the wrapped `return`'s back-edge.
-   `.next` is NOT part of this: 27.1.4.2.1 forwards VERBATIM, which makes it CALL-SITE-RESOLVED
+   `.next` is NOT part of this: 27.1.3.2.1.1.1 forwards VERBATIM, which makes it CALL-SITE-RESOLVED
    (tramp_unwrap_iter_next replaces the record) rather than a machine — a different mechanism, not a fallback. */
 typedef struct JSIterWrapReturn {
     JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -24113,7 +24113,7 @@ static void js_enum_keys_free(JSContext *ctx, JSEnumKeys *c)
 
 /* The cursor performs the SEQUENCE — [[OwnPropertyKeys]] then one [[GetOwnProperty]] per string key — and
    reports the FACTS: which keys still exist and whether each is enumerable. It does not apply anyone's rule.
-   EnumerableOwnPropertyNames wants the enumerable ones (js_enum_keys_keep_enumerable); 14.7.5.10's for-in wants
+   EnumerableOwnPropertyNames wants the enumerable ones (js_enum_keys_keep_enumerable); 14.7.5.10.2.1's for-in wants
    ALL of them, because a non-enumerable key SHADOWS an enumerable one deeper in the prototype chain and
    dropping it would enumerate a hidden property. Filtering here would have made for-in a second walk.
    `in` is the previous request's answer (UNDEFINED on entry). Returns 11 / 12 for the next request, 0 when the
@@ -24246,7 +24246,7 @@ static void js_enum_keys_keep_enumerable(JSContext *ctx, JSEnumKeys *c)
     c->kept = kept;
 }
 
-/* ---- for-in's key collection, 14.7.5.10 EnumerateObjectProperties ----
+/* ---- for-in's key collection, 14.7.5.9 EnumerateObjectProperties ----
 
    build_for_in_iterator ran the whole enumeration from C: [[GetPrototypeOf]] per link (a Proxy's
    `getPrototypeOf` trap) and [[OwnPropertyKeys]] + one [[GetOwnProperty]] per key per link (its `ownKeys` and
@@ -24282,9 +24282,24 @@ typedef struct JSForIn {
     JSValue cur;           /* the prototype-chain link being walked (owned) */
     JSValue result;        /* DONE: the iterator (owned) */
     JSEnumKeys *ek;        /* the current link's key walk (owned) */
-    uint8_t phase;
 } JSForIn;
-enum { FI_LINK = 0, FI_KEYS, FI_PROTO };
+
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The chain walk had a
+   PRIVATE `phase` cursor beside the stage, and the machine parks in all three of its values — so the stage alone
+   said only "somewhere in the chain walk", which is exactly the approximate rest point the declaration exists to
+   remove. The phases ARE the stages now and the field is gone.
+   14.7.5.9 EnumerateObjectProperties is one prose step; the operations it REQUIRES an implementation to perform
+   are 14.7.5.10.2.1's, and those are what this parks on. (The prose here called EnumerateObjectProperties
+   14.7.5.10, which is the containing "For-In Iterator Objects" section, not the operation.) */
+#define FORIN_STAGES(X) \
+    X(FI_CREATE, "14.7.5.9 step 1, built as 14.7.5.10.1 CreateForInIterator(object) steps 1-6 - and the " \
+                 "ordinary-object collection, which reaches no internal method the page can trap") \
+    X(FI_LINK,   "14.7.5.10.2.1 step 5 (the Repeat head) and step 5.f (a null object ends the enumeration)") \
+    X(FI_KEYS,   "14.7.5.10.2.1 steps 5.a.i and 5.b.iii.1 (keys is object.[[OwnPropertyKeys]](); desc is " \
+                 "object.[[GetOwnProperty]](r) for each key)") \
+    X(FI_PROTO,  "14.7.5.10.2.1 steps 5.c-5.e (object is object.[[GetPrototypeOf]]())")
+enum { FORIN_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_for_in_steps[] = { FORIN_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 /* The fast path, in full: the enumeration is exactly the receiver's own enumerable string keys, which holds
    when nothing above it contributes any. Returns 1 = `it` is filled and the walk is over, 0 = not this
@@ -24357,12 +24372,11 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
     JSForIn *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == FI_CREATE) {
         JSValue obj;
         JSForInIterator *it;
         JSObject *p;
         uint32_t tag;
-        s->hdr.stage = 1;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->enum_obj = JS_UNDEFINED; s->cur = JS_UNDEFINED; s->result = JS_UNDEFINED;
@@ -24403,26 +24417,25 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
             return 0;
         }
         s->cur = js_dup(obj);
-        s->phase = FI_LINK;
-        s->hdr.stage = 2;
+        s->hdr.stage = FI_LINK;
     }
 
     for (;;) {
-        switch (s->phase) {
+        switch (s->hdr.stage) {
         case FI_LINK:
             if (JS_IsNull(s->cur)) {
                 JS_FreeValue(ctx, cb_result);
                 s->result = s->enum_obj; s->enum_obj = JS_UNDEFINED;
                 return 0;
             }
-            /* 14.7.5.10's own-key list for THIS link. Non-enumerable keys are collected too: one of them
+            /* 14.7.5.10.2.1 step 5.a.i's own-key list for THIS link. Non-enumerable keys are collected too: one of them
                SHADOWS an enumerable key of the same name further up, so dropping it here would enumerate a
                property the spec hides. */
             s->ek = js_mallocz(ctx, sizeof(*s->ek));
             if (!s->ek) { JS_FreeValue(ctx, cb_result); return -1; }
             js_enum_keys_init(s->ek);
             s->ek->obj = js_dup(s->cur);
-            s->phase = FI_KEYS;
+            s->hdr.stage = FI_KEYS;
             continue;
 
         case FI_KEYS: {
@@ -24439,19 +24452,19 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
             js_enum_keys_free(ctx, s->ek);
             js_free(ctx, s->ek); s->ek = NULL;
             /* the next link: [[GetPrototypeOf]], which on a Proxy is its trap. */
-            s->phase = FI_PROTO;
+            s->hdr.stage = FI_PROTO;
             s->hdr.cb_coerce[0] = s->cur;   /* borrowed: the machine holds it across the request */
             *out_cb = s->hdr.cb_coerce; *out_argc = 0;
             return 18;
         }
 
         default:
-            DCHECK(s->phase == FI_PROTO, "the for-in key walk resumed in no phase");
+            DCHECK(s->hdr.stage == FI_PROTO, "the for-in key walk resumed in no phase");
             JS_FreeValue(ctx, s->cur);
             s->cur = cb_result;
             cb_result = JS_UNDEFINED;
             if (JS_IsException(s->cur)) { s->cur = JS_UNDEFINED; return -1; }
-            s->phase = FI_LINK;
+            s->hdr.stage = FI_LINK;
             continue;
         }
     }
@@ -25177,7 +25190,7 @@ static inline int tramp_agen_method_magic(JSValueConst method, JSValueConst this
 
 static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                      int *pdone, int magic);
-/* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.4.2.1 is `Return ? Call([[NextMethod]], [[Iterator]])`
+/* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.3.2.1.1.1 is `Return ? Call([[NextMethod]], [[Iterator]])`
    with nothing after the call. That makes it CALL-SITE-RESOLVED (§C-stack): a driver replaces the
    (iterator, nextMethod) pair with the WRAPPED one and drives that, so a wrapped plain iterator's bytecode
    .next() runs on the tramp like any other. Reached through js_iterator_wrap_next instead, it recursed
@@ -25220,7 +25233,7 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
 #define TRAMP_DRIVE_ITER_NEXT(diter, dnext, statep, kindc, pdrive, darg)                                \
     do {                                                                                                 \
         /* IteratorNext(record, value) FORWARDS its value, and WrapForValidIterator's .next does NOT      \
-           (27.1.4.2.1 step 4 calls with no arguments) — so a drive CARRYING one must not unwrap, or the  \
+           (27.1.3.2.1.1.1 step 4 calls with no arguments) — so a drive CARRYING one must not unwrap, or the  \
            wrapped iterator would see an argument the wrapper would have swallowed. */                    \
         if (JS_IsUninitialized(darg)) tramp_unwrap_iter_next(&(diter), &(dnext));                        \
         if (iter_helper_drive_ready((dnext), (diter))) {                                              \
@@ -25581,7 +25594,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        ap_cfirst/ap_cargc parameterize do_return's operand cleanup for the two operand shapes. */
     JSValueConst ap_func = JS_UNDEFINED, ap_this = JS_UNDEFINED, ap_array = JS_UNDEFINED;
     int ap_cfirst = -2, ap_cargc = 0;
-    /* 19.2.3.1's answer, delivered by CONT_ARG_LIST. ap_list_n < 0 = the list has not been built yet, which is
+    /* 7.3.19's answer, delivered by CONT_ARG_LIST. ap_list_n < 0 = the list has not been built yet, which is
        what makes do_apply_tramp issue the sequence; read+reset there, so a second apply on this frame cannot
        inherit the first one's arguments. */
     JSValue *ap_list = NULL; int ap_list_n = -1;
@@ -26582,7 +26595,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 /* THE RESIDUE, and all that is left of this opcode's C fall-through: a non-object, non-nullish
                    argument list. Both arms above cover every list a call can actually be made with, so what
-                   remains is two throws in spec order — 19.2.3.6 step 1's IsCallable, then 19.2.3.1 step 2's
+                   remains is two throws in spec order — 20.2.3.1 step 1's IsCallable, then 7.3.19 step 2's
                    "not a object" — and js_function_apply was being called to perform exactly those. Doing them
                    here is what let its C body be deleted instead of kept for them. The operands stay on the stack
                    for the frame's own catch-search, as for any throwing operator. */
@@ -27623,7 +27636,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue *ap_tab; int ap_tab_n;
                 JSTrampBodyEntry ap_tbe;
                 if (ap_list_n < 0) {
-                    /* 19.2.3.1 CreateListFromArrayLike, ONCE and BEFORE the target's kind is asked — which is why
+                    /* 7.3.19 CreateListFromArrayLike, ONCE and BEFORE the target's kind is asked — which is why
                        it is here and not at each of the three arms below, where build_arg_list used to sit three
                        times. Its `length` read and every element read are the page's code, so the whole apply
                        parks on them unless the operand is a fast array, for which the reads invoke nothing. */
@@ -27963,7 +27976,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 if (tramp_first == -2) {
-                    /* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.4.2.1 is
+                    /* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.3.2.1.1.1 is
                        `Return ? Call([[NextMethod]], [[Iterator]])`, with no arguments passed and nothing after
                        the call. That makes it a REWRITE like the bound arm below, not an arm of its own: produce
                        the wrapped (receiver, callee) and re-enter, so every kind below answers the wrapped .next
@@ -29359,7 +29372,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         if (0) {
         do_for_in_next_loop:
-            /* 14.7.5.10's per-key step, reached from OP_for_in_next and re-entered from the delivery below —
+            /* 14.7.5.10.2.1's per-key step, reached from OP_for_in_next and re-entered from the delivery below —
                ONE loop, not one in the opcode and another in a C helper. Taking the next candidate off the
                iterator's own snapshot runs nothing; deciding whether that candidate is STILL a property is the
                page's code, a `has` trap on any Proxy in the prototype chain, so it is a request. */
@@ -29942,7 +29955,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_arg_list_step:
-            /* 19.2.3.1 CreateListFromArrayLike, ONE label with a phase and a cursor. `ret_val` is whichever
+            /* 7.3.19 CreateListFromArrayLike, ONE label with a phase and a cursor. `ret_val` is whichever
                request just answered. The whole apply shape rides the state, so the resume re-enters
                do_apply_tramp with the list already built. */
             {
@@ -32415,7 +32428,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int afs_close = (afs_mode == AFS_DELIVER_CLOSE);
                 int afs_iter_magic = tramp_afs_magic; tramp_afs_magic = GEN_MAGIC_NEXT;   /* read + reset (ITERCALL only) */
                 int afs_noarg = tramp_afs_noarg; tramp_afs_noarg = 0;
-                /* 7.4.9's close OF THE WRAPPER *is* 27.1.4.2.3 with no argument — GetMethod the sync iterator's
+                /* 7.4.9's close OF THE WRAPPER *is* 27.1.6.2.2 with no argument — GetMethod the sync iterator's
                    own `return`, call it, wrap the result — so it runs the ITERCALL operation and differs ONLY in
                    the delivery (its promise is never awaited). Written as its own arm it knew a GENERATOR source
                    and nothing else, and every other source fell to the generic 7.4.9 path, which reads `return`
@@ -32468,7 +32481,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 s->pending_error = JS_UNINITIALIZED;
                 s->deliver = afs_mode;
-                /* .return() passes closeOnRejection=false (27.1.4.2.3 step 11): it has already asked the sync
+                /* .return() passes closeOnRejection=false (27.1.6.2.2 step 13): it has already asked the sync
                    iterator to close, so neither step 6 nor step 14 may close it again. .next()/.throw() pass
                    true. AFS_DELIVER_CLOSE is OP_iterator_close driving the wrapper's own .return(). */
                 s->close_on_rejection = !(afs_itercall && afs_iter_magic == GEN_MAGIC_RETURN);
@@ -32514,7 +32527,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             cont_st = s;
                             goto do_async_from_sync_step;   /* wraps + delivers exactly like a driven result */
                         }
-                        /* 27.1.4.2.4 step 7: IteratorClose(syncIteratorRecord, throwCompletion), THEN reject
+                        /* 27.1.6.2.3 step 8.c: IteratorClose(syncIteratorRecord, closeCompletion), THEN reject
                            with the TypeError. Both halves of the close — GetMethod and the call — are the page's
                            code, so it is PARKED (a JSIterClose whose saved completion is the TypeError and whose
                            waiting machine is this one); JS_IteratorClose ran them from C, so a `return` with a
@@ -32706,7 +32719,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        "TypeError to raise after it");
                 if (unlikely(!ce)) { JS_ThrowOutOfMemory(ctx); goto do_async_from_sync_abrupt; }
                 ce->iter = js_dup(s->sync_iter);
-                /* UNINITIALIZED when nothing is pending, which IS the normal-completion close 27.1.4.2.4 asks
+                /* UNINITIALIZED when nothing is pending, which IS the normal-completion close 27.1.6.2.3 step 8.c asks
                    for: the close's own throw then propagates and step 6's must-be-an-Object applies. */
                 ce->saved_exc = rt->current_exception;
                 rt->current_exception = JS_UNINITIALIZED;
@@ -36113,7 +36126,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_for_in_start):
             sf->cur_pc = pc;
             {
-                /* 14.7.5.10's key collection is a machine, driven straight from here: an opcode has no callee
+                /* 14.7.5.9's key collection is a machine, driven straight from here: an opcode has no callee
                    slot to reach a def through, so it names the def by id. The operand shape is a plain call
                    with no arguments — first = -1, argc = 0 — which drops sp[-1] and places the iterator in the
                    same slot, exactly what the compiled stack expects. The source stays on the stack and is
@@ -36458,7 +36471,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (co && ck == CONT_ASYNC_FROM_SYNC) {
                     /* the wrapper asked for this close on its way to REJECTING its promise. Either the close
                        preserved a completion (that is the rejection) or it was the normal-completion close
-                       27.1.4.2.4 performs before rejecting with its own TypeError. */
+                       27.1.6.2.3 step 8 performs before rejecting with its own TypeError. */
                     JSAsyncFromSync *as2 = (JSAsyncFromSync *)co;
                     DCHECK(failed || as2->close_then_typeerror,
                            "an async-from-sync close ended with no completion and nothing to raise");
@@ -42605,7 +42618,7 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-/* AsyncGeneratorEnqueue (27.7.3.4): one .next()/.throw()/.return() request joins the queue and gets the promise
+/* AsyncGeneratorEnqueue (27.6.3.4): one .next()/.throw()/.return() request joins the queue and gets the promise
    the call evaluates to. `s == NULL` is the receiver-is-not-an-async-generator case, whose promise is REJECTED
    rather than thrown — a genuinely different outcome, not a fallback for the drive. */
 static JSValue js_async_generator_enqueue(JSContext *ctx, JSAsyncGeneratorData *s, int magic, JSValueConst arg)
@@ -53711,7 +53724,7 @@ static JSResolveResultEnum js_resolve_export1(JSContext *ctx,
                 goto frame_done;
             if (ret == JS_RESOLVE_RES_FOUND) {
                 if (f->acc_me != NULL) {
-                    /* 16.2.1.6.3 ResolveExport step 10.d.ii compares the ResolvedBinding's [[Module]] and
+                    /* 16.2.1.7.2.2 ResolveExport step 10.d.ii compares the ResolvedBinding's [[Module]] and
                        [[BindingName]]. For an `all` indirect entry (`export * as ns from "m"`, and an
                        `export { ns }` of a namespace import) the ResolvedBinding is
                        { Module: the IMPORTED module, BindingName: namespace } — NOT the re-exporting module
@@ -54454,7 +54467,7 @@ static JSValue js_call_flow_complete(JSContext *ctx, JSValueConst func, JSValueC
     return res;
 }
 
-/* THE POST-ORDER half of InnerModuleLinking (16.2.1.5.2 steps 9-11): the indirect-export check, the import
+/* THE POST-ORDER half of InnerModuleLinking (16.2.1.6.1.2.1 steps 9-11): the indirect-export check, the import
    resolution, and the `initialize the global variables` call. It is its own function because the WALK around it is
    no longer C recursion — see js_inner_module_linking below. */
 static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **pstack_top)
@@ -54593,7 +54606,7 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
             }
         }
 
-        /* 16.2.1.6.4 InitializeEnvironment's tail: run the module body's `OP_push_this; OP_if_false <body>`
+        /* 16.2.1.7.3.1 InitializeEnvironment's tail: run the module body's `OP_push_this; OP_if_false <body>`
            prologue, which with `this === true` performs the hoisted-definition pass and returns. AS A FLOW —
            the same entry module EVALUATION uses — because a bytecode body entered by plain JS_Call from C
            cannot suspend, and this was the last such entry in the module machinery (the walk around it is
@@ -54632,7 +54645,7 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
     return -1;
 }
 
-/* 16.2.1.5.2 InnerModuleLinking, as an EXPLICIT WORKLIST rather than C recursion. Two things were wrong with the
+/* 16.2.1.6.1.2.1 InnerModuleLinking, as an EXPLICIT WORKLIST rather than C recursion. Two things were wrong with the
    recursive form and only one of them is about depth.
      The DEPTH: it opened with js_check_stack_overflow and a JS_ThrowStackOverflow, so a module graph deeper than
    the C stack failed with a synthetic error. That is a BOUND on the input, which this engine does not have — the
@@ -55552,7 +55565,7 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
     if (!js_async_function_run(ctx, s))
         return -1;
     /* A PARKED BODY IS STILL EVALUATING, so finish it before this returns and the walk starts the next module.
-       §16.2.1.5.3 evaluates [[RequestedModules]] in source order, and a module with no top-level await must be
+       §16.2.1.6.1.3.1 evaluates [[RequestedModules]] in source order, and a module with no top-level await must be
        DONE before its sibling begins. Every bytecode body goes through this function precisely so a park is
        possible, which means "started" and "finished" are no longer the same event — and the caller's loop over
        available ancestors reads a parked body as finished and moves on. Two siblings then interleave and the
@@ -55620,7 +55633,7 @@ fail:
 
 /* spec: InnerModuleEvaluation. Return (index, JS_UNDEFINED) or (-1,
    exception) */
-/* 16.2.1.5.3 InnerModuleEvaluation, split so the WALK around it is an explicit frame stack rather than C
+/* 16.2.1.6.1.3.1 InnerModuleEvaluation, split so the WALK around it is an explicit frame stack rather than C
    recursion — see js_inner_module_evaluation below. This is its POST-ORDER half (steps 12-16). */
 static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **pstack_top, JSValue *pvalue)
 {
@@ -55666,7 +55679,7 @@ static int js_module_eval_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **p
                 break;
         }
     }
-    /* THE BODY RUNS AFTER THE SCC POP, and the reason is forking. 16.2.1.5.3 executes at step 13 and pops at
+    /* THE BODY RUNS AFTER THE SCC POP, and the reason is forking. 16.2.1.6.1.3.1 executes at step 13 and pops at
        steps 14-16, which is sound only because the body's asynchronous CONTINUATION cannot run before the pop —
        and AsyncModuleExecutionFulfilled asserts exactly that (`[[Status]] is EVALUATING-ASYNC`). A forked flow
        breaks the "cannot": the sibling's world is the one that existed AT the branch inside the body, where the
@@ -55806,7 +55819,7 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
    modules. Return a promise or an exception. */
 /* THE MODULE'S EVALUATION STATE, as one owned blob — the module twin of JS_AsyncStateSave, and for the same
    reason: it is shared baseline state that a flow WRITES, through fields no property hook can see. These are
-   exactly 16.2.1.5.3's per-evaluation fields (the struct already groups them under "temp use during
+   exactly 16.2.1.6.1.3.1's per-evaluation fields (the struct already groups them under "temp use during
    js_module_evaluate") plus the capability and the status they drive. The module's BINDINGS need nothing here —
    they are closure cells and cell_write already captures them; what was missing is the state that decides
    whether a flow evaluates AT ALL. */
@@ -67367,7 +67380,7 @@ static int js_dynfunc_check_halves(JSContext *ctx, JSFunctionKindEnum func_kind,
    declaration, which was already wrong for this builtin: that declaration asserts the body has no user code LEFT
    once its arguments are primitive, and this body then evaluated the synthesized source — a BYTECODE BODY, run by
    C recursion below a live flow with no way to park — and finished with GetPrototypeFromConstructor's
-   `Get(newTarget, "prototype")` (step 29), a [[Get]] a Proxy new.target traps. Each of the three is a request
+   `Get(newTarget, "prototype")` (step 25), a [[Get]] a Proxy new.target traps. Each of the three is a request
    here, and the parse-and-create is the shared program sub-sequence indirect eval also performs. */
 typedef struct JSDynFunc {
     JSStepHdr hdr;
@@ -67377,6 +67390,21 @@ typedef struct JSDynFunc {
     int nstrs;
 } JSDynFunc;
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). All four
+   constructors run 20.2.1.1.1 with a different `kind`, so the STEPS are the same list and only the
+   `algorithm` each definition names differs. */
+#define DYNFUNC_STAGES(X) \
+    X(DYNF_ENTRY,  "20.2.1.1.1 steps 1-7 (newTarget; the kind's prefix and parse symbols; argCount; " \
+                   "parameterStrings is a new empty List)") \
+    X(DYNF_STRS,   "20.2.1.1.1 steps 8-9 (each element of parameterArgs is ToString'd, then bodyString is " \
+                   "ToString(bodyArg))") \
+    X(DYNF_PARSE,  "20.2.1.1.1 steps 12-28 (P; bodyParseString; sourceString; the ParseText calls and their " \
+                   "SyntaxErrors; F is OrdinaryFunctionCreate)") \
+    X(DYNF_PROTO,  "20.2.1.1.1 step 25 (proto is GetPrototypeFromConstructor(newTarget, fallbackProto)), set " \
+                   "on F")
+enum { DYNFUNC_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_dynfunc_steps[] = { DYNFUNC_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDynFunc *s = st;
@@ -67385,7 +67413,7 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     JSValue proto;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DYNF_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -67395,9 +67423,9 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             if (unlikely(!s->strs))
                 return -1;
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = DYNF_STRS;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == DYNF_STRS) {
         JSValue src;
         while (s->nstrs < s->hdr.argc) {
             JSValue str;
@@ -67411,13 +67439,13 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         src = js_dynfunc_source(ctx, func_kind, s->strs, s->nstrs, DYNSRC_ALL);
         if (JS_IsException(src))
             return -1;
-        s->hdr.stage = 2;
+        s->hdr.stage = DYNF_PARSE;
         r = step_program_run(ctx, &s->hdr, ctx, src, JS_UNDEFINED, &s->func, out_cb, out_argc,
                              JS_EVAL_FLAG_FUNCTION_CTOR);
         JS_FreeValue(ctx, src);
         if (r) return r < 0 ? -1 : r;
         created = true;
-    } else if (s->hdr.stage == 2) {
+    } else if (s->hdr.stage == DYNF_PARSE) {
         r = step_program_run(ctx, &s->hdr, ctx, JS_UNDEFINED, cb_result, &s->func, out_cb, out_argc,
                              JS_EVAL_FLAG_FUNCTION_CTOR);
         if (r) return r < 0 ? -1 : r;
@@ -67425,7 +67453,7 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     }
     if (created) {
         cb_result = JS_UNDEFINED;
-        s->hdr.stage = 3;
+        s->hdr.stage = DYNF_PROTO;
         /* The CALL form leaves new.target undefined, and the synthesized source already gave the function the
            intrinsic prototype of its own kind, so there is no read and nothing to set. */
         if (JS_IsUndefined(s->hdr.this_val)) {
@@ -67434,7 +67462,7 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             return 0;
         }
     }
-    DCHECK(s->hdr.stage == 3, "CreateDynamicFunction resumed in an unknown stage");
+    DCHECK(s->hdr.stage == DYNF_PROTO, "CreateDynamicFunction resumed in an unknown stage");
     r = step_proto_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, func_kind_to_class_id[func_kind],
                                  cb_result, &proto, out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
@@ -67507,7 +67535,7 @@ static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len)
     js_free(ctx, tab);
 }
 
-/* DELETED: build_arg_list. It WAS 19.2.3.1 CreateListFromArrayLike performed from C — `? LengthOfArrayLike(obj)`
+/* DELETED: build_arg_list. It WAS 7.3.19 CreateListFromArrayLike performed from C — `? LengthOfArrayLike(obj)`
    with js_get_length32 and a `? Get(obj, index)` loop with JS_GetPropertyUint32 — which is the page's code at every
    step, and it had ten callers across the apply trampoline, the construct dispatch, two unreachable
    generator reshapes, OP_apply_eval and three unregistered C bodies. CONT_ARG_LIST performs the operation on the
@@ -67544,6 +67572,21 @@ static int prim_arg_check(JSContext *ctx, JSValueConst v, int hint)
     return 0;
 }
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). This machine is
+   SHARED by every coerce-then-compute builtin, and what it performs is not one of their algorithms: it is
+   7.1.1 over the arguments each of them DECLARES it coerces, after which the body has no user code left to
+   reach. So the algorithm named here is that operation, and which builtin's body follows it is what the
+   definition's `body` says. */
+#define PRIMARGS_STAGES(X) \
+    X(PRIMARGS_ENTRY,  "7.1.1 over a coerce-then-compute builtin's declared arguments: the leading validation " \
+                       "the spec performs BEFORE any coercion (the definition's `precheck`), then the padded " \
+                       "argument vector") \
+    X(PRIMARGS_COERCE, "7.1.1 step 2.a ToPrimitive(argument, hint) for each declared argument in argument " \
+                       "order, with the definition's `midcheck` interleaved after the first - then the body, " \
+                       "which over primitives reaches none of the page's code")
+enum { PRIMARGS_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_primargs_steps[] = { PRIMARGS_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPrimArgs *s = st;
@@ -67552,7 +67595,7 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     int nargs = (s->hdr.arg >> 16) & 0xff;
     int i;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == PRIMARGS_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;
         if (s->hdr.def->precheck && s->hdr.def->precheck(ctx, &s->hdr) < 0)
@@ -67563,7 +67606,7 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         for (i = 0; i < s->nargp; i++)
             s->argp[i] = js_dup(step_arg(&s->hdr, i));
         s->next = 0;
-        s->hdr.stage = 1;
+        s->hdr.stage = PRIMARGS_COERCE;
     } else {
         DCHECK(s->next > 0, "coerce-then-compute: a primitive arrived with no coercion in flight");
         s->hdr.coercing = 0;
@@ -67682,6 +67725,19 @@ typedef struct JSCreateCtor {
     int nargp;
 } JSCreateCtor;
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). Like the
+   coerce-then-compute machine, this one is SHARED by every constructor that begins with
+   OrdinaryCreateFromConstructor, and the operation it performs is 10.1.13 rather than any one of their
+   algorithms - which constructor's body runs after it is what the definition's `body` says. */
+#define CRECTOR_STAGES(X) \
+    X(CRECTOR_ENTRY,  "10.1.13, entered: the validation the constructor's own algorithm performs before it " \
+                      "(the definition's `precheck`)") \
+    X(CRECTOR_CREATE, "10.1.13 steps 1-3 (proto is GetPrototypeFromConstructor(constructor, " \
+                      "intrinsicDefaultProto), whose step 3 is Get(constructor, \"prototype\"); the object is " \
+                      "OrdinaryObjectCreate(proto)) - then the constructor's own body over it")
+enum { CRECTOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_creatector_steps[] = { CRECTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSCreateCtor *s = st;
@@ -67689,13 +67745,13 @@ static int js_creatector_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     int r;
     bool plain;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == CRECTOR_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
         if (s->hdr.def->precheck && s->hdr.def->precheck(ctx, &s->hdr) < 0)
             return -1;
-        s->hdr.stage = 1;
+        s->hdr.stage = CRECTOR_CREATE;
     }
     /* the NEW TARGET this algorithm treats as ABSENT. Undefined always is (the CALL form); Object additionally
        counts ITSELF, which is 20.1.1.1 step 1's second clause and the whole of the difference. */
@@ -68040,7 +68096,22 @@ typedef struct JSFuncBind {
     JSValue result;     /* DONE (owned) */
     int arg_count;      /* the bound arguments, which the target's `length` is reduced by */
 } JSFuncBind;
-enum { FB_PROTO_GOT = 1, FB_LEN_OWN, FB_LEN_OWN_GOT, FB_LEN_GOT, FB_NAME_GOT };
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The stage that
+   DISPATCHED the HasOwnProperty rested at no step - it was entered and left inside one step() call - so it is
+   the tail of the stage that builds F now. */
+#define FBIND_STAGES(X) \
+    X(FB_ENTRY,       "20.2.3.2 steps 1-2 (Target is the this value; the IsCallable TypeError) - and the " \
+                      "dispatch of step 3's BoundFunctionCreate, whose 10.4.1.3 step 1 is " \
+                      "Target.[[GetPrototypeOf]]()") \
+    X(FB_PROTO_GOT,   "20.2.3.2 step 3 -> 10.4.1.3 steps 1-6 (proto arrives; F holds [[BoundTargetFunction]], " \
+                      "[[BoundThis]] and [[BoundArguments]]) - and the dispatch of step 5's " \
+                      "HasOwnProperty(Target, \"length\")") \
+    X(FB_LEN_OWN_GOT, "20.2.3.2 steps 4-5 (L is 0; targetHasLength arrives)") \
+    X(FB_LEN_GOT,     "20.2.3.2 steps 6.a-7 (targetLen is Get(Target, \"length\"); L; SetFunctionLength(F, L))") \
+    X(FB_NAME_GOT,    "20.2.3.2 steps 8-10 (targetName is Get(Target, \"name\"); SetFunctionName(F, " \
+                      "targetName, \"bound\")) - and step 11, Return F")
+enum { FBIND_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_func_bind_steps[] = { FBIND_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 /* steps 6-7's SetFunctionLength(F, L): the target's own `length`, reduced by the bound argument count and
    clamped at zero, and anything that is not a Number contributes nothing. CONSUMES len_val. */
@@ -68074,7 +68145,7 @@ static int js_func_bind_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     JSFuncBind *s = st;
     JSValue name1;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == FB_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->func_obj = JS_UNDEFINED; s->result = JS_UNDEFINED;
@@ -68111,18 +68182,16 @@ static int js_func_bind_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         bf->argc = s->arg_count;
         for (i = 0; i < s->arg_count; i++)
             bf->argv[i] = js_dup(step_arg(&s->hdr, i + 1));
-        p->u.bound_function = bf;                       /* steps 3-6: the bound target, this and arguments */
-        s->hdr.stage = FB_LEN_OWN;
-    }
-    switch (s->hdr.stage) {
-    case FB_LEN_OWN:
+        p->u.bound_function = bf;                  /* 10.4.1.3 steps 3-6: the bound target, this and arguments */
         /* step 5: HasOwnProperty(Target, "length"). Only whether it EXISTS is wanted, so the ordinary
-           descriptor-object answer says it — undefined means absent. */
-        JS_FreeValue(ctx, cb_result);
+           descriptor-object answer says it — undefined means absent. Dispatched here rather than from a stage
+           of its own: a stage with no request left in it is one nothing can park at. */
         s->hdr.stage = FB_LEN_OWN_GOT;
         s->hdr.cb_coerce[0] = s->hdr.this_val;   /* borrowed: the machine holds the target across the request */
         *out_cb = s->hdr.cb_coerce; *out_argc = (int)JS_ATOM_length;
         return 12;
+    }
+    switch (s->hdr.stage) {
     case FB_LEN_OWN_GOT: {
         bool has_len;
         if (JS_IsException(cb_result))
@@ -68318,7 +68387,7 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
     }
 }
 
-/* 13.10.2 InstanceofOperator and 7.3.20 OrdinaryHasInstance — ONE machine with two entries, because step 2 of
+/* 13.10.2 InstanceofOperator and 7.3.21 OrdinaryHasInstance — ONE machine with two entries, because step 2 of
    the second IS the first: a BOUND function's `instanceof` recurses through the whole operator on its target,
    re-reading @@hasInstance there. The arg picks the entry; Function.prototype[@@hasInstance] is the ordinary
    one, and the operator is the other.
@@ -68345,8 +68414,24 @@ typedef struct JSInstanceOf {
     uint8_t mode;       /* the CURRENT entry: a bound target restarts at the operator whichever entry began */
 } JSInstanceOf;
 #define INSTOF_OPERATOR 0   /* 13.10.2, from the top */
-#define INSTOF_ORDINARY 1   /* 7.3.20 directly — what Function.prototype[@@hasInstance] is */
-enum { IO_HI_GOT = 1, IO_CALL_GOT, IO_ORDINARY, IO_PROTO_GOT, IO_LINK_GOT };
+#define INSTOF_ORDINARY 1   /* 7.3.21 directly — what Function.prototype[@@hasInstance] is */
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). TWO algorithms and
+   ONE list, unlike pop/shift: this machine does not pick one at its definition and stay there — 7.3.21 step 2.b
+   RE-ENTERS 13.10.2 on a bound function's target, so a flow that started in either can be parked in the other,
+   and each label names the operation the stage belongs to. (The prose here called OrdinaryHasInstance 7.3.20.) */
+#define INSTOF_STAGES(X) \
+    X(IO_ENTRY,     "13.10.2 steps 1-2 (target is an Object; the dispatch of GetMethod(target, " \
+                    "%Symbol.hasInstance%)), re-entered here by 7.3.21 step 2.b for a bound target") \
+    X(IO_HI_GOT,    "13.10.2 steps 2-3 (instOfHandler arrives; when it is not undefined, the dispatch of " \
+                    "Call(instOfHandler, target, <<V>>))") \
+    X(IO_CALL_GOT,  "13.10.2 step 3.a (ToBoolean of the handler's result)") \
+    X(IO_ORDINARY,  "13.10.2 steps 4-5 -> 7.3.21 steps 1-4 (IsCallable(C); a bound C re-enters 13.10.2 on its " \
+                    "[[BoundTargetFunction]]; O is an Object; the dispatch of Get(C, \"prototype\"))") \
+    X(IO_PROTO_GOT, "7.3.21 steps 5-6.a (P arrives and is an Object; the dispatch of O.[[GetPrototypeOf]]())") \
+    X(IO_LINK_GOT,  "7.3.21 steps 6.a-6.c (the link arrives; null returns false, SameValue(P, O) returns true, " \
+                    "otherwise the next O.[[GetPrototypeOf]]())")
+enum { INSTOF_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_instanceof_steps[] = { INSTOF_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 /* steps 6.a-c over ORDINARY links, which have no [[GetPrototypeOf]] of their own to run: the shape's proto is
    the answer. Returns 0 = keep walking from s->val (a PROXY link needs the request), 1 = decided. */
@@ -68372,7 +68457,7 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
 {
     JSInstanceOf *s = st;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == IO_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED; s->proto = JS_UNDEFINED; s->handler = JS_UNDEFINED;
         s->mode = (uint8_t)s->hdr.arg;
@@ -68387,7 +68472,7 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         }
     }
     for (;;) {
-        if (s->hdr.stage == 0) {
+        if (s->hdr.stage == IO_ENTRY) {
             if (s->mode == INSTOF_ORDINARY) { s->hdr.stage = IO_ORDINARY; continue; }
             if (!JS_IsObject(s->ctor)) {                     /* step 1 */
                 JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
@@ -68430,7 +68515,7 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
                     JS_ThrowTypeError(ctx, "invalid 'instanceof' right operand");
                     return -1;
                 }
-                s->result = JS_FALSE;                        /* 7.3.20 step 1 */
+                s->result = JS_FALSE;                        /* 7.3.21 step 1 */
                 return 0;
             }
             p = JS_VALUE_GET_OBJ(s->ctor);
@@ -68441,7 +68526,7 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
                 JS_FreeValue(ctx, s->ctor);
                 s->ctor = tgt;
                 s->mode = INSTOF_OPERATOR;
-                s->hdr.stage = 0;
+                s->hdr.stage = IO_ENTRY;
                 continue;
             }
             if (!JS_IsObject(s->val)) {                      /* step 3 */
@@ -72374,7 +72459,7 @@ static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         e = (s->i < 0) ? (JSValueConst)s->obj : step_arg(&s->hdr, s->i);
         if (s->hdr.stage == ACAT_SPREADABLE) {
             if (s->i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); s->hdr.stage = ACAT_SETLEN; break; }
-            /* IsConcatSpreadable(e) — 23.1.3.1.1: a non-object is never spread; otherwise the page's
+            /* IsConcatSpreadable(e) — 23.1.3.2.1: a non-object is never spread; otherwise the page's
                @@isConcatSpreadable decides, and only its absence falls back to IsArray. */
             if (!JS_IsObject(e)) {
                 JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
@@ -73889,7 +73974,9 @@ static const char *const js_json_parse_steps[];
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0, .visit = js_json_reviver_visit,
                        .algorithm = "25.5.1 JSON.parse",
                        .steps = js_json_parse_steps };
-static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0, .visit = js_for_in_visit };
+static const char *const js_for_in_steps[];
+static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0, .visit = js_for_in_visit,
+                        .algorithm = "14.7.5.9 EnumerateObjectProperties", .steps = js_for_in_steps };
 static int check_iterator(JSContext *ctx, JSValueConst obj);
 
 /* %IteratorHelperPrototype%.return: close flatMap's active inner if there is one, then the source, then answer
@@ -74171,7 +74258,9 @@ static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_look
 static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1, .visit = js_lookup_acc_visit,
                       .algorithm = "B.2.2.5 Object.prototype.__lookupSetter__",
                       .steps = js_lookupsetter_steps };
-static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0, .visit = js_func_bind_visit };
+static const char *const js_func_bind_steps[];
+static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0, .visit = js_func_bind_visit,
+                        .algorithm = "20.2.3.2 Function.prototype.bind", .steps = js_func_bind_steps };
 static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor,
                                                     .home_class = JS_CLASS_ITERATOR, .visit = js_iter_setter_visit,
                                                     .algorithm = "27.1.4.1.2 set Iterator.prototype.constructor",
@@ -74187,8 +74276,12 @@ static const JSTrampStepDef js_error_set_stack_def = { sizeof(JSIterSetter), js_
                                                       .home_class = JS_CLASS_ERROR, .precheck = js_error_stack_precheck, .visit = js_iter_setter_visit,
                                                       .algorithm = "set Error.prototype.stack (proposal-error-stack-accessor)",
                                                       .steps = js_error_set_stack_steps };
-static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_OPERATOR, .visit = js_instanceof_visit };
-static const JSTrampStepDef js_ordinary_hasinst_def = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_ORDINARY, .visit = js_instanceof_visit };
+static const char *const js_instanceof_steps[];
+static const JSTrampStepDef js_instanceof_def  = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_OPERATOR, .visit = js_instanceof_visit,
+                        .algorithm = "13.10.2 InstanceofOperator", .steps = js_instanceof_steps };
+static const JSTrampStepDef js_ordinary_hasinst_def = { sizeof(JSInstanceOf), js_instanceof_step, js_instanceof_fini, INSTOF_ORDINARY, .visit = js_instanceof_visit,
+                        .algorithm = "20.2.3.6 Function.prototype [ %Symbol.hasInstance% ], which is 7.3.21 OrdinaryHasInstance",
+                        .steps = js_instanceof_steps };
 static const JSTrampStepDef js_obj_tolocale_def = { sizeof(JSObjToLocale), js_object_tolocale_step, js_object_tolocale_fini, 0, .visit = js_object_tolocale_visit,
                       .algorithm = "20.1.3.5 Object.prototype.toLocaleString",
                       .steps = js_obj_tolocale_steps };
@@ -74229,7 +74322,9 @@ static const char *const js_str_concat_steps[];
 static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_concat_step, js_str_concat_fini, 0, .visit = js_str_concat_visit,
                                                    .algorithm = "22.1.3.5 String.prototype.concat",
                                                    .steps = js_str_concat_steps };
-static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0, .visit = js_str_ctor_visit };
+static const char *const js_str_ctor_steps[];
+static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0, .visit = js_str_ctor_visit,
+                        .algorithm = "22.1.1.1 String ( value )", .steps = js_str_ctor_steps };
 static const char *const js_array_at_steps[];
 static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0, .visit = js_array_at_visit,
                         .algorithm = "23.1.3.1 Array.prototype.at", .steps = js_array_at_steps };
@@ -74427,9 +74522,11 @@ static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_cto
    use for a leading validation. The count is part of the declaration for the same reason PRIMARGS carries its
    own: js_call_c_function pads a C body's vector to its declared length and a machine gets the call's real
    operands, so a body that reads argv[1] of a zero-argument call needs the padding built here. */
+static const char *const js_creatector_steps[];
 #define CREATECTOR_DEF_FULL(class_id, nargs, proto, fn, magic, pre) \
     { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG(class_id, nargs), \
-      { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), NULL, NULL, .visit = js_creatector_visit }
+      { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), NULL, NULL, .visit = js_creatector_visit, \
+      .algorithm = "10.1.13 OrdinaryCreateFromConstructor", .steps = js_creatector_steps }
 #define CREATECTOR_DEF(class_id, nargs, proto, fn, magic) \
     CREATECTOR_DEF_FULL(class_id, nargs, proto, fn, magic, NULL)
 static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -74538,7 +74635,8 @@ static int js_map_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 #define MAP_CTOR_DEF(magic) \
     { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG(JS_CLASS_MAP + (magic), 0), \
       { .generic_magic = js_map_ctor_body }, JS_CFUNC_generic_magic, (magic), js_map_ctor_precheck, NULL, NULL, \
-      .visit = js_creatector_visit }
+      .visit = js_creatector_visit, .algorithm = "10.1.13 OrdinaryCreateFromConstructor", \
+      .steps = js_creatector_steps }
 static const JSTrampStepDef js_map_ctor_defs[4] = {
     MAP_CTOR_DEF(0), MAP_CTOR_DEF(1), MAP_CTOR_DEF(2), MAP_CTOR_DEF(3),
 };
@@ -74547,13 +74645,16 @@ static JSValue js_object_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, 
    Object constructor itself as absent. */
 static const JSTrampStepDef js_object_ctor_def =
     { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG_SELF_PLAIN(JS_CLASS_OBJECT, 1),
-      { .generic = js_object_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL, .visit = js_creatector_visit };
+      { .generic = js_object_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL, .visit = js_creatector_visit,
+      .algorithm = "10.1.13 OrdinaryCreateFromConstructor", .steps = js_creatector_steps };
 static const JSTrampStepDef js_boolean_ctor_def =
     { sizeof(JSCreateCtor), js_creatector_step, js_creatector_fini, CREATECTOR_ARG_WRAP(JS_CLASS_BOOLEAN, 1),
-      { .generic = js_boolean_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL, .visit = js_creatector_visit };
+      { .generic = js_boolean_ctor_body }, JS_CFUNC_generic, 0, NULL, NULL, NULL, .visit = js_creatector_visit,
+      .algorithm = "10.1.13 OrdinaryCreateFromConstructor", .steps = js_creatector_steps };
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
-      { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL, .visit = js_primargs_visit };
+      { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL, .visit = js_primargs_visit,
+      .algorithm = "7.1.1 ToPrimitive over a coerce-then-compute builtin's declared arguments", .steps = js_primargs_steps };
 static JSValue js_symbol_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static int js_symbol_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 /* 20.4.1.1 Symbol([description]): step 1 rejects a NewTarget, step 2 is `? ToString(description)`, and the rest
@@ -74575,7 +74676,8 @@ static const JSTrampStepDef js_error_tostring_def =
 static const JSTrampStepDef js_symbol_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
       { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL,
-      .visit = js_primargs_visit };
+      .visit = js_primargs_visit, .algorithm = "7.1.1 ToPrimitive over a coerce-then-compute builtin's declared arguments",
+      .steps = js_primargs_steps };
 static const char *const js_array_indexOf_steps[];
 static const char *const js_array_lastIndexOf_steps[];
 static const char *const js_array_includes_steps[];
@@ -74588,8 +74690,10 @@ static const JSTrampStepDef js_array_includes_def    = { sizeof(JSArraySearch), 
 static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result);
 static void js_string_raw_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const char *const js_string_raw_steps[];
 static const JSTrampStepDef js_string_raw_def =
-    { sizeof(JSStringRaw), js_string_raw_step, js_string_raw_fini, 0, .visit = js_string_raw_visit };
+    { sizeof(JSStringRaw), js_string_raw_step, js_string_raw_fini, 0, .visit = js_string_raw_visit,
+      .algorithm = "22.1.2.4 String.raw", .steps = js_string_raw_steps };
 /* Declared where the machine is; a definition sits with its siblings rather than with the algorithm it
    belongs to, so the labels are named here and written there. */
 static const char *const js_str_trim_steps[];
@@ -74736,7 +74840,7 @@ static const JSTrampStepDef js_ta_set_def         = { sizeof(JSTAIdx), js_ta_idx
 /* Declared where the machine is; the definition names it here. */
 static const char *const js_json_raw_steps[];
 static const JSTrampStepDef js_json_raw_def       = { sizeof(JSJsonRaw), js_json_raw_step, js_json_raw_fini, 0, .visit = js_json_raw_visit,
-                        .algorithm = "25.5.4 JSON.rawJSON",
+                        .algorithm = "JSON.rawJSON (proposal-json-parse-with-source)",
                         .steps = js_json_raw_steps };
 static const JSTrampStepDef js_proto_chain_def    = { sizeof(JSProtoChain), js_proto_chain_step, js_proto_chain_fini, 0, .visit = js_proto_chain_visit,
                         .algorithm = "20.1.3.3 Object.prototype.isPrototypeOf",
@@ -74847,9 +74951,12 @@ static const JSTrampStepDef js_array_flatMap_def   = { sizeof(JSArrayFlat), js_a
 static const char *const js_array_fromlike_steps[];
 static const JSTrampStepDef js_array_fromlike_def  = { sizeof(JSArrayFromLike), js_array_fromlike_step, js_array_fromlike_fini, 0, .visit = js_array_fromlike_visit,
                         .algorithm = "23.1.2.1 Array.from, over an array-like source", .steps = js_array_fromlike_steps };
+static const char *const js_primargs_steps[];
 #define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err), \
-      .visit = js_primargs_visit }
+      .visit = js_primargs_visit, \
+      .algorithm = "7.1.1 ToPrimitive over a coerce-then-compute builtin's declared arguments", \
+      .steps = js_primargs_steps }
 #define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
 #define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid)  PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, NULL)
 static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int isComponent);
@@ -74969,9 +75076,12 @@ static void js_atomics_visit(JSContext *ctx, void *st, JSStepVisit *v);
 #define ATOMICS_WAITABLE(a) (((a) >> 8) & 3)
 #define ATOMICS_ISWRITE(a)  (((a) >> 10) & 1)
 #define ATOMICS_NARGS(a)    (((a) >> 16) & 0xff)
+static const char *const js_atomics_steps[];
 #define ATOMICS_DEF(mask, nargs, waitable, write, proto, fn, magic) \
     { sizeof(JSAtomics), js_atomics_step, js_atomics_fini, ATOMICS_ARG(mask, nargs, waitable, write), \
-      { .proto = (fn) }, JS_CFUNC_##proto, (magic), .visit = js_atomics_visit }
+      { .proto = (fn) }, JS_CFUNC_##proto, (magic), .visit = js_atomics_visit, \
+      .algorithm = "25.4.3.1 ValidateIntegerTypedArray then 25.4.3.2 ValidateAtomicAccess, an Atomics operation's prologue", \
+      .steps = js_atomics_steps }
 /* the read-modify-write eight: index and value(s), access mode ~write~ */
 static const JSTrampStepDef js_atomics_add_def   = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_ADD);
 static const JSTrampStepDef js_atomics_and_def   = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_AND);
@@ -75128,11 +75238,17 @@ static const JSTrampStepDef js_str_fromCodePoint_def = PRIMARGS_DEF(PRIMARGS_ALL
 static const JSTrampStepDef js_date_UTC_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 7), generic, js_Date_UTC, 0);
 /* new Function(a, b, body) / the generator and async variants. The receiver slot is new_target on a constructor
    step, which is what step 29's GetPrototypeFromConstructor reads. */
-#define DYNFUNC_DEF(kind) { sizeof(JSDynFunc), js_dynfunc_step, js_dynfunc_fini, kind, .visit = js_dynfunc_visit }
-static const JSTrampStepDef js_function_ctor_def  = DYNFUNC_DEF(JS_FUNC_NORMAL);
-static const JSTrampStepDef js_genfn_ctor_def     = DYNFUNC_DEF(JS_FUNC_GENERATOR);
-static const JSTrampStepDef js_asyncfn_ctor_def   = DYNFUNC_DEF(JS_FUNC_ASYNC);
-static const JSTrampStepDef js_asyncgenfn_ctor_def= DYNFUNC_DEF(JS_FUNC_ASYNC_GENERATOR);
+static const char *const js_dynfunc_steps[];
+#define DYNFUNC_DEF(kind, alg) { sizeof(JSDynFunc), js_dynfunc_step, js_dynfunc_fini, kind, .visit = js_dynfunc_visit, \
+                                 .algorithm = (alg), .steps = js_dynfunc_steps }
+static const JSTrampStepDef js_function_ctor_def  = DYNFUNC_DEF(JS_FUNC_NORMAL,
+    "20.2.1.1 Function ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
+static const JSTrampStepDef js_genfn_ctor_def     = DYNFUNC_DEF(JS_FUNC_GENERATOR,
+    "27.3.1.1 GeneratorFunction ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
+static const JSTrampStepDef js_asyncfn_ctor_def   = DYNFUNC_DEF(JS_FUNC_ASYNC,
+    "27.7.1.1 AsyncFunction ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
+static const JSTrampStepDef js_asyncgenfn_ctor_def= DYNFUNC_DEF(JS_FUNC_ASYNC_GENERATOR,
+    "27.4.1.1 AsyncGeneratorFunction ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
 #undef DYNFUNC_DEF
 #define DV_STEPDEF_DEF(N) \
     static const JSTrampStepDef js_dv_get_##N##_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 2), generic_magic, js_dataview_getValue, JS_CLASS_##N##_ARRAY); \
@@ -81545,6 +81661,15 @@ static const JSClassExoticMethods js_string_exotic_methods = {
 
 
 /* No prologue: the machine's whole job is the coercion, so there is no stage 0 to write. */
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). */
+#define STRCTOR_STAGES(X) \
+    X(STRCTOR_VALUE,   "22.1.1.1 steps 1-3 (s is the empty String, SymbolDescriptiveString(value) for a plain " \
+                       "call on a Symbol, or ToString(value); NewTarget undefined returns s)") \
+    X(STRCTOR_WRAPPER, "22.1.1.1 step 4 (StringCreate(s, GetPrototypeFromConstructor(NewTarget, " \
+                       "\"%String.prototype%\")))")
+enum { STRCTOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_str_ctor_steps[] = { STRCTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSStrCtor *s = st;
@@ -81553,8 +81678,8 @@ static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     JSValue val, obj;
     int r;
 
-    /* stage 1 = the string is computed and parked on the state; only the wrapper's prototype read is left */
-    if (s->hdr.stage == 1)
+    /* the wrapper stage = the string is computed and parked on the state; only its prototype read is left */
+    if (s->hdr.stage == STRCTOR_WRAPPER)
         goto made_value;
     /* 22.1.1.1 over UNKNOWN INPUT: String(x) of unknown external input is unknown, with the source kept — the
        operator answers, because the ToString boundary below owes C a real string. `new String(x)` is a wrapper
@@ -81600,7 +81725,7 @@ static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     }
     /* the wrapper's prototype read can suspend, so the computed string moves onto the state first */
     s->val = val;
-    s->hdr.stage = 1;
+    s->hdr.stage = STRCTOR_WRAPPER;
 made_value:
     r = step_create_from_ctor_run(ctx, &s->hdr, nt, JS_CLASS_STRING, cb_result, &obj, out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
@@ -81723,8 +81848,21 @@ static JSValue js_string_fromCodePoint(JSContext *ctx, JSValueConst this_val,
    `? Get(cooked, "raw")`, step 4's LengthOfArrayLike, step 7.a's `? Get(literals, Pk)` and the ToString of every
    literal (7.b) and every substitution (7.e.ii) are all its code, on accessors or Proxy traps. js_string_raw
    ran the whole loop from C, so a loop in any of them had no flow base and aborted at its back-edge.
-   Stages: 0 ToObject(template), 1 Get "raw" + ToObject, 2 length, 3 the loop head, 4 the literal read,
-   5 its ToString, 6 the substitution's ToString. */
+   ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The Repeat is step
+   8; the prose here called it step 7 throughout, which is `nextIndex is 0`. The loop HEAD had a stage of its
+   own and rested at no step - it ran no request, so it was entered and left inside one step() call - and it is
+   the literal read's own bounds test now. */
+#define SRAW_STAGES(X) \
+    X(SRAW_TOOBJECT, "22.1.2.4 steps 1-2 (substitutionCount; cooked is ToObject(template))") \
+    X(SRAW_RAW,      "22.1.2.4 step 3 (literals is ToObject(Get(cooked, \"raw\")))") \
+    X(SRAW_LENGTH,   "22.1.2.4 step 4 (literalCount is LengthOfArrayLike(literals))") \
+    X(SRAW_LITERAL,  "22.1.2.4 steps 5-8.a (a literalCount of 0 or less is the empty String; R; nextIndex; " \
+                     "nextLiteralVal is Get(literals, ToString(nextIndex)))") \
+    X(SRAW_LITSTR,   "22.1.2.4 steps 8.b-8.d (nextLiteral is ToString(nextLiteralVal); R is R and it; the last " \
+                     "literal returns R)") \
+    X(SRAW_SUBST,    "22.1.2.4 steps 8.e-8.f (nextSub is ToString(substitutions[nextIndex]); R is R and it)")
+enum { SRAW_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_string_raw_steps[] = { SRAW_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -81732,7 +81870,7 @@ static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     JSValue str;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == SRAW_TOOBJECT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds, and it ends
            the buffer — one initialised late is freed with a NULL ctx. */
@@ -81741,9 +81879,9 @@ static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         s->len = 0; s->i = 0;
         s->cooked = JS_ToObject(ctx, step_arg(&s->hdr, 0));
         if (JS_IsException(s->cooked)) { s->cooked = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = SRAW_RAW;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == SRAW_RAW) {
         r = step_getprop_run(ctx, &s->hdr, s->cooked, JS_ATOM_raw, cb_result, &s->el, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -81751,37 +81889,34 @@ static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         s->literals = JS_ToObject(ctx, s->el);
         JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
         if (JS_IsException(s->literals)) { s->literals = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 2;
+        s->hdr.stage = SRAW_LENGTH;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == SRAW_LENGTH) {
         r = step_length_run(ctx, &s->hdr, s->literals, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 3;
+        s->hdr.stage = SRAW_LITERAL;
     }
     for (;;) {
-        if (s->hdr.stage == 3) {
+        if (s->hdr.stage == SRAW_LITERAL) {
             /* step 5 folds in here: literalCount <= 0 leaves the buffer empty, which IS the empty String. */
             if (s->i >= s->len) { JS_FreeValue(ctx, cb_result); break; }
-            s->hdr.stage = 4;
-        }
-        if (s->hdr.stage == 4) {
             r = step_getidx_run(ctx, &s->hdr, s->literals, s->i, cb_result, &s->el, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
-            s->hdr.stage = 5;
+            s->hdr.stage = SRAW_LITSTR;
         }
-        if (s->hdr.stage == 5) {
+        if (s->hdr.stage == SRAW_LITSTR) {
             r = step_tostring_run(ctx, &s->hdr, s->el, cb_result, &str, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
             JS_FreeValue(ctx, s->el); s->el = JS_UNDEFINED;
             if (string_buffer_concat_value_free(&s->b, str)) return -1;
-            /* step 7.d: the LAST literal ends the string — the trailing substitution is never appended. */
+            /* step 8.d: the LAST literal ends the string — the trailing substitution is never appended. */
             if (s->i + 1 >= s->len) break;
-            s->hdr.stage = 6;
+            s->hdr.stage = SRAW_SUBST;
         }
-        /* step 7.e: the substitution, present only while there are any left */
+        /* step 8.e: the substitution, present only while there are any left */
         if (s->i + 1 < s->hdr.argc) {
             r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, (int)(s->i + 1)), cb_result, &str,
                                   out_cb, out_argc);
@@ -81792,7 +81927,7 @@ static int js_string_raw_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         }
         s->i++;
-        s->hdr.stage = 3;
+        s->hdr.stage = SRAW_LITERAL;
     }
     return 0;
 }
@@ -88612,9 +88747,13 @@ static bool is_valid_raw_json_char(int c)
 
 /* Steps 2-8 run none of the page's code: the validation is this engine's parser over a String it already holds,
    and the object it builds is not reachable by the page until it is returned. */
+/* The standard has no section number for this one: json-parse-with-source is not in the published edition, so
+   the algorithm is named and its steps are the proposal's own — 25.5.4 is a section that does not exist, and a
+   number invented here would be a claim about the standard rather than a reference to it (see B64OP_STAGES). */
 #define JSONRAW_STAGES(X) \
-    X(JSONRAW_TOSTRING, "25.5.4 step 1 (jsonString is ToString(text))") \
-    X(JSONRAW_BUILD,    "25.5.4 steps 2-8 (jsonString is a valid JSON text; obj carries it, frozen)")
+    X(JSONRAW_TOSTRING, "proposal-json-parse-with-source JSON.rawJSON step 1 (jsonString is ToString(text))") \
+    X(JSONRAW_BUILD,    "proposal-json-parse-with-source JSON.rawJSON steps 2-8 (jsonString is a valid JSON " \
+                        "text; obj carries it, frozen)")
 enum { JSONRAW_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_json_raw_steps[] = { JSONRAW_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -90742,18 +90881,26 @@ typedef struct JSSymbolFor {
 } JSSymbolFor;
 _Static_assert(offsetof(JSSymbolFor, hdr) == 0, "JSStepHdr must be first in JSSymbolFor");
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). */
+#define SYMFOR_STAGES(X) \
+    X(SYMFOR_ENTRY,    "20.4.2.2, entered: the machine has its key and nothing has been coerced yet") \
+    X(SYMFOR_TOSTRING, "20.4.2.2 step 1 (stringKey is ToString(key)) - and steps 2-5, the registry lookup and " \
+                       "the new Symbol, which run none of the page's code")
+enum { SYMFOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_symbol_for_steps[] = { SYMFOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_symbol_for_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSSymbolFor *m = st;
     JSValue str;
     int r;
 
-    if (m->hdr.stage == 0) {
+    if (m->hdr.stage == SYMFOR_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         m->result = JS_UNDEFINED;
-        m->hdr.stage = 1;
+        m->hdr.stage = SYMFOR_TOSTRING;
     }
-    DCHECK(m->hdr.stage == 1, "Symbol.for resumed in an unknown stage");
+    DCHECK(m->hdr.stage == SYMFOR_TOSTRING, "Symbol.for resumed in an unknown stage");
     r = step_tostring_run(ctx, &m->hdr, step_arg(&m->hdr, 0), cb_result, &str, out_cb, out_argc);
     if (r) return r;
     /* __JS_NewAtom CONSUMES the string, which is why there is no free here — the C body relied on that too, and
@@ -90786,7 +90933,8 @@ static JSValue js_symbol_for_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 static const JSTrampStepDef js_symbol_for_def = {
-    sizeof(JSSymbolFor), js_symbol_for_step, js_symbol_for_fini, 0, .visit = js_symbol_for_visit };
+    sizeof(JSSymbolFor), js_symbol_for_step, js_symbol_for_fini, 0, .visit = js_symbol_for_visit,
+    .algorithm = "20.4.2.2 Symbol.for", .steps = js_symbol_for_steps };
 
 static JSValue js_symbol_keyFor(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
@@ -102291,6 +102439,19 @@ static int js_atomics_access(JSContext *ctx, JSAtomics *s)
     return 0;
 }
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). SHARED by all twelve
+   entry points, and what it performs is not one of their algorithms but the validation-then-coercion prologue
+   every one of them begins with; which body follows is what the definition's `body` says. */
+#define ATOMICS_STAGES(X) \
+    X(ATOM_VALIDATE, "25.4.3.1 ValidateIntegerTypedArray(typedArray, waitable) and 25.4.3.2 step 1 (length is " \
+                     "TypedArrayLength(taRecord)) - both BEFORE the first coercion, which is why the length " \
+                     "lives on the state") \
+    X(ATOM_COERCE,   "25.4.3.2 steps 2-4 (accessIndex is ToIndex(requestIndex), tested against the captured " \
+                     "length) and the operation's own ToNumber/ToBigInt on each declared value argument - then " \
+                     "the body, which over primitives reaches none of the page's code")
+enum { ATOMICS_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_atomics_steps[] = { ATOMICS_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_atomics_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSAtomics *s = st;
@@ -102299,7 +102460,7 @@ static int js_atomics_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     int nargs = ATOMICS_NARGS(arg);
     int i;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ATOM_VALIDATE) {
         JSObject *p;
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;
@@ -102314,7 +102475,7 @@ static int js_atomics_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         for (i = 0; i < s->nargp; i++)
             s->argp[i] = js_dup(step_arg(&s->hdr, i));
         s->i = 0;
-        s->hdr.stage = 1;
+        s->hdr.stage = ATOM_COERCE;
     } else {
         DCHECK(s->i > 0, "an Atomics operation received a primitive with no coercion in flight");
         s->hdr.coercing = 0;
