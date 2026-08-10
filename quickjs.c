@@ -64712,7 +64712,15 @@ static JSValue js_global_eval_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* isNaN (arg 0) and isFinite (arg 1): stage 0 is ToNumber(argv[0]); the predicate needs no stage of its own. */
+/* isNaN (arg 0) and isFinite (arg 1): ONE stage, the ToNumber; each algorithm's remaining step tests a number
+   and runs nothing. ONE stage list expanded once per algorithm; see AFIND_STAGES. */
+#define COERCE1_STAGES(X, NUM) X(COERCE1_NUM, NUM)
+enum { COERCE1_STAGES(JS_STEP_STAGE_ENUM, 0) };
+static const char *const js_isNaN_steps[] = {
+    COERCE1_STAGES(JS_STEP_STAGE_LABEL, "19.2.3 step 1 (num is ToNumber(number))") NULL };
+static const char *const js_isFinite_steps[] = {
+    COERCE1_STAGES(JS_STEP_STAGE_LABEL, "19.2.2 step 1 (num is ToNumber(number))") NULL };
+
 static int js_coerce1_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSCoerce1 *s = st;
@@ -64940,13 +64948,33 @@ static JSValue js_object_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
 
 /* magic = 1 if called as Reflect.defineProperty */
 /* hdr.arg: 0 = parseFloat, 1 = parseInt (which additionally coerces a radix). */
+/* TWO algorithms, one machine. parseFloat has no radix, so its middle stage coerces nothing and says so rather
+   than naming a step it does not have. ONE stage list expanded once per algorithm; see AFIND_STAGES. */
+#define PARSENUM_STAGES(X, STR, RADIX, PARSE) \
+    X(PARSENUM_STR,   STR)   \
+    X(PARSENUM_RADIX, RADIX) \
+    X(PARSENUM_PARSE, PARSE)
+enum { PARSENUM_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_parseInt_steps[] = {
+    PARSENUM_STAGES(JS_STEP_STAGE_LABEL,
+        "19.2.5 step 1 (inputString is ToString(string))",
+        "19.2.5 step 5 (R is ToInt32(radix))",
+        "19.2.5 steps 6-16 (the trimmed string is parsed in radix R)")
+    NULL };
+static const char *const js_parseFloat_steps[] = {
+    PARSENUM_STAGES(JS_STEP_STAGE_LABEL,
+        "19.2.4 step 1 (inputString is ToString(string))",
+        "19.2.4 takes no radix: nothing is coerced here",
+        "19.2.4 steps 2-5 (the trimmed string is parsed as a StrDecimalLiteral)")
+    NULL };
+
 static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSParseNum *s = st;
     const char *cs, *q;
     int radix, flags, r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == PARSENUM_STR) {
         if (s->hdr.str_phase == STR_PH_START) { s->str = JS_UNDEFINED; s->result = JS_UNDEFINED; }
         /* 19.2.5/19.2.4 OVER UNKNOWN INPUT. §solver states it directly: opacity SURVIVES numeric
            coercion, so parseInt of an unknown is an unknown NUMBER and a branch on it still forks —
@@ -64959,16 +64987,17 @@ static int js_parse_num_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 1;
+        s->hdr.stage = PARSENUM_RADIX;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == PARSENUM_RADIX) {
         if (s->hdr.arg) {
             r = step_toint32_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->radix, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
         }
-        s->hdr.stage = 2;
+        s->hdr.stage = PARSENUM_PARSE;
     }
+    DCHECK(s->hdr.stage == PARSENUM_PARSE, "parseInt resumed in no stage");
     JS_FreeValue(ctx, cb_result);
 
     cs = JS_ToCString(ctx, s->str);   /* the value is already a string: no user code */
@@ -74118,10 +74147,13 @@ static const JSTrampStepDef js_iter_zip_next_def =
 static const JSTrampStepDef js_iter_zip_return_def =
     { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_RETURN, .visit = js_iter_zip_drive_visit };
 static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static const char *const js_iter_concat_next_steps[];
 static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iter_concat_next_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_concat_next_def =
-    { sizeof(JSIterConcatNext), js_iter_concat_next_step, js_iter_concat_next_fini, 0, .visit = js_iter_concat_next_visit };
+    { sizeof(JSIterConcatNext), js_iter_concat_next_step, js_iter_concat_next_fini, 0, .visit = js_iter_concat_next_visit,
+      .algorithm = "Iterator.concat's closure (proposal-iterator-sequencing), resumed by %IteratorHelperPrototype%.next",
+      .steps = js_iter_concat_next_steps };
 static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_concat_return_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iter_concat_return_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -74492,8 +74524,12 @@ static const JSTrampStepDef js_ownkeys_syms_def   = { sizeof(JSOwnKeys), js_ownk
 static const JSTrampStepDef js_reflect_ownkeys_def = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, OWNKEYS_REFLECT, .visit = js_ownkeys_visit,
                                                      .algorithm = "28.1.10 Reflect.ownKeys",
                                                      .steps = js_reflect_ownkeys_steps };
-static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 , .visit = js_parse_num_visit };
-static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 , .visit = js_parse_num_visit };
+static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 , .visit = js_parse_num_visit,
+                        .algorithm = "19.2.5 parseInt",
+                        .steps = js_parseInt_steps };
+static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 , .visit = js_parse_num_visit,
+                        .algorithm = "19.2.4 parseFloat",
+                        .steps = js_parseFloat_steps };
 static const char *const js_str_split_steps[];
 static const JSTrampStepDef js_str_split_def      = { sizeof(JSStrSplit), js_str_split_step, js_str_split_fini, 0, .visit = js_str_split_visit,
                                                      .algorithm = "22.1.3.23 String.prototype.split",
@@ -74831,15 +74867,37 @@ static const JSTrampStepDef js_asyncgenfn_ctor_def= DYNFUNC_DEF(JS_FUNC_ASYNC_GE
     static const JSTrampStepDef js_dv_set_##N##_def = PRIMARGS_DEF_PRE(PRIMARGS(0x3, HINT_NUMBER, 3), generic_magic, js_dataview_setValue, JS_CLASS_##N##_ARRAY, js_dataview_set_precheck, js_dataview_set_midcheck);
 DV_STEPDEF_LIST(DV_STEPDEF_DEF)
 #undef DV_STEPDEF_DEF
-static const JSTrampStepDef js_num_ctor_def       = { sizeof(JSNumCtor), js_num_ctor_step, js_num_ctor_fini, 0, .visit = js_num_ctor_visit };
-static const JSTrampStepDef js_num_tostring_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOSTRING, .visit = js_number_fmt_visit };
-static const JSTrampStepDef js_num_tolocale_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOLOCALESTRING, .visit = js_number_fmt_visit };
-static const JSTrampStepDef js_num_tofixed_def    = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOFIXED, .visit = js_number_fmt_visit };
-static const JSTrampStepDef js_num_toexp_def      = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOEXPONENTIAL, .visit = js_number_fmt_visit };
-static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION, .visit = js_number_fmt_visit };
+static const char *const js_num_ctor_steps[];
+static const JSTrampStepDef js_num_ctor_def       = { sizeof(JSNumCtor), js_num_ctor_step, js_num_ctor_fini, 0, .visit = js_num_ctor_visit,
+                        .algorithm = "21.1.1.1 Number ( value )",
+                        .steps = js_num_ctor_steps };
+static const char *const js_num_tostring_steps[];
+static const JSTrampStepDef js_num_tostring_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOSTRING, .visit = js_number_fmt_visit,
+                        .algorithm = "21.1.3.6 Number.prototype.toString",
+                        .steps = js_num_tostring_steps };
+static const char *const js_num_tolocale_steps[];
+static const JSTrampStepDef js_num_tolocale_def   = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOLOCALESTRING, .visit = js_number_fmt_visit,
+                        .algorithm = "21.1.3.4 Number.prototype.toLocaleString",
+                        .steps = js_num_tolocale_steps };
+static const char *const js_num_tofixed_steps[];
+static const JSTrampStepDef js_num_tofixed_def    = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOFIXED, .visit = js_number_fmt_visit,
+                        .algorithm = "21.1.3.3 Number.prototype.toFixed",
+                        .steps = js_num_tofixed_steps };
+static const char *const js_num_toexp_steps[];
+static const JSTrampStepDef js_num_toexp_def      = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOEXPONENTIAL, .visit = js_number_fmt_visit,
+                        .algorithm = "21.1.3.2 Number.prototype.toExponential",
+                        .steps = js_num_toexp_steps };
+static const char *const js_num_toprec_steps[];
+static const JSTrampStepDef js_num_toprec_def     = { sizeof(JSNumberFmt), js_number_fmt_step, js_number_fmt_fini, NUMFMT_TOPRECISION, .visit = js_number_fmt_visit,
+                        .algorithm = "21.1.3.5 Number.prototype.toPrecision",
+                        .steps = js_num_toprec_steps };
 static const JSTrampStepDef js_global_eval_def    = { sizeof(JSProgEval), js_global_eval_step, js_global_eval_fini, 0, .visit = js_global_eval_visit };
-static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 , .visit = js_coerce1_visit };
-static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 , .visit = js_coerce1_visit };
+static const JSTrampStepDef js_isNaN_def          = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 0 , .visit = js_coerce1_visit,
+                        .algorithm = "19.2.3 isNaN",
+                        .steps = js_isNaN_steps };
+static const JSTrampStepDef js_isFinite_def       = { sizeof(JSCoerce1), js_coerce1_step, js_coerce1_fini, 1 , .visit = js_coerce1_visit,
+                        .algorithm = "19.2.2 isFinite",
+                        .steps = js_isFinite_steps };
 static const JSTrampStepDef js_function_call_def  = { sizeof(JSFuncCall), js_function_call_step, js_function_call_fini, 0, .visit = js_function_call_visit };
 static const JSTrampStepDef js_function_apply_def = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 0, .visit = js_function_apply_visit };
 static const JSTrampStepDef js_reflect_apply_def  = { sizeof(JSFuncApply), js_function_apply_step, js_function_apply_fini, 1, .visit = js_function_apply_visit };
@@ -79133,8 +79191,27 @@ static void js_iterator_concat_mark(JSRuntime *rt, JSValueConst val,
    every resume rather than cached across a suspension. `running` is the spec's re-entrancy guard; the teardown
    clears it, which is what makes an abrupt exit leave the iterator usable exactly as the C body's `done:` label
    did. */
-enum { CONCAT_PH_HEAD = 0, CONCAT_PH_ITER, CONCAT_PH_NEXTM, CONCAT_PH_CALL,
-       CONCAT_PH_DONE, CONCAT_PH_VALUE };
+/* WHICH STEP OF Iterator.concat's ABSTRACT CLOSURE EACH STAGE RESTS AT. The builtin is a generator in the spec,
+   so `.next()` is GeneratorResume and the algorithm a parked flow is really in is the closure — whose walk this
+   machine performs one page-visible operation at a time. Iterator.concat is not in ES2025, so it is named by its
+   proposal rather than by a clause number this file's edition does not have.
+   Each of the five REST stages already named the operation it waits in; what they lacked was the ability to SAY
+   so, which is exactly what a resume across a build needs. */
+#define CONCAT_PH_STAGES(X) \
+    X(CONCAT_PH_HEAD,  "proposal-iterator-sequencing Iterator.concat closure step 1.a (the next Record of " \
+                       "iterables, or the walk is over)") \
+    X(CONCAT_PH_ITER,  "proposal-iterator-sequencing Iterator.concat closure steps 1.a.i-ii (iterator is " \
+                       "Call(iterable.[[OpenMethod]], iterable.[[Iterable]]))") \
+    X(CONCAT_PH_NEXTM, "proposal-iterator-sequencing Iterator.concat closure step 1.a.iii -> 7.4.2 " \
+                       "GetIteratorDirect (Get(iterator, \"next\"))") \
+    X(CONCAT_PH_CALL,  "proposal-iterator-sequencing Iterator.concat closure step 1.a.v.1 -> 7.4.10 " \
+                       "IteratorStepValue step 1 -> 7.4.6 IteratorNext (Call(nextMethod, iterator))") \
+    X(CONCAT_PH_DONE,  "proposal-iterator-sequencing Iterator.concat closure step 1.a.v.1 -> 7.4.10 " \
+                       "IteratorStepValue step 4 -> 7.4.7 IteratorComplete (Get(result, \"done\"))") \
+    X(CONCAT_PH_VALUE, "proposal-iterator-sequencing Iterator.concat closure step 1.a.v.1 -> 7.4.10 " \
+                       "IteratorStepValue step 8 -> 7.4.8 IteratorValue (Get(result, \"value\"))")
+enum { CONCAT_PH_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_iter_concat_next_steps[] = { CONCAT_PH_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static JSIteratorConcatData *js_iter_concat_data(JSContext *ctx, JSValueConst this_val)
 {
@@ -80364,6 +80441,12 @@ static const JSCFunctionListEntry js_array_iterator_proto_funcs[] = {
 
 /* 21.1.1.1. The receiver slot IS new_target on a constructor step; UNDEFINED means a plain `Number(x)` call.
    The ToNumeric is a TOPRIMITIVE step, so a valueOf with a loop in it parks like any other callee. */
+#define NUMCTOR_STAGES(X) \
+    X(NUMCTOR_VALUE,  "21.1.1.1 steps 1-3 (prim is ToNumeric(value); n)") \
+    X(NUMCTOR_CREATE, "21.1.1.1 step 4 (O is OrdinaryCreateFromConstructor(NewTarget, \"%Number.prototype%\"))")
+enum { NUMCTOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_num_ctor_steps[] = { NUMCTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSNumCtor *s = st;
@@ -80372,8 +80455,8 @@ static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     JSValue val, obj;
     int r;
 
-    /* stage 1 = the value is computed and parked on the state; only the wrapper's prototype read is left */
-    if (s->hdr.stage == 1)
+    /* the value is computed and parked on the state; only the wrapper's prototype read is left */
+    if (s->hdr.stage == NUMCTOR_CREATE)
         goto made_value;
     /* 21.1.1.1 over UNKNOWN INPUT: Number(x) of unknown external input is unknown, source kept — the operator
        answers, because the ToNumber boundary owes C a real number. `new Number(x)` is a wrapper and is not this
@@ -80426,7 +80509,7 @@ static int js_num_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     }
     /* the wrapper's prototype read can suspend, so the computed value moves onto the state first */
     s->val = val;
-    s->hdr.stage = 1;
+    s->hdr.stage = NUMCTOR_CREATE;
 made_value:
     r = step_create_from_ctor_run(ctx, &s->hdr, nt, JS_CLASS_NUMBER, cb_result, &obj, out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
@@ -80558,7 +80641,45 @@ static int js_get_radix(JSContext *ctx, JSValueConst val)
    nothing (it unwraps the receiver or throws), but the DIGITS argument is ToInt32Sat'd — the page's code, from
    a C body, so `(1).toFixed({valueOf(){while(x){}}})` preempted with no flow base and `(1).toFixed([2])`
    reaches Array.prototype.toString, which is a machine no C body can drive.
-   Stage 0 unwraps the receiver, 1 coerces the argument where the mode has one, 2 formats. */
+   Stage 0 unwraps the receiver, 1 coerces the argument where the mode has one, 2 formats.
+   FIVE algorithms, one machine; ONE stage list expanded once per algorithm, see AFIND_STAGES. toLocaleString
+   coerces nothing, so its middle label says that rather than naming a step it does not have. */
+#define NUMFMT_STAGES(X, RECV, ARG, FORMAT) \
+    X(NUMFMT_RECV,   RECV) \
+    X(NUMFMT_ARG,    ARG)  \
+    X(NUMFMT_FORMAT, FORMAT)
+enum { NUMFMT_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_num_tostring_steps[] = {
+    NUMFMT_STAGES(JS_STEP_STAGE_LABEL,
+        "21.1.3.6 step 1 (x is ThisNumberValue(this value))",
+        "21.1.3.6 steps 2-3 (radixMV is 10, or ToIntegerOrInfinity(radix))",
+        "21.1.3.6 steps 4-5 (radixMV is between 2 and 36; Number::toString(x, radixMV))")
+    NULL };
+static const char *const js_num_tolocale_steps[] = {
+    NUMFMT_STAGES(JS_STEP_STAGE_LABEL,
+        "21.1.3.4 step 1 (x is ThisNumberValue(this value))",
+        "21.1.3.4 coerces no argument: reserved1 and reserved2 are not read",
+        "21.1.3.4 step 2 (Number::toString(x, 10))")
+    NULL };
+static const char *const js_num_tofixed_steps[] = {
+    NUMFMT_STAGES(JS_STEP_STAGE_LABEL,
+        "21.1.3.3 step 1 (x is ThisNumberValue(this value))",
+        "21.1.3.3 step 2 (f is ToIntegerOrInfinity(fractionDigits))",
+        "21.1.3.3 steps 4-10 (f is between 0 and 100; the fixed-notation String)")
+    NULL };
+static const char *const js_num_toexp_steps[] = {
+    NUMFMT_STAGES(JS_STEP_STAGE_LABEL,
+        "21.1.3.2 step 1 (x is ThisNumberValue(this value))",
+        "21.1.3.2 step 2 (f is ToIntegerOrInfinity(fractionDigits))",
+        "21.1.3.2 steps 3-15 (f is between 0 and 100; the exponential-notation String)")
+    NULL };
+static const char *const js_num_toprec_steps[] = {
+    NUMFMT_STAGES(JS_STEP_STAGE_LABEL,
+        "21.1.3.5 step 1 (x is ThisNumberValue(this value))",
+        "21.1.3.5 steps 2-3 (an absent precision is ToString(x); p is ToIntegerOrInfinity(precision))",
+        "21.1.3.5 steps 4-13 (p is between 1 and 100; the String of p significant digits)")
+    NULL };
+
 static int js_number_fmt_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSNumberFmt *s = st;
@@ -80566,14 +80687,14 @@ static int js_number_fmt_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     JSValueConst arg0 = step_arg(&s->hdr, 0);
     int f, flags, r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == NUMFMT_RECV) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
         s->val = js_thisNumberValue(ctx, s->hdr.this_val);
         if (JS_IsException(s->val)) { s->val = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = NUMFMT_ARG;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == NUMFMT_ARG) {
         /* WHICH modes coerce, and when, is observable: toString with no radix and toPrecision with no
            precision never touch the argument, while toExponential and toFixed coerce even an undefined one. */
         bool coerces = (mode == NUMFMT_TOFIXED || mode == NUMFMT_TOEXPONENTIAL)
@@ -80585,8 +80706,9 @@ static int js_number_fmt_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
         }
-        s->hdr.stage = 2;
+        s->hdr.stage = NUMFMT_FORMAT;
     }
+    DCHECK(s->hdr.stage == NUMFMT_FORMAT, "a Number formatter resumed in no stage");
     JS_FreeValue(ctx, cb_result);
 
     /* JS_ToInt32Sat's saturation, applied to the int64-saturated result the sub-sequence delivers */
