@@ -74155,10 +74155,13 @@ static const JSTrampStepDef js_iter_concat_next_def =
       .algorithm = "Iterator.concat's closure (proposal-iterator-sequencing), resumed by %IteratorHelperPrototype%.next",
       .steps = js_iter_concat_next_steps };
 static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+static const char *const js_iter_concat_return_steps[];
 static JSValue js_iter_concat_return_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iter_concat_return_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_concat_return_def =
-    { sizeof(JSIterConcatReturn), js_iter_concat_return_step, js_iter_concat_return_fini, 0, .visit = js_iter_concat_return_visit };
+    { sizeof(JSIterConcatReturn), js_iter_concat_return_step, js_iter_concat_return_fini, 0, .visit = js_iter_concat_return_visit,
+      .algorithm = "Iterator.concat's closure (proposal-iterator-sequencing) resumed with a return completion",
+      .steps = js_iter_concat_return_steps };
 static int js_iter_wrap_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static const char *const js_iter_wrap_return_steps[];
 static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_result);
@@ -79361,22 +79364,36 @@ static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_resu
     return r;
 }
 
+/* WHICH STEP EACH STAGE RESTS AT. A return completion delivered into the closure runs 7.4.11 IteratorClose on
+   the iterator the walk is standing in, and this machine performs exactly that; the stages that REST are its two
+   page-visible operations. */
+#define CONCAT_RET_STAGES(X) \
+    X(CONCAT_RET_ENTER,  "27.1.2.1.2 steps 1-4 (the concat iterator's [[GeneratorState]]; the live inner " \
+                         "iterator, if any)") \
+    X(CONCAT_RET_METHOD, "27.1.2.1.2 step 4.c -> 7.4.11 IteratorClose step 3 (Get(iterator, \"return\"))") \
+    X(CONCAT_RET_CALL,   "27.1.2.1.2 step 4.c -> 7.4.11 IteratorClose step 4.c (Call(return, iterator))") \
+    X(CONCAT_RET_END,    "27.1.2.1.2 step 4.d (CreateIteratorResultObject(undefined, true); the remaining " \
+                         "iterables are released)")
+enum { CONCAT_RET_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_iter_concat_return_steps[] = { CONCAT_RET_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSIterConcatReturn *s = st;
     JSIteratorConcatData *it;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == CONCAT_RET_ENTER) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->self = JS_UNDEFINED; s->result = JS_UNDEFINED; s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
         it = js_iter_concat_data(ctx, s->hdr.this_val);
         if (!it) return -1;
         if (it->running) { JS_ThrowTypeError(ctx, "already running"); return -1; }
         s->self = js_dup(s->hdr.this_val);
-        s->hdr.stage = JS_IsUndefined(it->iter) ? 3 : 1;   /* nothing live to close */
+        /* nothing live to close */
+        s->hdr.stage = JS_IsUndefined(it->iter) ? CONCAT_RET_END : CONCAT_RET_METHOD;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == CONCAT_RET_METHOD) {
         JSValue rm = JS_UNDEFINED;
         it = js_iter_concat_data(ctx, s->self);
         DCHECK(it != NULL, "Iterator.concat .return(): the receiver lost its data");
@@ -79392,20 +79409,20 @@ static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_resul
         s->cb[1] = rm;
         it->running = true;
         s->held = 1;
-        s->hdr.stage = 2;
+        s->hdr.stage = CONCAT_RET_CALL;
         *out_cb = s->cb; *out_argc = 0;
         return 3;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == CONCAT_RET_CALL) {
         it = js_iter_concat_data(ctx, s->self);
         DCHECK(it != NULL, "Iterator.concat .return(): the receiver lost its data across its `return` call");
         it->running = false;
         s->held = 0;
         s->result = cb_result;
-        s->hdr.stage = 3;
+        s->hdr.stage = CONCAT_RET_END;
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
     }
-    DCHECK(s->hdr.stage == 3, "Iterator.concat .return(): unknown stage");
+    DCHECK(s->hdr.stage == CONCAT_RET_END, "Iterator.concat .return(): unknown stage");
     it = js_iter_concat_data(ctx, s->self);
     DCHECK(it != NULL, "Iterator.concat .return(): the receiver lost its data before its release");
     while (it->index < it->count) {
