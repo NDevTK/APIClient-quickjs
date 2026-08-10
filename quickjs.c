@@ -23639,7 +23639,31 @@ typedef struct JSIterZip {
 } JSIterZip;
 
 enum { ZIP_DRIVE_NEXT = 0, ZIP_DRIVE_RETURN };
-enum { ZD_INIT = 0, ZD_STEP, ZD_CLOSEALL };
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The zipper's `next`
+   and `return` are the SAME closure driven two ways, so the stages are one list and only the algorithm each
+   definition names differs. Not in the published edition — see ZIP_STAGES. */
+#define ZIPDRIVE_STAGES(X, INIT, STEP, CLOSEALL) \
+    X(ZD_INIT,     INIT) \
+    X(ZD_STEP,     STEP) \
+    X(ZD_CLOSEALL, CLOSEALL)
+enum { ZIPDRIVE_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_iter_zip_next_steps[] = {
+    ZIPDRIVE_STAGES(JS_STEP_STAGE_LABEL,
+        "proposal-joint-iteration's zip closure, entered: the generator's state decides whether this call runs "
+        "the body, answers {undefined, true}, or throws for a re-entrant call",
+        "proposal-joint-iteration's zip closure step 3.b (one IteratorStepValue per live input, in order; a "
+        "spent input contributes its pad and `strict` raises the mismatch TypeError)",
+        "proposal-joint-iteration's zip closure -> IteratorCloseAll(iters, completion), one input at a time "
+        "from the last")
+    NULL };
+static const char *const js_iter_zip_return_steps[] = {
+    ZIPDRIVE_STAGES(JS_STEP_STAGE_LABEL,
+        "27.1.2.1.2 %IteratorHelperPrototype%.return steps 1-4 (the generator is COMPLETED; a suspended-start "
+        "zipper answers {undefined, true} without running the closes)",
+        "27.1.2.1.2: unreached - a return drives no input's next",
+        "27.1.2.1.2 step 5 -> proposal-joint-iteration's IteratorCloseAll(iters, NormalCompletion), one input "
+        "at a time from the last")
+    NULL };
 
 typedef struct JSIterZipDrive {
     JSStepHdr hdr;
@@ -35354,7 +35378,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    operation itself. The capability created above for the abrupt case is dropped by the delivery
                    when the coercion completes normally — it was never observed, and creating one runs none of the
                    page's code — which is why nothing above this label needs to run again. */
-                /* 16.2.1.8 steps 4-12 with the specifier already primitive. The options walk runs the
+                /* 13.3.10.2 steps 7-13 with the specifier already primitive. The options walk runs the
                    page's code — the `with` read, the `ownKeys`/`getOwnPropertyDescriptor` pair, and each
                    attribute's value read — and every failure REJECTS rather than throwing, so it is a machine
                    whose result is the promise on both paths. Operand shape: two consumed, one pushed. */
@@ -39985,7 +40009,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             goto do_promise_all_settle;
         } else if (xck == CONT_STEP && ((JSStepHdr *)xcs)->def->catches_abrupt) {
             /* The machine's algorithm CATCHES this call's abrupt completion instead of propagating it —
-               DisposeResources keeps disposing and folds the throw into a SuppressedError, the way 16.2.1.8 folds
+               DisposeResources keeps disposing and folds the throw into a SuppressedError, the way 13.3.10.2 folds
                a throwing trap into a rejection. catches_abrupt already said this for a GETPROP request; a CALL is
                the same declaration about a different request, and without it the only way to write such an
                algorithm was a JS_Call from C with the result inspected in place — which is the drive-to-completion
@@ -55123,7 +55147,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-/* ---- import()'s options, 16.2.1.8 steps 8-11, as a step machine ----
+/* ---- import()'s options, 13.3.10.2 EvaluateImportCall steps 8-11, as a step machine ----
 
    js_dynamic_import ran three of the page's operations from C: `Get(options, "with")`, the attribute record's
    `ownKeys` + per-key `getOwnPropertyDescriptor`, and the `Get` of each attribute's VALUE. Every one of them is
@@ -55135,7 +55159,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
    every value, which a Proxy sees as a different sequence. The cursor performs the whole operation now, so the
    order is the algorithm's rather than the implementation's.
 
-   Every failure here REJECTS the promise instead of throwing — 16.2.1.8 wraps steps 4 onward in
+   Every failure here REJECTS the promise instead of throwing — 13.3.10.2 wraps steps 8 onward in
    IfAbruptRejectPromise — so the machine's result is the promise whatever happens, and a throwing trap comes
    back to it as a value (catches_abrupt). That also unifies the two capabilities the old code created: the
    coercion's, made by OP_import for exactly this rejection, and js_dynamic_import's own. */
@@ -55150,7 +55174,7 @@ typedef struct JSImportOpts {
     JSEnumKeys *ek;        /* 7.3.23 over attrs_obj, key+value (owned) */
 } JSImportOpts;
 
-/* The abrupt completion of any of steps 4-11 is a REJECTION. `err` is consumed. Always returns 0: the opcode
+/* The abrupt completion of any of steps 8-11 is a REJECTION. `err` is consumed. Always returns 0: the opcode
    completes normally with the promise, which is the whole point of IfAbruptRejectPromise. */
 static int js_import_opts_reject(JSContext *ctx, JSImportOpts *s, JSValue err)
 {
@@ -55171,13 +55195,28 @@ static int js_import_opts_enqueue(JSContext *ctx, JSImportOpts *s)
     return 0;
 }
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). This machine's
+   prose numbered the operation 16.2.1.8, which is Synthetic Module Records; dynamic import is 13.3.10.2
+   EvaluateImportCall, and its step letters here were an edition behind as well. */
+#define IMPOPTS_STAGES(X) \
+    X(IMPOPTS_SPEC,  "13.3.10.2 steps 1-2 and 7-11.b (referrer; promiseCapability; specifierString is " \
+                     "ToString(specifier), already primitive; attributes is a new empty List; a non-Object " \
+                     "options rejects) - and the dispatch of step 11.b's Get(options, \"with\")") \
+    X(IMPOPTS_WITH,  "13.3.10.2 steps 11.b-11.d.i (attributesObj arrives; undefined leaves the attribute list " \
+                     "empty and a non-Object rejects)") \
+    X(IMPOPTS_ATTRS, "13.3.10.2 steps 11.d.ii-11.d.iv (entries is EnumerableOwnProperties(attributesObj, " \
+                     "key+value) - the ownKeys trap, then per key a getOwnPropertyDescriptor and a Get, " \
+                     "interleaved in that order - and each entry's key and value are validated)")
+enum { IMPOPTS_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_import_opts_steps[] = { IMPOPTS_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSImportOpts *s = st;
     JSValueConst options = step_arg(&s->hdr, 1);
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == IMPOPTS_SPEC) {
         JSAtom basename;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
@@ -55194,9 +55233,9 @@ static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
            has to exist first. Creating one runs nothing — it is the intrinsic Promise. */
         s->promise = JS_NewPromiseCapability(ctx, s->funcs);
         if (JS_IsException(s->promise)) { s->promise = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = IMPOPTS_WITH;
 
-        /* step 6: the specifier is a PRIMITIVE by now — an object one was coerced by OP_import's ToPrimitive
+        /* step 8: the specifier is a PRIMITIVE by now — an object one was coerced by OP_import's ToPrimitive
            request before the opcode resumed — so this runs nothing. It still throws for a Symbol, and that
            throw rejects like every other. */
         s->spec_str = JS_ToString(ctx, step_arg(&s->hdr, 0));
@@ -55205,41 +55244,41 @@ static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             return js_import_opts_reject(ctx, s, JS_GetException(ctx));
         }
         if (JS_IsUndefined(options))
-            return js_import_opts_enqueue(ctx, s);          /* step 8: no options, no attributes */
+            return js_import_opts_enqueue(ctx, s);          /* steps 10-11: no options, no attributes */
         if (!JS_IsObject(options)) {
-            JS_ThrowTypeError(ctx, "options must be an object");   /* step 9.a */
+            JS_ThrowTypeError(ctx, "options must be an object");   /* step 11.a */
             return js_import_opts_reject(ctx, s, JS_GetException(ctx));
         }
-        /* step 9.b: `Get(options, "with")` — an accessor or a Proxy `get` trap. */
+        /* step 11.b: `Get(options, "with")` — an accessor or a Proxy `get` trap. */
         return step_getprop_run(ctx, &s->hdr, options, JS_ATOM_with, JS_UNDEFINED,
                                 &s->attrs_obj, out_cb, out_argc);
     }
 
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == IMPOPTS_WITH) {
         if (JS_IsException(cb_result))
             return js_import_opts_reject(ctx, s, JS_GetException(ctx));
         step_getprop_done(ctx, &s->hdr, JS_ATOM_NULL, cb_result, &s->attrs_obj);
         cb_result = JS_UNDEFINED;
         if (JS_IsUndefined(s->attrs_obj))
-            return js_import_opts_enqueue(ctx, s);          /* step 9.c: no `with`, no attributes */
+            return js_import_opts_enqueue(ctx, s);          /* step 11.d: no `with`, no attributes */
         if (!JS_IsObject(s->attrs_obj)) {
-            JS_ThrowTypeError(ctx, "options.with must be an object");   /* step 9.c.i */
+            JS_ThrowTypeError(ctx, "options.with must be an object");   /* step 11.d.i */
             return js_import_opts_reject(ctx, s, JS_GetException(ctx));
         }
         s->attrs = JS_NewObjectProto(ctx, JS_NULL);
         if (JS_IsException(s->attrs)) { s->attrs = JS_UNDEFINED; return -1; }
-        /* step 9.c.ii: `EnumerableOwnProperties(attributesObj, key+value)` — the `ownKeys` trap, then per key
+        /* step 11.d.ii: `EnumerableOwnProperties(attributesObj, key+value)` — the `ownKeys` trap, then per key
            a `getOwnPropertyDescriptor` and, if it survives, a `get`, INTERLEAVED in that order. */
         s->ek = js_mallocz(ctx, sizeof(*s->ek));
         if (!s->ek) return -1;
         js_enum_keys_init(s->ek);
         s->ek->obj = js_dup(s->attrs_obj);
         s->ek->want_values = 1;
-        s->hdr.stage = 2;
+        s->hdr.stage = IMPOPTS_ATTRS;
         cb_result = JS_UNDEFINED;
     }
 
-    DCHECK(s->hdr.stage == 2, "import()'s options machine resumed in no stage");
+    DCHECK(s->hdr.stage == IMPOPTS_ATTRS, "import()'s options machine resumed in no stage");
     if (JS_IsException(cb_result))
         return js_import_opts_reject(ctx, s, JS_GetException(ctx));
     r = js_enum_keys_run(ctx, s->ek, cb_result, out_cb, out_argc);
@@ -70136,12 +70175,35 @@ reject_in: {
     }
 }
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The standard has no
+   section number for this: array-from-async is not in the published edition, so the algorithm is named and its
+   steps are the proposal's own (see B64OP_STAGES). The CLOSURE's own resumption point is the FA_PHASE field of
+   the shared state, not one of these stages, because it survives the machine instance: an Await is answered by a
+   promise reaction, which is a fresh machine taking over from a dead one. */
+#define FAENTRY_STAGES(X) \
+    X(FAE_ENTRY, "proposal-array-from-async Array.fromAsync step 1 (C is the this value) - and the dispatch of " \
+                 "step 2's NewPromiseCapability(%Promise%)") \
+    X(FAE_CAP,   "proposal-array-from-async Array.fromAsync step 2 (promiseCapability arrives; its own failure " \
+                 "is the one completion of this algorithm that propagates instead of rejecting)") \
+    X(FAE_RUN,   "proposal-array-from-async Array.fromAsync steps 3-5 (fromAsyncClosure's state is built and " \
+                 "the closure runs to its first Await; the capability's promise is the answer). Which request " \
+                 "the closure is parked on is the state's FA_PHASE, not this stage")
+enum { FAENTRY_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_fromasync_steps[] = { FAENTRY_STAGES(JS_STEP_STAGE_LABEL) NULL };
+#define FALINK_STAGES(X) \
+    X(FAL_ENTRY, "proposal-array-from-async's fromAsyncClosure, entered by a promise reaction: the settled " \
+                 "value is delivered to the request the state's FA_PHASE names") \
+    X(FAL_RUN,   "proposal-array-from-async's fromAsyncClosure, running: it advances through the requests " \
+                 "FA_PHASE names until it Awaits again or settles the capability")
+enum { FALINK_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_fromasync_steps[] = { FALINK_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 /* The two drivers. They differ only in where the state comes from: the BUILTIN creates it, a LINK reads the one
    its closure carries. Everything after that is fa_advance. */
 static int js_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSFromAsync *s = stt;
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == FAL_ENTRY) {
         JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -70149,7 +70211,7 @@ static int js_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result, JSVal
         s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
         s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
         fa_set(ctx, s->st, FA_PHASE, js_dup(rec->data[1]));
-        s->hdr.stage = 1;
+        s->hdr.stage = FAL_RUN;
         /* the settled value the reaction was called with */
         return fa_advance(ctx, s, js_dup(step_arg(&s->hdr, 0)), out_cb, out_argc);
     }
@@ -70180,7 +70242,9 @@ static JSValue js_fromasync_fini(JSContext *ctx, void *ctx_st, bool take_result)
 static const JSTrampStepDef js_fromasync_def = {
     sizeof(JSFromAsync), js_fromasync_step, js_fromasync_fini, 0,
     .catches_abrupt = 1   /* every abrupt completion of the closure is IfAbruptRejectPromise: the caller holds
-                             the capability's promise, so a throw is a VALUE this algorithm settles with */, .visit = js_fromasync_visit };
+                             the capability's promise, so a throw is a VALUE this algorithm settles with */,
+    .visit = js_fromasync_visit,
+    .algorithm = "fromAsyncClosure, resumed (proposal-array-from-async)", .steps = js_fromasync_steps };
 
 /* 27.1.4.1 steps 1-2 and 4-5: create the capability, build the state, and run the closure to its first Await.
    The capability's promise is the answer whatever the closure does after that. */
@@ -70188,18 +70252,18 @@ static int js_array_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result,
 {
     JSFromAsync *s = stt;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == FAE_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
         s->st = JS_UNDEFINED;
         s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
         s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
-        s->hdr.stage = 1;
+        s->hdr.stage = FAE_CAP;
         s->cb[0] = js_dup(ctx->promise_ctor);
         *out_cb = s->cb; *out_argc = 0;
         return 16;   /* CAPABILITY (step 2) */
     }
-    if (s->hdr.stage != 1)
+    if (s->hdr.stage != FAE_CAP)
         return fa_advance(ctx, s, cb_result, out_cb, out_argc);   /* a request answered; just continue */
     /* step 2 itself: there is no capability yet to reject with, so its failure is the ONE completion that
        propagates. Every later abrupt is inside the capability and settles it. */
@@ -70207,7 +70271,7 @@ static int js_array_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result,
         return -1;
     /* stage 1 runs ONCE: the capability has arrived, so build the state and start the closure. Without a stage
        past it every request delivery re-ran this block and rebuilt the state at phase 0 forever. */
-    s->hdr.stage = 2;
+    s->hdr.stage = FAE_RUN;
     JS_FreeValue(ctx, cb_result);
     JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
     {
@@ -70246,7 +70310,8 @@ static const JSTrampStepDef js_array_fromasync_def = {
     sizeof(JSFromAsync), js_array_fromasync_step, js_fromasync_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
     .catches_abrupt = 1,  /* as above: steps 3 on run inside the capability, so they REJECT rather than throw */
-    .visit = js_fromasync_visit
+    .visit = js_fromasync_visit,
+    .algorithm = "Array.fromAsync (proposal-array-from-async)", .steps = js_array_fromasync_steps
 };
 
 /* DELETED: js_array_from. Every branch it had is a machine: the ITERABLE walk is ITERCONS_FROM, the ARRAY-LIKE
@@ -73965,7 +74030,9 @@ static const JSTrampStepDef js_re_match_def           = { sizeof(JSReMatch), js_
 static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_ctor_fini(JSContext *ctx, void *st, bool take_result);
 static void js_re_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v);
-static const JSTrampStepDef js_re_ctor_def            = { sizeof(JSReCtor), js_re_ctor_step, js_re_ctor_fini, 0, .visit = js_re_ctor_visit };
+static const char *const js_re_ctor_steps[];
+static const JSTrampStepDef js_re_ctor_def            = { sizeof(JSReCtor), js_re_ctor_step, js_re_ctor_fini, 0, .visit = js_re_ctor_visit,
+                        .algorithm = "22.2.4.1 RegExp ( pattern, flags )", .steps = js_re_ctor_steps };
 static int js_re_matchall_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_re_matchall_fini(JSContext *ctx, void *st, bool take_result);
 static void js_re_matchall_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -74397,11 +74464,13 @@ static const JSTrampStepDef js_obj_isfrozen_def = { sizeof(JSIntegrity), js_inte
 static const JSTrampStepDef js_iter_helper_return_def = { sizeof(JSIterHelperReturn), js_iter_helper_return_step, js_iter_helper_return_fini, 0, .visit = js_iter_helper_return_visit,
                                                          .algorithm = "27.1.2.1.2 %IteratorHelperPrototype%.return",
                                                          .steps = js_iter_helper_return_steps };
+static const char *const js_import_opts_steps[];
 static const JSTrampStepDef js_import_opts_def  = {
     sizeof(JSImportOpts), js_import_opts_step, js_import_opts_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
-    .catches_abrupt = 1,  /* 16.2.1.8 wraps steps 4 on in IfAbruptRejectPromise: a throw is a VALUE here */
-    .visit = js_import_opts_visit
+    .catches_abrupt = 1,  /* 13.3.10.2 wraps steps 8 on in IfAbruptRejectPromise: a throw is a VALUE here */
+    .visit = js_import_opts_visit,
+    .algorithm = "13.3.10.2 EvaluateImportCall", .steps = js_import_opts_steps
 };
 /* Declared where the machine is; the definition names it here. */
 static const char *const js_json_str_steps[];
@@ -74547,17 +74616,26 @@ static const JSTrampStepDef js_str_towellformed_def =
 static const JSTrampStepDef js_str_iterator_def =
     { sizeof(JSStrIterCreate), js_string_iterator_create_step, js_string_iterator_create_fini, 0 , .visit = js_string_iterator_create_visit,
       .algorithm = "22.1.3.36 String.prototype [ @@iterator ]", .steps = js_str_iterator_steps };
+static const char *const js_iterator_zip_steps[];
 static const JSTrampStepDef js_iter_zip_def =
-    { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0, .visit = js_iterator_zip_visit };
+    { sizeof(JSIterZip), js_iterator_zip_step, js_iterator_zip_fini, 0, .visit = js_iterator_zip_visit,
+      .algorithm = "Iterator.zip (proposal-joint-iteration)", .steps = js_iterator_zip_steps };
 static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_zip_keyed_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iterator_zip_keyed_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const char *const js_iterator_zip_keyed_steps[];
 static const JSTrampStepDef js_iter_zip_keyed_def =
-    { sizeof(JSIterZipKeyed), js_iterator_zip_keyed_step, js_iterator_zip_keyed_fini, 0, .visit = js_iterator_zip_keyed_visit };
+    { sizeof(JSIterZipKeyed), js_iterator_zip_keyed_step, js_iterator_zip_keyed_fini, 0, .visit = js_iterator_zip_keyed_visit,
+      .algorithm = "Iterator.zipKeyed (proposal-joint-iteration)", .steps = js_iterator_zip_keyed_steps };
+static const char *const js_iter_zip_next_steps[];
+static const char *const js_iter_zip_return_steps[];
 static const JSTrampStepDef js_iter_zip_next_def =
-    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_NEXT, .visit = js_iter_zip_drive_visit };
+    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_NEXT, .visit = js_iter_zip_drive_visit,
+      .algorithm = "the zip closure's next (proposal-joint-iteration)", .steps = js_iter_zip_next_steps };
 static const JSTrampStepDef js_iter_zip_return_def =
-    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_RETURN, .visit = js_iter_zip_drive_visit };
+    { sizeof(JSIterZipDrive), js_iter_zip_drive_step, js_iter_zip_drive_fini, ZIP_DRIVE_RETURN, .visit = js_iter_zip_drive_visit,
+      .algorithm = "27.1.2.1.2 %IteratorHelperPrototype%.return over a zipper (proposal-joint-iteration)",
+      .steps = js_iter_zip_return_steps };
 static int js_iter_concat_next_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static const char *const js_iter_concat_next_steps[];
 static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_result);
@@ -74947,7 +75025,10 @@ static const char *const js_re_str_iter_steps[];
 static const JSTrampStepDef js_re_str_iter_def    = { sizeof(JSReStrIter), js_re_str_iter_step, js_re_str_iter_fini, 0, .visit = js_re_str_iter_visit,
                                                     .algorithm = "22.2.9.2.1 %RegExpStringIteratorPrototype%.next",
                                                     .steps = js_re_str_iter_steps };
-static const JSTrampStepDef js_regexp_set_input_def = { sizeof(JSReSetInput), js_regexp_set_input_step, js_regexp_set_input_fini, 0, .visit = js_regexp_set_input_visit };
+static const char *const js_regexp_set_input_steps[];
+static const JSTrampStepDef js_regexp_set_input_def = { sizeof(JSReSetInput), js_regexp_set_input_step, js_regexp_set_input_fini, 0, .visit = js_regexp_set_input_visit,
+                        .algorithm = "set RegExp.input / set RegExp.$_ (proposal-regexp-legacy-features)",
+                        .steps = js_regexp_set_input_steps };
 static const char *const js_regexp_flags_steps[];
 static const JSTrampStepDef js_regexp_flags_def   = { sizeof(JSRegExpFlags), js_regexp_flags_step, js_regexp_flags_fini, 0, .visit = js_regexp_flags_visit,
                                                     .algorithm = "22.2.6.4 get RegExp.prototype.flags",
@@ -75859,8 +75940,30 @@ static int zip_close_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase, JSValue *
 }
 
 /* --- Iterator.zip itself (27.1.3.3 steps 1-16) --- */
-enum { ZS_INIT = 0, ZS_MODE, ZS_PADDING, ZS_IN_ITER, ZS_ELEM_STEP, ZS_ELEM_ITER, ZS_PAD_ITER, ZS_PAD_STEP,
-       ZS_PAD_CLOSE };
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The standard has no
+   section number for this one: joint-iteration is not in the published edition — every other number in this
+   file is ES2025 — so the algorithm is named and its steps are the proposal's own, exactly as the
+   ArrayBuffer-base64 machines are (B64OP_STAGES). A number invented here would be a claim about the standard
+   rather than a reference to it. */
+#define ZIP_STAGES(X) \
+    X(ZS_INIT,      "proposal-joint-iteration Iterator.zip steps 2-3 (iterables and options are Objects) - and " \
+                    "the dispatch of step 4's Get(options, \"mode\")") \
+    X(ZS_MODE,      "proposal-joint-iteration Iterator.zip steps 4-5 (mode arrives and is one of shortest, " \
+                    "longest, strict) - and the dispatch of step 6's Get(options, \"padding\")") \
+    X(ZS_PADDING,   "proposal-joint-iteration Iterator.zip steps 6-6.b (padding arrives, for `longest` only, " \
+                    "and must be undefined or an Object)") \
+    X(ZS_IN_ITER,   "proposal-joint-iteration Iterator.zip step 10 (inputIter is GetIterator(iterables, sync))") \
+    X(ZS_ELEM_STEP, "proposal-joint-iteration Iterator.zip step 12.a (next is IteratorStepValue(inputIter))") \
+    X(ZS_ELEM_ITER, "proposal-joint-iteration Iterator.zip step 12.c.i (iter is " \
+                    "GetIteratorFlattenable(next, reject-strings))") \
+    X(ZS_PAD_ITER,  "proposal-joint-iteration Iterator.zip step 13.b (paddingIter is " \
+                    "GetIterator(paddingOption, sync))") \
+    X(ZS_PAD_STEP,  "proposal-joint-iteration Iterator.zip step 13.d (one IteratorStepValue(paddingIter) per " \
+                    "input; both done and value are read every time)") \
+    X(ZS_PAD_CLOSE, "proposal-joint-iteration Iterator.zip step 13.e (IteratorClose(paddingIter, " \
+                    "NormalCompletion), whose throw propagates)")
+enum { ZIP_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_iterator_zip_steps[] = { ZIP_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 
 static int js_zip_push_input(JSContext *ctx, JSIterZip *s, JSValue iter, JSValue nextm)
@@ -76157,7 +76260,27 @@ static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result)
    JS_GetOwnPropertyFlagsInternal — were an `ownKeys` trap and a `getOwnPropertyDescriptor` trap performed from C.
    Both are requests here. The zipper it builds is the SAME record and the SAME drive: the whole difference is that
    the record carries KEYS, which is what makes each result an object keyed by them instead of an array. --- */
-enum { ZK_INIT = 0, ZK_MODE, ZK_PADDING, ZK_KEYS, ZK_HASOWN, ZK_VALUE, ZK_ITER, ZK_PAD };
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). Not in the published
+   edition, so the algorithm is named and its steps are the proposal's — see ZIP_STAGES. */
+#define ZIPK_STAGES(X) \
+    X(ZK_INIT,    "proposal-joint-iteration Iterator.zipKeyed steps 2-3 (iterables and options are Objects) - " \
+                  "and the dispatch of step 4's Get(options, \"mode\")") \
+    X(ZK_MODE,    "proposal-joint-iteration Iterator.zipKeyed steps 4-5 (mode arrives and is one of shortest, " \
+                  "longest, strict) - and the dispatch of step 6's Get(options, \"padding\")") \
+    X(ZK_PADDING, "proposal-joint-iteration Iterator.zipKeyed steps 6-6.b (padding arrives, for `longest` " \
+                  "only, and must be undefined or an Object)") \
+    X(ZK_KEYS,    "proposal-joint-iteration Iterator.zipKeyed step 9 (allKeys is " \
+                  "iterables.[[OwnPropertyKeys]]())") \
+    X(ZK_HASOWN,  "proposal-joint-iteration Iterator.zipKeyed step 10 (the Repeat over allKeys) - and the " \
+                  "dispatch of step 10.a's iterables.[[GetOwnProperty]](key)") \
+    X(ZK_VALUE,   "proposal-joint-iteration Iterator.zipKeyed steps 10.a-10.b (desc arrives; a non-enumerable " \
+                  "or absent key is dropped) - and the dispatch of step 10.b.i's Get(iterables, key)") \
+    X(ZK_ITER,    "proposal-joint-iteration Iterator.zipKeyed steps 10.b.i-10.b.ii (value arrives, an " \
+                  "undefined one drops its key; iter is GetIteratorFlattenable(value, reject-strings))") \
+    X(ZK_PAD,     "proposal-joint-iteration Iterator.zipKeyed step 12 (one Get(padding, key) per kept key - " \
+                  "read off the object, not walked as an iterator the way Iterator.zip's is)")
+enum { ZIPK_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_iterator_zip_keyed_steps[] = { ZIPK_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 
 static int js_zipk_push(JSContext *ctx, JSIterZipKeyed *s, JSAtom key, JSValue iter, JSValue nextm)
@@ -80390,7 +80513,45 @@ typedef struct JSIterDispose {
 } JSIterDispose;
 _Static_assert(offsetof(JSIterDispose, hdr) == 0, "JSStepHdr must be first in JSIterDispose");
 
-enum { IDSP_READ = 1, IDSP_CALLED, IDSP_WRAP, IDSP_ATTACH };
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). Two algorithms over
+   one walk, and the standard has no section number for either: explicit-resource-management is not in the
+   published edition — every other number in this file is ES2025 — so each is named and its steps are the
+   proposal's own, exactly as the ArrayBuffer-base64 machines are (B64OP_STAGES).
+   The sync form ENDS at the call, so its array stops there and the two promise stages belong to the async one
+   alone; a sync dispose that ever rested in them is a stage past the end of ITS algorithm. */
+#define IDISP_STAGES(X, ENTRY, READ, CALLED) \
+    X(IDSP_ENTRY,  ENTRY)  \
+    X(IDSP_READ,   READ)   \
+    X(IDSP_CALLED, CALLED)
+#define IDISP_ASYNC_EXTRA(X, WRAP, ATTACH) \
+    X(IDSP_WRAP,   WRAP) \
+    X(IDSP_ATTACH, ATTACH)
+enum { IDISP_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) IDISP_ASYNC_EXTRA(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_iter_dispose_steps[] = {
+    IDISP_STAGES(JS_STEP_STAGE_LABEL,
+        "proposal-explicit-resource-management %IteratorPrototype%[%Symbol.dispose%] step 1 (O is the this "
+        "value)",
+        "proposal-explicit-resource-management %IteratorPrototype%[%Symbol.dispose%] step 3 (return is "
+        "GetMethod(O, \"return\"))",
+        "proposal-explicit-resource-management %IteratorPrototype%[%Symbol.dispose%] step 4 (Call(return, O)) "
+        "- and step 5, Return undefined")
+    NULL };
+static const char *const js_async_iter_dispose_steps[] = {
+    IDISP_STAGES(JS_STEP_STAGE_LABEL,
+        "proposal-explicit-resource-management %AsyncIteratorPrototype%[%Symbol.asyncDispose%] steps 1-2 (O is "
+        "the this value; promiseCapability is NewPromiseCapability(%Promise%), created first because every "
+        "later abrupt completion rejects it)",
+        "proposal-explicit-resource-management %AsyncIteratorPrototype%[%Symbol.asyncDispose%] step 3 (return "
+        "is GetMethod(O, \"return\"))",
+        "proposal-explicit-resource-management %AsyncIteratorPrototype%[%Symbol.asyncDispose%] steps 5-6 "
+        "(Call(return, O); undefined stands in for its result when there is no return method)")
+    IDISP_ASYNC_EXTRA(JS_STEP_STAGE_LABEL,
+        "proposal-explicit-resource-management %AsyncIteratorPrototype%[%Symbol.asyncDispose%] step 7 "
+        "(resultWrapper is PromiseResolve(%Promise%, result), whose `constructor` read and resolve are the "
+        "page's code)",
+        "proposal-explicit-resource-management %AsyncIteratorPrototype%[%Symbol.asyncDispose%] steps 8-10 "
+        "(unwrap; PerformPromiseThen(resultWrapper, unwrap, undefined, promiseCapability))")
+    NULL };
 
 static JSValue js_async_dispose_to_undef(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv,
@@ -80416,7 +80577,7 @@ static int js_iter_dispose_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         return 0;
     }
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == IDSP_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED; s->method = JS_UNDEFINED; s->inner = JS_UNDEFINED;
         s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
@@ -80515,11 +80676,16 @@ static JSValue js_iter_dispose_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 static const JSTrampStepDef js_iter_dispose_def = {
-    sizeof(JSIterDispose), js_iter_dispose_step, js_iter_dispose_fini, 0, .visit = js_iter_dispose_visit
+    sizeof(JSIterDispose), js_iter_dispose_step, js_iter_dispose_fini, 0, .visit = js_iter_dispose_visit,
+    .algorithm = "%IteratorPrototype% [ %Symbol.dispose% ] (proposal-explicit-resource-management)",
+    .steps = js_iter_dispose_steps
 };
 static const JSTrampStepDef js_async_iter_dispose_def = {
     sizeof(JSIterDispose), js_iter_dispose_step, js_iter_dispose_fini, 1,
-    .catches_abrupt = 1   /* steps 4/6/7 are IfAbruptRejectPromise: an abrupt is this algorithm's VALUE */, .visit = js_iter_dispose_visit
+    .catches_abrupt = 1   /* steps 4/6/7 are IfAbruptRejectPromise: an abrupt is this algorithm's VALUE */,
+    .visit = js_iter_dispose_visit,
+    .algorithm = "%AsyncIteratorPrototype% [ %Symbol.asyncDispose% ] (proposal-explicit-resource-management)",
+    .steps = js_async_iter_dispose_steps
 };
 
 static JSValue js_iterator_proto_iterator(JSContext *ctx, JSValueConst this_val,
@@ -85207,6 +85373,28 @@ static int js_is_regexp(JSContext *ctx, JSValueConst obj)
    `Reflect.construct(RegExp, [p, f], nt)` with accessors on all three observes the difference.
    Stages: 0 the receiver split, 9 IsRegExp, 1 the same-constructor shortcut, 2 Get "source", 3 Get "flags",
    4 RegExpAlloc, 5 ToString(P), 6 ToString(F) + the compile. */
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The IsRegExp stage
+   was numbered 9 - out of sequence, appended after the rest - which is the workaround the single declaration
+   removes: a parked machine holds its stage's LABEL, so the list is in the standard's order. */
+#define RECTOR_STAGES(X) \
+    X(RECTOR_ENTRY,    "22.2.4.1, entered: a non-object pattern settles step 1 with no read at all") \
+    X(RECTOR_ISREGEXP, "22.2.4.1 step 1 -> 7.2.6 IsRegExp step 2 (matcher is Get(argument, %Symbol.match%); " \
+                       "only undefined falls back to the [[RegExpMatcher]] slot)") \
+    X(RECTOR_CTOR,     "22.2.4.1 steps 2-6 (a plain call takes the active function object as newTarget and, " \
+                       "for a RegExp pattern with no flags, reads Get(pattern, \"constructor\") to decide step " \
+                       "2.b.ii; P and F otherwise come from the slots or the arguments)") \
+    X(RECTOR_SOURCE,   "22.2.4.1 step 5.a (P is Get(pattern, \"source\"))") \
+    X(RECTOR_FLAGS,    "22.2.4.1 steps 5.b-5.c (F is flags, or Get(pattern, \"flags\") when it is undefined)") \
+    X(RECTOR_ALLOC,    "22.2.4.1 step 7 -> 22.2.3.2 RegExpAlloc (OrdinaryCreateFromConstructor(newTarget, " \
+                       "\"%RegExp.prototype%\"), whose Get(newTarget, \"prototype\") runs here; lastIndex is " \
+                       "defined after it)") \
+    X(RECTOR_PATSTR,   "22.2.4.1 step 8 -> 22.2.3.3 RegExpInitialize step 1 (P is ToString(pattern), or the " \
+                       "empty String when it is undefined)") \
+    X(RECTOR_FLAGSTR,  "22.2.4.1 step 8 -> 22.2.3.3 RegExpInitialize step 2 (F is ToString(flags)) - and steps " \
+                       "3-12, the parse and the compiled matcher, which run none of the page's code")
+enum { RECTOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_re_ctor_steps[] = { RECTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSReCtor *s = st;
@@ -85215,7 +85403,7 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     JSRegExp *re;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == RECTOR_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->pat = JS_UNDEFINED; s->flg = JS_UNDEFINED; s->obj = JS_UNDEFINED;
@@ -85233,11 +85421,11 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         /* A non-object is never a RegExp and reads nothing; anything else asks. The read is its OWN stage
            because this one opens by discarding cb_result — a suspension inside it would land back here and
            throw away the very value the read produced. */
-        s->hdr.stage = JS_IsObject(pat) ? 9 : 1;
+        s->hdr.stage = JS_IsObject(pat) ? RECTOR_ISREGEXP : RECTOR_CTOR;
     }
-    if (s->hdr.stage == 9) {
-        /* step 1, IsRegExp: `? Get(pattern, @@match)` decides it unless undefined, when the [[RegExpMatcher]]
-           slot does. */
+    if (s->hdr.stage == RECTOR_ISREGEXP) {
+        /* step 1, 7.2.6 IsRegExp: `? Get(pattern, @@match)` decides it unless undefined, when the
+           [[RegExpMatcher]] slot does. */
         JSValue m;
         r = step_getprop_run(ctx, &s->hdr, pat, JS_ATOM_Symbol_match, cb_result, &m, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -85247,9 +85435,9 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         else
             s->patIsRe = JS_ToBool(ctx, m);
         JS_FreeValue(ctx, m);
-        s->hdr.stage = 1;
+        s->hdr.stage = RECTOR_CTOR;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == RECTOR_CTOR) {
         /* step 2: called as a FUNCTION. `RegExp(re)` with no flags hands back `re` itself when its own
            `constructor` is this very RegExp — and that read is the page's. */
         if (JS_IsUndefined(s->hdr.this_val)) {
@@ -85276,22 +85464,22 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             s->pat = js_dup(JS_MKPTR(JS_TAG_STRING, re->pattern));
             if (!s->haveFlags) s->bc = js_dup(JS_MKPTR(JS_TAG_STRING, re->bytecode));
             else s->flg = js_dup(step_arg(&s->hdr, 1));
-            s->hdr.stage = 4;
+            s->hdr.stage = RECTOR_ALLOC;
         } else if (s->patIsRe) {
-            s->hdr.stage = 2;
+            s->hdr.stage = RECTOR_SOURCE;
         } else {
             s->pat = js_dup(pat);
             s->flg = js_dup(step_arg(&s->hdr, 1));
-            s->hdr.stage = 4;
+            s->hdr.stage = RECTOR_ALLOC;
         }
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == RECTOR_SOURCE) {
         r = step_getprop_run(ctx, &s->hdr, pat, JS_ATOM_source, cb_result, &s->pat, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 3;
+        s->hdr.stage = RECTOR_FLAGS;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == RECTOR_FLAGS) {
         if (s->haveFlags) {
             s->flg = js_dup(step_arg(&s->hdr, 1));
         } else {
@@ -85299,9 +85487,9 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
         }
-        s->hdr.stage = 4;
+        s->hdr.stage = RECTOR_ALLOC;
     }
-    if (s->hdr.stage == 4) {
+    if (s->hdr.stage == RECTOR_ALLOC) {
         /* step 7, RegExpAlloc: `? Get(newTarget, "prototype")`, BEFORE step 8's coercions. The shape fast path
            is only taken when there is no NewTarget to ask, so it reads nothing either. */
         if (JS_IsUndefined(s->ntgt) && ctx->regexp_shape) {
@@ -85317,9 +85505,9 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             if (JS_DefinePropertyValue(ctx, s->obj, JS_ATOM_lastIndex, js_int32(0), JS_PROP_WRITABLE) < 0)
                 return -1;
         }
-        s->hdr.stage = 5;
+        s->hdr.stage = RECTOR_PATSTR;
     }
-    if (s->hdr.stage == 5) {
+    if (s->hdr.stage == RECTOR_PATSTR) {
         /* step 8, RegExpInitialize step 1: `? ToString(P)`, or "" when P is undefined */
         if (JS_IsUndefined(s->pat)) {
             s->pat = js_empty_string(ctx->rt);
@@ -85331,7 +85519,7 @@ static int js_re_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             JS_FreeValue(ctx, s->pat);
             s->pat = str;
         }
-        s->hdr.stage = 6;
+        s->hdr.stage = RECTOR_FLAGSTR;
     }
     /* RegExpInitialize step 2: `? ToString(F)`. js_compile_regexp reads the flags as a C string, so the
        coercion is hoisted out of it and run here, where it can suspend. */
@@ -85403,7 +85591,18 @@ typedef struct JSRegExpCompile {
 } JSRegExpCompile;
 _Static_assert(offsetof(JSRegExpCompile, hdr) == 0, "JSStepHdr must be first in JSRegExpCompile");
 
-enum { RC_PATTERN = 1, RC_FLAGS, RC_BUILD };
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). */
+#define RCOMPILE_STAGES(X) \
+    X(RC_ENTRY,   "B.2.4.1 steps 1-4 (O is the this value; RequireInternalSlot(O, [[RegExpMatcher]]); the " \
+                  "proposal-regexp-legacy-features guards; P and F from a RegExp pattern's own slots or from " \
+                  "the arguments)") \
+    X(RC_PATTERN, "B.2.4.1 step 5 -> 22.2.3.3 RegExpInitialize step 1 (P is ToString(pattern))") \
+    X(RC_FLAGS,   "B.2.4.1 step 5 -> 22.2.3.3 RegExpInitialize step 2 (F is ToString(flags)) - and the " \
+                  "compile, which runs none of the page's code") \
+    X(RC_BUILD,   "B.2.4.1 step 5 -> 22.2.3.3 RegExpInitialize steps 10-12 (the receiver is re-validated, its " \
+                  "slots are rewritten and Set(obj, \"lastIndex\", +0, true) runs)")
+enum { RCOMPILE_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_regexp_compile_steps[] = { RCOMPILE_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_regexp_compile_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
@@ -85414,7 +85613,7 @@ static int js_regexp_compile_step(JSContext *ctx, void *st, JSValue cb_result, J
     JSRegExp *re, *re1;
     int r;
 
-    if (m->hdr.stage == 0) {
+    if (m->hdr.stage == RC_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         m->result = JS_UNDEFINED; m->pattern = JS_UNDEFINED;
         /* every validation the spec performs before either coercion */
@@ -85508,7 +85707,8 @@ static JSValue js_regexp_compile_fini(JSContext *ctx, void *st, bool take_result
 }
 
 static const JSTrampStepDef js_regexp_compile_def = {
-    sizeof(JSRegExpCompile), js_regexp_compile_step, js_regexp_compile_fini, 0, .visit = js_regexp_compile_visit };
+    sizeof(JSRegExpCompile), js_regexp_compile_step, js_regexp_compile_fini, 0, .visit = js_regexp_compile_visit,
+    .algorithm = "B.2.4.1 RegExp.prototype.compile", .steps = js_regexp_compile_steps };
 
 /* Write `c` as an escape if it is a LineTerminator, and say whether it did. The two-code-unit ones keep the
    spelling a reader expects; U+2028 and U+2029 have no short form and take the six-unit one. */
@@ -87729,14 +87929,25 @@ static JSValue js_regexp_get_input(JSContext *ctx, JSValueConst this_val)
     return js_regexp_get_legacy_magic(ctx, this_val, RE_LEGACY_INPUT);
 }
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The standard has no
+   section number for these: regexp-legacy-features is not in the published edition, so the algorithm is named
+   and its steps are the proposal's own (see B64OP_STAGES). */
+#define RESETIN_STAGES(X) \
+    X(RESETIN_ENTRY,    "proposal-regexp-legacy-features `set RegExp.input` step 1 (the receiver must be " \
+                        "%RegExp% itself)") \
+    X(RESETIN_TOSTRING, "proposal-regexp-legacy-features `set RegExp.input` step 2 (the value is ToString'd " \
+                        "before it is stored)")
+enum { RESETIN_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_regexp_set_input_steps[] = { RESETIN_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_regexp_set_input_step(JSContext *ctx, void *st, JSValue cb_result,
                                     JSValue **out_cb, int *out_argc)
 {
     JSReSetInput *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
-        s->hdr.stage = 1;
+    if (s->hdr.stage == RESETIN_ENTRY) {
+        s->hdr.stage = RESETIN_TOSTRING;
         s->result = JS_UNDEFINED;
         s->str = JS_UNDEFINED;
         if (!js_same_value(ctx, s->hdr.this_val, ctx->regexp_ctor)) {
@@ -92276,15 +92487,30 @@ static void js_dispose_fold_error(JSContext *ctx, JSDisposeRun *s)
     }
 }
 
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The standard has no
+   section number for any of the explicit-resource-management machines - it is not in the published edition, and
+   every other number in this file is ES2025 - so each algorithm is NAMED and its steps are the proposal's own,
+   exactly as the ArrayBuffer-base64 machines are (B64OP_STAGES). A number invented here would be a claim about
+   the standard rather than a reference to it. */
+#define DISPSYNC_STAGES(X) \
+    X(DSY_ENTRY, "proposal-explicit-resource-management DisposableStack.prototype.dispose steps 1-4 (the " \
+                 "receiver's [[DisposableState]]; an already-disposed stack returns undefined; the stack is " \
+                 "marked disposed and its resource list is taken)") \
+    X(DSY_CALL,  "proposal-explicit-resource-management DisposeResources step 3 (the LIFO walk: Call(method, " \
+                 "value) for one resource; a throwing method is folded into a SuppressedError and the walk " \
+                 "continues, which is why the throw is a value here)")
+enum { DISPSYNC_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_dispose_sync_steps[] = { DISPSYNC_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_dispose_sync_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDisposeRun *s = st;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DSY_ENTRY) {
         JSDisposableStack *ds = JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_DISPOSABLE_STACK);
         JS_FreeValue(ctx, cb_result);
         s->error = JS_UNINITIALIZED;
-        s->hdr.stage = 1;
+        s->hdr.stage = DSY_CALL;
         if (!ds)
             return -1;
         if (ds->disposed)
@@ -92370,7 +92596,9 @@ static const JSTrampStepDef js_dispose_sync_def = {
     sizeof(JSDisposeRun), js_dispose_sync_step, js_dispose_sync_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
     .catches_abrupt = 1,  /* step 3.d: a throwing dispose method is a VALUE — it becomes the SuppressedError */
-    .visit = js_dispose_sync_visit
+    .visit = js_dispose_sync_visit,
+    .algorithm = "DisposableStack.prototype.dispose (proposal-explicit-resource-management)",
+    .steps = js_dispose_sync_steps
 };
 
 static void js_disposable_stack_clear(JSRuntime *rt, JSDisposableStack *ds)
@@ -92404,21 +92632,31 @@ static int js_disposable_stack_add(JSContext *ctx, JSDisposableStack *ds,
     return 0;
 }
 
+/* ONE list expanded twice; not in the published edition, so named rather than numbered - see DISPSYNC_STAGES. */
+#define SDWRAP_STAGES(X) \
+    X(SDW_ENTRY, "proposal-explicit-resource-management GetDisposeMethod step 1.b.ii's closure, entered: " \
+                 "the dispatch of Call(method, this)") \
+    X(SDW_DONE,  "proposal-explicit-resource-management GetDisposeMethod step 1.b.ii's closure step 2 " \
+                 "(the sync method's result is DISCARDED - an async disposal must not await it - and the " \
+                 "closure returns undefined)")
+enum { SDWRAP_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_sync_dispose_wrap_steps[] = { SDWRAP_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_sync_dispose_wrap_step(JSContext *ctx, void *st, JSValue cb_result,
                                      JSValue **out_cb, int *out_argc)
 {
     JSSyncDisposeWrap *s = st;
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == SDW_ENTRY) {
         JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
         JS_FreeValue(ctx, cb_result);
-        s->hdr.stage = 1;
+        s->hdr.stage = SDW_DONE;
         s->cb[0] = js_dup(s->hdr.this_val);
         s->cb[1] = js_dup(rec->data[0]);
         s->cb[2] = JS_UNDEFINED;
         *out_cb = s->cb; *out_argc = 0;
         return 3;
     }
-    DCHECK(s->hdr.stage == 1, "a sync-dispose wrapper resumed in an unknown stage");
+    DCHECK(s->hdr.stage == SDW_DONE, "a sync-dispose wrapper resumed in an unknown stage");
     JS_FreeValue(ctx, cb_result);   /* DISCARDED: that is what the wrapper is for */
     return 0;
 }
@@ -92440,7 +92678,9 @@ static JSValue js_sync_dispose_wrap_fini(JSContext *ctx, void *st, bool take_res
 }
 
 static const JSTrampStepDef js_sync_dispose_wrap_def = {
-    sizeof(JSSyncDisposeWrap), js_sync_dispose_wrap_step, js_sync_dispose_wrap_fini, 0, .visit = js_sync_dispose_wrap_visit
+    sizeof(JSSyncDisposeWrap), js_sync_dispose_wrap_step, js_sync_dispose_wrap_fini, 0, .visit = js_sync_dispose_wrap_visit,
+    .algorithm = "GetDisposeMethod's sync-dispose wrapper (proposal-explicit-resource-management)",
+    .steps = js_sync_dispose_wrap_steps
 };
 
 /* The wrapper's C entry, for the reason the chain link has one: JS_NewCFunctionData takes a function pointer and
@@ -92479,7 +92719,32 @@ typedef struct JSGetDisposeMethod {
 } JSGetDisposeMethod;
 _Static_assert(offsetof(JSGetDisposeMethod, hdr) == 0, "JSStepHdr must be first in JSGetDisposeMethod");
 
-enum { GDM_FIRST = 0, GDM_ASYNC_GOT, GDM_SYNC_GOT };
+/* ONE list expanded once PER HINT; not in the published edition, so named rather than numbered - see
+   DISPSYNC_STAGES. The async hint reads @@asyncDispose FIRST and falls back to @@dispose, so it rests at two
+   different steps of its own algorithm; the sync hint reads one property and its array is the shorter one. */
+#define GDM_STAGES(X, FIRST, SYNC_GOT) \
+    X(GDM_FIRST,     FIRST) \
+    X(GDM_SYNC_GOT,  SYNC_GOT)
+#define GDM_ASYNC_EXTRA(X, ASYNC_GOT) \
+    X(GDM_ASYNC_GOT, ASYNC_GOT)
+enum { GDM_STAGES(JS_STEP_STAGE_ENUM, 0, 0) GDM_ASYNC_EXTRA(JS_STEP_STAGE_ENUM, 0) };
+static const char *const js_get_dispose_sync_steps[] = {
+    GDM_STAGES(JS_STEP_STAGE_LABEL,
+        "proposal-explicit-resource-management GetDisposeMethod with hint sync-dispose, entered: V is an Object, "
+        "and the dispatch of step 2's GetMethod(V, %Symbol.dispose%)",
+        "proposal-explicit-resource-management GetDisposeMethod with hint sync-dispose step 2 (method arrives "
+        "and must be callable)")
+    NULL };
+static const char *const js_get_dispose_async_steps[] = {
+    GDM_STAGES(JS_STEP_STAGE_LABEL,
+        "proposal-explicit-resource-management GetDisposeMethod with hint async-dispose, entered: V is an "
+        "Object, and the dispatch of step 1.a's GetMethod(V, %Symbol.asyncDispose%)",
+        "proposal-explicit-resource-management GetDisposeMethod step 1.b (the @@dispose method arrives and is "
+        "WRAPPED, because an async disposal must not await what a sync method returns)")
+    GDM_ASYNC_EXTRA(JS_STEP_STAGE_LABEL,
+        "proposal-explicit-resource-management GetDisposeMethod step 1.a (the @@asyncDispose method arrives; "
+        "undefined or null falls through to step 1.b's @@dispose read)")
+    NULL };
 
 static int js_get_dispose_method_step(JSContext *ctx, void *st, JSValue cb_result,
                                       JSValue **out_cb, int *out_argc)
@@ -92547,10 +92812,14 @@ static JSValue js_get_dispose_method_fini(JSContext *ctx, void *st, bool take_re
 }
 
 static const JSTrampStepDef js_get_dispose_sync_def = {
-    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 0, .visit = js_get_dispose_method_visit
+    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 0, .visit = js_get_dispose_method_visit,
+    .algorithm = "GetDisposeMethod, hint sync-dispose (proposal-explicit-resource-management)",
+    .steps = js_get_dispose_sync_steps
 };
 static const JSTrampStepDef js_get_dispose_async_def = {
-    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 1, .visit = js_get_dispose_method_visit
+    sizeof(JSGetDisposeMethod), js_get_dispose_method_step, js_get_dispose_method_fini, 1, .visit = js_get_dispose_method_visit,
+    .algorithm = "GetDisposeMethod, hint async-dispose (proposal-explicit-resource-management)",
+    .steps = js_get_dispose_async_steps
 };
 
 static int js_disposable_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
@@ -92634,6 +92903,30 @@ typedef struct JSDisposableUse {
 } JSDisposableUse;
 _Static_assert(offsetof(JSDisposableUse, hdr) == 0, "JSStepHdr must be first in JSDisposableUse");
 
+/* ONE list expanded once per stack class; not in the published edition, so named rather than numbered - see
+   DISPSYNC_STAGES. */
+#define DUSE_STAGES(X, ENTRY, GOT) \
+    X(DUSE_ENTRY, ENTRY) \
+    X(DUSE_GOT,   GOT)
+enum { DUSE_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_disposable_use_steps[] = {
+    DUSE_STAGES(JS_STEP_STAGE_LABEL,
+        "proposal-explicit-resource-management DisposableStack.prototype.use steps 1-4 (the receiver's "
+        "[[DisposableState]] must be pending; a null or undefined value is returned unchanged) - and the "
+        "delegation of step 5's AddDisposableResource, whose GetDisposeMethod is a machine of its own",
+        "proposal-explicit-resource-management DisposableStack.prototype.use step 5 (the dispose method "
+        "arrives; the resource is recorded against the stack the receiver holds NOW, because the getter or "
+        "trap that produced the method is the page's code) - and step 6, Return value")
+    NULL };
+static const char *const js_async_disposable_use_steps[] = {
+    DUSE_STAGES(JS_STEP_STAGE_LABEL,
+        "proposal-explicit-resource-management AsyncDisposableStack.prototype.use steps 1-4 (the receiver's "
+        "[[AsyncDisposableState]] must be pending; a null or undefined value is still RECORDED, so "
+        "disposeAsync performs the Await it owes) - and the delegation of step 5's AddDisposableResource",
+        "proposal-explicit-resource-management AsyncDisposableStack.prototype.use step 5 (the dispose method "
+        "arrives and the resource is recorded) - and step 6, Return value")
+    NULL };
+
 static int js_disposable_stack_use_step(JSContext *ctx, void *st, JSValue cb_result,
                                         JSValue **out_cb, int *out_argc)
 {
@@ -92643,9 +92936,9 @@ static int js_disposable_stack_use_step(JSContext *ctx, void *st, JSValue cb_res
     JSDisposableStack *ds;
 
     ds = js_disposable_stack_get(ctx, s->hdr.this_val, class_id);
-    if (!ds) { if (s->hdr.stage == 0) s->result = JS_UNDEFINED; JS_FreeValue(ctx, cb_result); return -1; }
+    if (!ds) { if (s->hdr.stage == DUSE_ENTRY) s->result = JS_UNDEFINED; JS_FreeValue(ctx, cb_result); return -1; }
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DUSE_ENTRY) {
         void *inner;
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;
@@ -92657,7 +92950,7 @@ static int js_disposable_stack_use_step(JSContext *ctx, void *st, JSValue cb_res
             s->result = js_dup(value);
             return 0;
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = DUSE_GOT;
         inner = tramp_step_state_new(ctx,
                                      class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK ? &js_get_dispose_async_def
                                                                                  : &js_get_dispose_sync_def,
@@ -92666,7 +92959,7 @@ static int js_disposable_stack_use_step(JSContext *ctx, void *st, JSValue cb_res
         s->hdr.delegate = inner;
         return 17;   /* DELEGATE */
     }
-    DCHECK(s->hdr.stage == 1, "DisposableStack.prototype.use resumed in an unknown stage");
+    DCHECK(s->hdr.stage == DUSE_GOT, "DisposableStack.prototype.use resumed in an unknown stage");
     /* cb_result = the dispose method. The RECORD is added under the stack the receiver holds NOW: the getter or
        trap that produced the method is the page's code and can have disposed or replaced it, which is why the
        receiver is re-validated above rather than captured at stage 0. */
@@ -92698,11 +92991,15 @@ static JSValue js_disposable_stack_use_fini(JSContext *ctx, void *st, bool take_
 
 static const JSTrampStepDef js_disposable_use_def = {
     sizeof(JSDisposableUse), js_disposable_stack_use_step, js_disposable_stack_use_fini,
-    JS_CLASS_DISPOSABLE_STACK, .visit = js_disposable_stack_use_visit
+    JS_CLASS_DISPOSABLE_STACK, .visit = js_disposable_stack_use_visit,
+    .algorithm = "DisposableStack.prototype.use (proposal-explicit-resource-management)",
+    .steps = js_disposable_use_steps
 };
 static const JSTrampStepDef js_async_disposable_use_def = {
     sizeof(JSDisposableUse), js_disposable_stack_use_step, js_disposable_stack_use_fini,
-    JS_CLASS_ASYNC_DISPOSABLE_STACK, .visit = js_disposable_stack_use_visit
+    JS_CLASS_ASYNC_DISPOSABLE_STACK, .visit = js_disposable_stack_use_visit,
+    .algorithm = "AsyncDisposableStack.prototype.use (proposal-explicit-resource-management)",
+    .steps = js_async_disposable_use_steps
 };
 
 static JSValue js_disposable_stack_adopt(JSContext *ctx, JSValueConst this_val,
@@ -92783,6 +93080,16 @@ static JSValue js_async_dispose_step(JSContext *ctx, JSValueConst this_val,
    [value, method, hint] and the magic says whether a previous link already failed (so this one's completion is a
    SuppressedError). The dispose method is the page's code, so it is a CALL request rather than a JS_Call — the
    closure declares itself a step machine and the job pump's reaction dispatch drives it on the tramp. */
+/* ONE list expanded twice; not in the published edition, so named rather than numbered - see DISPSYNC_STAGES. */
+#define ADLINK_STAGES(X) \
+    X(ADL_ENTRY, "proposal-explicit-resource-management DisposeResources' async chain, one link entered: " \
+                 "the dispatch of Call(method, value) for this resource, or Await(undefined) when it has none") \
+    X(ADL_DONE,  "proposal-explicit-resource-management DisposeResources' async chain, one link's method " \
+                 "settled: its value becomes the next link's Await, and a throw becomes the completion - " \
+                 "wrapped in a SuppressedError when this link already carries one")
+enum { ADLINK_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_async_dispose_link_steps[] = { ADLINK_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_result,
                                       JSValue **out_cb, int *out_argc)
 {
@@ -92790,11 +93097,11 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
     JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
     bool has_prev_err = (rec->magic == 1);
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ADL_ENTRY) {
         JSValueConst method = rec->data[1];
         int hint = JS_VALUE_GET_INT(rec->data[2]);
         JS_FreeValue(ctx, cb_result);
-        s->hdr.stage = 1;
+        s->hdr.stage = ADL_DONE;
         if (JS_IsUndefined(method)) {
             /* a null/undefined resource on an async stack still performs Await(undefined) */
             if (!has_prev_err)
@@ -92813,7 +93120,7 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
         *out_cb = s->cb;
         return 3;
     }
-    DCHECK(s->hdr.stage == 1, "an async dispose link resumed in an unknown stage");
+    DCHECK(s->hdr.stage == ADL_DONE, "an async dispose link resumed in an unknown stage");
     if (JS_IsException(cb_result)) {
         JSValue new_err = JS_GetException(ctx);
         if (has_prev_err) {
@@ -92879,7 +93186,9 @@ static const JSTrampStepDef js_async_dispose_link_def = {
     sizeof(JSAsyncDisposeLink), js_async_dispose_link_step, js_async_dispose_link_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
     .catches_abrupt = 1,  /* a throwing dispose method is this algorithm's VALUE: it becomes the completion */
-    .visit = js_async_dispose_link_visit
+    .visit = js_async_dispose_link_visit,
+    .algorithm = "DisposeResources' async chain link (proposal-explicit-resource-management)",
+    .steps = js_async_dispose_link_steps
 };
 
 /* Build one chain link's two reaction closures over [value, method, hint], both declared step machines. The
@@ -92928,15 +93237,27 @@ static JSValue js_dispose_async_settled(JSContext *ctx, JSValue v, int is_reject
     return p;
 }
 
+/* ONE list expanded twice; not in the published edition, so named rather than numbered - see DISPSYNC_STAGES. */
+#define DASYNC_STAGES(X) \
+    X(DAS_ENTRY, "proposal-explicit-resource-management AsyncDisposableStack.prototype.disposeAsync steps 1-5 " \
+                 "(every failure here is a REJECTION, never a throw; an already-disposed stack settles with " \
+                 "undefined; the stack is marked disposed and its resource list is taken)") \
+    X(DAS_CHAIN, "proposal-explicit-resource-management AsyncDisposableStack.prototype.disposeAsync, the chain " \
+                 "built: the remaining resources are linked LIFO, each link Awaiting the one above it") \
+    X(DAS_FIRST, "proposal-explicit-resource-management DisposeResources step 3, the TOP resource: " \
+                 "Call(method, value) - its settlement is what the rest of the chain is attached to")
+enum { DASYNC_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_dispose_async_steps[] = { DASYNC_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_dispose_async_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDisposeAsync *s = st;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DAS_ENTRY) {
         JSDisposableStack *ds = JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_ASYNC_DISPOSABLE_STACK);
         JSDisposableResource *top;
         JS_FreeValue(ctx, cb_result);
-        s->hdr.stage = 1;
+        s->hdr.stage = DAS_CHAIN;
         if (!ds) {
             /* every failure of this builtin is a REJECTION, never a throw */
             s->result = js_dispose_async_settled(ctx, JS_GetException(ctx), 1);
@@ -92969,7 +93290,7 @@ static int js_dispose_async_step(JSContext *ctx, void *st, JSValue cb_result, JS
             default: /* SYNC */         s->cb[0] = value;                        *out_argc = 0; break;
             }
             *out_cb = s->cb;
-            s->hdr.stage = 2;
+            s->hdr.stage = DAS_FIRST;
             return 3;
         }
         /* a null/undefined top resource: its Await(undefined) IS the start of the chain */
@@ -92979,7 +93300,7 @@ static int js_dispose_async_step(JSContext *ctx, void *st, JSValue cb_result, JS
         s->result = js_dispose_async_settled(ctx, JS_UNDEFINED, 0);
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; js_dispose_async_drop(ctx, s, s->i - 1); return -1; }
     } else {
-        DCHECK(s->hdr.stage == 2, "disposeAsync resumed in an unknown stage");
+        DCHECK(s->hdr.stage == DAS_FIRST, "disposeAsync resumed in an unknown stage");
         /* the first dispose method returned or threw; either way it starts the chain as a SETTLED promise */
         if (JS_IsException(cb_result))
             s->result = js_dispose_async_settled(ctx, JS_GetException(ctx), 1);
@@ -93056,7 +93377,9 @@ static const JSTrampStepDef js_dispose_async_def = {
     sizeof(JSDisposeAsync), js_dispose_async_step, js_dispose_async_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
     .catches_abrupt = 1,  /* the first dispose method's throw REJECTS the returned promise, it does not propagate */
-    .visit = js_dispose_async_visit
+    .visit = js_dispose_async_visit,
+    .algorithm = "AsyncDisposableStack.prototype.disposeAsync (proposal-explicit-resource-management)",
+    .steps = js_dispose_async_steps
 };
 
 static JSValue js_disposable_stack_move(JSContext *ctx, JSValueConst this_val,
@@ -95114,7 +95437,7 @@ static __exception int perform_promise_then(JSContext *ctx,
 }
 
 /* PerformPromiseThen with a fresh NATIVE capability. The HOST operations that attach reactions to an
-   engine-created promise perform exactly this — 16.2.1.5.3's module evaluation and 16.2.1.8's
+   engine-created promise perform exactly this — 16.2.1.6.1.3.1's module evaluation and 13.3.10.2's
    ContinueDynamicImport state PerformPromiseThen directly, never Promise.prototype.then — so no `constructor`
    and no @@species is read and there is no subclass constructor to construct. It is the operation the spec
    names for those callers, not a fallback for the method: they went through js_promise_then only because that
