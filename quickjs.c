@@ -1754,9 +1754,6 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
 static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
                                               JSValue pattern, JSValue bc);
 static void gc_decref(JSRuntime *rt);
-/* Its inverse, forward for the SAME reason gc_decref is: JS_FreeRuntime's leak report runs the pair to learn
-   which leaked objects are rooted from outside the heap, and puts every refcount back with it. */
-static void gc_scan(JSRuntime *rt);
 static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
                         const JSClassDef *class_def, JSAtom name);
 static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
@@ -3244,52 +3241,6 @@ void JS_FreeRuntime(JSRuntime *rt)
                 cn = JS_AtomGetStrRT(rt, cbuf, sizeof(cbuf), rt->class_array[kinds[i].cid].class_name);
             fprintf(stderr, "[gcleak] %-14s %-28s x%-6d refcount %d..%d\n",
                     tn, cn, kinds[i].n, kinds[i].rc_min, kinds[i].rc_max);
-        }
-
-        /* WHICH OF THEM IS ROOTED FROM OUTSIDE THE HEAP — the only part of this report that names a CULPRIT.
-           A leaked CYCLE has no owner to go looking for: every object in it is held by another object in it,
-           so ONE stray reference from outside keeps a whole realm alive and the table above then lists two
-           thousand objects, every one of them innocent. quickjs's own JS_DUMP_LEAKS pass already answers the
-           question — gc_decref subtracts every reference the heap makes OF ITSELF, so whatever still has a
-           refcount afterwards is held by something that is not a GC object at all: a C record, a parked flow's
-           frame, a host handle. That is the thing to go and free.
-           It runs unconditionally rather than behind a dump flag because a non-empty list is ALWAYS a failure
-           of this gate, and it is non-destructive: gc_scan puts every refcount and mark back, exactly as
-           JS_RunGC does between the same two calls (nothing here is garbage — the JS_RunGC above already took
-           it — so gc_scan's first loop returns the entire set to gc_obj_list). */
-        {
-            struct { int type, cid, n, rc_min, rc_max; } roots[64];
-            int nr = 0;
-            gc_decref(rt);
-            list_for_each(el, &rt->gc_obj_list) {
-                JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
-                int type = JS_GC_TYPE(h);
-                int cid = (type == JS_GC_OBJ_TYPE_JS_OBJECT) ? ((JSObject *)h)->class_id : -1;
-                int rc = JS_REF_COUNT(h);
-                for (i = 0; i < nr; i++)
-                    if (roots[i].type == type && roots[i].cid == cid) {
-                        roots[i].n++;
-                        if (rc < roots[i].rc_min) roots[i].rc_min = rc;
-                        if (rc > roots[i].rc_max) roots[i].rc_max = rc;
-                        break;
-                    }
-                if (i == nr && nr < (int)countof(roots)) {
-                    roots[nr].type = type; roots[nr].cid = cid; roots[nr].n = 1;
-                    roots[nr].rc_min = roots[nr].rc_max = rc; nr++;
-                }
-            }
-            gc_scan(rt);
-            for (i = 0; i < nr; i++) {
-                static const char *const TYPE_NAME[] = { "object", "bytecode", "shape", "var_ref", "async_function", "context" };
-                const char *tn = (roots[i].type >= 0 && roots[i].type < (int)countof(TYPE_NAME))
-                                 ? TYPE_NAME[roots[i].type] : "?";
-                char cbuf[ATOM_GET_STR_BUF_SIZE];
-                const char *cn = "";
-                if (roots[i].cid > 0 && roots[i].cid < (int)rt->class_count)
-                    cn = JS_AtomGetStrRT(rt, cbuf, sizeof(cbuf), rt->class_array[roots[i].cid].class_name);
-                fprintf(stderr, "[gcroot] held from OUTSIDE the heap: %-14s %-28s x%-6d refcount %d..%d\n",
-                        tn, cn, roots[i].n, roots[i].rc_min, roots[i].rc_max);
-            }
         }
     }
     DCHECK(list_empty(&rt->gc_obj_list), "list_empty(&rt->gc_obj_list)");
@@ -40947,25 +40898,10 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
    "non-bytecode cur_func" DCHECK — an async body that forked AFTER an await, which is as ordinary as this
    engine gets. */
 #define STEP_FLOW_SLOTS 16
-static int clone_susp_frame(JSContext *ctx, JSAsyncFunctionState *cs, const JSAsyncFunctionState *os,
-                            ptrdiff_t live) {
-    JSStackFrame *cf = &cs->frame;
-    const JSStackFrame *of = &os->frame;
+static int clone_susp_frame(JSContext *ctx, JSStackFrame *cf, const JSStackFrame *of, ptrdiff_t live) {
     JSObject *p = JS_VALUE_GET_OBJ(of->cur_func);
     JSFunctionBytecode *b = NULL;
     int al = of->arg_count, lc, nrefs;
-
-    /* THE RECEIVER HAS ONE OWNER AND THE FRAME BORROWS IT — async_func_init's law, asserted on the SOURCE and
-       then obeyed on the clone. It is the state's field that every teardown releases (async_func_free and
-       JS_FlowFree both free `s->this_val` and never `sf->this_val`), so a clone that dup'd on BOTH sides took a
-       reference with no owner at all: for a flow base, whose receiver is the global object, that one reference
-       retained the Window, its context and every intrinsic in the realm — reported by the runtime's walk as
-       seventeen hundred anonymous Functions with nothing naming the root. It is the state that is cloned here
-       for exactly that reason: taking a bare JSStackFrame left the receiver to three call sites to get right,
-       and the ownership question is the frame's own, not theirs. */
-    DCHECK(js_same_value(ctx, of->this_val, os->this_val),
-           "clone_susp_frame: the source frame's this_val is not its state's — the state owns the one reference "
-           "and the frame borrows it, so a frame holding a different value has an owner nothing will find");
 
     if (of->is_call_root) {
         lc = STEP_FLOW_SLOTS;
@@ -41002,8 +40938,7 @@ static int clone_susp_frame(JSContext *ctx, JSAsyncFunctionState *cs, const JSAs
     cf->is_constructor = of->is_constructor;
     cf->step_func = js_dup(of->step_func);
     cf->step_this = js_dup(of->step_this);
-    cs->this_val = js_dup(os->this_val);   /* the ONE reference, owned by the state … */
-    cf->this_val = cs->this_val;           /* … and borrowed by the frame, exactly as async_func_init does */
+    cf->this_val = js_dup(of->this_val);
     return 0;
 }
 
@@ -41119,7 +41054,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     JSAsyncFunctionState *c = flow_clone_state_alloc(ctx, s);
     if (!c) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     JSStackFrame *cb = &c->frame;
-    if (clone_susp_frame(ctx, c, s, blive) < 0) { flow_clone_state_free_shell(ctx, c); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+    if (clone_susp_frame(ctx, cb, ob, blive) < 0) { flow_clone_state_free_shell(ctx, c); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+    c->this_val = js_dup(s->this_val);
     c->argc = s->argc; c->throw_flag = s->throw_flag;
     cb->cur_sp = NULL;         /* dormant: the live point is in the chain */
 
@@ -41186,9 +41122,10 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             as2->resolving_funcs[0] = JS_UNDEFINED; as2->resolving_funcs[1] = JS_UNDEFINED;
             JSValue aprom2 = JS_NewPromiseCapability(ctx, as2->resolving_funcs);
             if (JS_IsException(aprom2)) { js_async_function_free(ctx->rt, as2); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-            if (clone_susp_frame(ctx, &as2->func_state, &as->func_state, live_end - aof->arg_buf) < 0) {
+            if (clone_susp_frame(ctx, &as2->func_state.frame, aof, live_end - aof->arg_buf) < 0) {
                 JS_FreeValue(ctx, aprom2); js_async_function_free(ctx->rt, as2); js_free(ctx, oa); js_free(ctx, ca); return NULL;
             }
+            as2->func_state.this_val = js_dup(as->func_state.this_val);
             as2->func_state.argc = as->func_state.argc;
             as2->func_state.throw_flag = as->func_state.throw_flag;
             as2->func_state.tramp_top = NULL;
@@ -41222,9 +41159,10 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             if (!g1) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
             g1->state = g0->state;
             g1->cow_ref = 1;   /* the sibling delta's gendata entry owns this clone (creation ref transfers there) */
-            if (clone_susp_frame(ctx, &g1->func_state, &g0->func_state, live_end - gof->arg_buf) < 0) {
+            if (clone_susp_frame(ctx, &g1->func_state.frame, gof, live_end - gof->arg_buf) < 0) {
                 js_free(ctx, g1); js_free(ctx, oa); js_free(ctx, ca); return NULL;
             }
+            g1->func_state.this_val = js_dup(g0->func_state.this_val);
             g1->func_state.argc = g0->func_state.argc;
             g1->func_state.throw_flag = g0->func_state.throw_flag;
             g1->func_state.tramp_top = NULL;
@@ -41521,31 +41459,59 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
        suspend leaves the BASE cur_sp NULL — its live point is in the chain, not the base). */
     DCHECK(sf->cur_sp != NULL || s->tramp_top != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
     if (s->tramp_top != NULL) return clone_deep_flow(ctx, s);   /* deep: base + tramp chain */
+    /* Captured-local cells are CLOSED heap cells now (V8 Context model) — the clone SHARES them (one COW-
+       swappable cell per captured var, isolated per-flow by the delta) and takes its own ownership ref. */
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b;
+    int arg_buf_len;
     /* A base suspended with an EMPTY chain is suspended in its own bytecode, and a call root has none: its
        "body" is the callee's frame, which is exactly what the chain holds. A fork here would be a fork before
        anything ran. */
     DCHECK(!sf->is_call_root,
            "a call-root base was snapshot-forked with no tramp chain — its body has not been dispatched yet, so "
            "there is nothing at that branch to clone");
+    b = p->u.func.function_bytecode;
+    arg_buf_len = sf->arg_count;
+    /* the ONE layout law — same frame, same size (scratch reserve included) as async_func_init built. */
+    int local_count = TRAMP_FRAME_SLOTS(arg_buf_len, b);
+    size_t alloc_size = sizeof(JSValue) * (local_count > 0 ? local_count : 1) + sizeof(JSVarRef *) * b->var_ref_count;
 
-    /* ONE FRAME CLONE, NOT TWO. This arm used to build the frame itself, field by field, and it had already
-       DRIFTED from the one clone_deep_flow uses: it never assigned `this_val` at all (so the clone's frame
-       carried whatever js_mallocz left — the very "receiver reported as an integer" async_func_init's own
-       comment describes), and it dropped `step_func`/`step_this`, so a flow forked while a builtin drove it
-       lost that builtin from its stack traces. Neither was reachable by reading this function; both are
-       obvious the moment there is only one implementation of "clone a suspended frame". The two paths differ
-       in exactly one thing — where the LIVE point is — and that is the parameter and the line below. */
-    ptrdiff_t live = sf->cur_sp - sf->arg_buf;
-    DCHECK(live >= 0 && live <= TRAMP_FRAME_SLOTS(sf->arg_count,
-               JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode),
-           "JS_FlowClone: the source frame's live region is outside its own frame slots — cur_sp has run past "
-           "the layout law's reserve, so the copy writes past the clone's allocation");
     JSAsyncFunctionState *c = flow_clone_state_alloc(ctx, s);
     if (!c) return NULL;
-    if (clone_susp_frame(ctx, c, s, live) < 0) { flow_clone_state_free_shell(ctx, c); return NULL; }
+    JSStackFrame *cf = &c->frame;
+    cf->arg_buf = js_malloc(ctx, alloc_size);
+    if (!cf->arg_buf) { flow_clone_state_free_shell(ctx, c); return NULL; }
+
+    cf->is_strict_mode = sf->is_strict_mode;
+    cf->cur_func = js_dup(sf->cur_func);
+    c->this_val = js_dup(s->this_val);
     c->argc = s->argc;
     c->throw_flag = s->throw_flag;
-    c->frame.cur_sp = c->frame.arg_buf + live;   /* SHALLOW: the live point is the base's own, not a chain's */
+    cf->arg_count = sf->arg_count;
+    cf->var_buf = cf->arg_buf + arg_buf_len;
+    cf->var_refs = TRAMP_VAR_REFS(cf->var_buf + b->var_count, b);
+    DCHECK((JSValue *)cf->var_refs == cf->arg_buf + local_count,
+           "JS_FlowClone: the var-ref array is not at the end of the frame slots — the allocation size and the "
+           "placement come from the same layout law and must agree");
+    DCHECK(sf->var_ref_count == b->var_ref_count,
+           "JS_FlowClone: the frame's var-ref count disagrees with its bytecode's — the clone is sized from the "
+           "bytecode, so a larger frame count writes past the allocation");
+    cf->var_ref_count = sf->var_ref_count;   /* share the closed cells; take an ownership ref on each */
+    for (int vi = 0; vi < sf->var_ref_count; vi++) {
+        cf->var_refs[vi] = sf->var_refs[vi];
+        if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++;
+    }
+    cf->cur_pc = sf->cur_pc;   /* same bytecode, resume at the same instruction */
+    cf->prev_frame = NULL;
+
+    /* deep-copy the LIVE frame slots [arg_buf, cur_sp): args + vars + live stack — each value dup'd, so the
+       clone owns its own state and the two frames never alias. */
+    ptrdiff_t live = sf->cur_sp - sf->arg_buf;
+    DCHECK(live >= 0 && live <= local_count,
+           "JS_FlowClone: the source frame's live region is outside its own frame slots — cur_sp has run past "
+           "the layout law's reserve, so the copy writes past the clone's allocation");
+    for (ptrdiff_t i = 0; i < live; i++) cf->arg_buf[i] = js_dup(sf->arg_buf[i]);
+    cf->cur_sp = cf->arg_buf + live;
     return (JSValue *)c;
 }
 
