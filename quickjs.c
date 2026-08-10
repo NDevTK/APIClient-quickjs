@@ -71223,19 +71223,32 @@ static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_resu
     return r;
 }
 
+/* 21.4.2.1's three shapes share one machine and one stage list: no argument, one argument (a Date object read
+   from its slot, or a ToPrimitive), or several (a ToNumber per field). The per-field stage carries its own `i`
+   cursor, and each field's conversion completes before the next begins — which is the ordering step 5 states and
+   what a NaN in an earlier field must not skip. */
+#define DATECTOR_STAGES(X) \
+    X(DATECTOR_ENTRY,  "21.4.2.1 steps 1-4.a (numberOfArgs; a Date argument's [[DateValue]] is read from its slot)") \
+    X(DATECTOR_ONE,    "21.4.2.1 step 4.b (v is ToPrimitive(value), then a String is parsed and anything else is ToNumber)") \
+    X(DATECTOR_FIELD,  "21.4.2.1 steps 5.b-5.h (each provided field is ToNumber, in argument order)") \
+    X(DATECTOR_CLIP,   "21.4.2.1 steps 4.c and 5.i (dv is TimeClip(MakeDate(MakeDay, MakeTime)))") \
+    X(DATECTOR_CREATE, "21.4.2.1 step 6 (O is OrdinaryCreateFromConstructor(NewTarget, \"%Date.prototype%\"))")
+enum { DATECTOR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_date_ctor_steps[] = { DATECTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDateCtor *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DATECTOR_ENTRY) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED; s->prim = JS_UNDEFINED;
         s->val = 0; s->i = 0;
         /* `Date(...)` called as a FUNCTION ignores its arguments entirely — it does not coerce them. */
         s->n = JS_IsUndefined(s->hdr.this_val) ? 0 : s->hdr.argc;
-        if (s->n == 0) { s->val = date_now(); s->hdr.stage = 5; }
+        if (s->n == 0) { s->val = date_now(); s->hdr.stage = DATECTOR_CLIP; }
         else if (s->n == 1) {
             /* a Date OBJECT is read from its slot: step 4.a, no coercion */
             if (JS_VALUE_GET_TAG(step_arg(&s->hdr, 0)) == JS_TAG_OBJECT) {
@@ -71243,18 +71256,18 @@ static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 if (p->class_id == JS_CLASS_DATE && JS_IsNumber(p->u.object_data)) {
                     if (JS_ToFloat64(ctx, &s->val, p->u.object_data)) return -1;
                     s->val = time_clip(s->val);
-                    s->hdr.stage = 5;
+                    s->hdr.stage = DATECTOR_CLIP;
                 }
             }
-            if (s->hdr.stage != 5) s->hdr.stage = 1;
+            if (s->hdr.stage != DATECTOR_CLIP) s->hdr.stage = DATECTOR_ONE;
         } else {
             static const double init[7] = { 0, 0, 1, 0, 0, 0, 0 };
             memcpy(s->fields, init, sizeof(init));
             if (s->n > 7) s->n = 7;
-            s->hdr.stage = 3;
+            s->hdr.stage = DATECTOR_FIELD;
         }
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == DATECTOR_ONE) {
         /* step 4.b's ToPrimitive with the DEFAULT hint */
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 0), HINT_NONE, cb_result, &s->prim, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -71272,32 +71285,29 @@ static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             }
             s->val = time_clip(s->val);
         }
-        s->hdr.stage = 5;
+        s->hdr.stage = DATECTOR_CLIP;
     }
-    while (s->hdr.stage == 3 || s->hdr.stage == 4) {
-        if (s->hdr.stage == 3) {
-            if (s->i >= s->n) { s->hdr.stage = 5; break; }
-            /* step 7's ToNumber per field. EVERY provided argument is coerced, in order, before any of them is
-               examined — a NaN in an earlier one does not skip the later coercions the page can observe. */
-            r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), HINT_NUMBER, cb_result, &s->prim,
-                                out_cb, out_argc);
-            cb_result = JS_UNDEFINED;
-            if (r) return r < 0 ? -1 : r;
-            s->hdr.stage = 4;
-        }
-        if (s->hdr.stage == 4) {
-            JSValue v = s->prim;
-            double a;
-            s->prim = JS_UNDEFINED;
-            if (JS_ToFloat64Free(ctx, &a, v)) return -1;
-            s->fields[s->i] = isfinite(a) ? trunc(a) : NAN;
-            if (s->i == 0 && isfinite(a) && s->fields[0] >= 0 && s->fields[0] < 100)
-                s->fields[0] += 1900;
-            s->i++;
-            s->hdr.stage = 3;
-        }
+    while (s->hdr.stage == DATECTOR_FIELD) {
+        JSValue v;
+        double a;
+        if (s->i >= s->n) { s->hdr.stage = DATECTOR_CLIP; break; }
+        /* the ToNumber per field. EVERY provided argument is coerced, in order, before any of them is
+           examined — a NaN in an earlier one does not skip the later coercions the page can observe. The
+           NUMERIC half runs right here, on a primitive, so it invokes nothing and needs no stage: a stage
+           between the two would be entered and left inside one step() call and rest at no step at all. */
+        r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), HINT_NUMBER, cb_result, &s->prim,
+                            out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        v = s->prim;
+        s->prim = JS_UNDEFINED;
+        if (JS_ToFloat64Free(ctx, &a, v)) return -1;
+        s->fields[s->i] = isfinite(a) ? trunc(a) : NAN;
+        if (s->i == 0 && isfinite(a) && s->fields[0] >= 0 && s->fields[0] < 100)
+            s->fields[0] += 1900;
+        s->i++;
     }
-    if (s->hdr.stage != 6) {
+    if (s->hdr.stage != DATECTOR_CREATE) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         if (s->n >= 2) {
             int k;
@@ -71305,7 +71315,7 @@ static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 if (!isfinite(s->fields[k])) break;
             s->val = (k == s->n) ? set_date_fields(s->fields, 1) : NAN;
         }
-        s->hdr.stage = 6;
+        s->hdr.stage = DATECTOR_CREATE;
     }
     r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, JS_CLASS_DATE, cb_result, &s->result,
                                   out_cb, out_argc);
@@ -71339,12 +71349,18 @@ static JSValue js_date_ctor_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+#define DATETOPRIM_STAGES(X) \
+    X(DATETOPRIM_HINT, "21.4.4.45 steps 1-5 (O is an Object; tryFirst is decided by hint)") \
+    X(DATETOPRIM_PRIM, "21.4.4.45 step 6 (OrdinaryToPrimitive(O, tryFirst))")
+enum { DATETOPRIM_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_date_toPrim_steps[] = { DATETOPRIM_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDateToPrim *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DATETOPRIM_HINT) {
         JSAtom hint = JS_ATOM_NULL;
         int hint_num;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
@@ -71363,8 +71379,9 @@ static int js_date_toprim_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         default: JS_ThrowTypeError(ctx, "invalid hint"); return -1;
         }
         s->hint = hint_num | HINT_FORCE_ORDINARY;
-        s->hdr.stage = 1;
+        s->hdr.stage = DATETOPRIM_PRIM;
     }
+    DCHECK(s->hdr.stage == DATETOPRIM_PRIM, "Date.prototype[@@toPrimitive] resumed in no stage");
     r = step_toprim_run(ctx, &s->hdr, s->hdr.this_val, s->hint, cb_result, &s->result,
                         out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
@@ -71388,21 +71405,31 @@ static JSValue js_date_toprim_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* Step 4 is Invoke(O, "toISOString"), and 7.3.20 Invoke is a GetV and a Call — two of the page's operations, so
+   the machine rests once in each half of that step. */
+#define DATETOJSON_STAGES(X) \
+    X(DATETOJSON_OBJ,    "21.4.4.37 step 1 (O is ToObject(this value))") \
+    X(DATETOJSON_PRIM,   "21.4.4.37 steps 2-3 (tv is ToPrimitive(O, number); a non-finite tv is null)") \
+    X(DATETOJSON_METHOD, "21.4.4.37 step 4 via 7.3.20 step 2 (func is GetV(O, \"toISOString\"))") \
+    X(DATETOJSON_CALL,   "21.4.4.37 step 4 via 7.3.20 step 3 (Call(func, O))")
+enum { DATETOJSON_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_date_toJSON_steps[] = { DATETOJSON_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDateToJSON *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == DATETOJSON_OBJ) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->tv = JS_UNDEFINED; s->result = JS_UNDEFINED;
         s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = DATETOJSON_PRIM;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == DATETOJSON_PRIM) {
         r = step_toprim_run(ctx, &s->hdr, s->obj, HINT_NUMBER, cb_result, &s->tv, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -71412,9 +71439,9 @@ static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             if (JS_ToFloat64(ctx, &d, s->tv) < 0) return -1;
             if (!isfinite(d)) { s->result = JS_NULL; return 0; }
         }
-        s->hdr.stage = 2;
+        s->hdr.stage = DATETOJSON_METHOD;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == DATETOJSON_METHOD) {
         r = step_getprop_run(ctx, &s->hdr, s->obj, JS_ATOM_toISOString, cb_result, &s->cb[1], out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -71423,11 +71450,11 @@ static int js_date_tojson_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
             return -1;
         }
         s->cb[0] = js_dup(s->obj);
-        s->hdr.stage = 3;
+        s->hdr.stage = DATETOJSON_CALL;
         *out_cb = s->cb; *out_argc = 0;
         return 3;
     }
-    DCHECK(s->hdr.stage == 3, "Date.prototype.toJSON: unknown stage");
+    DCHECK(s->hdr.stage == DATETOJSON_CALL, "Date.prototype.toJSON: unknown stage");
     s->result = cb_result;
     return 0;
 }
@@ -74107,8 +74134,12 @@ static void js_iter_wrap_return_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_wrap_return_def =
     { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0, .visit = js_iter_wrap_return_visit,
       .algorithm = "27.1.3.2.1.1.2 %WrapForValidIteratorPrototype%.return", .steps = js_iter_wrap_return_steps };
-static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 , .visit = js_date_tojson_visit };
-static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 , .visit = js_date_toprim_visit };
+static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 , .visit = js_date_tojson_visit,
+                     .algorithm = "21.4.4.37 Date.prototype.toJSON",
+                     .steps = js_date_toJSON_steps };
+static const JSTrampStepDef js_date_toPrim_def = { sizeof(JSDateToPrim), js_date_toprim_step, js_date_toprim_fini, 0 , .visit = js_date_toprim_visit,
+                     .algorithm = "21.4.4.45 Date.prototype [ @@toPrimitive ]",
+                     .steps = js_date_toPrim_steps };
 /* the captured half of an Atomics operation: the length ValidateAtomicAccess reads at step 1, held across the
    index's own coercion, plus the argument vector the body will read. */
 typedef struct JSAtomics {
@@ -74130,7 +74161,9 @@ typedef struct JSDateSet {
     int i, n;             /* the coercion cursor and how many arguments the spec names */
     bool nonfinite;       /* an argument coerced to an infinity or a NaN */
 } JSDateSet;
-static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0, .visit = js_date_ctor_visit };
+static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_ctor_step, js_date_ctor_fini, 0, .visit = js_date_ctor_visit,
+                   .algorithm = "21.4.2.1 Date ( ...values )",
+                   .steps = js_date_ctor_steps };
 /* An OrdinaryCreateFromConstructor declaration: the CLASS and the body's DECLARED ARGUMENT COUNT in `arg`, the
    post-create body (NULL = the object is the result), and the same precheck hook the coerce-then-compute machines
    use for a leading validation. The count is part of the declaration for the same reason PRIMARGS carries its
@@ -90614,15 +90647,32 @@ static JSValue js_map_get_size(JSContext *ctx, JSValueConst this_val, int magic)
    the spec then requires this loop to visit). What changes is that "across the call" now means across a
    SUSPENSION — so the locked record and the cursor live on the state, and fini releases the lock, because an
    abandoned machine is the one path a C local could not have covered. */
+/* TWO algorithms, one machine: the walk is the same and a Set passes its key twice. ONE stage list expanded once
+   per algorithm; see AFIND_STAGES. */
+#define MAPFOREACH_STAGES(X, ENTRY, CALL) \
+    X(MAPFOREACH_ENTRY, ENTRY) \
+    X(MAPFOREACH_CALL,  CALL)
+enum { MAPFOREACH_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_map_foreach_steps[] = {
+    MAPFOREACH_STAGES(JS_STEP_STAGE_LABEL,
+        "24.1.3.5 steps 1-6 (M has [[MapData]]; IsCallable(callbackfn); entries; index is 0)",
+        "24.1.3.5 step 7.c.i (Call(callbackfn, thisArg, <<e.[[Value]], e.[[Key]], M>>))")
+    NULL };
+static const char *const js_set_foreach_steps[] = {
+    MAPFOREACH_STAGES(JS_STEP_STAGE_LABEL,
+        "24.2.4.6 steps 1-6 (S has [[SetData]]; IsCallable(callbackfn); entries; index is 0)",
+        "24.2.4.6 step 7.b.i (Call(callbackfn, thisArg, <<e, e, S>>))")
+    NULL };
+
 static int js_map_foreach_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSMapForEach *m = st;
     int magic = m->hdr.arg;
     JSMapState *s;
 
-    if (m->hdr.stage == 0) {
+    if (m->hdr.stage == MAPFOREACH_ENTRY) {
         JS_FreeValue(ctx, cb_result);
-        m->hdr.stage = 1;
+        m->hdr.stage = MAPFOREACH_CALL;
         s = JS_GetOpaque2(ctx, m->hdr.this_val, JS_CLASS_MAP + magic);
         if (!s)
             return -1;
@@ -90698,10 +90748,14 @@ static JSValue js_map_foreach_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 static const JSTrampStepDef js_map_foreach_def = {
-    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, 0, .visit = js_map_foreach_visit
+    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, 0, .visit = js_map_foreach_visit,
+    .algorithm = "24.1.3.5 Map.prototype.forEach",
+    .steps = js_map_foreach_steps
 };
 static const JSTrampStepDef js_set_foreach_def = {
-    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, MAGIC_SET, .visit = js_map_foreach_visit
+    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, MAGIC_SET, .visit = js_map_foreach_visit,
+    .algorithm = "24.2.4.6 Set.prototype.forEach",
+    .steps = js_set_foreach_steps
 };
 
 
@@ -94512,18 +94566,33 @@ static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx,
                                1, 0, 1, func_data);
 }
 
-/* 27.1.4.4 step 11 `closeIterator`: IteratorClose(syncIteratorRecord, ThrowCompletion(error)), as a STEP
+/* 27.1.6.4 step 13.a `closeIterator`: IteratorClose(syncIteratorRecord, ThrowCompletion(error)), as a STEP
    MACHINE. It has to be one: the sync iterator's `return` is often a GENERATOR body — `try { yield p } finally
    { … }` — and a coroutine body must suspend on the tramp, which a JS_Call out of a C reaction body cannot do.
-   Stages: 0 capture, 1 GetMethod(iterator,"return") then call it, 2 finish. This machine NEVER completes
-   normally: 7.4.11 step 4 says a throw completion is the result whatever the close did, so every exit is the
-   stored error, re-thrown by fini over anything the close itself raised. */
+   This machine NEVER completes normally: 7.4.11 step 5 says a throw completion is the result whatever the close
+   did, so every exit is the stored error, re-thrown by fini over anything the close itself raised.
+   The prose said 27.1.4.4 step 11; 27.1.4.4 is Iterator.prototype.filter, and AsyncFromSyncIteratorContinuation
+   is 27.1.6.4 with the closure at step 13.a. Its 7.4.11 step numbers were one low throughout, for the same
+   reason every other unchecked comment in this file was. */
 typedef struct JSIterCloseThrow {
     JSStepHdr hdr;       /* MUST be first: the driver casts state -> JSStepHdr * */
     JSValue error;       /* the rejection reason — the completion that wins (owned) */
-    JSValue cb_args[2];  /* [this=iterator, return_fn] — owned; borrowed by the callback frame */
+    JSValue method;      /* the `return` GetMethod produced, held across the Call (owned) */
+    JSValue cb_args[2];  /* [this=iterator, return_fn] — the CALL request */
+    JSValue iter;        /* the sync iterator (owned) */
+    uint8_t call_phase;
 } JSIterCloseThrow;
 _Static_assert(offsetof(JSIterCloseThrow, hdr) == 0, "JSStepHdr must be first in JSIterCloseThrow");
+
+/* WHICH STEP OF 7.4.11 EACH STAGE RESTS AT. The Call was an ISSUE stage and a CONSUME stage, so a flow parked
+   inside the sync iterator's `return` — the generator body this machine exists for — reported the stage that
+   discards its answer. */
+#define ICT_STAGES(X) \
+    X(ICT_METHOD, "27.1.6.4 step 13.a -> 7.4.11 IteratorClose step 3 (innerResult is GetMethod(iterator, " \
+                  "\"return\"))") \
+    X(ICT_CALL,   "27.1.6.4 step 13.a -> 7.4.11 IteratorClose step 4.c (innerResult is Call(return, iterator))")
+enum { ICT_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_iter_close_throw_steps[] = { ICT_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_iter_close_throw_step(JSContext *ctx, void *st, JSValue cb_result,
                                    JSValue **out_cb, int *out_argc)
@@ -94531,31 +94600,33 @@ static int js_iter_close_throw_step(JSContext *ctx, void *st, JSValue cb_result,
     JSIterCloseThrow *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
-        JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
-        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
-        /* every owned field is placed BEFORE anything that can throw: the teardown frees exactly what the
-           state holds and nothing else. */
-        s->error = s->hdr.argc > 0 ? js_dup(s->hdr.argv[0]) : JS_UNDEFINED;
-        s->cb_args[0] = js_dup(rec->data[0]);   /* the sync iterator */
-        s->cb_args[1] = JS_UNDEFINED;
-        s->hdr.stage = 1;
-    }
-    if (s->hdr.stage == 1) {
-        r = step_getprop_run(ctx, &s->hdr, s->cb_args[0], JS_ATOM_return, cb_result,
-                             &s->cb_args[1], out_cb, out_argc);   /* 7.4.11 step 2 GetMethod */
+    if (s->hdr.stage == ICT_METHOD) {
+        if (s->hdr.get_phase == GET_PH_START) {
+            JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
+            /* every owned field is placed BEFORE anything that can throw: the teardown frees exactly what the
+               state holds and nothing else. */
+            s->error = s->hdr.argc > 0 ? js_dup(s->hdr.argv[0]) : JS_UNDEFINED;
+            s->method = JS_UNDEFINED;
+            s->cb_args[0] = JS_UNDEFINED; s->cb_args[1] = JS_UNDEFINED;
+            s->iter = js_dup(rec->data[0]);   /* the sync iterator */
+        }
+        r = step_getprop_run(ctx, &s->hdr, s->iter, JS_ATOM_return, cb_result, &s->method, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
-        if (JS_IsUndefined(s->cb_args[1]) || JS_IsNull(s->cb_args[1]))
-            return -1;                          /* step 3.b: nothing to call, the completion is all there is */
-        *out_cb = s->cb_args; *out_argc = 0;     /* step 3.c Call(return, iterator) */
-        return 3;
+        if (JS_IsUndefined(s->method) || JS_IsNull(s->method))
+            return -1;                          /* step 4.b: nothing to call, the completion is all there is */
+        s->hdr.stage = ICT_CALL;
     }
-    DCHECK(s->hdr.stage == 2, "IteratorClose-throw: unknown stage");
-    /* steps 5 and 6 are unreachable under a throw completion — step 4 returns before them, so neither the
-       inner result's abruptness nor its not-an-Object-ness is observable. */
-    JS_FreeValue(ctx, cb_result);
+    DCHECK(s->hdr.stage == ICT_CALL, "IteratorClose-throw: unknown stage");
+    {
+        JSValue inner = JS_UNDEFINED;
+        r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb_args), s->method, s->iter, 0, NULL,
+                          cb_result, &inner, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+        /* steps 6 and 7 are unreachable under a throw completion — step 5 returns before them, so neither the
+           inner result's abruptness nor its not-an-Object-ness is observable. */
+        JS_FreeValue(ctx, inner);
+    }
     return -1;
 }
 
@@ -94565,6 +94636,8 @@ static void js_iter_close_throw_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSIterCloseThrow *s = st;
     v->val(ctx, &s->error);
+    v->val(ctx, &s->method);
+    v->val(ctx, &s->iter);
     v->val(ctx, &s->cb_args[0]);
     v->val(ctx, &s->cb_args[1]);
 }
@@ -94573,7 +94646,7 @@ static JSValue js_iter_close_throw_fini(JSContext *ctx, void *st, bool take_resu
 {
     JSIterCloseThrow *s = st;
     DCHECK(!take_result, "IteratorClose-throw never completes normally");
-    /* step 4: the stored completion is the result, REPLACING whatever the `return` call or the GetMethod
+    /* step 5: the stored completion is the result, REPLACING whatever the `return` call or the GetMethod
        raised. JS_Throw TAKES the reference, so the error leaves the machine here the way a result does — the
        declaration below is what the OTHER consumer, the fork, reads. */
     JS_Throw(ctx, s->error);
@@ -94584,7 +94657,8 @@ static JSValue js_iter_close_throw_fini(JSContext *ctx, void *st, bool take_resu
 }
 
 static const JSTrampStepDef js_iter_close_throw_def = {
-    sizeof(JSIterCloseThrow), js_iter_close_throw_step, js_iter_close_throw_fini, 0, .visit = js_iter_close_throw_visit
+    sizeof(JSIterCloseThrow), js_iter_close_throw_step, js_iter_close_throw_fini, 0, .visit = js_iter_close_throw_visit,
+    .algorithm = "27.1.6.4 step 13.a closeIterator", .steps = js_iter_close_throw_steps
 };
 
 /* The closure has no C body: its only dispatch is as a Promise reaction, and promise_reaction_job routes a
