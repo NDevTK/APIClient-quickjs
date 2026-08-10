@@ -73168,12 +73168,20 @@ static const JSTrampStepDef js_re_search_def =
 static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_str_match_fini(JSContext *ctx, void *st, bool take_result);
 static void js_str_match_visit(JSContext *ctx, void *st, JSStepVisit *v);
+/* Declared where the machine is; a definition sits with its siblings rather than with the algorithm it
+   belongs to, so the labels are named here and written there. */
+static const char *const js_str_match_steps[];
+static const char *const js_str_matchAll_steps[];
+static const char *const js_str_search_steps[];
 static const JSTrampStepDef js_str_match_def =
-    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_match, .visit = js_str_match_visit };
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_match, .visit = js_str_match_visit,
+      .algorithm = "22.1.3.13 String.prototype.match", .steps = js_str_match_steps };
 static const JSTrampStepDef js_str_matchAll_def =
-    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_matchAll, .visit = js_str_match_visit };
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_matchAll, .visit = js_str_match_visit,
+      .algorithm = "22.1.3.14 String.prototype.matchAll", .steps = js_str_matchAll_steps };
 static const JSTrampStepDef js_str_search_def =
-    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search, .visit = js_str_match_visit };
+    { sizeof(JSStrMatch), js_str_match_step, js_str_match_fini, JS_ATOM_Symbol_search, .visit = js_str_match_visit,
+      .algorithm = "22.1.3.21 String.prototype.search", .steps = js_str_search_steps };
 static const JSTrampStepDef js_str_replace_def         = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 0, .visit = js_str_replace_visit };
 static const JSTrampStepDef js_str_replaceAll_def      = { sizeof(JSStrReplace), js_str_replace_vstep, js_str_replace_fini, 1, .visit = js_str_replace_visit };
 static const JSTrampStepDef js_array_every_def     = { sizeof(JSArrayEvery), js_array_every_vstep, js_array_every_vfini, special_every, .visit = js_array_every_visit,
@@ -81035,14 +81043,71 @@ static JSValue js_string_includes_search(JSContext *ctx, JSValueConst strv, JSVa
     return js_bool(ret);   /* both strings are BORROWED: the machine owns them and its fini frees them */
 }
 
-/* 21.1.3.11 String.prototype.match, 21.1.3.12 .matchAll and 21.1.3.16 .search — ONE machine, the @@-method's
+/* 22.1.3.13 String.prototype.match, 22.1.3.14 .matchAll and 22.1.3.21 .search — ONE machine, the @@-method's
    atom in hdr.arg, exactly as js_string_match was one body with a magic. It called the @@-method with
    JS_CallFree straight out of C, and that method is itself a step machine, so the call reached the DFAIL that
    says a step builtin was invoked outside the interpreter's dispatch. Every other step is the page's code too:
    GetMethod's read, matchAll's IsRegExp + `flags` + ToString, ToString(this), Construct(RegExp, ...) and the
-   final Get + Call.
-   Stages: 0 the receiver check, 1 IsRegExp's read, 2 the `flags` read, 3 its ToString, 4 GetMethod, 5 the Call,
-   6 ToString(this), 7 the construct, 8 the constructed regexp's method, 9 the Invoke. */
+   final Get + Call. */
+/* ONE STAGE LIST EXPANDED ONCE PER ALGORITHM, with that algorithm's own step text — see RES_STAGES for the
+   shape and JSTrampStepDef.steps for why the label rather than the index is a parked machine's rest point.
+   MATCH'S AND SEARCH'S ARRAYS ARE SHORTER, and that is the declaration doing its job: only matchAll performs
+   IsRegExp and the `flags` read, so its three extra rest points are a SEPARATE list appended after the seven
+   they share. Two of the three algorithms therefore simply END at the Invoke, and a rest in one of matchAll's
+   stages is a stage past the end of their array — which step_stage_check names on its own, with no
+   placeholder step to invent and no DCHECK to write.
+   The stage NUMBERS are consequently not the order the blocks appear in below; the label is the identity and
+   the block order is the algorithm's. */
+#define STRMATCH_STAGES(X, RECV, METHOD, CALLED, STR, CREATED, INVOKE, INVOKED) \
+    X(SM_RECV,    RECV) \
+    X(SM_METHOD,  METHOD) \
+    X(SM_CALLED,  CALLED) \
+    X(SM_STR,     STR) \
+    X(SM_CREATED, CREATED) \
+    X(SM_INVOKE,  INVOKE) \
+    X(SM_INVOKED, INVOKED)
+/* The three only matchAll reaches. */
+#define STRMATCH_ALL_STAGES(X, ISREGEXP, FLAGS, FLAGSTR) \
+    X(SM_ISREGEXP, ISREGEXP) \
+    X(SM_FLAGS,    FLAGS) \
+    X(SM_FLAGSTR,  FLAGSTR)
+enum { STRMATCH_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0, 0, 0)
+       STRMATCH_ALL_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_str_match_steps[] = {
+    STRMATCH_STAGES(JS_STEP_STAGE_LABEL,
+        "22.1.3.13 step 1 (O is RequireObjectCoercible(this)) and step 2's `regexp is an Object` test",
+        "22.1.3.13 step 2.a (matcher is GetMethod(regexp, @@match))",
+        "22.1.3.13 step 2.b.i (return Call(matcher, regexp, «O»))",
+        "22.1.3.13 step 3 (S is ToString(O))",
+        "22.1.3.13 step 4 (rx is RegExpCreate(regexp, undefined))",
+        "22.1.3.13 step 5 (Invoke's Get(rx, @@match))",
+        "22.1.3.13 step 5 (Invoke's Call(matcher, rx, «S»))")
+    NULL };
+static const char *const js_str_matchAll_steps[] = {
+    STRMATCH_STAGES(JS_STEP_STAGE_LABEL,
+        "22.1.3.14 step 1 (O is RequireObjectCoercible(this)) and step 2's `regexp is an Object` test",
+        "22.1.3.14 step 2.c (matcher is GetMethod(regexp, @@matchAll))",
+        "22.1.3.14 step 2.d.i (return Call(matcher, regexp, «O»))",
+        "22.1.3.14 step 3 (S is ToString(O))",
+        "22.1.3.14 step 4 (rx is RegExpCreate(regexp, \"g\"))",
+        "22.1.3.14 step 5 (Invoke's Get(rx, @@matchAll))",
+        "22.1.3.14 step 5 (Invoke's Call(matcher, rx, «S»))")
+    STRMATCH_ALL_STAGES(JS_STEP_STAGE_LABEL,
+        "22.1.3.14 step 2.a (isRegExp is IsRegExp(regexp) — its Get(regexp, @@match))",
+        "22.1.3.14 steps 2.b.i-ii (flags is Get(regexp, \"flags\"); RequireObjectCoercible(flags))",
+        "22.1.3.14 step 2.b.iii (whether ToString(flags) contains \"g\")")
+    NULL };
+static const char *const js_str_search_steps[] = {
+    STRMATCH_STAGES(JS_STEP_STAGE_LABEL,
+        "22.1.3.21 step 1 (O is RequireObjectCoercible(this)) and step 2's `regexp is an Object` test",
+        "22.1.3.21 step 2.a (searcher is GetMethod(regexp, @@search))",
+        "22.1.3.21 step 2.b.i (return Call(searcher, regexp, «O»))",
+        "22.1.3.21 step 3 (string is ToString(O))",
+        "22.1.3.21 step 4 (rx is RegExpCreate(regexp, undefined))",
+        "22.1.3.21 step 5 (Invoke's Get(rx, @@search))",
+        "22.1.3.21 step 5 (Invoke's Call(searcher, rx, «string»))")
+    NULL };
+
 static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSStrMatch *s = st;
@@ -81051,7 +81116,9 @@ static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
     JSValue str;
     int r;
 
-    if (s->hdr.stage == 0) {
+    /* match and search have no IsRegExp and no `flags` read, so their arrays end at SM_INVOKED and a rest in
+       one of matchAll's three is a stage past the end — which step_stage_check names on its own. */
+    if (s->hdr.stage == SM_RECV) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->matcher = JS_UNDEFINED; s->str = JS_UNDEFINED; s->rx = JS_UNDEFINED;
@@ -81061,10 +81128,10 @@ static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             return JS_ThrowTypeError(ctx, "cannot convert to object"), -1;
         /* step 2 gates on `regexp` being an OBJECT: a primitive's prototype is never consulted, which
            cstm-matcher-on-string-primitive.js checks by making String.prototype[@@match] a throwing getter. */
-        if (!JS_IsObject(regexp)) s->hdr.stage = 6;
-        else s->hdr.stage = (atom == JS_ATOM_Symbol_matchAll) ? 1 : 4;
+        if (!JS_IsObject(regexp)) s->hdr.stage = SM_STR;
+        else s->hdr.stage = (atom == JS_ATOM_Symbol_matchAll) ? SM_ISREGEXP : SM_METHOD;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == SM_ISREGEXP) {
         /* matchAll step 2.a, IsRegExp: `? Get(argument, @@match)` decides it unless it is undefined, in which
            case the [[RegExpMatcher]] slot does. */
         JSValue m;
@@ -81076,18 +81143,18 @@ static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         else
             s->isRegExp = JS_ToBool(ctx, m);
         JS_FreeValue(ctx, m);
-        s->hdr.stage = s->isRegExp ? 2 : 4;
+        s->hdr.stage = s->isRegExp ? SM_FLAGS : SM_METHOD;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == SM_FLAGS) {
         r = step_getprop_run(ctx, &s->hdr, regexp, JS_ATOM_flags, cb_result, &s->flags, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         /* step 2.b.ii: RequireObjectCoercible(flags) */
         if (JS_IsUndefined(s->flags) || JS_IsNull(s->flags))
             return JS_ThrowTypeError(ctx, "cannot convert to object"), -1;
-        s->hdr.stage = 3;
+        s->hdr.stage = SM_FLAGSTR;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == SM_FLAGSTR) {
         r = step_tostring_run(ctx, &s->hdr, s->flags, cb_result, &str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -81096,31 +81163,32 @@ static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         if (string_indexof_char(JS_VALUE_GET_STRING(s->flags), 'g', 0) < 0)
             return JS_ThrowTypeError(ctx, "regexp must have the 'g' flag"), -1;
         JS_FreeValue(ctx, s->flags); s->flags = JS_UNDEFINED;
-        s->hdr.stage = 4;
+        s->hdr.stage = SM_METHOD;
     }
-    if (s->hdr.stage == 4) {
-        /* step 2.c: GetMethod(regexp, @@x) — the read is the page's; an uncallable non-nullish result throws */
+    if (s->hdr.stage == SM_METHOD) {
+        /* step 2.a (2.c for matchAll): GetMethod(regexp, @@x) — the read is the page's; an uncallable
+           non-nullish result throws */
         r = step_getprop_run(ctx, &s->hdr, regexp, atom, cb_result, &s->matcher, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         if (JS_IsUndefined(s->matcher) || JS_IsNull(s->matcher)) {
             JS_FreeValue(ctx, s->matcher); s->matcher = JS_UNDEFINED;
-            s->hdr.stage = 6;
+            s->hdr.stage = SM_STR;
         } else {
             if (check_function(ctx, s->matcher)) return -1;
             s->cb[0] = (JSValue)regexp;      /* this */
             s->cb[1] = s->matcher;           /* a borrowed view of what the state owns */
             s->cb[2] = s->hdr.this_val;
             *out_cb = s->cb; *out_argc = 1;
-            s->hdr.stage = 5;
+            s->hdr.stage = SM_CALLED;
             return 3;
         }
     }
-    if (s->hdr.stage == 5) {
+    if (s->hdr.stage == SM_CALLED) {
         s->result = cb_result;
         return 0;
     }
-    if (s->hdr.stage == 6) {
+    if (s->hdr.stage == SM_STR) {
         r = step_tostring_run(ctx, &s->hdr, s->hdr.this_val, cb_result, &s->str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -81139,15 +81207,15 @@ static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             *out_argc = 1;
         }
         *out_cb = s->cb;
-        s->hdr.stage = 7;
+        s->hdr.stage = SM_CREATED;
         return 4;
     }
-    if (s->hdr.stage == 7) {
+    if (s->hdr.stage == SM_CREATED) {
         JS_FreeValue(ctx, s->flags); s->flags = JS_UNDEFINED;
         s->rx = cb_result; cb_result = JS_UNDEFINED;
-        s->hdr.stage = 8;
+        s->hdr.stage = SM_INVOKE;
     }
-    if (s->hdr.stage == 8) {
+    if (s->hdr.stage == SM_INVOKE) {
         /* step 5: Invoke(rx, @@x, «S») — the read and the call are two separate observable steps */
         r = step_getprop_run(ctx, &s->hdr, s->rx, atom, cb_result, &s->matcher, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -81157,10 +81225,10 @@ static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         s->cb[1] = s->matcher;
         s->cb[2] = s->str;
         *out_cb = s->cb; *out_argc = 1;
-        s->hdr.stage = 9;
+        s->hdr.stage = SM_INVOKED;
         return 3;
     }
-    DCHECK(s->hdr.stage == 9, "String.prototype.match resumed in an unknown stage");
+    DCHECK(s->hdr.stage == SM_INVOKED, "String.prototype.match resumed in an unknown stage");
     s->result = cb_result;
     return 0;
 }
@@ -92587,67 +92655,63 @@ static JSValue js_promise_then_native(JSContext *ctx, JSValueConst promise, JSVa
    flow base, and `.catch` and `.finally` reached it too, since both are spelled as an Invoke of `then`. */
 typedef struct JSPromiseThen {
     JSStepHdr hdr;         /* MUST be first */
-    JSValue ctor;          /* the species constructor (owned); UNDEFINED means %Promise% */
+    JSValue ctor;          /* the species constructor (owned) */
     JSValue result;        /* the result promise (owned) */
-    JSValue cb_args[1];    /* the GETPROP request's object */
+    JSValue cb_args[1];    /* the CAPABILITY request's constructor */
 } JSPromiseThen;
 _Static_assert(offsetof(JSPromiseThen, hdr) == 0, "JSStepHdr must be first in JSPromiseThen");
+
+/* WHICH STEP OF 27.2.5.4 EACH STAGE RESTS AT. The machine had five private stages, three of which were
+   SpeciesConstructor hand-inlined — its `constructor` read, its @@species read and the validation between them —
+   so a flow parked in the middle of that operation could say only "stage 2 of something". 7.3.22 is ONE step of
+   this algorithm and the engine already performs it as one sub-sequence (step_speciesctor_run), so the three
+   collapse into the step the standard actually writes, and the duplicate copy of 7.3.22 goes with them. */
+#define PTHEN_STAGES(X) \
+    X(PTHEN_REQUIRE, "27.2.5.4 steps 2-3 (RequireInternalSlot(promise, [[PromiseState]]))") \
+    X(PTHEN_SPECIES, "27.2.5.4 step 4 (C is SpeciesConstructor(promise, %Promise%))") \
+    X(PTHEN_CAP,     "27.2.5.4 step 5 (resultCapability is NewPromiseCapability(C))") \
+    X(PTHEN_PERFORM, "27.2.5.4 step 6 (PerformPromiseThen(promise, onFulfilled, onRejected, resultCapability))")
+enum { PTHEN_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_promise_then_steps[] = { PTHEN_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPromiseThen *s = st;
-    /* THE STAGE DISPATCH IS A LOOP, not a recursion. Two stages finish by deciding the NEXT stage should run
-       immediately — SpeciesConstructor's default when `constructor` is undefined, and again when @@species is —
-       and they said so by tail-calling this function with a fresh UNDEFINED. Depth two, so nothing was at risk;
-       what it cost was a self-edge in engine/check_recursion.sh's graph for a control-flow decision that has a
-       `continue`. */
-    for (;;) {
-    if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
+    int r;
+
+    if (s->hdr.stage == PTHEN_REQUIRE) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->ctor = JS_UNDEFINED; s->result = JS_UNDEFINED; s->cb_args[0] = JS_UNDEFINED;
         /* steps 2-3: RequireInternalSlot([[PromiseState]]), before anything is read */
         if (!JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_PROMISE))
             return -1;
-        s->hdr.stage = 1;
-        s->cb_args[0] = js_dup(s->hdr.this_val);
-        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_constructor;
-        return 6;   /* GETPROP: SpeciesConstructor step 2 */
+        s->hdr.stage = PTHEN_SPECIES;
     }
-    if (s->hdr.stage == 1) {
-        /* cb_result = O.constructor. Steps 3-4: undefined is the default; a non-object is a TypeError. */
-        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
-        if (JS_IsUndefined(cb_result)) { s->hdr.stage = 3; cb_result = JS_UNDEFINED; continue; }
-        if (!JS_IsObject(cb_result)) { JS_FreeValue(ctx, cb_result); JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-        s->hdr.stage = 2;
-        s->cb_args[0] = cb_result;   /* the constructor, held for the @@species read (owned) */
-        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_Symbol_species;
-        return 6;   /* GETPROP: SpeciesConstructor step 5 */
-    }
-    if (s->hdr.stage == 2) {
-        /* cb_result = C[@@species]. Steps 6-8: nullish is the default; a non-constructor is a TypeError. */
-        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
-        if (JS_IsUndefined(cb_result) || JS_IsNull(cb_result)) { JS_FreeValue(ctx, cb_result); }
-        else if (!JS_IsConstructor(ctx, cb_result)) {
-            JS_ThrowTypeErrorNotAConstructor(ctx, cb_result);
-            JS_FreeValue(ctx, cb_result);
-            return -1;
-        } else s->ctor = cb_result;
-        s->hdr.stage = 3;
+    if (s->hdr.stage == PTHEN_SPECIES) {
+        /* step 4: `constructor` and then @@species, either of which is an accessor or a Proxy trap — so the
+           machine parks INSIDE this one step rather than spending a stage on each half of it. */
+        r = step_speciesctor_run(ctx, &s->hdr, s->hdr.this_val, ctx->promise_ctor, cb_result, &s->ctor,
+                                 out_cb, out_argc);
         cb_result = JS_UNDEFINED;
-        continue;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = PTHEN_CAP;
     }
-    if (s->hdr.stage == 3) {
-        /* step 5: NewPromiseCapability(C). The PromiseHook's parent is this promise, and it rides the request
-           because the Construct suspends. */
-        JS_FreeValue(ctx, cb_result);
-        s->hdr.stage = 4;
-        s->cb_args[0] = js_dup(s->ctor);
-        *out_cb = s->cb_args; *out_argc = 0;
-        return 16;   /* CAPABILITY */
+    if (s->hdr.stage == PTHEN_CAP) {
+        /* step 5: a SUBCLASS constructor is the page's code, so the machine RESTS in this step — it issues the
+           request while the header carries no capability and is re-entered at the same stage once the delivery
+           has put one there, which is the same shape every *_run sub-sequence has. */
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        if (JS_IsUndefined(s->hdr.cap_promise)) {
+            s->cb_args[0] = js_dup(s->ctor);
+            *out_cb = s->cb_args; *out_argc = 0;
+            return 16;   /* CAPABILITY */
+        }
+        JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
+        s->hdr.stage = PTHEN_PERFORM;
     }
-    /* stage 4: the capability is on the header. Step 6 PerformPromiseThen invokes nothing. */
+    /* step 6: PerformPromiseThen invokes nothing. */
     JS_FreeValue(ctx, cb_result);
-    JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
     {
         JSValueConst rf[2], handlers[2];
         int ret;
@@ -92664,7 +92728,6 @@ static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         s->result = s->hdr.cap_promise; s->hdr.cap_promise = JS_UNDEFINED;
     }
     return 0;
-    }
 }
 
 /* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). @@species is the page's, so the result promise's constructor is a request. */
@@ -92687,7 +92750,8 @@ static JSValue js_promise_then_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 static const JSTrampStepDef js_promise_then_def = {
-    sizeof(JSPromiseThen), js_promise_then_step, js_promise_then_fini, 0, .visit = js_promise_then_visit
+    sizeof(JSPromiseThen), js_promise_then_step, js_promise_then_fini, 0, .visit = js_promise_then_visit,
+    .algorithm = "27.2.5.4 Promise.prototype.then", .steps = js_promise_then_steps
 };
 
 
