@@ -65185,23 +65185,48 @@ typedef struct JSSetProto {
     JSValue result;   /* the object (Object's form) or the boolean (Reflect's) (owned) */
 } JSSetProto;
 
+/* Object.setPrototypeOf and Reflect.setPrototypeOf are ONE machine and TWO algorithms: what the prologue rejects
+   and what the epilogue answers differ, the [[SetPrototypeOf]] between them does not. ONE stage list expanded once
+   per algorithm with that algorithm's own step text — see AFIND_STAGES. The prologue runs NONE of the page's code
+   (RequireObjectCoercible and two type tests), which is what lets it be one stage rather than three. */
+#define SETPROTO_STAGES(X, ENTRY, SET) \
+    X(SETPROTO_ENTRY, ENTRY) \
+    X(SETPROTO_SET,   SET)
+enum { SETPROTO_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_obj_setproto_steps[] = {
+    SETPROTO_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.23 steps 1-3 (RequireObjectCoercible(O); proto is an Object or null; a non-object O is returned)",
+        "20.1.2.23 step 4 (status is O.[[SetPrototypeOf]](proto))")
+    NULL };
+static const char *const js_reflect_setproto_steps[] = {
+    SETPROTO_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.13 steps 1-2 (target is an Object; proto is an Object or null)",
+        "28.1.13 step 3 (status is target.[[SetPrototypeOf]](proto))")
+    NULL };
+
 static int js_setproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSSetProto *s = st;
     int reflect = s->hdr.def->arg;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == SETPROTO_ENTRY) {
         JSValueConst obj = step_arg(&s->hdr, 0), proto = step_arg(&s->hdr, 1);
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;   /* FIRST, before anything that can throw */
+        /* 28.1.13 STEP 1 IS THE TARGET, step 2 the prototype; 20.1.2.23 tests them the other way round because
+           its step 1 is RequireObjectCoercible. Naming the stage after the steps is what showed the two were
+           being run in one order for both — the same TypeError either way, so nothing could report it. */
+        if (reflect && JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
         if (JS_VALUE_GET_TAG(proto) != JS_TAG_NULL && JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT) {
             JS_ThrowTypeError(ctx, "not an object or null");
             return -1;
         }
         if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
-            if (reflect) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-            /* 20.1.2.21 steps 1-3: a nullish O is a TypeError, any other primitive is returned unchanged with
-               no internal method performed at all. */
+            /* 20.1.2.23 steps 1 and 3: a nullish O is RequireObjectCoercible's TypeError, any other primitive is
+               returned unchanged with no internal method performed at all. */
             if (JS_VALUE_GET_TAG(obj) == JS_TAG_NULL || JS_VALUE_GET_TAG(obj) == JS_TAG_UNDEFINED) {
                 JS_ThrowTypeErrorNotAnObject(ctx);
                 return -1;
@@ -65209,7 +65234,7 @@ static int js_setproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             s->result = js_dup(obj);
             return 0;
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = SETPROTO_SET;
         s->hdr.cb_coerce[0] = obj;     /* borrowed: the caller's stack holds both across the request */
         s->hdr.cb_coerce[1] = proto;
         *out_cb = s->hdr.cb_coerce; *out_argc = 0;
@@ -65243,12 +65268,41 @@ static JSValue js_setproto_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* FOUR algorithms, one machine: Object and Reflect × isExtensible and preventExtensions. Each rests on its one
+   object-level internal method, and each spells its entry differently — Object answers a primitive where Reflect
+   rejects it. ONE stage list expanded once per algorithm — see AFIND_STAGES. Object.preventExtensions' steps 3-4
+   (throw on false, return O) run none of the page's code, so they finish in the stage that rests at step 2. */
+#define EXTOP_STAGES(X, ENTRY, OP) \
+    X(EXTOP_ENTRY, ENTRY) \
+    X(EXTOP_OP,    OP)
+enum { EXTOP_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_obj_isext_steps[] = {
+    EXTOP_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.16 step 1 (a non-object O is false)",
+        "20.1.2.16 step 2 (IsExtensible(O))")
+    NULL };
+static const char *const js_reflect_isext_steps[] = {
+    EXTOP_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.9 step 1 (target is an Object)",
+        "28.1.9 step 2 (target.[[IsExtensible]]())")
+    NULL };
+static const char *const js_obj_prevext_steps[] = {
+    EXTOP_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.20 step 1 (a non-object O is returned unchanged)",
+        "20.1.2.20 step 2 (status is O.[[PreventExtensions]]())")
+    NULL };
+static const char *const js_reflect_prevext_steps[] = {
+    EXTOP_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.11 step 1 (target is an Object)",
+        "28.1.11 step 2 (target.[[PreventExtensions]]())")
+    NULL };
+
 static int js_extop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSExtOp *s = st;
     int arg = s->hdr.def->arg;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == EXTOP_ENTRY) {
         JSValueConst obj = step_arg(&s->hdr, 0);
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;   /* FIRST, before anything that can throw */
@@ -65259,7 +65313,7 @@ static int js_extop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **
             s->result = (arg & EXTOP_PREVENT) ? js_dup(obj) : JS_FALSE;
             return 0;
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = EXTOP_OP;
         s->hdr.cb_coerce[0] = obj;   /* borrowed: the caller's stack holds it across the request */
         *out_cb = s->hdr.cb_coerce; *out_argc = 0;
         return (arg & EXTOP_PREVENT) ? 20 : 19;
@@ -65293,11 +65347,28 @@ static JSValue js_extop_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* Object.getPrototypeOf and Reflect.getPrototypeOf: one [[GetPrototypeOf]] each, differing only in what their
+   first step does with a primitive. ONE stage list expanded once per algorithm — see AFIND_STAGES. */
+#define GETPROTO_STAGES(X, RECV, GET) \
+    X(GETPROTO_RECV, RECV) \
+    X(GETPROTO_GET,  GET)
+enum { GETPROTO_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_obj_getproto_steps[] = {
+    GETPROTO_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.12 step 1 (obj is ToObject(O))",
+        "20.1.2.12 step 2 (obj.[[GetPrototypeOf]]())")
+    NULL };
+static const char *const js_reflect_getproto_steps[] = {
+    GETPROTO_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.7 step 1 (target is an Object)",
+        "28.1.7 step 2 (target.[[GetPrototypeOf]]())")
+    NULL };
+
 static int js_getproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSGetProto *s = st;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == GETPROTO_RECV) {
         JSValueConst val = step_arg(&s->hdr, 0);
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;   /* FIRST, before anything that can throw: the teardown frees what it holds */
@@ -65310,7 +65381,7 @@ static int js_getproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
                 return -1;
             }
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = GETPROTO_GET;
         s->hdr.cb_coerce[0] = val;   /* borrowed: the caller's stack holds it across the request */
         *out_cb = s->hdr.cb_coerce; *out_argc = 0;
         return 18;   /* GETPROTO */
@@ -65344,12 +65415,34 @@ typedef struct JSGopd {
     JSAtom atom;      /* the coerced key (owned) */
 } JSGopd;
 
+/* Object.getOwnPropertyDescriptor and Reflect.getOwnPropertyDescriptor: the same three steps, differing only in
+   whether step 1 boxes a primitive or rejects it. Step 4's FromPropertyDescriptor runs none of the page's code —
+   the engine builds the object — so the machine ends in the stage that rests at step 3. ONE stage list expanded
+   once per algorithm — see AFIND_STAGES. */
+#define GOPD_STAGES(X, RECV, KEY, GET) \
+    X(GOPD_RECV, RECV) \
+    X(GOPD_KEY,  KEY)  \
+    X(GOPD_GET,  GET)
+enum { GOPD_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_obj_gopd_steps[] = {
+    GOPD_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.8 step 1 (obj is ToObject(O))",
+        "20.1.2.8 step 2 (key is ToPropertyKey(P))",
+        "20.1.2.8 step 3 (desc is obj.[[GetOwnProperty]](key))")
+    NULL };
+static const char *const js_reflect_gopd_steps[] = {
+    GOPD_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.6 step 1 (target is an Object)",
+        "28.1.6 step 2 (key is ToPropertyKey(propertyKey))",
+        "28.1.6 step 3 (desc is target.[[GetOwnProperty]](key))")
+    NULL };
+
 static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSGopd *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == GOPD_RECV) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->result = JS_UNDEFINED; s->atom = JS_ATOM_NULL;
@@ -65362,18 +65455,18 @@ static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **o
             s->obj = JS_ToObject(ctx, step_arg(&s->hdr, 0));   /* a primitive wrapper; runs no user code */
             if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = GOPD_KEY;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == GOPD_KEY) {
         r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->atom, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = GOPD_GET;
         s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds it across the request */
         *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->atom;
         return 12;
     }
-    DCHECK(s->hdr.stage == 2, "getOwnPropertyDescriptor: unknown stage");
+    DCHECK(s->hdr.stage == GOPD_GET, "getOwnPropertyDescriptor: unknown stage");
     s->result = cb_result;
     return JS_IsException(s->result) ? -1 : 0;
 }
@@ -73953,27 +74046,47 @@ static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, H
 static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result);
 static void js_gopd_visit(JSContext *ctx, void *st, JSStepVisit *v);
-static const JSTrampStepDef js_obj_gopd_def       = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 0, .visit = js_gopd_visit };
-static const JSTrampStepDef js_reflect_gopd_def   = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 1, .visit = js_gopd_visit };
+static const JSTrampStepDef js_obj_gopd_def       = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 0, .visit = js_gopd_visit,
+                                                     .algorithm = "20.1.2.8 Object.getOwnPropertyDescriptor",
+                                                     .steps = js_obj_gopd_steps };
+static const JSTrampStepDef js_reflect_gopd_def   = { sizeof(JSGopd), js_gopd_step, js_gopd_fini, 1, .visit = js_gopd_visit,
+                                                     .algorithm = "28.1.6 Reflect.getOwnPropertyDescriptor",
+                                                     .steps = js_reflect_gopd_steps };
 static int js_getproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_getproto_fini(JSContext *ctx, void *st, bool take_result);
 static void js_getproto_visit(JSContext *ctx, void *st, JSStepVisit *v);
 /* Object.getPrototypeOf and Reflect.getPrototypeOf differ only in whether a PRIMITIVE argument is boxed or
    rejected — Object's ES6 concession — which is the arg, exactly as it was the C function's magic. */
-static const JSTrampStepDef js_obj_getproto_def     = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 0, .visit = js_getproto_visit };
-static const JSTrampStepDef js_reflect_getproto_def = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 1, .visit = js_getproto_visit };
+static const JSTrampStepDef js_obj_getproto_def     = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 0, .visit = js_getproto_visit,
+                                                        .algorithm = "20.1.2.12 Object.getPrototypeOf",
+                                                        .steps = js_obj_getproto_steps };
+static const JSTrampStepDef js_reflect_getproto_def = { sizeof(JSGetProto), js_getproto_step, js_getproto_fini, 1, .visit = js_getproto_visit,
+                                                        .algorithm = "28.1.7 Reflect.getPrototypeOf",
+                                                        .steps = js_reflect_getproto_steps };
 static int js_extop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_extop_fini(JSContext *ctx, void *st, bool take_result);
 static void js_extop_visit(JSContext *ctx, void *st, JSStepVisit *v);
-static const JSTrampStepDef js_obj_isext_def      = { sizeof(JSExtOp), js_extop_step, js_extop_fini, 0, .visit = js_extop_visit };
-static const JSTrampStepDef js_reflect_isext_def  = { sizeof(JSExtOp), js_extop_step, js_extop_fini, EXTOP_REFLECT, .visit = js_extop_visit };
-static const JSTrampStepDef js_obj_prevext_def    = { sizeof(JSExtOp), js_extop_step, js_extop_fini, EXTOP_PREVENT, .visit = js_extop_visit };
-static const JSTrampStepDef js_reflect_prevext_def= { sizeof(JSExtOp), js_extop_step, js_extop_fini, EXTOP_PREVENT | EXTOP_REFLECT, .visit = js_extop_visit };
+static const JSTrampStepDef js_obj_isext_def      = { sizeof(JSExtOp), js_extop_step, js_extop_fini, 0, .visit = js_extop_visit,
+                                                     .algorithm = "20.1.2.16 Object.isExtensible",
+                                                     .steps = js_obj_isext_steps };
+static const JSTrampStepDef js_reflect_isext_def  = { sizeof(JSExtOp), js_extop_step, js_extop_fini, EXTOP_REFLECT, .visit = js_extop_visit,
+                                                     .algorithm = "28.1.9 Reflect.isExtensible",
+                                                     .steps = js_reflect_isext_steps };
+static const JSTrampStepDef js_obj_prevext_def    = { sizeof(JSExtOp), js_extop_step, js_extop_fini, EXTOP_PREVENT, .visit = js_extop_visit,
+                                                     .algorithm = "20.1.2.20 Object.preventExtensions",
+                                                     .steps = js_obj_prevext_steps };
+static const JSTrampStepDef js_reflect_prevext_def= { sizeof(JSExtOp), js_extop_step, js_extop_fini, EXTOP_PREVENT | EXTOP_REFLECT, .visit = js_extop_visit,
+                                                     .algorithm = "28.1.11 Reflect.preventExtensions",
+                                                     .steps = js_reflect_prevext_steps };
 static int js_setproto_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_setproto_fini(JSContext *ctx, void *st, bool take_result);
 static void js_setproto_visit(JSContext *ctx, void *st, JSStepVisit *v);
-static const JSTrampStepDef js_obj_setproto_def     = { sizeof(JSSetProto), js_setproto_step, js_setproto_fini, 0, .visit = js_setproto_visit };
-static const JSTrampStepDef js_reflect_setproto_def = { sizeof(JSSetProto), js_setproto_step, js_setproto_fini, 1, .visit = js_setproto_visit };
+static const JSTrampStepDef js_obj_setproto_def     = { sizeof(JSSetProto), js_setproto_step, js_setproto_fini, 0, .visit = js_setproto_visit,
+                                                        .algorithm = "20.1.2.23 Object.setPrototypeOf",
+                                                        .steps = js_obj_setproto_steps };
+static const JSTrampStepDef js_reflect_setproto_def = { sizeof(JSSetProto), js_setproto_step, js_setproto_fini, 1, .visit = js_setproto_visit,
+                                                        .algorithm = "28.1.13 Reflect.setPrototypeOf",
+                                                        .steps = js_reflect_setproto_steps };
 /* ALL FIVE iterator-helper factories, as ONE machine. take/drop were a coerce-then-compute definition and
    map/filter/flatMap were plain C functions, and the `next` READ their shared body performed could be routed from
    neither shape. The kind rides body_magic, exactly as it did on the C function; onerror is the IfAbruptClose. */
@@ -75275,41 +75388,55 @@ static const JSTrampStepDef js_promise_reject_def = {
 typedef struct JSPromiseCatch {
     JSStepHdr hdr;         /* MUST be first */
     JSValue result;        /* owned: then's return, which IS catch's */
-    JSValue cb_args[4];    /* [this=promise, then, undefined, onRejected] */
+    JSValue method;        /* owned: what the GetV produced, held across the Call */
+    JSValue cb[4];         /* the CALL request's [this=promise, then, undefined, onRejected] */
+    uint8_t call_phase;
 } JSPromiseCatch;
 _Static_assert(offsetof(JSPromiseCatch, hdr) == 0, "JSStepHdr must be first in JSPromiseCatch");
+
+/* WHICH STEP OF 27.2.5.1 EACH STAGE RESTS AT. The whole algorithm is one Invoke, so the two stages are 7.3.20's
+   two operations — and BOTH are the page's code, which is why they are two stages and not one. Stage 0 used to
+   ISSUE the read and stage 1 CONSUME it, so the machine parked one stage past the operation it was inside; the
+   sub-sequence form parks at the stage that names the read, which is what a resume has to be able to say. */
+#define PCATCH_STAGES(X) \
+    X(PCATCH_GET,  "27.2.5.1 step 2 -> 7.3.20 Invoke step 2 (func is GetV(promise, \"then\"))") \
+    X(PCATCH_CALL, "27.2.5.1 step 2 -> 7.3.20 Invoke step 3 (Call(func, promise, <<undefined, onRejected>>))")
+enum { PCATCH_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_promise_catch_steps[] = { PCATCH_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_promise_catch_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPromiseCatch *s = st;
-    if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
-        s->hdr.stage = 1;
-        s->cb_args[0] = js_dup(s->hdr.this_val);
-        *out_cb = s->cb_args; *out_argc = (int)JS_ATOM_then;
-        return 6;   /* GETPROP: Invoke's GetV(promise, "then") */
+    int r;
+
+    if (s->hdr.stage == PCATCH_GET) {
+        r = step_getprop_run(ctx, &s->hdr, s->hdr.this_val, JS_ATOM_then, cb_result, &s->method,
+                             out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = PCATCH_CALL;
     }
-    if (s->hdr.stage == 1) {
-        /* cb_result = the `then` method. Invoke's Call is next; a non-callable one is that Call's TypeError. */
-        s->hdr.stage = 2;
-        s->cb_args[1] = cb_result;                       /* the method (owned) */
-        s->cb_args[2] = JS_UNDEFINED;                    /* onFulfilled */
-        s->cb_args[3] = js_dup(step_arg(&s->hdr, 0));    /* onRejected */
-        *out_cb = s->cb_args; *out_argc = 2;
-        return 3;   /* CALL */
+    {
+        /* a non-callable `then` is this Call's TypeError, which is where the spec puts it. */
+        JSValueConst args[2];
+        args[0] = JS_UNDEFINED;                  /* onFulfilled */
+        args[1] = step_arg(&s->hdr, 0);          /* onRejected */
+        r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb), s->method, s->hdr.this_val,
+                          2, args, cb_result, &s->result, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
     }
-    s->result = cb_result;
     return 0;
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). [this=promise, then, undefined, onRejected] — the promise and
-   the `then` read off it are references this machine took, and onRejected was dup'd out of the call. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The `then` read off the promise is a reference this machine
+   took and holds across the Call, and the call buffer holds [this, func, args] while the request is in flight. */
 static void js_promise_catch_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSPromiseCatch *s = st;
     int k;
     v->val(ctx, &s->result);
-    for (k = 0; k < 4; k++) v->val(ctx, &s->cb_args[k]);
+    v->val(ctx, &s->method);
+    for (k = 0; k < 4; k++) v->val(ctx, &s->cb[k]);
 }
 
 static JSValue js_promise_catch_fini(JSContext *ctx, void *st, bool take_result)
@@ -75323,7 +75450,8 @@ static JSValue js_promise_catch_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 static const JSTrampStepDef js_promise_catch_def = {
-    sizeof(JSPromiseCatch), js_promise_catch_step, js_promise_catch_fini, 0, .visit = js_promise_catch_visit
+    sizeof(JSPromiseCatch), js_promise_catch_step, js_promise_catch_fini, 0, .visit = js_promise_catch_visit,
+    .algorithm = "27.2.5.1 Promise.prototype.catch", .steps = js_promise_catch_steps
 };
 
 /* .finally's machine is defined with the rest of the Promise code, below this table, because it builds the
