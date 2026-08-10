@@ -68903,16 +68903,29 @@ static bool js_error_stack_formatting(void)
     return false;
 }
 
+/* `Error.prototype.stack` IS NOT ECMASCRIPT — it is V8's stack-trace API, and its steps are that API's, so
+   they are cited by their documented names rather than by a clause number that does not exist. The read either
+   answers a string the capture already formatted, or CALLS the page's `Error.prepareStackTrace(error,
+   callsites)` and memoizes what it returns; the call is the one thing that reaches the page, and it is the
+   stage this machine parks at. */
+#define ESTACK_STAGES(X) \
+    X(ESTACK_READ,    "V8 stack-trace API: read the Error's captured stack — a formatted string is the answer, " \
+                      "and a pending [prepareStackTrace, callsites] pair becomes the call below") \
+    X(ESTACK_PREPARE, "V8 stack-trace API: Error.prepareStackTrace(error, structuredStackTrace), whose result " \
+                      "is memoized onto the Error")
+enum { ESTACK_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_error_get_stack_steps[] = { ESTACK_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
                                    JSValue **out_cb, int *out_argc)
 {
     JSErrGetStack *s = st;
     JSObject *p;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ESTACK_READ) {
         JSValue d;
         JS_FreeValue(ctx, cb_result);
-        s->hdr.stage = 1;
+        s->hdr.stage = ESTACK_PREPARE;
         s->result = JS_UNDEFINED;
         s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
         s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
@@ -68964,7 +68977,7 @@ static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
         *out_cb = s->cb; *out_argc = 2;
         return 3;
     }
-    DCHECK(s->hdr.stage == 1, "the Error stack accessor resumed in an unknown stage");
+    DCHECK(s->hdr.stage == ESTACK_PREPARE, "the Error stack accessor resumed in an unknown stage");
     /* the hook's THROW propagates out of the accessor, exactly as any getter's does. build_backtrace used to
        swallow it because it ran under a live exception; there is no exception here to protect. */
     if (JS_IsException(cb_result))
@@ -74056,7 +74069,9 @@ static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_it
                                                     .home_class = JS_CLASS_ITERATOR, .visit = js_iter_setter_visit,
                                                     .algorithm = "27.1.4.14.2 set Iterator.prototype [ %Symbol.toStringTag% ]",
                                                     .steps = js_iter_set_tag_steps };
-static const JSTrampStepDef js_error_get_stack_def = { sizeof(JSErrGetStack), js_error_get_stack_step, js_error_get_stack_fini, 0, .visit = js_error_get_stack_visit };
+static const JSTrampStepDef js_error_get_stack_def = { sizeof(JSErrGetStack), js_error_get_stack_step, js_error_get_stack_fini, 0, .visit = js_error_get_stack_visit,
+                        .algorithm = "V8 stack-trace API: the Error.prototype.stack getter",
+                        .steps = js_error_get_stack_steps };
 static const JSTrampStepDef js_error_set_stack_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_stack,
                                                       .home_class = JS_CLASS_ERROR, .precheck = js_error_stack_precheck, .visit = js_iter_setter_visit,
                                                       .algorithm = "set Error.prototype.stack (proposal-error-stack-accessor)",
@@ -76366,11 +76381,22 @@ struct JSMapUpsert {
    the map — a continuation-holding builtin, driven by js_map_getOrInsert with JS_Call from its C entry, so
    `new Map().getOrInsertComputed(1, function(){ for(;;){} })` aborted with no flow base. `arg` is the same
    `class_id << 1 | computed` magic the C body took. */
-#define MAP_UPSERT_DEF(magic) { sizeof(struct JSMapUpsert), js_map_upsert_step, js_map_upsert_fini, (magic) }
-static const JSTrampStepDef js_map_upsert_def      = MAP_UPSERT_DEF(JS_CLASS_MAP << 1 | 0);
-static const JSTrampStepDef js_map_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS_MAP << 1 | 1);
-static const JSTrampStepDef js_weakmap_upsert_def      = MAP_UPSERT_DEF(JS_CLASS_WEAKMAP << 1 | 0);
-static const JSTrampStepDef js_weakmap_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS_WEAKMAP << 1 | 1);
+static void js_map_upsert_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const char *const js_map_upsert_steps[];
+static const char *const js_map_upsert_comp_steps[];
+static const char *const js_weakmap_upsert_steps[];
+static const char *const js_weakmap_upsert_comp_steps[];
+#define MAP_UPSERT_DEF(magic, alg, stagelist) \
+    { sizeof(struct JSMapUpsert), js_map_upsert_step, js_map_upsert_fini, (magic), \
+      .visit = js_map_upsert_visit, .algorithm = (alg), .steps = (stagelist) }
+static const JSTrampStepDef js_map_upsert_def      = MAP_UPSERT_DEF(JS_CLASS_MAP << 1 | 0,
+    "24.1.3.7 Map.prototype.getOrInsert", js_map_upsert_steps);
+static const JSTrampStepDef js_map_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS_MAP << 1 | 1,
+    "24.1.3.8 Map.prototype.getOrInsertComputed", js_map_upsert_comp_steps);
+static const JSTrampStepDef js_weakmap_upsert_def      = MAP_UPSERT_DEF(JS_CLASS_WEAKMAP << 1 | 0,
+    "24.3.3.4 WeakMap.prototype.getOrInsert", js_weakmap_upsert_steps);
+static const JSTrampStepDef js_weakmap_upsert_comp_def = MAP_UPSERT_DEF(JS_CLASS_WEAKMAP << 1 | 1,
+    "24.3.3.5 WeakMap.prototype.getOrInsertComputed", js_weakmap_upsert_comp_steps);
 /* likewise: the resolving-function machine is defined with the Promise code it settles. */
 static const JSTrampStepDef js_promise_resolvefn_def;
 static const JSTrampStepDef js_proxy_call_def;
@@ -90777,10 +90803,35 @@ static JSValue js_map_get(JSContext *ctx, JSValueConst this_val,
         return js_dup(mr->value);
 }
 
-/* 24.1.3.x getOrInsert / getOrInsertComputed, as ONE machine. The computed form's callbackfn is the page's
-   code AND the operation continues into the map afterwards — a continuation-holding builtin, which
-   js_map_getOrInsert drove with JS_Call from its C entry. Everything else in it (the record walk, the add, the
-   weak-target test) invokes nothing. */
+/* getOrInsert / getOrInsertComputed, as ONE machine. The computed form's callbackfn is the page's code AND the
+   operation continues into the map afterwards — a continuation-holding builtin, which js_map_getOrInsert drove
+   with JS_Call from its C entry. Everything else in it (the record walk, the add, the weak-target test) invokes
+   nothing.
+   FOUR algorithms; the plain forms never reach the CALL stage, so their arrays end one stage earlier and a plain
+   machine resting there is a stage past its end, which step_stage_check names on its own. */
+#define MAPUPSERT_STAGES(X, ENTRY) X(MAPUPSERT_ENTRY, ENTRY)
+#define MAPUPSERT_CALL_STAGE(X, CALL) X(MAPUPSERT_CALL, CALL)
+enum { MAPUPSERT_STAGES(JS_STEP_STAGE_ENUM, 0) MAPUPSERT_CALL_STAGE(JS_STEP_STAGE_ENUM, 0) };
+static const char *const js_map_upsert_steps[] = {
+    MAPUPSERT_STAGES(JS_STEP_STAGE_LABEL,
+        "24.1.3.7 steps 1-4 (M has [[MapData]]; key is canonicalized; the record walk)")
+    NULL };
+static const char *const js_map_upsert_comp_steps[] = {
+    MAPUPSERT_STAGES(JS_STEP_STAGE_LABEL,
+        "24.1.3.8 steps 1-5 (M has [[MapData]]; IsCallable(callbackfn); key is canonicalized; the record walk)")
+    MAPUPSERT_CALL_STAGE(JS_STEP_STAGE_LABEL,
+        "24.1.3.8 step 6 (value is Call(callbackfn, undefined, <<key>>))")
+    NULL };
+static const char *const js_weakmap_upsert_steps[] = {
+    MAPUPSERT_STAGES(JS_STEP_STAGE_LABEL,
+        "24.3.3.4 steps 1-4 (M has [[WeakMapData]]; key is a valid WeakMap key; the record walk)")
+    NULL };
+static const char *const js_weakmap_upsert_comp_steps[] = {
+    MAPUPSERT_STAGES(JS_STEP_STAGE_LABEL,
+        "24.3.3.5 steps 1-5 (M has [[WeakMapData]]; IsCallable(callbackfn); a valid key; the record walk)")
+    MAPUPSERT_CALL_STAGE(JS_STEP_STAGE_LABEL,
+        "24.3.3.5 step 6 (value is Call(callbackfn, undefined, <<key>>))")
+    NULL };
 _Static_assert(offsetof(struct JSMapUpsert, hdr) == 0, "JSStepHdr must be first in JSMapUpsert");
 
 static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -90798,7 +90849,7 @@ static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     if (!ms) { JS_FreeValue(ctx, cb_result); return -1; }
     key = map_normalize_key_const(ctx, step_arg(&s->hdr, 0));
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == MAPUPSERT_ENTRY) {
         JS_FreeValue(ctx, cb_result);
         s->result = JS_UNDEFINED;
         s->cb_args[0] = JS_UNDEFINED; s->cb_args[1] = JS_UNDEFINED; s->cb_args[2] = JS_UNDEFINED;
@@ -90811,7 +90862,7 @@ static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         mr = map_find_record(ctx, ms, key);
         if (mr) { s->result = js_dup(mr->value); return 0; }
         if (computed) {
-            s->hdr.stage = 1;
+            s->hdr.stage = MAPUPSERT_CALL;
             s->cb_args[1] = js_dup(step_arg(&s->hdr, 1));
             s->cb_args[2] = js_dup(key);
             *out_cb = s->cb_args; *out_argc = 1;
@@ -90819,13 +90870,21 @@ static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         }
         value = js_dup(step_arg(&s->hdr, 1));
     } else {
-        /* the callbackfn returned. It may have inserted the key itself, which the spec discards in favour of
-           this value — the same re-find-and-delete the C body performed, on a table it must look up again. */
-        DCHECK(s->hdr.stage == 1, "the map upsert resumed in no stage");
+        /* the callbackfn returned. It may have inserted the key itself, and the spec's step 7.a SETS that
+           record's value — it does not remove and re-append it. The C body deleted and re-added, which moves the
+           entry to the END of a Map's insertion order, so
+           `m.set("a",1); m.getOrInsertComputed("b", () => { m.set("b",0); m.set("c",3); return 2 })` iterated
+           a, c, b where the standard iterates a, b, c. Only naming the stage after step 6 made the step after
+           it something to read. The table is looked up again because the callback may have rehashed it. */
+        DCHECK(s->hdr.stage == MAPUPSERT_CALL, "the map upsert resumed in no stage");
         value = cb_result;
         mr = map_find_record(ctx, ms, key);
-        if (mr)
-            map_delete_record(ctx->rt, ms, mr);
+        if (mr) {
+            JS_FreeValue(ctx, mr->value);
+            mr->value = value;
+            s->result = js_dup(value);
+            return 0;
+        }
     }
     mr = map_add_record(ctx, ms, key);
     if (!mr) { JS_FreeValue(ctx, value); return -1; }
@@ -90834,12 +90893,24 @@ static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     return 0;
 }
 
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). It had none, so a concolic branch inside the callbackfn would
+   have hit the fork's DCHECK rather than forking: two arms of a flow standing in one getOrInsertComputed each
+   need their own callback operands and their own result. */
+static void js_map_upsert_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    struct JSMapUpsert *s = st;
+    v->val(ctx, &s->result);
+    v->val(ctx, &s->cb_args[0]);
+    v->val(ctx, &s->cb_args[1]);
+    v->val(ctx, &s->cb_args[2]);
+}
+
 static JSValue js_map_upsert_fini(JSContext *ctx, void *st, bool take_result)
 {
     struct JSMapUpsert *s = st;
-    JSValue r = take_result ? s->result : (JS_FreeValue(ctx, s->result), JS_UNDEFINED);
-    int i;
-    for (i = 0; i < 3; i++) JS_FreeValue(ctx, s->cb_args[i]);
+    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
+    tramp_step_visit_free(ctx, s);
     js_free_rt(ctx->rt, s);
     return r;
 }
