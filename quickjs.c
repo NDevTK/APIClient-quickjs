@@ -71665,12 +71665,47 @@ static JSValue js_ta_subarray_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* FIVE algorithms, one machine: validate and read the length, then coerce the arguments the page controls, then
+   a tail that runs nothing. The coercion stage carries its own `i` cursor over the arguments for the reason
+   JSStepHdr's len_phase carries one — it is one step's worth of sub-sequence, and each argument's conversion
+   COMPLETES before the next begins, which is the ordering the label names. ONE stage list expanded once per
+   algorithm; see AFIND_STAGES. */
+#define TACOERCE_STAGES(X, VALIDATE, COERCE) \
+    X(TACOERCE_VALIDATE, VALIDATE) \
+    X(TACOERCE_ARGS,     COERCE)
+enum { TACOERCE_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_ta_fill_steps[] = {
+    TACOERCE_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.9 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))",
+        "23.2.3.9 steps 4-12 (value is ToBigInt or ToNumber; start and end are ToIntegerOrInfinity)")
+    NULL };
+static const char *const js_ta_copyWithin_steps[] = {
+    TACOERCE_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.6 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))",
+        "23.2.3.6 steps 4-13 (target, start and end are ToIntegerOrInfinity)")
+    NULL };
+static const char *const js_ta_indexOf_steps[] = {
+    TACOERCE_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.17 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))",
+        "23.2.3.17 step 5 (n is ToIntegerOrInfinity(fromIndex))")
+    NULL };
+static const char *const js_ta_lastIndexOf_steps[] = {
+    TACOERCE_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.20 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))",
+        "23.2.3.20 step 5 (n is ToIntegerOrInfinity(fromIndex) when fromIndex is present)")
+    NULL };
+static const char *const js_ta_includes_steps[] = {
+    TACOERCE_STAGES(JS_STEP_STAGE_LABEL,
+        "23.2.3.16 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))",
+        "23.2.3.16 step 5 (n is ToIntegerOrInfinity(fromIndex))")
+    NULL };
+
 static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSTACoerce *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == TACOERCE_VALIDATE) {
         JSObject *p;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
@@ -71689,9 +71724,9 @@ static int js_ta_coerce_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         s->len = p->u.array.count;
         /* the defaults the spec gives an omitted bound: `start` 0, `end` the length */
         s->idx[0] = 0; s->idx[1] = 0; s->idx[2] = s->len;
-        s->hdr.stage = 1;
+        s->hdr.stage = TACOERCE_ARGS;
     }
-    while (s->hdr.stage == 1) {
+    while (s->hdr.stage == TACOERCE_ARGS) {
         int mode = TAPRO_MODE(s->hdr.arg);
         if (s->i >= 3) break;
         if (!ta_coerce_wants(s, s->i)) { s->i++; continue; }
@@ -71754,12 +71789,21 @@ static JSValue js_ta_coerce_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+/* Steps 9-12 build the result from primitives this machine already holds, so the last coercion's stage carries
+   them. */
+#define TAWITH_STAGES(X) \
+    X(TAWITH_VALIDATE, "23.2.3.36 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))") \
+    X(TAWITH_INDEX,    "23.2.3.36 steps 4-6 (relativeIndex is ToIntegerOrInfinity(index); actualIndex)") \
+    X(TAWITH_VALUE,    "23.2.3.36 steps 7-8 (numericValue is ToBigInt(value) or ToNumber(value))")
+enum { TAWITH_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_ta_with_steps[] = { TAWITH_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSTAWith *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == TAWITH_VALIDATE) {
         int vlen;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
@@ -71771,21 +71815,21 @@ static int js_ta_with_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         vlen = js_typed_array_get_length_unsafe(ctx, s->hdr.this_val);
         if (vlen < 0) return -1;
         s->len = vlen;
-        s->hdr.stage = 1;
+        s->hdr.stage = TAWITH_INDEX;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == TAWITH_INDEX) {
         r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         if (s->idx < 0) s->idx += s->len;   /* resolved against the ORIGINAL length, per steps 5-6 */
-        s->hdr.stage = 2;
+        s->hdr.stage = TAWITH_VALUE;
     }
-    if (s->hdr.stage == 2) {
+    DCHECK(s->hdr.stage == TAWITH_VALUE, "%TypedArray%.prototype.with resumed in no stage");
+    {
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 1), HINT_NUMBER, cb_result, &s->val,
                             out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 3;
     }
     JS_FreeValue(ctx, cb_result);
     { JSValue v = s->val; s->val = JS_UNDEFINED;
@@ -92593,6 +92637,23 @@ typedef struct JSPromiseResolveFn {
 } JSPromiseResolveFn;
 _Static_assert(offsetof(JSPromiseResolveFn, hdr) == 0, "JSStepHdr must be first in JSPromiseResolveFn");
 
+/* WHICH STEP OF THE PAIR EACH STAGE RESTS AT. ONE machine, TWO algorithms — which of them this is comes from the
+   CLASS, so one list names both and the reject half simply never reaches the second stage.
+   THE STEP NUMBERS IN THIS MACHINE WERE ALL ONE LOW: the comments said 6, 7, 8, 9, 11 and 12 for what ES2025
+   numbers 7, 8, 9, 10, 12 and 13-15 — the numbering of a much older edition, carried forward. A stage that
+   DECLARES its step is checked by the driver at every rest; a comment is checked by nobody, which is the whole
+   argument for the declaration and is what this pass keeps finding.
+   The second stage names a RANGE because the machine rests inside the only page-visible operation in it: the
+   `then` read parks here, and steps 10-15 that follow run no user code at all — the thenable's `then` is
+   ENQUEUED as a job rather than called. */
+#define PRF_STAGES(X) \
+    X(PRF_HEAD, "27.2.1.3.1 steps 1-7 / 27.2.1.3.2 steps 1-8 (the pair fires ONCE; a reject settles here, and " \
+                "so does a self resolution or a non-Object resolution)") \
+    X(PRF_THEN, "27.2.1.3.2 steps 9-15 (then is Get(resolution, \"then\"); an abrupt read REJECTS; a callable " \
+                "thenAction enqueues NewPromiseResolveThenableJob)")
+enum { PRF_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_promise_resolvefn_steps[] = { PRF_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 /* [[AlreadyResolved]] latches in exactly two places — the step machine below and the C entry a JS_Call from C
    still reaches — so the time-travel capture of it lives WITH the latch rather than beside each of them. Both
    arms of a fork call the same pre-fork `resolve`, and a latch that does not rewind makes the second call a
@@ -92618,17 +92679,17 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
     JSPromiseFunctionData *s = p->u.promise_function_data;
     bool is_reject = (p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION) != 0;
 
-    if (m->hdr.stage == 0) {
+    if (m->hdr.stage == PRF_HEAD) {
         JSValueConst resolution = step_arg(&m->hdr, 0);
         JS_FreeValue(ctx, cb_result);
         m->cb[0] = JS_UNDEFINED;   /* before anything that can throw: the teardown frees what the state holds */
-        /* step 1-3: the pair fires ONCE, and [[AlreadyResolved]] is shared with its twin. */
+        /* steps 5-6: the pair fires ONCE, and [[AlreadyResolved]] is shared with its twin. */
         if (!s || s->presolved->already_resolved) return 0;
         js_promise_latch_resolved(ctx, m->hdr.func_obj, s);
         if (is_reject || !JS_IsObject(resolution))
-            return js_promise_resolvefn_settle(ctx, s, resolution, is_reject);   /* step 7 / RejectPromise */
+            return js_promise_resolvefn_settle(ctx, s, resolution, is_reject);   /* 27.2.1.3.1 step 7 / .2 step 8 */
         if (js_same_value(ctx, resolution, s->promise)) {
-            /* step 6: resolving a promise with itself is a TypeError that REJECTS it, not a raise. */
+            /* step 7: resolving a promise with itself is a TypeError that REJECTS it, not a raise. */
             JSValue err;
             JS_ThrowTypeError(ctx, "promise self resolution");
             err = JS_GetException(ctx);
@@ -92636,29 +92697,29 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
             JS_FreeValue(ctx, err);
             return 0;
         }
-        m->hdr.stage = 1;
+        m->hdr.stage = PRF_THEN;
         m->cb[0] = js_dup(resolution);
         *out_cb = m->cb; *out_argc = (int)JS_ATOM_then;
-        return 6;   /* GETPROP: step 8's Get(resolution, "then") */
+        return 6;   /* GETPROP: step 9's Get(resolution, "then"), which is where the machine RESTS */
     }
-    DCHECK(m->hdr.stage == 1, "a promise resolving function has only the `then` read to wait on");
+    DCHECK(m->hdr.stage == PRF_THEN, "a promise resolving function has only the `then` read to wait on");
     {
         JSValueConst resolution = m->cb[0];
         JSValue then = cb_result;
         if (JS_IsException(then)) {
-            /* step 9: the read threw, and that abrupt completion REJECTS rather than propagating. */
+            /* step 10: the read threw, and that abrupt completion REJECTS rather than propagating. */
             JSValue err = JS_GetException(ctx);
             js_promise_resolvefn_settle(ctx, s, err, true);
             JS_FreeValue(ctx, err);
             return 0;
         }
         if (!JS_IsFunction(ctx, then)) {
-            /* step 11: a non-callable `then` means this is not a thenable — fulfil with it. */
+            /* step 12: a non-callable thenAction means this is not a thenable — fulfil with it. */
             JS_FreeValue(ctx, then);
             return js_promise_resolvefn_settle(ctx, s, resolution, false);
         }
         {
-            /* step 12: the CALL is deferred to a job, so nothing user-written runs here. */
+            /* steps 13-15: the CALL is deferred to a job, so nothing user-written runs here. */
             JSValueConst args[3];
             args[0] = s->promise;
             args[1] = resolution;
@@ -92689,8 +92750,10 @@ static JSValue js_promise_resolvefn_fini(JSContext *ctx, void *st, bool take_res
 static const JSTrampStepDef js_promise_resolvefn_def = {
     sizeof(JSPromiseResolveFn), js_promise_resolvefn_step, js_promise_resolvefn_fini, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
-    .catches_abrupt = 1   /* step 9: a throwing `then` read REJECTS, it does not propagate */,
-    .visit = js_promise_resolvefn_visit
+    .catches_abrupt = 1   /* step 10: a throwing `then` read REJECTS, it does not propagate */,
+    .visit = js_promise_resolvefn_visit,
+    .algorithm = "27.2.1.3.1 Promise Reject Functions / 27.2.1.3.2 Promise Resolve Functions",
+    .steps = js_promise_resolvefn_steps
 };
 
 static JSValue js_promise_resolve_function_call(JSContext *ctx,
@@ -93767,10 +93830,10 @@ _Static_assert(offsetof(JSPromiseThen, hdr) == 0, "JSStepHdr must be first in JS
    this algorithm and the engine already performs it as one sub-sequence (step_speciesctor_run), so the three
    collapse into the step the standard actually writes, and the duplicate copy of 7.3.22 goes with them. */
 #define PTHEN_STAGES(X) \
-    X(PTHEN_REQUIRE, "27.2.5.4 steps 2-3 (RequireInternalSlot(promise, [[PromiseState]]))") \
-    X(PTHEN_SPECIES, "27.2.5.4 step 4 (C is SpeciesConstructor(promise, %Promise%))") \
-    X(PTHEN_CAP,     "27.2.5.4 step 5 (resultCapability is NewPromiseCapability(C))") \
-    X(PTHEN_PERFORM, "27.2.5.4 step 6 (PerformPromiseThen(promise, onFulfilled, onRejected, resultCapability))")
+    X(PTHEN_REQUIRE, "27.2.5.4 steps 1-2 (promise is the this value; IsPromise(promise))") \
+    X(PTHEN_SPECIES, "27.2.5.4 step 3 (C is SpeciesConstructor(promise, %Promise%))") \
+    X(PTHEN_CAP,     "27.2.5.4 step 4 (resultCapability is NewPromiseCapability(C))") \
+    X(PTHEN_PERFORM, "27.2.5.4 step 5 (PerformPromiseThen(promise, onFulfilled, onRejected, resultCapability))")
 enum { PTHEN_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_promise_then_steps[] = { PTHEN_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -93783,13 +93846,13 @@ static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->ctor = JS_UNDEFINED; s->result = JS_UNDEFINED; s->cb_args[0] = JS_UNDEFINED;
-        /* steps 2-3: RequireInternalSlot([[PromiseState]]), before anything is read */
+        /* step 2: IsPromise(promise), before anything is read */
         if (!JS_GetOpaque2(ctx, s->hdr.this_val, JS_CLASS_PROMISE))
             return -1;
         s->hdr.stage = PTHEN_SPECIES;
     }
     if (s->hdr.stage == PTHEN_SPECIES) {
-        /* step 4: `constructor` and then @@species, either of which is an accessor or a Proxy trap — so the
+        /* step 3: `constructor` and then @@species, either of which is an accessor or a Proxy trap — so the
            machine parks INSIDE this one step rather than spending a stage on each half of it. */
         r = step_speciesctor_run(ctx, &s->hdr, s->hdr.this_val, ctx->promise_ctor, cb_result, &s->ctor,
                                  out_cb, out_argc);
@@ -93798,7 +93861,7 @@ static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         s->hdr.stage = PTHEN_CAP;
     }
     if (s->hdr.stage == PTHEN_CAP) {
-        /* step 5: a SUBCLASS constructor is the page's code, so the machine RESTS in this step — it issues the
+        /* step 4: a SUBCLASS constructor is the page's code, so the machine RESTS in this step — it issues the
            request while the header carries no capability and is re-entered at the same stage once the delivery
            has put one there, which is the same shape every *_run sub-sequence has. */
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
@@ -93810,7 +93873,7 @@ static int js_promise_then_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         JS_FreeValue(ctx, s->cb_args[0]); s->cb_args[0] = JS_UNDEFINED;
         s->hdr.stage = PTHEN_PERFORM;
     }
-    /* step 6: PerformPromiseThen invokes nothing. */
+    /* step 5: PerformPromiseThen invokes nothing. */
     JS_FreeValue(ctx, cb_result);
     {
         JSValueConst rf[2], handlers[2];
