@@ -65896,29 +65896,54 @@ typedef struct JSOwnKeys {
     JSValue keys;     /* the validated key ARRAY the request delivers (owned) */
 } JSOwnKeys;
 
+/* Object.getOwnPropertyNames and .getOwnPropertySymbols ARE 20.1.2.11.1 GetOwnPropertyKeys — their own bodies are
+   one line each — so their two stages name ITS steps, exactly as find's walk names FindViaPredicate's.
+   Reflect.ownKeys states the same two operations itself. Its step 3 and GetOwnPropertyKeys' steps 3-5 run none of
+   the page's code (the key array is one this engine built), so both finish in the stage that rests on the
+   internal method. ONE stage list expanded once per algorithm — see AFIND_STAGES. */
+#define OWNKEYS_STAGES(X, RECV, KEYS) \
+    X(OWNKEYS_RECV, RECV) \
+    X(OWNKEYS_KEYS, KEYS)
+enum { OWNKEYS_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
+static const char *const js_ownkeys_names_steps[] = {
+    OWNKEYS_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.11.1 step 1 (obj is ToObject(O))",
+        "20.1.2.11.1 step 2 (keys is obj.[[OwnPropertyKeys]]())")
+    NULL };
+static const char *const js_ownkeys_syms_steps[] = {
+    OWNKEYS_STAGES(JS_STEP_STAGE_LABEL,
+        "20.1.2.11.1 step 1 (obj is ToObject(O))",
+        "20.1.2.11.1 step 2 (keys is obj.[[OwnPropertyKeys]]())")
+    NULL };
+static const char *const js_reflect_ownkeys_steps[] = {
+    OWNKEYS_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.10 step 1 (target is an Object)",
+        "28.1.10 step 2 (keys is target.[[OwnPropertyKeys]]())")
+    NULL };
+
 static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSOwnKeys *s = st;
     JSValueConst arg0 = step_arg(&s->hdr, 0);
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == OWNKEYS_RECV) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->keys = JS_UNDEFINED;
         if (s->hdr.arg == OWNKEYS_REFLECT) {
-            /* 28.1.11 step 1: Reflect.ownKeys takes an Object, it does not coerce one. */
+            /* 28.1.10 step 1: Reflect.ownKeys takes an Object, it does not coerce one. */
             if (JS_VALUE_GET_TAG(arg0) != JS_TAG_OBJECT) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
             s->obj = js_dup(arg0);
         } else {
             s->obj = JS_ToObject(ctx, arg0);   /* a primitive wrapper; runs no user code */
             if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
         }
-        s->hdr.stage = 1;
+        s->hdr.stage = OWNKEYS_KEYS;
         s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds it across the request */
         *out_cb = s->hdr.cb_coerce; *out_argc = 0;
         return 11;
     }
-    DCHECK(s->hdr.stage == 1, "Object.getOwnPropertyNames: unknown stage");
+    DCHECK(s->hdr.stage == OWNKEYS_KEYS, "Object.getOwnPropertyNames: unknown stage");
     s->keys = cb_result;
     if (JS_IsException(s->keys)) { s->keys = JS_UNDEFINED; return -1; }
     if (s->hdr.arg == OWNKEYS_REFLECT)
@@ -73879,9 +73904,15 @@ static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), 
 static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1, .visit = js_obj_defprop_visit };
 static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result);
-static const JSTrampStepDef js_ownkeys_names_def  = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_STRING_MASK, .visit = js_ownkeys_visit };
-static const JSTrampStepDef js_ownkeys_syms_def   = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_SYMBOL_MASK, .visit = js_ownkeys_visit };
-static const JSTrampStepDef js_reflect_ownkeys_def = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, OWNKEYS_REFLECT, .visit = js_ownkeys_visit };
+static const JSTrampStepDef js_ownkeys_names_def  = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_STRING_MASK, .visit = js_ownkeys_visit,
+                                                     .algorithm = "20.1.2.10 Object.getOwnPropertyNames",
+                                                     .steps = js_ownkeys_names_steps };
+static const JSTrampStepDef js_ownkeys_syms_def   = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, JS_GPN_SYMBOL_MASK, .visit = js_ownkeys_visit,
+                                                     .algorithm = "20.1.2.11 Object.getOwnPropertySymbols",
+                                                     .steps = js_ownkeys_syms_steps };
+static const JSTrampStepDef js_reflect_ownkeys_def = { sizeof(JSOwnKeys), js_ownkeys_step, js_ownkeys_fini, OWNKEYS_REFLECT, .visit = js_ownkeys_visit,
+                                                     .algorithm = "28.1.10 Reflect.ownKeys",
+                                                     .steps = js_reflect_ownkeys_steps };
 static const JSTrampStepDef js_parseInt_def       = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 1 , .visit = js_parse_num_visit };
 static const JSTrampStepDef js_parseFloat_def     = { sizeof(JSParseNum), js_parse_num_step, js_parse_num_fini, 0 , .visit = js_parse_num_visit };
 static const JSTrampStepDef js_str_split_def      = { sizeof(JSStrSplit), js_str_split_step, js_str_split_fini, 0, .visit = js_str_split_visit };
@@ -73895,10 +73926,23 @@ static const JSTrampStepDef js_obj_descs_def      = { sizeof(JSPropWalk), js_pro
 static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result);
 static void js_reflect_prop_visit(JSContext *ctx, void *st, JSStepVisit *v);
-static const JSTrampStepDef js_reflect_get_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_GET, .visit = js_reflect_prop_visit };
-static const JSTrampStepDef js_reflect_set_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_SET, .visit = js_reflect_prop_visit };
-static const JSTrampStepDef js_reflect_has_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_HAS, .visit = js_reflect_prop_visit };
-static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_DELETE, .visit = js_reflect_prop_visit };
+/* Declared where the machine is; a definition sits with its siblings rather than with the algorithm it names. */
+static const char *const js_reflect_get_steps[];
+static const char *const js_reflect_set_steps[];
+static const char *const js_reflect_has_steps[];
+static const char *const js_reflect_del_steps[];
+static const JSTrampStepDef js_reflect_get_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_GET, .visit = js_reflect_prop_visit,
+                                                     .algorithm = "28.1.5 Reflect.get",
+                                                     .steps = js_reflect_get_steps };
+static const JSTrampStepDef js_reflect_set_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_SET, .visit = js_reflect_prop_visit,
+                                                     .algorithm = "28.1.12 Reflect.set",
+                                                     .steps = js_reflect_set_steps };
+static const JSTrampStepDef js_reflect_has_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_HAS, .visit = js_reflect_prop_visit,
+                                                     .algorithm = "28.1.8 Reflect.has",
+                                                     .steps = js_reflect_has_steps };
+static const JSTrampStepDef js_reflect_del_def    = { sizeof(JSReflectProp), js_reflect_prop_step, js_reflect_prop_fini, GP_DELETE, .visit = js_reflect_prop_visit,
+                                                     .algorithm = "28.1.4 Reflect.deleteProperty",
+                                                     .steps = js_reflect_del_steps };
 static const JSTrampStepDef js_obj_entries_def    = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ENTRIES, .visit = js_prop_walk_visit };
 static const JSTrampStepDef js_obj_assign_def     = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_ASSIGN, .visit = js_prop_walk_visit };
 static const JSTrampStepDef js_obj_defprops_def   = { sizeof(JSPropWalk), js_prop_walk_step, js_prop_walk_fini, PROPWALK_DEFPROPS, .visit = js_prop_walk_visit };
@@ -85178,9 +85222,8 @@ static void js_re_rep_visit(JSContext *ctx, void *st, JSStepVisit *v)
 /* 22.2.6.16 RegExp.prototype.test and 22.2.6.12 RegExp.prototype [ @@search ] ( string ) — ONE machine.
    js_regexp_Symbol_search ran every step from C: ToString(string), `? Get(rx,"lastIndex")`, the reset,
    RegExpExec (whose `exec` the page can patch), the re-read, the restore and `? Get(result,"index")`.
-   Stages: 0 the receiver check, 1 ToString(string), 2 Get "lastIndex", 3 the reset, 4 the exec, 5 the re-read,
-   8 the restore, 6 the null check, 7 Get "index". `test` is the same walk with 2, 3, 5 and 8 skipped — it saves
-   no lastIndex — which is what hdr.arg selects, and nothing else. */
+   `test` is the same walk with the four lastIndex stages skipped — it saves no lastIndex — which is what
+   hdr.arg selects, and nothing else. */
 /* 22.2.6.12 RegExp.prototype [ @@search ] and 22.2.6.16 RegExp.prototype.test are ONE machine, so ONE stage
    list expanded twice with each algorithm's own step text — see ACB_STAGES.
    TEST'S ARRAY IS SHORTER, and that is the declaration doing its job: test has no lastIndex to save, restore or
@@ -85246,7 +85289,7 @@ static int js_re_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = search ? RES_PREV : 4;
+        s->hdr.stage = search ? RES_PREV : RES_EXEC;
     }
     if (s->hdr.stage == RES_PREV) {
         /* step 4: `? Get(rx, "lastIndex")` — saved so the search leaves no trace */
@@ -85281,7 +85324,7 @@ static int js_re_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         /* step 8: restore, and again only when it actually changed */
         r = js_same_value(ctx, cur, s->prevLast);
         JS_FreeValue(ctx, cur);
-        s->hdr.stage = r ? RES_NULL : 8;
+        s->hdr.stage = r ? RES_NULL : RES_RESTORE;
     }
     if (s->hdr.stage == RES_RESTORE) {
         /* BORROWED, like every other value handed to a keyed write: the request buffer takes no reference and
@@ -87432,12 +87475,46 @@ int JS_AddIntrinsicJSON(JSContext *ctx)
    ordinary object can be an accessor. Their C bodies performed the second with JS_GetPropertyInternal /
    JS_SetPropertyInternal2 / JS_HasProperty / JS_DeleteProperty, so a looping getter, setter or trap had no flow
    base. def->arg is the GP_* op. */
+/* FOUR algorithms, one machine. Their first two steps are identical and their last is the internal method the
+   spelling names; `get` and `set` additionally default the receiver at step 3, which runs none of the page's code
+   and so belongs to the stage that rests on the method. ONE stage list expanded once per algorithm — see
+   AFIND_STAGES. */
+#define REFLPROP_STAGES(X, RECV, KEY, OP) \
+    X(REFLPROP_RECV, RECV) \
+    X(REFLPROP_KEY,  KEY)  \
+    X(REFLPROP_OP,   OP)
+enum { REFLPROP_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_reflect_get_steps[] = {
+    REFLPROP_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.5 step 1 (target is an Object)",
+        "28.1.5 step 2 (key is ToPropertyKey(propertyKey))",
+        "28.1.5 steps 3-4 (receiver defaults to target; target.[[Get]](key, receiver))")
+    NULL };
+static const char *const js_reflect_set_steps[] = {
+    REFLPROP_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.12 step 1 (target is an Object)",
+        "28.1.12 step 2 (key is ToPropertyKey(propertyKey))",
+        "28.1.12 steps 3-4 (receiver defaults to target; target.[[Set]](key, V, receiver))")
+    NULL };
+static const char *const js_reflect_has_steps[] = {
+    REFLPROP_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.8 step 1 (target is an Object)",
+        "28.1.8 step 2 (key is ToPropertyKey(propertyKey))",
+        "28.1.8 step 3 (target.[[HasProperty]](key))")
+    NULL };
+static const char *const js_reflect_del_steps[] = {
+    REFLPROP_STAGES(JS_STEP_STAGE_LABEL,
+        "28.1.4 step 1 (target is an Object)",
+        "28.1.4 step 2 (key is ToPropertyKey(propertyKey))",
+        "28.1.4 step 3 (target.[[Delete]](key))")
+    NULL };
+
 static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSReflectProp *s = st;
     int op = s->hdr.arg, r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == REFLPROP_RECV) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->result = JS_UNDEFINED; s->atom = JS_ATOM_NULL;
@@ -87445,13 +87522,13 @@ static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSV
             JS_ThrowTypeErrorNotAnObject(ctx); return -1;
         }
         s->obj = js_dup(step_arg(&s->hdr, 0));
-        s->hdr.stage = 1;
+        s->hdr.stage = REFLPROP_KEY;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == REFLPROP_KEY) {
         r = step_topropkey_run(ctx, &s->hdr, step_arg(&s->hdr, 1), cb_result, &s->atom, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = REFLPROP_OP;
         /* the receiver defaults to the object; `set` takes it one argument later than `get` does. */
         s->hdr.cb_coerce[0] = s->obj;
         if (op == GP_GET) {
@@ -87463,7 +87540,7 @@ static int js_reflect_prop_step(JSContext *ctx, void *st, JSValue cb_result, JSV
         *out_cb = s->hdr.cb_coerce; *out_argc = (int)s->atom;
         return (op == GP_GET) ? 13 : (op == GP_SET) ? 14 : (op == GP_DELETE) ? 15 : 7;
     }
-    DCHECK(s->hdr.stage == 2, "Reflect property operation: unknown stage");
+    DCHECK(s->hdr.stage == REFLPROP_OP, "Reflect property operation: unknown stage");
     s->result = cb_result;
     return JS_IsException(s->result) ? -1 : 0;
 }
@@ -87487,18 +87564,6 @@ static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result)
     js_free(ctx, s);
     return r;
 }
-
-static JSValue js_reflect_setPrototypeOf(JSContext *ctx, JSValueConst this_val,
-                                         int argc, JSValueConst *argv)
-{
-    int ret;
-    ret = JS_SetPrototypeInternal(ctx, argv[0], argv[1], false);
-    if (ret < 0)
-        return JS_EXCEPTION;
-    else
-        return js_bool(ret);
-}
-
 
 static const JSCFunctionListEntry js_reflect_funcs[] = {
     JS_CFUNC_STEP_DEF("apply", 3, STEPDEF_REFLECT_APPLY ),
@@ -92906,83 +92971,115 @@ static JSValue js_promise_finally_thrower(JSContext *ctx, JSValueConst this_val,
    inline. */
 typedef struct JSPromiseThenFinally {
     JSStepHdr hdr;         /* MUST be first */
-    JSValue value;         /* owned: the original settled value/reason (replayed by the thunk) */
-    JSValue result;        /* owned: the .then result (the derived promise), set at phase 2 */
+    JSValue cbres;         /* owned: step 3's result, held until step 6 consumes it */
+    JSValue result;        /* owned: the Invoke's return, which IS this function's */
     int magic;             /* 0 = fulfil path (value thunk); 1 = reject path (thrower) */
-    JSValue ctor;          /* owned: the species constructor (needed at phase 1) */
-    JSValue cb_args[3];    /* phase 0: [undefined, onFinally]; phase 1: [promise, then_method, then_func] */
+    JSValue ctor;          /* owned: F.[[Constructor]], step 4 */
+    JSValue promise;       /* owned: step 6's promise, held across the `then` read and the Call */
+    JSValue method;        /* owned: the `then` the Invoke read off it */
+    JSValue thunk;         /* owned: step 8's valueThunk / thrower */
+    JSValue cb[3];         /* the CALL request's [this, func, arg] */
+    uint8_t call_phase, res_phase;
 } JSPromiseThenFinally;
 _Static_assert(offsetof(JSPromiseThenFinally, hdr) == 0, "JSStepHdr must be first in JSPromiseThenFinally");
 
-/* The phases ARE the header's stage: 0 = capture the closure's bound data and call onFinally, 1 = build the
-   derived promise and drive its .then, 2 = deliver. A private `phase` counter beside hdr.stage was two names for
-   one cursor. */
+/* WHICH STEP OF 27.2.5.3.1 / .2 EACH STAGE RESTS AT. The two closures are ONE machine because the standard
+   numbers them identically — only the closure built at step 8 differs — so one list serves both, and the
+   `algorithm` says which pair a parked flow is in.
+   The stages were 0, 1, 4 and 2, chosen so the DELEGATE could tell its own re-entry from a fresh one, and the
+   machine parked one stage PAST every operation it was inside. Each of the four now rests at the operation it
+   is performing, and the sub-phase byte is what distinguishes issue from delivery — the same shape every *_run
+   sub-sequence has. */
+#define TFIN_STAGES(X) \
+    X(TFIN_ONFINALLY, "27.2.5.3.1 / .2 step 3 (result is Call(onFinally, undefined))") \
+    X(TFIN_RESOLVE,   "27.2.5.3.1 / .2 step 6 (promise is PromiseResolve(C, result))") \
+    X(TFIN_GET_THEN,  "27.2.5.3.1 / .2 step 9 -> 7.3.20 Invoke step 2 (func is GetV(promise, \"then\"))") \
+    X(TFIN_THEN,      "27.2.5.3.1 / .2 step 9 -> 7.3.20 Invoke step 3 (Call(func, promise, <<valueThunk>>))")
+enum { TFIN_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_promise_then_finally_steps[] = { TFIN_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPromiseThenFinally *s = st;
-    if (s->hdr.stage == 0) {
+    int r;
+
+    if (s->hdr.stage == TFIN_ONFINALLY) {
         JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
-        s->hdr.stage = 1;
-        JS_FreeValue(ctx, cb_result);          /* UNDEFINED on the first step */
-        s->ctor = js_dup(rec->data[0]);
-        s->cb_args[0] = JS_UNDEFINED;
-        s->cb_args[1] = js_dup(rec->data[1]);   /* onFinally */
-        s->cb_args[2] = JS_UNDEFINED;
-        s->value = js_dup(step_arg(&s->hdr, 0));
-        s->result = JS_UNDEFINED;
-        s->magic = rec->magic;
-        *out_cb = s->cb_args; *out_argc = 0;   /* onFinally() — no args */
-        return 3;
+        if (s->call_phase == 0) {
+            /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. Steps 1-2
+               and 4-5 are the closure's captured data and two asserts — no user code, so no stage of their own. */
+            s->cbres = JS_UNDEFINED; s->result = JS_UNDEFINED;
+            s->promise = JS_UNDEFINED; s->method = JS_UNDEFINED; s->thunk = JS_UNDEFINED;
+            s->ctor = js_dup(rec->data[0]);
+            s->magic = rec->magic;
+        }
+        /* step 3: onFinally is the page's, and its body can loop. */
+        r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb), rec->data[1], JS_UNDEFINED,
+                          0, NULL, cb_result, &s->cbres, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = TFIN_RESOLVE;
     }
-    if (s->hdr.stage == 1) {
-        /* cb_result = onFinally's return. 27.2.5.3 step 4 is PromiseResolve(C, result) — the ABSTRACT OPERATION,
-           not `C.resolve`, so it cannot be reached as an ordinary call — and that operation IS the
-           Promise.resolve step machine. DELEGATE to it: driving it from C is what made `.finally` on a SUBCLASS
-           run that subclass's constructor and resolving function to completion. */
-        void *inner;
-        JSValueConst iarg = cb_result;
-        s->hdr.stage = 4;
-        JS_FreeValue(ctx, s->cb_args[1]);      /* onFinally no longer needed (phase 0 consumed it) */
-        s->cb_args[1] = JS_UNDEFINED;
-        inner = tramp_step_state_new(ctx, &js_promise_resolve_def, s->ctor, 1, &iarg, JS_UNDEFINED);
-        JS_FreeValue(ctx, cb_result);
-        if (!inner) return -1;
-        s->hdr.delegate = inner;
-        return 17;   /* DELEGATE */
+    if (s->hdr.stage == TFIN_RESOLVE) {
+        /* step 6: PromiseResolve(C, result) is the ABSTRACT OPERATION, not `C.resolve`, so it cannot be reached
+           as an ordinary call — and that operation IS the Promise.resolve step machine. DELEGATE to it: driving
+           it from C is what made `.finally` on a SUBCLASS run that subclass's constructor and its resolving
+           function to completion. */
+        if (s->res_phase == 0) {
+            JSValueConst iarg = s->cbres;
+            void *inner = tramp_step_state_new(ctx, &js_promise_resolve_def, s->ctor, 1, &iarg, JS_UNDEFINED);
+            JS_FreeValue(ctx, cb_result);
+            if (!inner) return -1;
+            s->hdr.delegate = inner;
+            s->res_phase = 1;
+            return 17;   /* DELEGATE */
+        }
+        s->res_phase = 0;
+        JS_FreeValue(ctx, s->cbres); s->cbres = JS_UNDEFINED;
+        s->promise = cb_result; cb_result = JS_UNDEFINED;
+        s->hdr.stage = TFIN_GET_THEN;
     }
-    if (s->hdr.stage == 4) {
-        /* cb_result = PromiseResolve's promise. Build the value-thunk/thrower and drive promise.then(then_func)
-           as the SECOND callback (its .then can be a user thenable that loops). */
-        JSValue promise = cb_result, then_func, then_method;
-        s->hdr.stage = 2;
-        then_func = JS_NewCFunctionData(ctx, s->magic == 0 ? js_promise_finally_value_thunk : js_promise_finally_thrower,
-                                        0, 0, 1, vc(&s->value));
-        if (JS_IsException(then_func)) { JS_FreeValue(ctx, promise); return -1; }
-        then_method = JS_GetProperty(ctx, promise, JS_ATOM_then);
-        if (JS_IsException(then_method)) { JS_FreeValue(ctx, promise); JS_FreeValue(ctx, then_func); return -1; }
-        s->cb_args[0] = promise;               /* this */
-        s->cb_args[1] = then_method;           /* the .then method */
-        s->cb_args[2] = then_func;             /* the thunk/thrower argument */
-        *out_cb = s->cb_args; *out_argc = 1;   /* promise.then(then_func) */
-        return 3;
+    if (s->hdr.stage == TFIN_GET_THEN) {
+        /* step 9's Invoke READS `then` off that promise, and on a subclass that read is the page's — an accessor
+           on the subclass prototype, or a Proxy. It was a JS_GetProperty from C, which has no flow under it. */
+        r = step_getprop_run(ctx, &s->hdr, s->promise, JS_ATOM_then, cb_result, &s->method, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+        s->hdr.stage = TFIN_THEN;
     }
-    /* phase 2: cb_result = the .then result — that IS the derived promise then_finally returns */
-    s->result = cb_result;
+    if (s->call_phase == 0) {
+        /* steps 7-8: the closure that replays the settled value, or rethrows the reason. */
+        JSValueConst d[1];
+        d[0] = step_arg(&s->hdr, 0);
+        s->thunk = JS_NewCFunctionData(ctx, s->magic == 0 ? js_promise_finally_value_thunk
+                                                          : js_promise_finally_thrower, 0, 0, 1, d);
+        if (JS_IsException(s->thunk)) { s->thunk = JS_UNDEFINED; JS_FreeValue(ctx, cb_result); return -1; }
+    }
+    {
+        /* step 9's Call. A user thenable's `then` can loop, so this parks like every other. */
+        JSValueConst arg = s->thunk;
+        r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb), s->method, s->promise,
+                          1, &arg, cb_result, &s->result, out_cb, out_argc);
+        if (r) return r < 0 ? -1 : r;
+    }
+    JS_FreeValue(ctx, s->thunk); s->thunk = JS_UNDEFINED;
     return 0;
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The settled value it replays through the thunk, the species
-   constructor it holds from phase 0 to phase 1, and all three request slots — which carry different things in
-   each phase ([undefined, onFinally] then [promise, then_method, then_func]) and are owned in both. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Step 3's result until step 6 consumes it, F.[[Constructor]],
+   the promise step 6 produced, the `then` read off it, the closure step 8 built, and the call buffer while a
+   request is in flight. */
 static void js_promise_then_finally_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSPromiseThenFinally *s = st;
+    int k;
     v->val(ctx, &s->result);
-    v->val(ctx, &s->value);
+    v->val(ctx, &s->cbres);
     v->val(ctx, &s->ctor);
-    v->val(ctx, &s->cb_args[0]);
-    v->val(ctx, &s->cb_args[1]);
-    v->val(ctx, &s->cb_args[2]);
+    v->val(ctx, &s->promise);
+    v->val(ctx, &s->method);
+    v->val(ctx, &s->thunk);
+    for (k = 0; k < 3; k++) v->val(ctx, &s->cb[k]);
 }
 
 static JSValue js_promise_then_finally_fini(JSContext *ctx, void *st, bool take_result)
@@ -92996,7 +93093,10 @@ static JSValue js_promise_then_finally_fini(JSContext *ctx, void *st, bool take_
 }
 
 static const JSTrampStepDef js_promise_then_finally_def = {
-    sizeof(JSPromiseThenFinally), js_promise_then_finally_step, js_promise_then_finally_fini, 0, .visit = js_promise_then_finally_visit
+    sizeof(JSPromiseThenFinally), js_promise_then_finally_step, js_promise_then_finally_fini, 0,
+    .visit = js_promise_then_finally_visit,
+    .algorithm = "27.2.5.3.1 Then Finally Functions / 27.2.5.3.2 Catch Finally Functions",
+    .steps = js_promise_then_finally_steps
 };
 
 /* The wrapper's C entry. It exists only because JS_NewCFunctionData takes a function pointer: the
