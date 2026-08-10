@@ -19307,12 +19307,67 @@ static int step_hasidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
      0   = *plen is filled, the sub-sequence is finished and reset
      5/6 = the caller must return that step code; it will be re-entered at the same stage
      -1  = threw. */
-enum { LEN_PH_START = 0, LEN_PH_GOT, LEN_PH_PRIM };
+enum { LEN_PH_START = 0, LEN_PH_GOT, LEN_PH_PRIM, LEN_PH_UNKNOWN };
+
+/* HOW LONG IS AN UNKNOWN ARRAY-LIKE — the one place opaque ITERATION is decided, because every walk that
+ * iterates by index (Array.from over an array-like, map/forEach/reduce/join/flat/sort, Web IDL's sequence<>)
+ * reaches its bound through this one sub-sequence. The read produced a value that is unknown external input, so
+ * ToLength has no answer: it reaches the conversion boundary's DCHECK, which is where `Array.from(document.cookie)`
+ * aborted the whole document.
+ *
+ * A length is not one fact with one answer — every non-negative integer is a world the program can be in, and
+ * the code behind `if (items.length)` and the value at each index differ between them. So the walk's bound is
+ * asked as a CHAIN OF PER-POSITION OUTCOME FORKS: at n, "is this collection longer than n?". Position n and
+ * position n+1 are DIFFERENT predicates — the operation string carries n, which is exactly what solver_outcome's
+ * key space is for — so neither is decided by the other's answer and the flow that keeps saying "longer" keeps
+ * forking rather than replaying one answer forever.
+ *
+ * OUTCOME 0 IS "no, the length is n", the completion a run with no forking policy takes: at n = 0 that is the
+ * empty walk, a concrete terminating path, which is what an @S candidate re-fire on its way to a sink needs.
+ * OUTCOME 1 is "longer", and it asks again at n + 1. There is NO BOUND on n and there must not be one — a cap, a
+ * seen-set or a same-length fixpoint would delete every world past it. What makes this behave like a finite walk
+ * is the WFQ: the flow that keeps answering "longer" emits nothing new, so CPU-aging sinks it below every flow
+ * that does, and it is outranked and paged rather than stopped.
+ *
+ * The probe cursor and the operation string live on the HEADER, not in this function's locals: the machine
+ * suspends at every ask (the sibling's snapshot is taken there) and its C locals are gone when it resumes. The
+ * unknown itself rides `coerce`, which the clone dups and the teardown frees, so a machine abandoned mid-chain
+ * leaks nothing. */
+static int step_length_unknown(JSContext *ctx, JSStepHdr *h, int64_t *plen)
+{
+    for (;;) {
+        int arm, r;
+        DCHECK(g_concolic.is && g_concolic.is(h->coerce),
+               "the unknown-length chain resumed holding something that is not unknown input — the operand it "
+               "forks over has to be the value the length read actually produced");
+        snprintf(h->len_op, sizeof h->len_op, "LengthOfArrayLike>%d", h->len_probe);
+        r = step_fork_run(ctx, h, h->coerce, h->len_op, 2, &arm);
+        if (r)
+            return r;                     /* JS_STEP_FORK: the driver snapshots the sibling and re-enters here */
+        if (arm == 0) {                   /* the length is exactly this many */
+            *plen = h->len_probe;
+            JS_FreeValue(ctx, h->coerce);
+            h->coerce = JS_UNDEFINED;
+            h->len_probe = 0;
+            h->len_phase = LEN_PH_START;
+            return 0;
+        }
+        h->len_probe++;                   /* longer: the next position is its own predicate */
+        CHECK(h->len_probe > 0, "the unknown-length probe wrapped — the frontier's floor is RAM and disk, not "
+                                "an integer width, so this cursor has to be wide enough to be one");
+    }
+}
 
 /* the tail shared by both entries into ToLength: `v` is the raw length value, owned and consumed. */
 static int step_length_value(JSContext *ctx, JSStepHdr *h, JSValue v, int64_t *plen,
                              JSValue **out_cb, int *out_argc)
 {
+    if (unlikely(g_concolic.is && g_concolic.is(v))) {
+        h->coerce = v;             /* owned across the whole chain of asks */
+        h->len_probe = 0;
+        h->len_phase = LEN_PH_UNKNOWN;
+        return step_length_unknown(ctx, h, plen);
+    }
     if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
         h->coerce = v;             /* owned until the primitive comes back */
         h->cb_coerce[0] = v;       /* borrowed view — the request buffer never owns */
@@ -19943,6 +19998,9 @@ static int step_getlen_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAto
         return 6;
     case LEN_PH_GOT:                      /* `in` is the value the read produced */
         return step_length_value(ctx, h, in, plen, out_cb, out_argc);
+    case LEN_PH_UNKNOWN:                  /* re-entered at an outcome fork; the unknown rides `coerce` */
+        JS_FreeValue(ctx, in);
+        return step_length_unknown(ctx, h, plen);
     default:                             /* `in` is the settled primitive */
         DCHECK(h->len_phase == LEN_PH_PRIM, "a keyed ToLength resumed in an unknown phase");
         JS_FreeValue(ctx, h->coerce);

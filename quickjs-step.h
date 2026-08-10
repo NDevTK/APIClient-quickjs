@@ -268,6 +268,14 @@ typedef struct JSStepHdr {
        one per suspension point. Every coercing prologue needs exactly this, so it lives in the header rather
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
+    /* THE UNKNOWN-LENGTH CHAIN's cursor and its operation string — see step_length_unknown. A length read that
+       produced unknown external input is answered by a chain of per-position outcome forks, and the machine
+       SUSPENDS at every one of them (the sibling's snapshot is taken at the ask), so neither the position nor
+       the string the fork is keyed by may live in a C local. The string is the header's own storage rather than
+       a shared scratch buffer because two machines can be in flight at once — an outer and its delegate — and
+       one formatting over the other's would key two different collections' positions to one predicate. */
+    int len_probe;
+    char len_op[32];
     JSValue cb_coerce[3];   /* three, because the BARE [[Set]] request carries [obj, receiver, value] — the
                                receiver is a separate operand in the spec and a builtin's Set(O,P,V,true) is the
                                one form that can leave it implicit. */
