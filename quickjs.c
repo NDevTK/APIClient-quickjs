@@ -94695,8 +94695,22 @@ typedef struct JSAfsCont {
     JSValue result;     /* owned: TRUE = the caller owes IteratorClose, undefined = nothing left */
     JSValue cb[4];      /* step_promiseresolve_run's buffer, OWNED here */
     uint8_t pr_phase;
+    uint8_t begun;      /* the owned fields are placed once, and this is what says so — the machine has ONE
+                           stage, so the stage cannot double as that flag */
 } JSAfsCont;
 _Static_assert(offsetof(JSAfsCont, hdr) == 0, "JSStepHdr must be first in JSAfsCont");
+
+/* WHICH STEP OF 27.1.6.4 THIS MACHINE RESTS AT. Steps 2-5 are already done when it is entered — the caller that
+   built this closure has `done` and `value` — so what it performs is one span, and ONE stage is the honest
+   count: it rests inside step 6's PromiseResolve, which is the only page-visible operation left, and steps 7-15
+   invoke nothing (the close is ENQUEUED as a reaction, and PerformPromiseThen calls no one).
+   The step numbers in this machine were all one low — 5, 6, 7, 8-9 and 11-14 for what ES2025 numbers 6, 7, 8,
+   9-10 and 12-14 — and the stage it used to carry was a private 0/1 pair with no step in it at all. */
+#define AFS_STAGES(X) \
+    X(AFS_RESOLVE, "27.1.6.4 steps 6-15 (valueWrapper is PromiseResolve(%Promise%, value); an abrupt one closes " \
+                   "the sync iterator; PerformPromiseThen attaches unwrap and closeIterator)")
+enum { AFS_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_afs_cont_steps[] = { AFS_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static JSValue js_iter_close_throw_create(JSContext *ctx, JSValueConst sync_iter);
 
@@ -94711,30 +94725,30 @@ static int js_afs_cont_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     JSValueConst rr[2], caps[2];
     int r, res;
 
-    if (m->hdr.stage == 0) {
+    DCHECK(m->hdr.stage == AFS_RESOLVE, "AsyncFromSyncIteratorContinuation resumed in an unknown stage");
+    if (!m->begun) {
+        m->begun = 1;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         m->result = JS_UNDEFINED;
         m->cb[0] = JS_UNDEFINED; m->cb[1] = JS_UNDEFINED;
         m->cb[2] = JS_UNDEFINED; m->cb[3] = JS_UNDEFINED;
         m->pr_phase = PRR_START;
-        m->hdr.stage = 1;
     }
-    DCHECK(m->hdr.stage == 1, "AsyncFromSyncIteratorContinuation resumed in an unknown stage");
     if (JS_IsException(cb_result)) {
-        /* step 5 completed abruptly — a poisoned `constructor` getter on the value. The exception stays LIVE:
-           step 6's close takes it as its saved completion, and step 7's reject takes it otherwise. */
+        /* step 6 completed abruptly — a poisoned `constructor` getter on the value. The exception stays LIVE:
+           step 7's close takes it as its saved completion, and step 8's reject takes it otherwise. */
         if (!done && close_on_rejection) { m->result = JS_TRUE; return 0; }
         return -1;
     }
     r = step_promiseresolve_run(ctx, &m->hdr, &m->pr_phase, step_arg(&m->hdr, 0), &value_wrapper, m->cb,
                                 cb_result, out_cb, out_argc);
     if (r) return r;
-    unwrap = js_async_from_sync_iterator_unwrap_func_create(ctx, done);   /* steps 8-9 */
+    unwrap = js_async_from_sync_iterator_unwrap_func_create(ctx, done);   /* steps 9-10 */
     if (JS_IsException(unwrap)) {
         JS_FreeValue(ctx, value_wrapper);
         return -1;
     }
-    /* steps 11-14: onRejected exists only while the sync iterator is still open and this method closes on
+    /* steps 12-14: onRejected exists only while the sync iterator is still open and this method closes on
        rejection (.next/.throw do, .return does not — it has already closed it). */
     if (!done && close_on_rejection) {
         on_rejected = js_iter_close_throw_create(ctx, sync_iter);
@@ -94776,8 +94790,9 @@ static JSValue js_afs_cont_fini(JSContext *ctx, void *st, bool take_result)
 
 static const JSTrampStepDef js_afs_cont_def = {
     sizeof(JSAfsCont), js_afs_cont_step, js_afs_cont_fini, 0,
-    .catches_abrupt = 1,  /* step 5's abrupt is a VALUE here: it selects between the close and the reject */
-    .visit = js_afs_cont_visit
+    .catches_abrupt = 1,  /* step 6's abrupt is a VALUE here: it selects between the close and the reject */
+    .visit = js_afs_cont_visit,
+    .algorithm = "27.1.6.4 AsyncFromSyncIteratorContinuation", .steps = js_afs_cont_steps
 };
 
 static JSValue js_afs_cont_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
