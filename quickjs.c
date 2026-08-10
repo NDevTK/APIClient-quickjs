@@ -73569,15 +73569,15 @@ typedef struct JSIterHelperReturn {
    Iterator.prototype is 27.1.4 and its `find` is .5; %IteratorHelperPrototype% is 27.1.2.1 and its `return` is
    its second member. The stages also parked one PAST each operation: a stage issued the `return` read and the
    machine rested at the stage that consumed it, so a park inside the read named the validation after it. Both
-   halves of 7.4.9 are a sub-sequence now, and the machine rests at the operation it is inside — which this
+   halves of 7.4.11 are a sub-sequence now, and the machine rests at the operation it is inside — which this
    machine performs TWICE, once for flatMap's active inner and once for the source, so a rest point that names
    the operation rather than the position is the only kind that can describe it. */
 #define IHR_STAGES(X) \
     X(IHR_START,  "27.1.2.1.2 steps 1-4.b (RequireInternalSlot(O, [[UnderlyingIterator]]); [[GeneratorState]] " \
                   "to completed)") \
-    X(IHR_METHOD, "27.1.2.1.2 step 4.c -> 7.4.9 IteratorClose step 3 (innerResult is GetMethod(iterator, " \
+    X(IHR_METHOD, "27.1.2.1.2 step 4.c -> 7.4.11 IteratorClose step 3 (innerResult is GetMethod(iterator, " \
                   "\"return\"))") \
-    X(IHR_CALLED, "27.1.2.1.2 step 4.c -> 7.4.9 IteratorClose step 4.c (innerResult is Call(return, iterator))")
+    X(IHR_CALLED, "27.1.2.1.2 step 4.c -> 7.4.11 IteratorClose step 4.c (innerResult is Call(return, iterator))")
 enum { IHR_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_iter_helper_return_steps[] = { IHR_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -73639,7 +73639,7 @@ static int js_iter_helper_return_step(JSContext *ctx, void *st, JSValue cb_resul
     }
     for (;;) {
         if (s->hdr.stage == IHR_METHOD) {
-            /* 7.4.9 step 3: GetMethod(iterator, "return") — a getter or a Proxy trap like any read, so the
+            /* 7.4.11 step 3: GetMethod(iterator, "return") — a getter or a Proxy trap like any read, so the
                machine RESTS in this step rather than in the one that reads its answer. */
             r = step_getprop_run(ctx, &s->hdr, s->target, JS_ATOM_return, cb_result, &s->method,
                                  out_cb, out_argc);
@@ -93046,28 +93046,39 @@ typedef struct JSPromiseWithResolvers {
 _Static_assert(offsetof(JSPromiseWithResolvers, hdr) == 0,
                "JSStepHdr must be first in JSPromiseWithResolvers");
 
+/* WHICH STEP OF 27.2.4.9 EACH STAGE RESTS AT. The capability's Construct is the page's, and the machine parked
+   at the stage AFTER it — so a flow suspended inside a subclass constructor reported the stage that builds the
+   result object. It rests in step 2 now: the request is issued while the header carries no capability, and the
+   same stage is re-entered once the delivery has put one there. */
+#define PWR_STAGES(X) \
+    X(PWR_CAP,   "27.2.4.9 steps 1-2 (C is the this value; promiseCapability is NewPromiseCapability(C))") \
+    X(PWR_BUILD, "27.2.4.9 steps 3-7 (obj is OrdinaryObjectCreate; promise, resolve and reject are defined on it)")
+enum { PWR_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_promise_withresolvers_steps[] = { PWR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_promise_withresolvers_step(JSContext *ctx, void *st, JSValue cb_result,
                                          JSValue **out_cb, int *out_argc)
 {
     JSPromiseWithResolvers *s = st;
     JSValue obj;
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == PWR_CAP) {
         JS_FreeValue(ctx, cb_result);
-        s->result = JS_UNDEFINED;
-        /* step 1: NewPromiseCapability's own "C is not a constructor" comes from the request; this is
-           withResolvers' receiver check, which the spec performs first. */
-        if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
-        s->hdr.stage = 1;
-        s->result = js_dup(s->hdr.this_val);   /* the request BORROWS cb[0]; the machine holds the reference */
-        *out_cb = &s->result; *out_argc = 0;
-        return 16;   /* CAPABILITY */
+        if (JS_IsUndefined(s->hdr.cap_promise)) {
+            s->result = JS_UNDEFINED;
+            /* step 1: NewPromiseCapability's own "C is not a constructor" comes from the request; this is
+               withResolvers' receiver check, which the spec performs first. */
+            if (!JS_IsObject(s->hdr.this_val)) { JS_ThrowTypeErrorNotAnObject(ctx); return -1; }
+            s->result = js_dup(s->hdr.this_val);   /* the request BORROWS cb[0]; the machine holds the reference */
+            *out_cb = &s->result; *out_argc = 0;
+            return 16;   /* CAPABILITY */
+        }
+        JS_FreeValue(ctx, s->result); s->result = JS_UNDEFINED;
+        s->hdr.stage = PWR_BUILD;
     }
-    DCHECK(s->hdr.stage == 1, "Promise.withResolvers resumed in an unknown stage");
-    JS_FreeValue(ctx, cb_result);
-    JS_FreeValue(ctx, s->result); s->result = JS_UNDEFINED;
+    DCHECK(s->hdr.stage == PWR_BUILD, "Promise.withResolvers resumed in an unknown stage");
     obj = JS_NewObject(ctx);
     if (JS_IsException(obj)) return -1;
-    /* steps 3-5. The record is TAKEN off the header: the header holds one capability and this is its consumer. */
+    /* steps 4-6. The record is TAKEN off the header: the header holds one capability and this is its consumer. */
     if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_promise, s->hdr.cap_promise, JS_PROP_C_W_E) < 0) {
         s->hdr.cap_promise = JS_UNDEFINED; JS_FreeValue(ctx, obj); return -1;
     }
@@ -93103,7 +93114,8 @@ static JSValue js_promise_withresolvers_fini(JSContext *ctx, void *st, bool take
 }
 
 static const JSTrampStepDef js_promise_withresolvers_def = {
-    sizeof(JSPromiseWithResolvers), js_promise_withresolvers_step, js_promise_withresolvers_fini, 0, .visit = js_promise_withresolvers_visit
+    sizeof(JSPromiseWithResolvers), js_promise_withresolvers_step, js_promise_withresolvers_fini, 0, .visit = js_promise_withresolvers_visit,
+    .algorithm = "27.2.4.9 Promise.withResolvers", .steps = js_promise_withresolvers_steps
 };
 
 static JSValue js_promise_try(JSContext *ctx, JSValueConst this_val,
@@ -93250,12 +93262,24 @@ static int js_promise_resolve_elem_prologue(JSContext *ctx, JSPromiseResolveElem
     return 0;
 }
 
+/* WHICH STEP OF EACH ELEMENT FUNCTION EACH STAGE RESTS AT. FOUR algorithms, one machine — which of them this is
+   comes from the closure's magic, so one list names all four; they differ only in what step 9 onwards builds and
+   in which half of the capability is called. The machine RESTS in the settle, which is the only page-visible
+   operation any of them has: a subclass's resolving function is the page's code. */
+#define PRE_STAGES(X) \
+    X(PRE_RECORD, "27.2.4.1.3 steps 2-9 / 27.2.4.2.2 steps 2-13 / 27.2.4.2.3 steps 2-13 / 27.2.4.3.2 steps 2-9 " \
+                  "([[AlreadyCalled]] latches; values[index] is set; remainingElementsCount is decremented)") \
+    X(PRE_SETTLE, "27.2.4.1.3 step 10.b / 27.2.4.2.2 step 14.b / 27.2.4.2.3 step 14.b / 27.2.4.3.2 step 10.c " \
+                  "(Call(promiseCapability.[[Resolve]] or [[Reject]], undefined, <<valuesArray or error>>))")
+enum { PRE_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_promise_resolve_elem_steps[] = { PRE_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_promise_resolve_elem_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSPromiseResolveElem *s = st;
     JS_FreeValue(ctx, cb_result);   /* UNDEFINED on the first step; the settle's discarded return afterwards */
-    if (s->hdr.stage == 0) {
-        s->hdr.stage = 1;
+    if (s->hdr.stage == PRE_RECORD) {
+        s->hdr.stage = PRE_SETTLE;
         s->cb_args[0] = JS_UNDEFINED;
         if (js_promise_resolve_elem_prologue(ctx, s))
             return -1;
@@ -93287,7 +93311,10 @@ static JSValue js_promise_resolve_elem_fini(JSContext *ctx, void *st, bool take_
 }
 
 static const JSTrampStepDef js_promise_resolve_elem_def = {
-    sizeof(JSPromiseResolveElem), js_promise_resolve_elem_step, js_promise_resolve_elem_fini, 0, .visit = js_promise_resolve_elem_visit
+    sizeof(JSPromiseResolveElem), js_promise_resolve_elem_step, js_promise_resolve_elem_fini, 0, .visit = js_promise_resolve_elem_visit,
+    .algorithm = "27.2.4.1.3 Promise.all / 27.2.4.2.2 and 27.2.4.2.3 Promise.allSettled / 27.2.4.3.2 Promise.any "
+                 "Resolve and Reject Element Functions",
+    .steps = js_promise_resolve_elem_steps
 };
 
 /* Mark a freshly-created resolve/reject element closure as a step machine, so its synchronous (thenable-driven)
@@ -93941,30 +93968,31 @@ static JSValue js_promise_finally_thrower(JSContext *ctx, JSValueConst this_val,
    inline. */
 typedef struct JSPromiseThenFinally {
     JSStepHdr hdr;         /* MUST be first */
-    JSValue cbres;         /* owned: step 3's result, held until step 6 consumes it */
+    JSValue cbres;         /* owned: step 6.a.i's result, held until 6.a.ii consumes it */
     JSValue result;        /* owned: the Invoke's return, which IS this function's */
     int magic;             /* 0 = fulfil path (value thunk); 1 = reject path (thrower) */
-    JSValue ctor;          /* owned: F.[[Constructor]], step 4 */
-    JSValue promise;       /* owned: step 6's promise, held across the `then` read and the Call */
+    JSValue ctor;          /* owned: C, the closure's captured constructor */
+    JSValue promise;       /* owned: p, held across the `then` read and the Call */
     JSValue method;        /* owned: the `then` the Invoke read off it */
-    JSValue thunk;         /* owned: step 8's valueThunk / thrower */
+    JSValue thunk;         /* owned: valueThunk / thrower */
     JSValue cb[3];         /* the CALL request's [this, func, arg] */
     uint8_t call_phase, res_phase;
 } JSPromiseThenFinally;
 _Static_assert(offsetof(JSPromiseThenFinally, hdr) == 0, "JSStepHdr must be first in JSPromiseThenFinally");
 
-/* WHICH STEP OF 27.2.5.3.1 / .2 EACH STAGE RESTS AT. The two closures are ONE machine because the standard
-   numbers them identically — only the closure built at step 8 differs — so one list serves both, and the
-   `algorithm` says which pair a parked flow is in.
+/* WHICH STEP OF 27.2.5.3 EACH STAGE RESTS AT. These two are not clauses of their own: ES2025 states them as the
+   ABSTRACT CLOSURES 27.2.5.3 step 6.a (thenFinallyClosure) and step 6.c (catchFinallyClosure), whose sub-steps
+   are numbered identically and differ only in the closure built at .iv — so one list serves both, and the
+   `algorithm` says which of the pair a parked flow is in.
    The stages were 0, 1, 4 and 2, chosen so the DELEGATE could tell its own re-entry from a fresh one, and the
    machine parked one stage PAST every operation it was inside. Each of the four now rests at the operation it
    is performing, and the sub-phase byte is what distinguishes issue from delivery — the same shape every *_run
    sub-sequence has. */
 #define TFIN_STAGES(X) \
-    X(TFIN_ONFINALLY, "27.2.5.3.1 / .2 step 3 (result is Call(onFinally, undefined))") \
-    X(TFIN_RESOLVE,   "27.2.5.3.1 / .2 step 6 (promise is PromiseResolve(C, result))") \
-    X(TFIN_GET_THEN,  "27.2.5.3.1 / .2 step 9 -> 7.3.20 Invoke step 2 (func is GetV(promise, \"then\"))") \
-    X(TFIN_THEN,      "27.2.5.3.1 / .2 step 9 -> 7.3.20 Invoke step 3 (Call(func, promise, <<valueThunk>>))")
+    X(TFIN_ONFINALLY, "27.2.5.3 step 6.a.i / 6.c.i (result is Call(onFinally, undefined))") \
+    X(TFIN_RESOLVE,   "27.2.5.3 step 6.a.ii / 6.c.ii (p is PromiseResolve(C, result))") \
+    X(TFIN_GET_THEN,  "27.2.5.3 step 6.a.v / 6.c.v -> 7.3.20 Invoke step 2 (func is GetV(p, \"then\"))") \
+    X(TFIN_THEN,      "27.2.5.3 step 6.a.v / 6.c.v -> 7.3.20 Invoke step 3 (Call(func, p, <<valueThunk>>))")
 enum { TFIN_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_promise_then_finally_steps[] = { TFIN_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -93976,14 +94004,14 @@ static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_res
     if (s->hdr.stage == TFIN_ONFINALLY) {
         JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
         if (s->call_phase == 0) {
-            /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. Steps 1-2
-               and 4-5 are the closure's captured data and two asserts — no user code, so no stage of their own. */
+            /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. onFinally
+               and C are the closure's CAPTURED data, which is not a step at all. */
             s->cbres = JS_UNDEFINED; s->result = JS_UNDEFINED;
             s->promise = JS_UNDEFINED; s->method = JS_UNDEFINED; s->thunk = JS_UNDEFINED;
             s->ctor = js_dup(rec->data[0]);
             s->magic = rec->magic;
         }
-        /* step 3: onFinally is the page's, and its body can loop. */
+        /* step 6.a.i / 6.c.i: onFinally is the page's, and its body can loop. */
         r = step_call_run(ctx, &s->call_phase, STEP_CB(s->cb), rec->data[1], JS_UNDEFINED,
                           0, NULL, cb_result, &s->cbres, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -93991,7 +94019,7 @@ static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_res
         s->hdr.stage = TFIN_RESOLVE;
     }
     if (s->hdr.stage == TFIN_RESOLVE) {
-        /* step 6: PromiseResolve(C, result) is the ABSTRACT OPERATION, not `C.resolve`, so it cannot be reached
+        /* step 6.a.ii / 6.c.ii: PromiseResolve(C, result) is the ABSTRACT OPERATION, not `C.resolve`, so it cannot be reached
            as an ordinary call — and that operation IS the Promise.resolve step machine. DELEGATE to it: driving
            it from C is what made `.finally` on a SUBCLASS run that subclass's constructor and its resolving
            function to completion. */
@@ -94010,15 +94038,15 @@ static int js_promise_then_finally_step(JSContext *ctx, void *st, JSValue cb_res
         s->hdr.stage = TFIN_GET_THEN;
     }
     if (s->hdr.stage == TFIN_GET_THEN) {
-        /* step 9's Invoke READS `then` off that promise, and on a subclass that read is the page's — an accessor
-           on the subclass prototype, or a Proxy. It was a JS_GetProperty from C, which has no flow under it. */
+        /* step 6.a.v / 6.c.v's Invoke READS `then` off that promise, and on a subclass that read is the page's —
+           an accessor on the subclass prototype, or a Proxy. It was a JS_GetProperty from C, no flow under it. */
         r = step_getprop_run(ctx, &s->hdr, s->promise, JS_ATOM_then, cb_result, &s->method, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         s->hdr.stage = TFIN_THEN;
     }
     if (s->call_phase == 0) {
-        /* steps 7-8: the closure that replays the settled value, or rethrows the reason. */
+        /* steps 6.a.iii-iv / 6.c.iii-iv: the closure that replays the settled value, or rethrows the reason. */
         JSValueConst d[1];
         d[0] = step_arg(&s->hdr, 0);
         s->thunk = JS_NewCFunctionData(ctx, s->magic == 0 ? js_promise_finally_value_thunk
