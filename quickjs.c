@@ -74092,8 +74092,10 @@ static const JSTrampStepDef js_array_iter_next_def =
 static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iterator_concat_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const char *const js_iterator_concat_steps[];
 static const JSTrampStepDef js_iter_concat_def =
-    { sizeof(JSIterConcat), js_iterator_concat_step, js_iterator_concat_fini, 0, .visit = js_iterator_concat_visit };
+    { sizeof(JSIterConcat), js_iterator_concat_step, js_iterator_concat_fini, 0, .visit = js_iterator_concat_visit,
+      .algorithm = "Iterator.concat (proposal-iterator-sequencing)", .steps = js_iterator_concat_steps };
 static int js_iterator_zip_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iterator_zip_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -79470,13 +79472,23 @@ static const JSCFunctionListEntry js_iterator_concat_proto_funcs[] = {
    accessor body or a Proxy `get` trap — and it ran from C once per argument. The requirement is not just that the
    read routes: the spec INTERLEAVES it with step 3.a's object check, so argument 1's check happens after argument
    0's read, which is why the walk is a cursor over the machine rather than a loop that validates up front. */
+/* WHICH STEP OF Iterator.concat EACH STAGE RESTS AT. The second stage is a LOOP over the arguments and it names
+   a range, which it may because the only page-visible operation in that range is the GetMethod the machine rests
+   in — the object test, the callable test, the append and the generator's construction invoke nothing. */
+#define ICC_STAGES(X) \
+    X(ICC_LIST,  "proposal-iterator-sequencing Iterator.concat step 1 (iterables is a new empty List)") \
+    X(ICC_ITEMS, "proposal-iterator-sequencing Iterator.concat steps 2-6 (per item: item is an Object; method " \
+                 "is GetMethod(item, %Symbol.iterator%); then gen is CreateIteratorFromClosure)")
+enum { ICC_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_iterator_concat_steps[] = { ICC_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSIterConcat *s = st;
     JSIteratorConcatData *it;
     JSValue obj;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ICC_LIST) {
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -79488,7 +79500,7 @@ static int js_iterator_concat_step(JSContext *ctx, void *st, JSValue cb_result, 
         s->it->count = 0;
         s->it->iter = JS_UNDEFINED;
         s->it->next = JS_UNDEFINED;
-        s->hdr.stage = 1;
+        s->hdr.stage = ICC_ITEMS;
     }
     it = s->it;
     while (s->i < s->hdr.argc) {
