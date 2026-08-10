@@ -367,6 +367,12 @@ struct JSRuntime {
     JSClass *class_array;
 
     struct list_head context_list; /* list of JSContext.link */
+    /* EVERY LIVE STEP MACHINE — see JSStepHdr.census_prev. gc_obj_list below is this list's model and its
+       reason: a GC object the runtime drops is named at teardown, and until this existed a step state was the
+       one allocation the engine makes that nothing counted. It is intrusive and unconditional for the same
+       reason gc_obj_list is — a leak report that exists only in some builds reports only some leaks. */
+    struct JSStepHdr *step_census;
+    int step_census_n;
     /* list of JSGCObjectHeader.link. List of allocated GC objects (used
        by the garbage collector) */
     struct list_head gc_obj_list;
@@ -3116,6 +3122,10 @@ void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
         rt->rt_info = s;
 }
 
+/* Defined with the census it walks, below the step surface's own types — same reason the GC-object namer's
+   helpers are declared inside JS_FreeRuntime rather than defined there. */
+static void js_step_census_report(JSRuntime *rt);
+
 void JS_FreeRuntime(JSRuntime *rt)
 {
     struct list_head *el, *el1;
@@ -3293,6 +3303,16 @@ void JS_FreeRuntime(JSRuntime *rt)
         }
     }
     DCHECK(list_empty(&rt->gc_obj_list), "list_empty(&rt->gc_obj_list)");
+
+    /* THE MACHINES NOBODY FINISHED. Declared here and defined with the census itself, for the reason the GC
+       object namer above is declared here: this report runs in JS_FreeRuntime, which sits above the step
+       surface's own types. */
+    js_step_census_report(rt);
+    DCHECK(rt->step_census == NULL,
+           "the runtime went down with step machines still live — a continuation-holding builtin was dropped "
+           "rather than finished, so its callback's state, its captured arguments and everything they hold are "
+           "leaked with nothing else that can free them; [stepleak] above names each by its algorithm and the "
+           "step it was resting at");
 
     /* free the classes */
     for(i = 0; i < rt->class_count; i++) {
@@ -18753,6 +18773,71 @@ typedef struct JSImportCap {
    last, with no "have I initialised my fields yet" flag for anyone to get wrong. */
 _Static_assert(JS_TAG_INT == 0, "a zeroed step state must be freeable: JSValue{0} has to be a non-refcounted tag");
 
+/* THE CENSUS OF LIVE MACHINES — see JSRuntime.step_census and JSStepHdr.census_prev. Two operations, called
+   from exactly the three sites that create or destroy a state, so "how many machines are live" is a fact the
+   runtime holds rather than one a sanitizer has to be run to learn. The double link is what makes the removal
+   O(1) at the teardown, which is on the hot path; the head-insert keeps the creation O(1) too. */
+static void js_step_census_add(JSRuntime *rt, JSStepHdr *h)
+{
+    DCHECK(h->census_prev == NULL && h->census_next == NULL,
+           "a step machine was entered in the census twice — a state carrying links already is either a CLONE "
+           "whose memcpy copied the original's (relink at the clone, never here) or a double registration");
+    h->census_prev = NULL;
+    h->census_next = rt->step_census;
+    if (rt->step_census) rt->step_census->census_prev = h;
+    rt->step_census = h;
+    rt->step_census_n++;
+}
+
+/* THE MACHINES NOBODY FINISHED, named by the ALGORITHM each one is. JS_FreeRuntime's object walk reports GC
+   objects and says nothing about a step state, which is plain memory — so a dropped machine showed up there
+   only as the objects it was still holding, attributed to no owner, and the state's own bytes showed up
+   nowhere at all. Counted per DEFINITION and RESTING STAGE rather than one line each, for [gcleak]'s reason: a
+   leak is thousands of one machine, and a scrollback of identical lines hides the two or three others that name
+   the real owner. The stage is printed because a machine's rest point IS its identity — "22.2.7.2 step 2" says
+   which suspension the driver walked away from, which is the difference between a report and a place to fix. */
+static void js_step_census_report(JSRuntime *rt)
+{
+    struct { const JSTrampStepDef *def; int stage; int n; } m[64];
+    int nm = 0, i;
+    JSStepHdr *h;
+
+    if (rt->step_census == NULL) return;
+    for (h = rt->step_census; h != NULL; h = h->census_next) {
+        for (i = 0; i < nm; i++)
+            if (m[i].def == h->def && m[i].stage == (int)h->stage) { m[i].n++; break; }
+        if (i == nm && nm < (int)countof(m)) {
+            m[nm].def = h->def; m[nm].stage = (int)h->stage; m[nm].n = 1; nm++;
+        }
+    }
+    for (i = 0; i < nm; i++) {
+        const char *alg = m[i].def->algorithm ? m[i].def->algorithm : "(undeclared algorithm)";
+        const char *st = "(undeclared stages)";
+        if (m[i].def->steps) {
+            int k = 0;
+            while (k < m[i].stage && m[i].def->steps[k] != NULL) k++;
+            st = (k == m[i].stage && m[i].def->steps[k] != NULL)
+                 ? m[i].def->steps[k] : "(a stage past the declared list)";
+        }
+        fprintf(stderr, "[stepleak] %-44s x%-7d resting at %s\n", alg, m[i].n, st);
+    }
+    fprintf(stderr, "[stepleak] %d live step machines at teardown\n", rt->step_census_n);
+}
+
+int JS_StepMachineCount(JSRuntime *rt) { return rt->step_census_n; }
+
+static void js_step_census_remove(JSRuntime *rt, JSStepHdr *h)
+{
+    DCHECK(rt->step_census_n > 0, "a step machine was removed from an empty census — it was freed twice, or "
+                                  "freed by something other than tramp_step_state_free_1");
+    if (h->census_prev) h->census_prev->census_next = h->census_next;
+    else { DCHECK(rt->step_census == h, "a step machine with no census predecessor is not the census head — "
+                                        "its links name a list it is not on"); rt->step_census = h->census_next; }
+    if (h->census_next) h->census_next->census_prev = h->census_prev;
+    h->census_prev = h->census_next = NULL;
+    rt->step_census_n--;
+}
+
 /* ONE way to make a step state and ONE way to destroy it. The driver uses both, and so does a machine that
    DELEGATES to another (String.prototype.replace hands its whole walk to the built-in @@replace machine): a
    second hand-rolled allocation there is a second capture and a second teardown to keep in sync. */
@@ -18778,6 +18863,7 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
         h->argv[i] = js_dup(argv[i]);
     h->this_val = js_dup(this_val);
     h->func_obj = js_dup(func_obj);
+    js_step_census_add(ctx->rt, h);
     return h;
 }
 
@@ -20052,6 +20138,7 @@ static JSValue tramp_step_state_free_1(JSContext *ctx, void *st, bool take_resul
     h->argc = 0;                     /* fini frees the block; nothing may read the captures after this */
     h->this_val = JS_UNDEFINED;
     h->func_obj = JS_UNDEFINED;
+    js_step_census_remove(ctx->rt, h);   /* fini frees the block, so the census must let go of it first */
     return h->def->fini(ctx, st, take_result);
 }
 
@@ -20286,6 +20373,11 @@ static void *tramp_step_state_clone(JSContext *ctx, const void *src)
     h = js_malloc(ctx, sz);
     if (unlikely(!h)) return NULL;
     memcpy(h, o, sz);
+    /* THE MEMCPY COPIED THE ORIGINAL'S CENSUS LINKS, which name a list this allocation is not on — the same
+       obligation every other pointer below carries, and the one whose omission would corrupt the list rather
+       than merely miscount it. Cleared BEFORE the add, which asserts they are. */
+    h->census_prev = h->census_next = NULL;
+    js_step_census_add(ctx->rt, h);
     h->argv = (JSValue *)((uint8_t *)h + STEP_ARGV_OFFSET(o->def->size));
     for (i = 0; i < h->argc; i++) h->argv[i] = js_dup(h->argv[i]);
     h->this_val = js_dup(h->this_val);

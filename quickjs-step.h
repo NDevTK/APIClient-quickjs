@@ -202,6 +202,15 @@ typedef struct JSTrampStepDef {
 
 typedef struct JSStepHdr {
     const JSTrampStepDef *def;
+    /* THE RUNTIME'S CENSUS OF LIVE MACHINES — the same accounting gc_obj_list gives every GC object, given to
+       the one allocation class that escapes it. A step state is plain js_malloc'd memory holding references, so
+       a machine the driver drops is invisible to JS_FreeRuntime's object walk AND to its refcount report: the
+       objects it held are reported with nothing naming their owner, and the state itself is reported by nothing
+       at all. Two pointers rather than a list_head because this header is public and list.h is not; the list is
+       quickjs.c's (js_step_census_*), and its invariants are asserted there — a machine is on it from
+       tramp_step_state_new (and from the CLONE, whose memcpy copies the ORIGINAL's links and must relink)
+       until tramp_step_state_free_1 takes it off, immediately before the definition's fini frees the block. */
+    struct JSStepHdr *census_prev, *census_next;
     int orig_cfirst, orig_cargc;
     uint8_t orig_is_tail;
     /* A step machine whose CALLBACK is itself a step machine — `arr.map(String)` is the ordinary case. The inner

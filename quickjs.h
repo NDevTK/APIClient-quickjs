@@ -1539,6 +1539,11 @@ JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
 /* Feature-engagement counters (anti-fake-green): requested = back-edge preempt points reached; fired = actually
    parked+rebuilt. requested>fired iff the feature is gated somewhere (nested async/generator activation). */
 JS_EXTERN void     JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired);
+/* LIVE STEP MACHINES — the runtime's census (see JSStepHdr.census_prev). Every continuation-holding builtin a
+   flow is currently suspended inside has one, and a machine nothing finishes is memory JS_ComputeMemoryUsage
+   cannot name: a step state is plain js_malloc'd bytes, so it lands in the residual the @HEAP line calls
+   `unattributed` with nothing to say what it is. Reported beside that residual for exactly that reason. */
+JS_EXTERN int      JS_StepMachineCount(JSRuntime *rt);
 
 
 /* DRIVE-TO-COMPLETION detector: total sites where a coroutine body ran to completion instead of suspend/resume on
