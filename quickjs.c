@@ -24673,6 +24673,8 @@ typedef struct JSIterHelperNew {
     JSValue limit;    /* take/drop: the limit argument, replaced in place by its primitive (owned) */
     int64_t count;    /* take/drop: the validated integer limit, computed BEFORE the `next` read */
     JSValue cb[1];    /* the TOPRIMITIVE request buffer */
+    uint8_t argp;     /* take/drop: the argument coercion's own cursor, so the machine RESTS at the step that
+                         performs it instead of at the stage after it */
 } JSIterHelperNew;
 
 typedef struct JSPrimArgs {
@@ -73178,7 +73180,6 @@ static void js_array_flat_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result);
 static void js_prop_walk_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int asIntN);
-static JSValue js_object_getOwnPropertyDescriptor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static int js_iter_helper_new_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_iter_helper_new_fini(JSContext *ctx, void *st, bool take_result);
 static void js_iter_helper_new_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -74198,14 +74199,28 @@ static const JSTrampStepDef js_reflect_setproto_def = { sizeof(JSSetProto), js_s
 /* ALL FIVE iterator-helper factories, as ONE machine. take/drop were a coerce-then-compute definition and
    map/filter/flatMap were plain C functions, and the `next` READ their shared body performed could be routed from
    neither shape. The kind rides body_magic, exactly as it did on the C function; onerror is the IfAbruptClose. */
-#define ITER_HELPER_NEW_DEF(kind) \
+/* The five factories are ONE walk over FIVE algorithms the standard numbers separately, so each definition
+   names the steps of ITS algorithm — declared where the machine is, and forward here for the same reason every
+   other steps array is. */
+static const char *const js_iter_take_steps[];
+static const char *const js_iter_drop_steps[];
+static const char *const js_iter_map_steps[];
+static const char *const js_iter_filter_steps[];
+static const char *const js_iter_flatmap_steps[];
+#define ITER_HELPER_NEW_DEF(kind, alg, stps) \
     { sizeof(JSIterHelperNew), js_iter_helper_new_step, js_iter_helper_new_fini, 0, { .generic = NULL }, 0, \
-      (kind), NULL, NULL, js_iterator_helper_close, .visit = js_iter_helper_new_visit }
-static const JSTrampStepDef js_iter_take_def      = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_TAKE);
-static const JSTrampStepDef js_iter_drop_def      = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_DROP);
-static const JSTrampStepDef js_iter_map_def       = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_MAP);
-static const JSTrampStepDef js_iter_filter_def    = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_FILTER);
-static const JSTrampStepDef js_iter_flatmap_def   = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_FLAT_MAP);
+      (kind), NULL, NULL, js_iterator_helper_close, .visit = js_iter_helper_new_visit, \
+      .algorithm = (alg), .steps = (stps) }
+static const JSTrampStepDef js_iter_take_def      = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_TAKE,
+                                                        "27.1.4.11 Iterator.prototype.take", js_iter_take_steps);
+static const JSTrampStepDef js_iter_drop_def      = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_DROP,
+                                                        "27.1.4.2 Iterator.prototype.drop", js_iter_drop_steps);
+static const JSTrampStepDef js_iter_map_def       = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_MAP,
+                                                        "27.1.4.8 Iterator.prototype.map", js_iter_map_steps);
+static const JSTrampStepDef js_iter_filter_def    = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_FILTER,
+                                                        "27.1.4.4 Iterator.prototype.filter", js_iter_filter_steps);
+static const JSTrampStepDef js_iter_flatmap_def   = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_FLAT_MAP,
+                                                        "27.1.4.6 Iterator.prototype.flatMap", js_iter_flatmap_steps);
 /* resize/grow and the three transfers are the same declared shape: ONE numeric argument, then a tail that runs
    no user code. The receiver validation the spec orders ahead of the coercion is the precheck. */
 static const JSTrampStepDef js_ab_resize_def     = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_resize, JS_CLASS_ARRAY_BUFFER, js_array_buffer_resize_precheck, NULL);
@@ -79162,49 +79177,91 @@ fail:
     return JS_EXCEPTION;
 }
 
-/* stage 0: 27.1.4.3/.5 steps 1-2 (the receiver, then the argument), and take/drop's limit ToPrimitive.
-   stage 1: the coerced limit arrives.
-   stage 2: GetIteratorDirect's `next` read arrives, and the helper is built. */
+/* WHICH STEP OF EACH FACTORY'S ALGORITHM EACH STAGE RESTS AT. ONE walk, FIVE algorithms the standard numbers
+   separately — take and drop validate a NUMBER (steps 4-8), map, filter and flatMap a CALLABLE (step 4) — so one
+   stage list is expanded once per algorithm with that algorithm's own step text. A stage cannot move in one of
+   them without moving in all five, and each definition still names the steps of ITS algorithm and nobody else's.
+   The prose here said "27.1.4.3/.5", which is `every` and `find`; the factories are drop, filter, flatMap, map
+   and take, and none of them is either of those. A private stage number cannot be wrong about which algorithm it
+   is in because it does not say — which is exactly why it had gone unnoticed. */
+#define IHN_STAGES(X, HEAD, ARG, DIRECT) \
+    X(IHN_HEAD,   HEAD) \
+    X(IHN_ARG,    ARG)  \
+    X(IHN_DIRECT, DIRECT)
+enum { IHN_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
+static const char *const js_iter_take_steps[] = {
+    IHN_STAGES(JS_STEP_STAGE_LABEL,
+        "27.1.4.11 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.4.11 steps 4-8 (numLimit is ToNumber(limit); NaN and negative close iterated with a RangeError)",
+        "27.1.4.11 step 9 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+    NULL };
+static const char *const js_iter_drop_steps[] = {
+    IHN_STAGES(JS_STEP_STAGE_LABEL,
+        "27.1.4.2 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.4.2 steps 4-8 (numLimit is ToNumber(limit); NaN and negative close iterated with a RangeError)",
+        "27.1.4.2 step 9 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+    NULL };
+static const char *const js_iter_map_steps[] = {
+    IHN_STAGES(JS_STEP_STAGE_LABEL,
+        "27.1.4.8 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.4.8 step 4 (IsCallable(mapper); a non-callable closes iterated with a TypeError)",
+        "27.1.4.8 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+    NULL };
+static const char *const js_iter_filter_steps[] = {
+    IHN_STAGES(JS_STEP_STAGE_LABEL,
+        "27.1.4.4 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.4.4 step 4 (IsCallable(predicate); a non-callable closes iterated with a TypeError)",
+        "27.1.4.4 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+    NULL };
+static const char *const js_iter_flatmap_steps[] = {
+    IHN_STAGES(JS_STEP_STAGE_LABEL,
+        "27.1.4.6 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.4.6 step 4 (IsCallable(mapper); a non-callable closes iterated with a TypeError)",
+        "27.1.4.6 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+    NULL };
+
 static int js_iter_helper_new_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSIterHelperNew *s = st;
     int magic = s->hdr.def->body_magic;
     bool has_limit = (magic == JS_ITERATOR_HELPER_KIND_TAKE || magic == JS_ITERATOR_HELPER_KIND_DROP);
 
-    if (s->hdr.stage == 0) {
-        JS_FreeValue(ctx, cb_result);
-        /* 27.1.4.3/.5 step 1-2's TypeError precedes everything and closes NOTHING, so it is raised while
-           `coercing` is still clear — that flag is what tramp_step_state_free consults before calling the
-           definition's onerror, so it is exactly "an abrupt completion from here on owes the IfAbruptClose". */
+    if (s->hdr.stage == IHN_HEAD) {
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* steps 1-2's TypeError precedes everything and closes NOTHING, so it is raised while `coercing` is
+           still clear — that flag is what tramp_step_state_free consults before calling the definition's
+           onerror, so it is exactly "an abrupt completion from here on owes the IfAbruptCloseIterator". */
         if (check_iterator(ctx, s->hdr.this_val) < 0)
             return -1;
-        s->hdr.coercing = 1;   /* every failure below this line closes the source */
+        /* step 3: the Iterator Record exists from here on, which is what makes every failure below close it. */
+        s->hdr.coercing = 1;
         s->limit = js_dup(step_arg(&s->hdr, 0));
-        s->hdr.stage = 1;
-        if (has_limit) {
-            if (JS_VALUE_GET_TAG(s->limit) == JS_TAG_OBJECT) {
-                s->cb[0] = s->limit;   /* borrowed: the state holds the reference */
-                *out_cb = s->cb; *out_argc = HINT_NUMBER;
-                return 5;
-            }
-        } else if (check_function(ctx, s->limit)) {
-            return -1;   /* 27.1.4.5 step 3: a non-callable mapper closes the source */
-        }
-    } else if (s->hdr.stage == 1) {
-        DCHECK(has_limit, "a non-coercing iterator-helper factory was resumed with a primitive");
-        JS_FreeValue(ctx, s->limit);
-        s->limit = cb_result;   /* the primitive REPLACES the argument the validation will read */
-        cb_result = JS_UNDEFINED;
+        s->hdr.stage = IHN_ARG;
     }
-    s->hdr.coercing = 1;   /* the TOPRIMITIVE resume clears it; the obligation is unchanged */
-    if (s->hdr.stage != 2) {
-        /* steps 3-7 BEFORE step 8's GetIteratorDirect: the limit's NaN/negative RangeErrors precede the `next`
-           read, so a rejected limit never makes that read observable and a throwing `next` getter never wins
-           over the RangeError. */
-        if (has_limit && js_iter_helper_limit(ctx, s->limit, &s->count) < 0)
-            return -1;
-        s->hdr.stage = 2;
-        cb_result = JS_UNDEFINED;
+    if (s->hdr.stage == IHN_ARG) {
+        s->hdr.coercing = 1;   /* the TOPRIMITIVE resume clears it; the obligation is unchanged */
+        if (has_limit) {
+            if (s->argp == 0) {
+                s->argp = 1;
+                if (JS_VALUE_GET_TAG(s->limit) == JS_TAG_OBJECT) {
+                    s->cb[0] = s->limit;   /* borrowed: the state holds the reference */
+                    *out_cb = s->cb; *out_argc = HINT_NUMBER;
+                    return 5;              /* the ToNumber is the page's valueOf, and the machine rests HERE */
+                }
+            } else {
+                JS_FreeValue(ctx, s->limit);
+                s->limit = cb_result;   /* the primitive REPLACES the argument the validation will read */
+                cb_result = JS_UNDEFINED;
+            }
+            /* the NaN/negative RangeErrors precede the `next` read, so a rejected limit never makes that read
+               observable and a throwing `next` getter never wins over the RangeError. */
+            if (js_iter_helper_limit(ctx, s->limit, &s->count) < 0)
+                return -1;
+        } else if (check_function(ctx, s->limit)) {
+            return -1;   /* a non-callable mapper/predicate closes the source */
+        }
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        s->hdr.stage = IHN_DIRECT;
     }
     {
         JSValue method = JS_UNDEFINED;
