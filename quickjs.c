@@ -71065,16 +71065,26 @@ typedef struct JSArrayOf {
     int i;
 } JSArrayOf;
 
+#define AOF_STAGES(X) \
+    X(AOF_CREATE,      "23.1.2.3 steps 3-4 (C is the this value; a constructor C is Construct(C, \u00ab len \u00bb), " \
+                       "otherwise A is ArrayCreate(len))") \
+    X(AOF_CONSTRUCTED, "23.1.2.3 step 4 (parked on Construct(C, \u00ab len \u00bb) — the page's constructor)") \
+    X(AOF_DEFINE,      "23.1.2.3 step 6.c (CreateDataPropertyOrThrow(A, ToString(k), items[k])), one element " \
+                       "per step") \
+    X(AOF_LENGTH,      "23.1.2.3 step 7 (Set(A, \"length\", len, true))")
+enum { AOF_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_of_steps[] = { AOF_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayOf *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == AOF_CREATE) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
         s->i = 0;
-        s->hdr.stage = 1;
+        s->hdr.stage = AOF_CONSTRUCTED;
         if (JS_IsConstructor(ctx, s->hdr.this_val)) {
             s->hdr.cb_coerce[0] = s->hdr.this_val;        /* borrowed: the header owns the receiver */
             s->hdr.cb_coerce[1] = js_int32(s->hdr.argc);  /* a number: nothing to own */
@@ -71083,17 +71093,17 @@ static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         }
         s->result = JS_NewArray(ctx);   /* ArrayCreate(0): no user code at all */
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 2;
+        s->hdr.stage = AOF_DEFINE;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == AOF_CONSTRUCTED) {
         s->result = cb_result;   /* the constructed object, owned */
         cb_result = JS_UNDEFINED;
-        s->hdr.stage = 2;
+        s->hdr.stage = AOF_DEFINE;
     }
     /* steps 5 and 6 are the PAGE's on a Proxy or a subclass: CreateDataPropertyOrThrow is a defineProperty trap
        and Set(A,"length") a setter, and both ran from C inside this body. */
-    while (s->hdr.stage == 2) {
-        if (s->i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = 3; break; }
+    while (s->hdr.stage == AOF_DEFINE) {
+        if (s->i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = AOF_LENGTH; break; }
         r = step_defidx_run(ctx, &s->hdr, s->result, s->i, step_arg(&s->hdr, s->i), cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -71160,31 +71170,40 @@ static int JS_isConcatSpreadable(JSContext *ctx, JSValueConst obj)
     return js_is_array(ctx, obj);
 }
 
+#define AAT_STAGES(X) \
+    X(AAT_TOOBJECT, "23.1.3.1 step 1 (O is ToObject(this value))") \
+    X(AAT_LENGTH,   "23.1.3.1 step 2 (len is LengthOfArrayLike(O): ToLength(Get(O, \"length\")))") \
+    X(AAT_INDEX,    "23.1.3.1 step 3 (relativeIndex is ToIntegerOrInfinity(index))") \
+    X(AAT_RESOLVE,  "23.1.3.1 steps 4-5 (k from relativeIndex; out of range returns undefined)") \
+    X(AAT_GET,      "23.1.3.1 step 6 (Get(O, ToString(k)))")
+enum { AAT_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_at_steps[] = { AAT_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayAt *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == AAT_TOOBJECT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
         s->result = JS_UNDEFINED;
-        s->hdr.stage = 1;
+        s->hdr.stage = AAT_LENGTH;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == AAT_LENGTH) {
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 2;
+        s->hdr.stage = AAT_INDEX;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == AAT_INDEX) {
         r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->idx, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        s->hdr.stage = 3;
+        s->hdr.stage = AAT_RESOLVE;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == AAT_RESOLVE) {
         if (s->idx < 0)
             s->idx = s->len + s->idx;
         if (s->idx < 0 || s->idx >= s->len) {
@@ -71192,7 +71211,7 @@ static int js_array_at_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             s->result = JS_UNDEFINED;
             return 0;
         }
-        s->hdr.stage = 4;
+        s->hdr.stage = AAT_GET;
     }
     /* Get(O, ! ToString(k)) — an index accessor or a Proxy `get` trap is the page's code, and reading it with
        JS_GetPropertyInt64 from here drove it to completion. */
@@ -72088,28 +72107,38 @@ static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
+#define AFILL_STAGES(X) \
+    X(AFILL_TOOBJECT, "23.1.3.7 step 1 (O is ToObject(this value))") \
+    X(AFILL_LENGTH,   "23.1.3.7 step 2 (len is LengthOfArrayLike(O))") \
+    X(AFILL_START,    "23.1.3.7 steps 3-4 (relativeStart is ToIntegerOrInfinity(start), clamped into k)") \
+    X(AFILL_END,      "23.1.3.7 steps 5-6 (an undefined end is len and coerces nothing; otherwise " \
+                      "ToIntegerOrInfinity(end), clamped into final)") \
+    X(AFILL_SET,      "23.1.3.7 step 7.b (Set(O, ToString(k), value, true)), one element per step")
+enum { AFILL_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_fill_steps[] = { AFILL_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayFill *s = st;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == AFILL_TOOBJECT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED;
         s->len = 0; s->k = 0; s->end = 0;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = AFILL_LENGTH;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == AFILL_LENGTH) {
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         s->k = 0; s->end = s->len;
-        s->hdr.stage = 2;
+        s->hdr.stage = AFILL_START;
     }
-    if (s->hdr.stage == 2) {
+    if (s->hdr.stage == AFILL_START) {
         /* an ABSENT or undefined bound is the default and coerces nothing — the same rule substring's second
            argument follows, and the reason the defaults are set above rather than here. */
         if (s->hdr.argc > 1 && !JS_IsUndefined(step_arg(&s->hdr, 1))) {
@@ -72118,16 +72147,16 @@ static int js_array_fill_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             if (r) return r < 0 ? -1 : r;
             s->k = arr_clamp_idx(s->k, s->len);
         }
-        s->hdr.stage = 3;
+        s->hdr.stage = AFILL_END;
     }
-    if (s->hdr.stage == 3) {
+    if (s->hdr.stage == AFILL_END) {
         if (s->hdr.argc > 2 && !JS_IsUndefined(step_arg(&s->hdr, 2))) {
             r = step_toint64_run(ctx, &s->hdr, s->hdr.argv[2], cb_result, &s->end, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r) return r < 0 ? -1 : r;
             s->end = arr_clamp_idx(s->end, s->len);
         }
-        s->hdr.stage = 4;
+        s->hdr.stage = AFILL_SET;
     }
     while (s->k < s->end) {
         /* Set(O, ! ToString(k), value, true): an index setter or a Proxy `set` trap runs on this chain. */
@@ -74119,9 +74148,13 @@ static const JSTrampStepDef js_str_concat_def   = { sizeof(JSStrConcat), js_str_
                                                    .algorithm = "22.1.3.5 String.prototype.concat",
                                                    .steps = js_str_concat_steps };
 static const JSTrampStepDef js_str_ctor_def     = { sizeof(JSStrCtor), js_str_ctor_step, js_str_ctor_fini, 0, .visit = js_str_ctor_visit };
-static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0, .visit = js_array_at_visit };
+static const char *const js_array_at_steps[];
+static const JSTrampStepDef js_array_at_def     = { sizeof(JSArrayAt), js_array_at_step, js_array_at_fini, 0, .visit = js_array_at_visit,
+                        .algorithm = "23.1.3.1 Array.prototype.at", .steps = js_array_at_steps };
 static const JSTrampStepDef js_array_with_def   = { sizeof(JSArrayWith), js_array_with_step, js_array_with_fini, 0, .visit = js_array_with_visit };
-static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0, .visit = js_array_fill_visit };
+static const char *const js_array_fill_steps[];
+static const JSTrampStepDef js_array_fill_def   = { sizeof(JSArrayFill), js_array_fill_step, js_array_fill_fini, 0, .visit = js_array_fill_visit,
+                        .algorithm = "23.1.3.7 Array.prototype.fill", .steps = js_array_fill_steps };
 static const JSTrampStepDef js_array_copyWithin_def = { sizeof(JSArrayCopyWithin), js_array_copywithin_step, js_array_copywithin_fini, 0, .visit = js_array_copywithin_visit };
 static JSValue js_bigint_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 /* 21.2.1.1 BigInt(value): its ONLY user code is step 2's ToPrimitive on the argument — everything after runs on a
@@ -74316,7 +74349,9 @@ static const JSTrampStepDef js_date_ctor_def = { sizeof(JSDateCtor), js_date_cto
 static int js_array_of_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_of_visit(JSContext *ctx, void *st, JSStepVisit *v);
-static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_step, js_array_of_fini, 0, .visit = js_array_of_visit };
+static const char *const js_array_of_steps[];
+static const JSTrampStepDef js_array_of_def = { sizeof(JSArrayOf), js_array_of_step, js_array_of_fini, 0, .visit = js_array_of_visit,
+                        .algorithm = "23.1.2.3 Array.of", .steps = js_array_of_steps };
 static int js_array_concat_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result);
@@ -74330,8 +74365,10 @@ static const JSTrampStepDef js_array_reverse_def =
 static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_toreversed_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_toreversed_visit(JSContext *ctx, void *st, JSStepVisit *v);
+static const char *const js_array_toreversed_steps[];
 static const JSTrampStepDef js_array_toReversed_def =
-    { sizeof(JSArrayToReversed), js_array_toreversed_step, js_array_toreversed_fini, 0, .visit = js_array_toreversed_visit };
+    { sizeof(JSArrayToReversed), js_array_toreversed_step, js_array_toreversed_fini, 0, .visit = js_array_toreversed_visit,
+      .algorithm = "23.1.3.33 Array.prototype.toReversed", .steps = js_array_toreversed_steps };
 static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_array_tospliced_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_tospliced_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -74345,8 +74382,11 @@ static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result);
 static void js_array_push_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_array_pop_def     = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  0, .visit = js_array_pop_visit };
 static const JSTrampStepDef js_array_shift_def   = { sizeof(JSArrayPop),  js_array_pop_step,  js_array_pop_fini,  1, .visit = js_array_pop_visit };
-static const JSTrampStepDef js_array_push_def    = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 0, .visit = js_array_push_visit };
-static const JSTrampStepDef js_array_unshift_def = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 1, .visit = js_array_push_visit };
+static const char *const js_array_push_steps[];
+static const JSTrampStepDef js_array_push_def    = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 0, .visit = js_array_push_visit,
+                        .algorithm = "23.1.3.23 Array.prototype.push", .steps = js_array_push_steps };
+static const JSTrampStepDef js_array_unshift_def = { sizeof(JSArrayPush), js_array_push_step, js_array_push_fini, 1, .visit = js_array_push_visit,
+                        .algorithm = "23.1.3.36 Array.prototype.unshift", .steps = js_array_push_steps };
 static const JSTrampStepDef js_array_ctor_def =
     CREATECTOR_DEF(JS_CLASS_ARRAY, 0, generic, js_array_ctor_body, 0);
 static const JSTrampStepDef js_array_slice_def  =
@@ -77480,13 +77520,30 @@ static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result)
    Stages: 0 the fast path / ToObject, 1 length, 2 unshift's shift, 3 the inserted writes,
    4 Set(O,"length",newLen). */
 
+/* push and unshift are ONE machine because they are one algorithm with one extra step: unshift moves what is
+   already there up by argCount first. ONE stage list, each label naming BOTH sections, because a stage of a
+   shared machine is ONE rest point — which of the two a parked flow is in is what the definition's `algorithm`
+   says. */
+#define APUSH_STAGES(X) \
+    X(APUSH_TOOBJECT, "23.1.3.23 push / 23.1.3.36 unshift step 1 (O is ToObject(this value))") \
+    X(APUSH_LENGTH,   "23.1.3.23 / 23.1.3.36 step 2 (len is LengthOfArrayLike(O)), and the 2^53-1 check that " \
+                      "follows it") \
+    X(APUSH_SHIFT,    "23.1.3.36 step 4.c (unshift only: each existing element moves up by argCount — " \
+                      "HasProperty, then Get and Set or DeletePropertyOrThrow — walked downwards so a copy " \
+                      "never overwrites a slot it has not read)") \
+    X(APUSH_APPEND,   "23.1.3.23 step 5.a / 23.1.3.36 step 4.e.i (Set(O, ToString(k), E, true)), one argument " \
+                      "per step") \
+    X(APUSH_SETLEN,   "23.1.3.23 step 6 / 23.1.3.36 step 5 (Set(O, \"length\", len, true))")
+enum { APUSH_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_push_steps[] = { APUSH_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayPush *s = st;
     int unshift = (s->hdr.arg != 0);
     int i, r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == APUSH_TOOBJECT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->obj = JS_UNDEFINED;
         s->len = 0; s->newLen = 0; s->from = 0; s->cs_i = 0; s->i = 0; s->present = 0;
@@ -77526,9 +77583,9 @@ static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         }
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = APUSH_LENGTH;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == APUSH_LENGTH) {
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -77541,16 +77598,16 @@ static int js_array_push_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         s->cs_i = 0; s->i = 0;
         s->hdr.stage = (unshift && s->hdr.argc > 0) ? 2 : 3;
     }
-    if (s->hdr.stage == 2) {   /* unshift: everything moves up by argc, backwards so the copy does not overlap */
+    if (s->hdr.stage == APUSH_SHIFT) {   /* unshift: everything moves up by argc, backwards so the copy does not overlap */
         r = step_copysub_run(ctx, &s->hdr, s->obj, s->hdr.argc, 0, s->len, -1,
                              &s->cs_i, &s->present, cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         s->from = 0;
-        s->hdr.stage = 3;
+        s->hdr.stage = APUSH_APPEND;
     }
-    while (s->hdr.stage == 3) {
-        if (s->i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = 4; break; }
+    while (s->hdr.stage == APUSH_APPEND) {
+        if (s->i >= s->hdr.argc) { JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED; s->hdr.stage = APUSH_SETLEN; break; }
         r = step_setidx_run(ctx, &s->hdr, s->obj, s->from + s->i, step_arg(&s->hdr, s->i),
                             cb_result, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -77711,6 +77768,13 @@ static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result)
    prototype lookup is reachable, so it is the same computation with no observable step.
    Stages: 0 ToObject, 1 length + allocate + the dense span, 2 the element read. */
 
+#define ATOREV_STAGES(X) \
+    X(ATOREV_TOOBJECT, "23.1.3.33 step 1 (O is ToObject(this value))") \
+    X(ATOREV_LENGTH,   "23.1.3.33 steps 2-3 (len is LengthOfArrayLike(O); A is ArrayCreate(len))") \
+    X(ATOREV_GET,      "23.1.3.33 step 5.c (fromValue is Get(O, ToString(len - k - 1))), one element per step")
+enum { ATOREV_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_array_toreversed_steps[] = { ATOREV_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
 static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayToReversed *s = st;
@@ -77718,16 +77782,16 @@ static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result,
     uint32_t count32;
     int r;
 
-    if (s->hdr.stage == 0) {
+    if (s->hdr.stage == ATOREV_TOOBJECT) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->obj = JS_UNDEFINED; s->arr = JS_UNDEFINED; s->el = JS_UNDEFINED;
         s->len = 0; s->k = 0;
         s->obj = JS_ToObject(ctx, s->hdr.this_val);
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
-        s->hdr.stage = 1;
+        s->hdr.stage = ATOREV_LENGTH;
     }
-    if (s->hdr.stage == 1) {
+    if (s->hdr.stage == ATOREV_LENGTH) {
         r = step_length_run(ctx, &s->hdr, s->obj, cb_result, &s->len, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -77743,7 +77807,7 @@ static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result,
                 *pval = js_dup(arrp[i]);
             return 0;
         }
-        s->hdr.stage = 2;
+        s->hdr.stage = ATOREV_GET;
     }
     for (;;) {
         if (s->k >= s->len) { JS_FreeValue(ctx, cb_result); return 0; }
