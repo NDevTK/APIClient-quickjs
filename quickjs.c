@@ -9583,8 +9583,29 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         JS_FreeValue(ctx, p->u.object_data);
         p->u.object_data = stack;
     } else if (can_add_backtrace(error_obj)) {
-        /* DOMException and the like keep an own "stack" data property. can_add_backtrace has just established
-           there is no own slot, so this is an add, not a define. */
+        /* DOMException and the like keep an own "stack" data PROPERTY, and a data property has no accessor to
+           render the pending [prepare, callsites] pair on first read — so what was stored was the PAIR, and
+           `new DOMException("x", "NotSupportedError").stack` answered an ARRAY where every engine answers a
+           STRING. Nothing rejects that; everything downstream simply does string work on an array. It cost a
+           whole WPT document: testharness keeps a failed test's `stack` and formats it, so ONE uncaught
+           DOMException in a test body left the harness unable to complete — 279 subtests of
+           dom/nodes/Document-createEvent.https.html reported as nothing at all, with no error anywhere naming
+           a type. The catch had worked; it was the reporting that could not.
+           THE DEFAULT RENDERING IS THE ANSWER HERE, for the reason JS_GetErrorStackString gives for the same
+           pair: this runs from build_backtrace, at CONSTRUCTION time, where Error.prepareStackTrace is the
+           page's function and there is no flow under this C activation to run it on. An Error defers that
+           decision to its accessor; a data property cannot defer anything, so it stores exactly what a read
+           with the hook unavailable produces. */
+        if (js_error_stack_is_pending(stack)) {
+            JSValue sites = JS_GetPropertyUint32(ctx, stack, 1);
+            JSValue rendered = JS_IsException(sites) ? JS_NULL : js_callsite_array_render(ctx, sites);
+            JS_FreeValue(ctx, sites);
+            JS_FreeValue(ctx, stack);
+            stack = JS_IsException(rendered) ? JS_NULL : rendered;
+        }
+        DCHECK(JS_IsString(stack) || JS_IsNull(stack),
+               "a DOMException's own `stack` is a data property, so it must already be the rendered string — "
+               "an unrendered pair there is an array where every consumer expects text");
         js_error_add_own(ctx, error_obj, JS_ATOM_stack, stack,
                          JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     } else {
