@@ -18927,6 +18927,35 @@ static int step_getprop_begin(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JS
     return 6;
 }
 
+/* ENDS a keyed request and says whether its completion was ABRUPT — the two lines every one of these answer
+   paths already ran, plus the one question none of them could ask.
+ *
+ * ENDING AND REPORTING ARE ONE EVENT, which is why this is a function and not a pair of lines copied around: a
+ * request that completed abruptly is over, so the cursor rewinds and the key is released exactly as a normal
+ * completion releases them, and the machine is then free to start its next sub-sequence at a clean cursor. The
+ * reset therefore comes BEFORE the test.
+ * -1 IS THE ANSWER BECAUSE -1 IS WHAT THESE HELPERS ALREADY PROMISED. Every one of them is documented "0 =
+ * done, N = the caller must return that step code, -1 = threw", and every caller in this engine was written to
+ * that contract — the contract simply had no mechanism behind it, because an abrupt completion never reached
+ * the helper at all. Giving it one is the whole fix, and it needs no call site to change: a machine that
+ * propagates already returns JS_STEP_ABRUPT on -1, and one whose definition declares catches_abrupt branches
+ * there instead. Handing the throw back as a JS_EXCEPTION *value* was the other candidate and is worse: a
+ * caller that forgets it flows an exception marker into JS_IsFunction and reports a fabricated TypeError over
+ * a live throw, which is a WRONG error rather than a loud one. */
+static bool step_keyed_abrupt(JSContext *ctx, JSStepHdr *h, JSValueConst in)
+{
+    DCHECK(h->get_atom != JS_ATOM_NULL, "a keyed operation was delivered with none in flight on this header");
+    JS_FreeAtom(ctx, h->get_atom);
+    h->get_atom = JS_ATOM_NULL;
+    h->get_phase = GET_PH_START;
+    if (JS_IsException(in)) {
+        DCHECK(JS_HasException(ctx),
+               "a keyed operation was delivered JS_EXCEPTION with no completion value live in the context");
+        return true;
+    }
+    return false;
+}
+
 /* the tail both entries share: the value arrived, so the key is done.
 
    THE TWO-PHASE CONTRACT, asserted here because violating it is otherwise SILENT. A sub-sequence parks on its
@@ -18938,33 +18967,75 @@ static int step_getprop_begin(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JS
    nothing on the answering path and so have no key to check. */
 static int step_getprop_done(JSContext *ctx, JSStepHdr *h, JSAtom atom, JSValue in, JSValue *pout)
 {
-    DCHECK(h->get_atom != JS_ATOM_NULL, "a keyed read was delivered with none in flight on this header");
-    DCHECK(atom == JS_ATOM_NULL || atom == h->get_atom,
-           "a keyed read was answered at a DIFFERENT call site than the one that parked it — the machine "
-           "advanced its phase before the request completed; a two-phase sub-sequence keeps its phase until it "
-           "returns 0");
-    JS_FreeAtom(ctx, h->get_atom);
-    h->get_atom = JS_ATOM_NULL;
-    h->get_phase = GET_PH_START;
+#if APICLIENT_DEV
+    /* THE MESSAGE CARRIES WHO AND WHICH KEY, because "a different call site" without them is a bug report with
+       the two facts that identify it left out — the algorithm and the pair of keys are exactly what turns this
+       from a hunt into a read. */
+    if (!(atom == JS_ATOM_NULL || atom == h->get_atom)) {
+        char why[420], want[80], got[80];
+        const char *aw = JS_AtomGetStr(ctx, want, sizeof want, atom);
+        const char *ag = JS_AtomGetStr(ctx, got, sizeof got, h->get_atom);
+        snprintf(why, sizeof why,
+                 "%s answered a keyed read of `%s` at the call site for `%s` — a DIFFERENT call site than the "
+                 "one that parked it, so this receives the other read's value as its own. A two-phase "
+                 "sub-sequence keeps its phase until it returns 0; a machine that CATCHES an abrupt delivery "
+                 "must still let the request END (call the helper, or take the -1 it reports) before starting "
+                 "the next one",
+                 h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)", ag, aw);
+        DFAIL(why);
+    }
+#endif
+    if (step_keyed_abrupt(ctx, h, in)) return -1;   /* a throwing accessor or `get` trap */
     *pout = in;
     return 0;
 }
 
-/* An ABRUPT delivery ENDS the request the machine parked on, so the in-flight key is released HERE — the same
-   thing step_getprop_done does on the normal path, and the only other way a request finishes. Without it a
-   catches_abrupt machine that ran a two-phase sub-sequence keeps the key on its header forever: the NEXT
-   sub-sequence it starts finds get_phase already GOT, takes the answering branch, and reads a value it never
-   asked for. Array.fromAsync found it — a failing CreateDataPropertyOrThrow is caught by step 12 and the close
-   that follows reads `return`, which is the next call site. */
-static void step_hdr_request_abandon(JSContext *ctx, JSStepHdr *h)
+/* AN ABRUPT COMPLETION IS A DELIVERY, NOT A DEMOLITION — and this is where that used to go wrong.
+ *
+ * There WAS a step_hdr_request_abandon here, called by the driver before it re-entered a catches_abrupt machine
+ * with JS_EXCEPTION: it released the in-flight key and reset get/keys/desc_phase, so the request the machine was
+ * parked on ceased to exist a moment before the machine was told about it. That is exactly one request kind
+ * answering differently from every other. A CALL reports its throw through the same `out` a return value comes
+ * back in (step_call_run's phase is the MACHINE's byte, which the driver cannot reach); a keyed read reported
+ * nothing at all, because the driver had already rewound its cursor to "not started" — so the machine's own
+ * `step_getprop_run` at the SAME call site took the ASK branch and issued the read a second time. The page's
+ * getter threw again, forever. It cost two components a workaround each and one WPT file its entire result:
+ * `EventListener-handleEvent`'s "rethrows errors when getting handleEvent" hung, and `observable-from.any.js`
+ * went from 48 subtests to a timeout, which discards the ones that had already passed.
+ *
+ * The delivery is now the ordinary one: the cursor stands, the machine re-enters its helper at the call site
+ * that parked, and the helper ENDS the request there — the same lines that end it on the normal path — and
+ * REPORTS the abrupt completion as -1, which is what every one of these helpers already documented and what
+ * every caller was already written for. Array.fromAsync's case, which the deleted function was written for, is
+ * served by that and better: step 12 catches the failing CreateDataPropertyOrThrow AT ITS OWN CALL SITE, where
+ * step_defidx_run resets the phase and frees the key, so the close that follows starts its `return` read at a
+ * cursor that is clean rather than one the driver guessed was.
+ *
+ * The invariant this leaves is asserted where every machine passes: see do_step_step. */
+
+/* "I TOOK THE ABRUPT DELIVERY MYSELF" — the one statement the driver could not make and the machine can.
+ *
+ * Most machines consume an abrupt completion at the call site that parked on it, and the helper there ends the
+ * request as part of reporting it. A few state their abrupt handling ONCE for every request they make, because
+ * that is what their algorithm says: Array.fromAsync's closure rejects its capability whatever threw, and
+ * IfAbruptCloseIterator then reads `return` — a DIFFERENT keyed request, started while the previous one is
+ * still on the header. That machine has consumed the delivery, so the request IS over, and only the machine
+ * knows it.
+ *
+ * This is NOT the deleted step_hdr_request_abandon under a new name, and the difference is the whole point of
+ * deleting it: that one was the DRIVER deciding, for every machine, that a request had ceased to exist BEFORE
+ * the machine was told about it — which is what re-issued the read and hung. This is the machine saying so at
+ * the point where it is true, and a machine that forgets does not fail silently: the next keyed read answers at
+ * a call site whose key does not match and step_getprop_done names both keys and the algorithm. */
+static void step_request_taken(JSContext *ctx, JSStepHdr *h)
 {
     if (h->get_atom != JS_ATOM_NULL) {
         JS_FreeAtom(ctx, h->get_atom);
         h->get_atom = JS_ATOM_NULL;
     }
     h->get_phase = GET_PH_START;
-    h->keys_phase = GET_PH_START;   /* the own-keys sub-sequence ends with the request too, for the same reason */
-    h->desc_phase = GET_PH_START;
+    h->keys_phase = GET_PH_START;   /* the own-keys and own-descriptor sub-sequences end with it, for the same */
+    h->desc_phase = GET_PH_START;   /* reason: the delivery they were waiting for has been consumed elsewhere */
 }
 
 /* a NAMED key, borrowed from the caller (a permanent atom in every current use). */
@@ -19092,6 +19163,7 @@ static int step_strop_run(JSContext *ctx, JSStepHdr *h, JSValueConst options, JS
         return step_getprop_run(ctx, h, options, key, in, &v, out_cb, out_argc);
     }
     r = step_getprop_run(ctx, h, options, key, in, &v, out_cb, out_argc);
+    if (r < 0) return -1;   /* the getter threw; GetOption has no catch of its own */
     DCHECK(r == 0, "an option read answered with something other than its value");
     if (JS_IsUndefined(v)) { *pout = fallback; return 0; }
     if (!JS_IsString(v)) {
@@ -19189,13 +19261,10 @@ static int step_setprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
         h->get_phase = GET_PH_GOT;
         return 8;
     }
-    DCHECK(h->get_atom != JS_ATOM_NULL, "a keyed write was delivered with none in flight on this header");
     DCHECK(atom == JS_ATOM_NULL || atom == h->get_atom,
            "a keyed write was answered at a DIFFERENT call site than the one that parked it — see the read's "
            "contract above");
-    JS_FreeAtom(ctx, h->get_atom);
-    h->get_atom = JS_ATOM_NULL;
-    h->get_phase = GET_PH_START;
+    if (step_keyed_abrupt(ctx, h, in)) return -1;   /* a throwing setter or `set` trap */
     JS_FreeValue(ctx, in);                  /* a write delivers no value */
     return 0;
 }
@@ -19252,9 +19321,7 @@ static int step_delidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
         h->get_phase = GET_PH_GOT;
         return 9;
     }
-    JS_FreeAtom(ctx, h->get_atom);
-    h->get_atom = JS_ATOM_NULL;
-    h->get_phase = GET_PH_START;
+    if (step_keyed_abrupt(ctx, h, in)) return -1;   /* a throwing `deleteProperty` trap */
     JS_FreeValue(ctx, in);                  /* a delete delivers no value */
     return 0;
 }
@@ -19278,9 +19345,7 @@ static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
         h->get_phase = GET_PH_GOT;
         return 10;
     }
-    JS_FreeAtom(ctx, h->get_atom);
-    h->get_atom = JS_ATOM_NULL;
-    h->get_phase = GET_PH_START;
+    if (step_keyed_abrupt(ctx, h, in)) return -1;   /* a throwing `defineProperty` trap */
     JS_FreeValue(ctx, in);                  /* a define delivers no value */
     return 0;
 }
@@ -19335,9 +19400,7 @@ static int step_delprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
         h->get_phase = GET_PH_GOT;
         return 15;
     }
-    JS_FreeAtom(ctx, h->get_atom);
-    h->get_atom = JS_ATOM_NULL;
-    h->get_phase = GET_PH_START;
+    if (step_keyed_abrupt(ctx, h, in)) return -1;   /* a throwing `deleteProperty` trap */
     JS_FreeValue(ctx, in);                  /* the boolean [[Delete]] answered is 25.5.1.1's to discard */
     return 0;
 }
@@ -19353,11 +19416,11 @@ static int step_hasprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
         r = step_getprop_begin(ctx, h, obj, JS_DupAtom(ctx, atom), out_cb, out_argc);
         return (r == 6) ? 7 : r;
     }
+    /* the END comes first, and so does the abrupt test: JS_ToBool of the JS_EXCEPTION marker would answer
+       "present" for a `has` trap that threw, which is a membership answer invented out of a throw. */
+    if (step_keyed_abrupt(ctx, h, in)) return -1;
     *pres = JS_ToBool(ctx, in);
     JS_FreeValue(ctx, in);
-    JS_FreeAtom(ctx, h->get_atom);
-    h->get_atom = JS_ATOM_NULL;
-    h->get_phase = GET_PH_START;
     return 0;
 }
 
@@ -19376,11 +19439,9 @@ static int step_hasidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
         r = step_getprop_begin(ctx, h, obj, atom, out_cb, out_argc);
         return (r == 6) ? 7 : r;   /* the same request, asking the other question */
     }
+    if (step_keyed_abrupt(ctx, h, in)) return -1;   /* see the named form: a thrown `has` is not a "present" */
     *pres = JS_ToBool(ctx, in);
     JS_FreeValue(ctx, in);
-    JS_FreeAtom(ctx, h->get_atom);
-    h->get_atom = JS_ATOM_NULL;
-    h->get_phase = GET_PH_START;
     return 0;
 }
 
@@ -21850,6 +21911,48 @@ static void step_stage_check(const JSStepHdr *h, const char *when)
     }
 #else
     (void)h; (void)when;
+#endif
+}
+
+/* A MACHINE MAY NOT ASK FOR ANYTHING OVER A LIVE THROW — the invariant an ABRUPT DELIVERY is made under, and
+ * therefore the one this asserts, at the single point where every machine's step() is called.
+ *
+ * A definition that declares catches_abrupt is re-entered with JS_EXCEPTION and the completion still live in the
+ * context, and its job is to CONSUME that delivery — at the request helper it parked in, which ends the request
+ * and hands the abrupt on in that operation's own encoding, or by taking the exception itself. A machine that
+ * does neither and simply asks again hands the page's code to the driver with a throw pending, and when the
+ * thing it asks for is THE SAME REQUEST AT THE SAME CURSOR the getter runs a second time, throws again, and the
+ * loop never ends. That is what this is here to make impossible to write: the failure mode is a HANG, and a
+ * timeout discards every subtest the file had already passed rather than failing one — `EventListener-handleEvent`
+ * and `observable-from.any.js` each cost exactly that, and neither produced a diagnostic of any kind.
+ *
+ * It also names the OTHER shape of the same gap. A request kind with no way to report an abrupt completion at
+ * all cannot be consumed by anybody, so the machine that made one arrives here with the throw still live and
+ * this says which algorithm, which stage and which step code — the missing capability, named, rather than a
+ * machine quietly running on over a pending exception. */
+static void step_request_check(JSContext *ctx, const JSStepHdr *h, int st)
+{
+#if APICLIENT_DEV
+    if (st > 0 && JS_HasException(ctx)) {
+        const char *label = "(a stage its definition does not declare)";
+        char why[420];
+        if (h->def->steps) {
+            int n = 0;
+            while (h->def->steps[n]) n++;
+            if (h->stage < (uint16_t)n) label = h->def->steps[h->stage];
+        }
+        snprintf(why, sizeof why,
+                 "%s asked for step code %d at stage %u (%s) with a throw still live in the context — an abrupt "
+                 "request completion was delivered to this machine and never consumed, so the driver is about to "
+                 "run the page's code over a pending exception; asking for the SAME request at the SAME cursor "
+                 "is the hang this check exists for. Consume the abrupt where the request ENDS (the helper the "
+                 "machine parked in), or take the exception; a request kind that cannot report one at all is the "
+                 "capability to build",
+                 h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)", st, (unsigned)h->stage, label);
+        DFAIL(why);
+    }
+#else
+    (void)ctx; (void)h; (void)st;
 #endif
 }
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
@@ -27734,6 +27837,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_iter_consume_step;
                         }
                         DCHECK(ckind == CONT_STEP, "do_construct_dispatch: unknown outer sequence kind");
+                        /* the in-place CONSTRUCT's abrupt, named for the same reason the in-place CALL's is —
+                           see the DCHECK at do_cont_dispatch's CONT_STEP delivery. */
+                        DCHECK(!(JS_IsException(ret_val) && ((JSStepHdr *)cont_st)->def->catches_abrupt),
+                               "a C constructor threw IN PLACE under a machine that declares catches_abrupt, and "
+                               "this arm abandons it instead of delivering — route it to do_step_step with "
+                               "JS_EXCEPTION, the way the frame unwind's CONT_STEP arm does");
                         if (unlikely(JS_IsException(ret_val))) goto step_abandon;
                         goto do_step_step;
                     }
@@ -28451,6 +28560,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             if (unlikely(JS_IsException(ret_val))) { js_toprim_abandon(ctx, cont_st); goto exception; }
                             goto do_toprim_step;
                         }
+                        /* THE IN-PLACE HALF OF THE ABRUPT DELIVERY, named here for the reason the inner-machine
+                           one below is: the callee was a C builtin, so nothing suspended and the throw arrives
+                           HERE rather than at the frame unwind — and this arm abandons the machine even when its
+                           definition declares that an abrupt call result is its algorithm's value. */
+                        DCHECK(!(JS_IsException(ret_val) && ((JSStepHdr *)cont_st)->def->catches_abrupt),
+                               "a C callee threw IN PLACE under a machine that declares catches_abrupt, and this "
+                               "arm abandons it instead of delivering — route it to do_step_step with "
+                               "JS_EXCEPTION, the way the frame unwind's CONT_STEP arm does");
                         if (unlikely(JS_IsException(ret_val))) goto step_abandon;
                         goto do_step_step;
                     }
@@ -28730,6 +28847,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 step_stage_check(h, "before");
                 st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
                 step_stage_check(h, "after");
+                step_request_check(ctx, h, st);
                 g_step_chain = prev_chain; g_step_running = prev_running;
                 if (unlikely(st < 0)) {
                     void *souter0 = h->outer; uint8_t sk0 = h->outer_kind;
@@ -28839,6 +28957,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         tramp_step_abrupt_free(ctx, stt);
                         cont_st = souter0;
                         goto do_getprop_abandon;
+                    }
+                    if (souter0 && sk0 == CONT_STEP && ((JSStepHdr *)souter0)->def->catches_abrupt) {
+                        /* THE OTHER HALF OF THE ABRUPT DELIVERY. A machine reached as another machine's CALL —
+                           `[1,2].map(String)`, and every Observable operator whose callback is a step builtin —
+                           hands its throw to this walk, which used to free the whole chain INCLUDING an outer
+                           whose definition declares that an abrupt request result is its algorithm's value. The
+                           same callback written with a BYTECODE body throws from the frame unwind, whose
+                           CONT_STEP arm delivers it, so one algorithm answered differently depending on how its
+                           callback happened to be written; `observable-catch.any.js` is where that shows.
+                           Only THIS machine goes; the outer is re-entered with JS_EXCEPTION exactly as it is
+                           re-entered with a value, and the operand drop is the DONE path's, because there is no
+                           delivery label between here and the outer's step to do it. */
+                        int cfirst2 = h->orig_cfirst, cargc2 = h->orig_cargc;
+                        JSValue *scargv;
+                        DCHECK(cargc2 >= cfirst2,
+                               "a step machine's invocation records operands ending below where they start");
+                        h->outer = NULL; h->outer_kind = CONT_NONE;
+                        tramp_step_abrupt_free(ctx, stt);
+                        scargv = sp - cargc2;
+                        for (i = cfirst2; i < cargc2; i++) JS_FreeValue(ctx, scargv[i]);
+                        sp += cfirst2 - cargc2;
+                        ret_val = JS_EXCEPTION; cont_st = souter0;
+                        goto do_step_step;
                     }
                     tramp_step_chain_free(ctx, stt);   /* and the machines waiting on it */
                     DCHECK(JS_HasException(ctx), "a step machine reported ABRUPT and left no completion value behind");
@@ -31554,12 +31695,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     DCHECK(gk3 == CONT_STEP, "property-get outer continuation: unknown machine kind");
                     if (((JSStepHdr *)gouter)->def->catches_abrupt) {
-                        step_hdr_request_abandon(ctx, (JSStepHdr *)gouter);
                         /* the machine's own algorithm catches it. WHERE the read threw — in place here, or after
                            a suspension at do_getprop_abandon — is not something the algorithm can observe, so
                            both paths must answer this ONE question the same way. They did not: Array.fromAsync's
                            `Get(null, @@asyncIterator)` throws before anything suspends, and this label freed the
-                           chain and propagated, so the builtin THREW where the spec rejects its promise. */
+                           chain and propagated, so the builtin THREW where the spec rejects its promise.
+                           THE MACHINE'S CURSOR IS LEFT ALONE. The request is ended by the helper the machine
+                           re-enters, at the call site that parked on it — see the note where
+                           step_hdr_request_abandon used to be. */
                         cont_st = gouter;
                         ret_val = JS_EXCEPTION;
                         goto do_step_step;
@@ -40277,8 +40420,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_iter_consume_abandon(ctx, gouter);
             } else if (gouter && gk2 == CONT_STEP && ((JSStepHdr *)gouter)->def->catches_abrupt) {
                 /* the read threw and the machine's own algorithm catches it: hand the exception back to step()
-                   with the throw still live, exactly as a normal result is handed back. */
-                step_hdr_request_abandon(ctx, (JSStepHdr *)gouter);
+                   with the throw still live, exactly as a normal result is handed back — which means the
+                   machine's request CURSOR is left exactly as a normal result leaves it, so the helper at the
+                   call site that parked is what ends the request. See the note where step_hdr_request_abandon
+                   used to be. */
                 cont_st = gouter;
                 ret_val = JS_EXCEPTION;
                 goto do_step_step;
@@ -55636,9 +55781,13 @@ static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     }
 
     if (s->hdr.stage == IMPOPTS_WITH) {
-        if (JS_IsException(cb_result))
+        /* THE REQUEST IS ENDED FIRST, WHATEVER ITS COMPLETION WAS. This used to test cb_result and return
+           BEFORE the read's answer ran, which was sound only while the driver rewound the cursor on an abrupt
+           delivery — and that rewind is the defect that hung two other components. The read ends here on both
+           completions and REPORTS an abrupt one as -1; step 11.b is inside the IfAbruptRejectPromise, so that
+           is what this rejects with. */
+        if (step_getprop_done(ctx, &s->hdr, JS_ATOM_NULL, cb_result, &s->attrs_obj) < 0)
             return js_import_opts_reject(ctx, s, JS_GetException(ctx));
-        step_getprop_done(ctx, &s->hdr, JS_ATOM_NULL, cb_result, &s->attrs_obj);
         cb_result = JS_UNDEFINED;
         if (JS_IsUndefined(s->attrs_obj))
             return js_import_opts_enqueue(ctx, s);          /* step 11.d: no `with`, no attributes */
@@ -70098,9 +70247,15 @@ static int fa_advance(JSContext *ctx, JSFromAsync *s, JSValue in, JSValue **out_
 
     /* catches_abrupt: a request that THREW is delivered as JS_EXCEPTION with the throw still live, exactly as a
        value is. It is not a value — treating it as one is what hung the mapfn-throws cases, because the next
-       phase stored an exception marker on the state and waited for a settle that could never come. */
+       phase stored an exception marker on the state and waited for a settle that could never come.
+       This machine states its abrupt handling ONCE for every request it makes — proposal-array-from-async wraps
+       the whole closure in an IfAbruptRejectPromise — so it consumes the delivery HERE rather than at the call
+       site that parked, and the request the header is holding ends with it. Without saying so, the close below
+       reads `return` while the failed CreateDataPropertyOrThrow's own key is still in flight, and that read is
+       answered at a call site that never asked for it. */
     if (JS_IsException(in)) {
         in = JS_UNDEFINED;
+        step_request_taken(ctx, &s->hdr);
         goto abrupt;
     }
 
@@ -89821,9 +89976,11 @@ static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValu
                 if (at == JS_ATOM_NULL) return -1;
                 return step_getprop_begin(ctx, &s->hdr, replacer, at, out_cb, out_argc);
             }
-            step_getprop_done(ctx, &s->hdr, JS_ATOM_NULL, in, &v);   /* an INDEX key: nothing to check */
+            /* the READ's own completion, taken from the request rather than sniffed off the value it wrote:
+               an abrupt one writes nothing, so a JS_IsException on an unwritten local was reading a slot the
+               request had never filled. */
+            if (step_getprop_done(ctx, &s->hdr, JS_ATOM_NULL, in, &v) < 0) { in = JS_UNDEFINED; return -1; }
             in = JS_UNDEFINED;
-            if (JS_IsException(v)) return -1;
             s->pi++;
             /* 25.5.2.1 step 3.b.iii: a String or a Number is the item; an Object with [[StringData]] or
                [[NumberData]] is ToString'd, which is the page's code; anything else is skipped. */
@@ -89996,9 +90153,8 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             return step_getprop_begin(ctx, &s->hdr, f->holder, JS_DupAtom(ctx, f->key_atom), out_cb, out_argc);
 
         case SJ_GOT:
-            step_getprop_done(ctx, &s->hdr, f->key_atom, in, &f->val);
+            if (step_getprop_done(ctx, &s->hdr, f->key_atom, in, &f->val) < 0) { in = JS_UNDEFINED; return -1; }
             in = JS_UNDEFINED;
-            if (JS_IsException(f->val)) { f->val = JS_UNDEFINED; return -1; }
             /* step 2: `If value is an Object or a BigInt, let toJSON be ? GetV(value, "toJSON")`. */
             if (JS_IsObject(f->val) || JS_IsBigInt(f->val)) {
                 f->phase = SJ_TOJSON_GOT;
@@ -90010,9 +90166,8 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
 
         case SJ_TOJSON_GOT: {
             JSValue fn;
-            step_getprop_done(ctx, &s->hdr, JS_ATOM_toJSON, in, &fn);
+            if (step_getprop_done(ctx, &s->hdr, JS_ATOM_toJSON, in, &fn) < 0) { in = JS_UNDEFINED; return -1; }
             in = JS_UNDEFINED;
-            if (JS_IsException(fn)) return -1;
             if (!JS_IsFunction(ctx, fn)) {
                 JS_FreeValue(ctx, fn);
                 f->phase = SJ_REPLACER_CALLED;

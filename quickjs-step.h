@@ -378,7 +378,19 @@ static inline JSValueConst step_arg(const JSStepHdr *h, int i)
    Web IDL attribute off an object the page supplied is one accessor or Proxy trap away from being the page's
    code, so it cannot be a JS_GetPropertyStr from C; this parks the machine on the read and answers at the SAME
    call site when it is re-entered. Returns JS_STEP_REQUEST (the caller returns it), 0 once *pout is set, or -1.
-   `atom` is BORROWED. */
+   `atom` is BORROWED.
+
+   -1 IS ALSO HOW AN ABRUPT COMPLETION ARRIVES — for this request and for every KEYED one below it (the write,
+   the define, the delete, the membership test, the own-keys and own-descriptor reads). The request ENDS at the
+   call site that parked on it, exactly as a normal completion ends it — the cursor rewinds, the key is
+   released — and returns -1 with the completion live in the context. A machine that propagates writes what it
+   already writes (`if (r < 0) return JS_STEP_ABRUPT;`); a machine whose definition declares `catches_abrupt`
+   branches there instead and says what its algorithm does with the throw. The CALL and CONSTRUCT requests
+   still report theirs as a JS_EXCEPTION in `*pout` — the encoding JS_Call itself uses — so the two halves of
+   the request layer do not yet answer the same way; moving them onto -1 is a change at ninety-nine call sites
+   and belongs in its own diff, not smuggled into this one. Neither encoding can go unnoticed: a machine that
+   ignores an abrupt delivery and asks for anything with that throw still live aborts at the driver's one
+   convergence point, naming its algorithm, its stage and the step code it asked for. */
 JS_EXTERN int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
                                JSValue *pout, JSValue **out_cb, int *out_argc);
 
