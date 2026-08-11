@@ -21914,26 +21914,34 @@ static void step_stage_check(const JSStepHdr *h, const char *when)
 #endif
 }
 
-/* A MACHINE MAY NOT ASK FOR ANYTHING OVER A LIVE THROW — the invariant an ABRUPT DELIVERY is made under, and
- * therefore the one this asserts, at the single point where every machine's step() is called.
+/* AN ABRUPT DELIVERY IS CONSUMED BEFORE THE MACHINE ASKS FOR ANYTHING ELSE — asserted at the single point where
+ * every machine's step() is called, because that is the only place the delivery and the answer are both in hand.
  *
  * A definition that declares catches_abrupt is re-entered with JS_EXCEPTION and the completion still live in the
  * context, and its job is to CONSUME that delivery — at the request helper it parked in, which ends the request
- * and hands the abrupt on in that operation's own encoding, or by taking the exception itself. A machine that
- * does neither and simply asks again hands the page's code to the driver with a throw pending, and when the
+ * and reports the abrupt as -1, or by taking the exception itself and saying so (step_request_taken). A machine
+ * that does neither and simply asks again hands the page's code to the driver with a throw pending, and when the
  * thing it asks for is THE SAME REQUEST AT THE SAME CURSOR the getter runs a second time, throws again, and the
- * loop never ends. That is what this is here to make impossible to write: the failure mode is a HANG, and a
- * timeout discards every subtest the file had already passed rather than failing one — `EventListener-handleEvent`
- * and `observable-from.any.js` each cost exactly that, and neither produced a diagnostic of any kind.
+ * loop never ends. That is what this makes impossible to write: the failure mode is a HANG, and a timeout
+ * discards every subtest the file had already passed rather than failing one — `EventListener-handleEvent` and
+ * `observable-from.any.js` each cost exactly that, and neither produced a diagnostic of any kind.
  *
  * It also names the OTHER shape of the same gap. A request kind with no way to report an abrupt completion at
  * all cannot be consumed by anybody, so the machine that made one arrives here with the throw still live and
  * this says which algorithm, which stage and which step code — the missing capability, named, rather than a
- * machine quietly running on over a pending exception. */
-static void step_request_check(JSContext *ctx, const JSStepHdr *h, int st)
+ * machine quietly running on over a pending exception.
+ *
+ * IT ASKS ABOUT THE DELIVERY, NOT ABOUT THE RUNTIME'S EXCEPTION SLOT, and the difference is not pedantry. The
+ * broader statement — "no machine may ask for anything while rt->current_exception is set" — was tried here and
+ * is FALSE in this engine: a step machine's FIRST entry can legitimately happen while a forked flow's own throw
+ * is pending, which §Offensive-programming names explicitly as not a @WHY (a forced-exec flow throwing on
+ * opaque input is the exploration surface). It fired on `Promise.prototype.catch`'s very first stage, on a
+ * machine that does not declare catches_abrupt and therefore can never receive a delivery at all. The invariant
+ * this diff builds is about the DELIVERY, so that is what it asks about. */
+static void step_request_check(JSContext *ctx, const JSStepHdr *h, int st, bool abrupt_in)
 {
 #if APICLIENT_DEV
-    if (st > 0 && JS_HasException(ctx)) {
+    if (abrupt_in && st > 0 && JS_HasException(ctx)) {
         const char *label = "(a stage its definition does not declare)";
         char why[420];
         if (h->def->steps) {
@@ -21952,7 +21960,7 @@ static void step_request_check(JSContext *ctx, const JSStepHdr *h, int st)
         DFAIL(why);
     }
 #else
-    (void)ctx; (void)h; (void)st;
+    (void)ctx; (void)h; (void)st; (void)abrupt_in;
 #endif
 }
 #define CONT_ITER_FROM     12  /* cont_state = JSIterFrom: Iterator.from(obj) — GetIterator(obj) is performed by the
@@ -28845,9 +28853,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    machine may not have. Asked on the way IN and on the way OUT, because the stage a machine
                    leaves behind is the one a park, a fork or a cross-session resume will find. */
                 step_stage_check(h, "before");
-                st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
-                step_stage_check(h, "after");
-                step_request_check(ctx, h, st);
+                {
+                    /* whether THIS entry is an abrupt delivery — read before the step, because the step
+                       consumes ret_val. */
+                    bool abrupt_in = JS_IsException(ret_val);
+                    st = h->def->step(step_realm(ctx, h), stt, ret_val, &cb, &cbn);
+                    step_stage_check(h, "after");
+                    step_request_check(ctx, h, st, abrupt_in);
+                }
                 g_step_chain = prev_chain; g_step_running = prev_running;
                 if (unlikely(st < 0)) {
                     void *souter0 = h->outer; uint8_t sk0 = h->outer_kind;
