@@ -101232,6 +101232,56 @@ JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
                                       JS_CLASS_UINT8C_ARRAY + type);
 }
 
+/* A DataView OVER A BUFFER THIS ENGINE ALREADY HAS — the C entry beside JS_NewTypedArray, for a caller that
+ * holds concrete numbers rather than a page's arguments.
+ *
+ * IT IS NOT A SHORTCUT PAST %DataView%, and the difference is exactly what makes it correct. The constructor is
+ * a step machine in this engine because 25.3.2.1 runs the PAGE's code twice — ToIndex on `byteOffset` and on
+ * `byteLength`, either of which can detach or resize the buffer — and once more for a subclass's `prototype`.
+ * A caller with a byte offset and a byte length in hand runs none of those: there is nothing to coerce and the
+ * prototype is this realm's intrinsic. What is left is the machine's own tail, which is what this is, and every
+ * check in that tail is repeated here because the buffer can have been detached before the call.
+ *
+ * STREAMS §4.7's BYOB PULL-INTO is the caller. It reconstructs the view it was given over the transferred
+ * buffer, and a DataView is the one BufferSource it could not rebuild: JS_NewTypedArray covers the other
+ * eleven.
+ *
+ * `byte_length` of (uint64_t)-1 is the constructor's own "to the end of the buffer" — the length is recomputed
+ * from the buffer, and on a RESIZABLE buffer the view then TRACKS it, which is what `track_rab` is. */
+JSValue JS_NewDataView(JSContext *ctx, JSValueConst buffer, uint64_t byte_offset, uint64_t byte_length)
+{
+    JSArrayBuffer *abuf = js_get_array_buffer(ctx, buffer);
+    JSTypedArray *ta;
+    JSValue obj;
+    JSObject *p;
+    bool to_end = byte_length == (uint64_t)-1;
+
+    if (!abuf)
+        return JS_ThrowTypeError(ctx, "a DataView was asked for over something that is not an ArrayBuffer");
+    if (abuf->detached)
+        return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+    if (byte_offset > abuf->byte_length)
+        return JS_ThrowRangeError(ctx, "invalid byteOffset");
+    if (to_end)
+        byte_length = abuf->byte_length - byte_offset;
+    else if (byte_offset + byte_length > abuf->byte_length)
+        return JS_ThrowRangeError(ctx, "invalid byteOffset or byteLength");
+    obj = JS_NewObjectClass(ctx, JS_CLASS_DATAVIEW);
+    if (JS_IsException(obj))
+        return obj;
+    ta = js_malloc(ctx, sizeof(*ta));
+    if (!ta) { JS_FreeValue(ctx, obj); return JS_EXCEPTION; }
+    p = JS_VALUE_GET_OBJ(obj);
+    ta->obj = p;
+    ta->buffer = JS_VALUE_GET_OBJ(js_dup(buffer));
+    ta->offset = byte_offset;
+    ta->length = byte_length;
+    ta->track_rab = to_end && array_buffer_is_resizable(abuf);
+    list_add_tail(&ta->link, &abuf->array_list);
+    p->u.typed_array = ta;
+    return obj;
+}
+
 /* WEB IDL'S `BufferSource` — see quickjs-step.h. A DataView is one and is not a typed array, which is the whole
    reason this exists beside JS_GetTypedArrayBuffer: both wear u.typed_array, and only the class test differs. */
 JSValue JS_GetArrayBufferView(JSContext *ctx, JSValueConst obj, size_t *pbyte_offset, size_t *pbyte_length)
