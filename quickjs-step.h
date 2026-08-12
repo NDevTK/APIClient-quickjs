@@ -440,7 +440,15 @@ JS_EXTERN int step_construct_run(JSContext *ctx, uint8_t *phase, JSValue *cb, in
    three-slot buffer scribbled over the field next door. A machine that FORWARDS someone else's buffer takes
    `(JSValue *cb, int cb_cap)` and forwards both; handing this macro that pointer yields a capacity of zero, so
    the mistake is a DCHECK on the first call rather than a corrupted neighbour. */
-#define STEP_CB(arr) (arr), (int)(sizeof(arr) / sizeof((arr)[0]))
+#define STEP_CB_SLOTS(arr) ((int)(sizeof(arr) / sizeof((arr)[0])))
+#define STEP_CB(arr) (arr), STEP_CB_SLOTS(arr)
+
+/* THE SAME DERIVATION, FOR THE THREE LOOPS EVERY OWNER OF A REQUEST BUFFER WRITES — the `init` that undefines
+   its slots, the `visit` that walks them for a fork, and the `fini` that releases them. Each of those was a
+   literal count beside an array declared with a literal size, so a buffer that grew had FOUR places to grow in
+   and the ones that were missed did not fail where they were: a visit one slot short leaves a live value the
+   fork never dups, and a fini one slot short leaks it. Derive the count from the array and there is one. */
+#define STEP_CB_FOREACH(arr, i) for ((i) = 0; (i) < STEP_CB_SLOTS(arr); (i)++)
 
 /* A WELL-KNOWN SYMBOL'S ATOM. A host machine can read any NAMED property (step_getprop_run takes an atom, and
    JS_NewAtom makes one from a string), but a symbol-keyed one it could not name at all — and @@iterator is the
