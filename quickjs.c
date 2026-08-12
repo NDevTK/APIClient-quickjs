@@ -2886,6 +2886,8 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
    globals. */
 static _Thread_local JSJobEnqueueHook g_job_enqueue_hook = NULL;
 void JS_SetJobEnqueueHook(JSJobEnqueueHook h) { g_job_enqueue_hook = h; }
+static _Thread_local JSJobDropHook g_job_drop_hook = NULL;
+void JS_SetJobDropHook(JSJobDropHook h) { g_job_drop_hook = h; }
 
 /* A C CALL CYCLE'S DEPTH, ASSERTED WHERE IT IS RELIED ON.
  *
@@ -2952,6 +2954,44 @@ int JS_EnqueueTaskJob(JSContext *ctx, JSJobFunc *job_func,
                       int argc, JSValueConst *argv)
 {
     return js_enqueue(ctx, job_func, argc, argv, true);
+}
+
+/* HTML §7.5.10 step 7 — see quickjs.h. BOTH runtime queues are walked because a document queues into both: a
+   promise reaction is a microtask and a navigation load is a task, and a drop that took only one of them would
+   leave exactly the entries whose whole purpose is to run later. The hook is asked LAST so that its count and
+   this walk's are one number.
+   IT WALKS DESTRUCTIVELY AND SAFELY: list_for_each_safe, because the entry being freed is the one holding the
+   link the walk would otherwise read next. */
+static int js_drop_jobs_from(JSRuntime *rt, struct list_head *q, JSContext *ctx)
+{
+    struct list_head *el, *el1;
+    int n = 0;
+
+    list_for_each_safe(el, el1, q) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        int i;
+
+        if (e->ctx != ctx)
+            continue;
+        list_del(&e->link);
+        for (i = 0; i < e->argc; i++)
+            JS_FreeValueRT(rt, e->argv[i]);
+        js_free_rt(rt, e);
+        n++;
+    }
+    return n;
+}
+
+int JS_DropJobsForContext(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    int n;
+
+    n  = js_drop_jobs_from(rt, &rt->job_list, ctx);
+    n += js_drop_jobs_from(rt, &rt->task_list, ctx);
+    if (g_job_drop_hook)
+        n += g_job_drop_hook(ctx);
+    return n;
 }
 
 bool JS_IsJobPending(JSRuntime *rt)
