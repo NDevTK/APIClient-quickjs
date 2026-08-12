@@ -379,6 +379,13 @@ struct JSRuntime {
     /* list of JSGCObjectHeader.link. Used during JS_FreeValueRT() */
     struct list_head gc_zero_ref_count_list;
     struct list_head tmp_obj_list; /* used during GC */
+    /* THE POST-COLLECTION SWEEP'S WORKLIST — see js_gc_sweep. It exists because a collection is a phase in
+       which some work is unsafe rather than a phase in which nothing may happen: a realm whose last reference
+       goes away INSIDE the collection releases its own references there (that half is phase-safe) and parks
+       the rest of its teardown here. Held by JSGCObjectHeader.link, which is free to reuse because the header
+       is out of gc_obj_list by the time it is on this list. */
+    struct list_head gc_ctx_sweep_list;   /* JSContext.header.link — realms whose references are released */
+    JSContextTeardownFunc *ctx_teardown;  /* see JS_SetContextTeardownHook */
     JSGCPhaseEnum gc_phase : 8;
     size_t malloc_gc_threshold;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
@@ -634,6 +641,11 @@ struct JSContext {
        - the prototype of Object.prototype is null (always true as it is immutable)
     */
     uint8_t std_array_prototype : 1;
+
+    /* THIS REALM'S HALF-TORN-DOWN STATE — see JS_FreeContext. Set by the half that releases every counted
+       reference the realm holds, read by the half that frees its tables, so the two cannot run out of order or
+       twice however far apart the collector's phase puts them. */
+    uint8_t refs_released : 1;
 
     JSShape *array_shape;   /* initial shape for Array objects */
     JSShape *arguments_shape;  /* shape for arguments objects */
@@ -1845,6 +1857,9 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                const char *input, size_t input_len,
                                const char *filename, int line, int flags, int scope_idx);
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+static void js_module_release_refs(JSContext *ctx, JSModuleDef *m);
+static void js_module_free_tables(JSContext *ctx, JSModuleDef *m);
+static void js_gc_sweep(JSRuntime *rt);
 static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                JS_MarkFunc *mark_func);
 static JSValue js_import_meta(JSContext *ctx);
@@ -2723,6 +2738,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
     init_list_head(&rt->gc_zero_ref_count_list);
+    init_list_head(&rt->gc_ctx_sweep_list);
     rt->gc_phase = JS_GC_PHASE_NONE;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
@@ -3210,6 +3226,11 @@ void JS_FreeRuntime(JSRuntime *rt)
     /* A parked cleanup entry that never became a job still owns its callback, held value and context, so it is
        released here rather than reported as a leak by the walk below. */
     js_finrec_drain(rt, false);
+    /* No realm is waiting for the second half of its teardown: every collection ends in js_gc_sweep, so the
+       list is empty outside one, and this is outside one. */
+    DCHECK(list_empty(&rt->gc_ctx_sweep_list),
+           "a realm was still waiting for the second half of its teardown when the runtime went — a collection "
+           "ended without reaching js_gc_sweep, so that realm's tables and its own memory were dropped");
 
     JS_RunGC(rt);
 
@@ -3617,21 +3638,18 @@ JSValue JS_GetFunctionProto(JSContext *ctx)
     return js_dup(ctx->function_proto);
 }
 
-typedef enum JSFreeModuleEnum {
-    JS_FREE_MODULE_ALL,
-    JS_FREE_MODULE_NOT_RESOLVED,
-} JSFreeModuleEnum;
-
-/* XXX: would be more efficient with separate module lists */
-static void js_free_modules(JSContext *ctx, JSFreeModuleEnum flag)
+/* THE MODULES A FAILED COMPILE LEFT BEHIND, and now the only reason to walk this list other than the realm's
+   own teardown — which is SPLIT IN TWO (see JS_FreeContext) and therefore walks it itself, once per half. The
+   "free them all" spelling went with that split rather than surviving beside it: a caller reaching it would be
+   freeing a module's memory in whichever phase it happened to be in.
+   XXX: would be more efficient with separate module lists */
+static void js_free_unresolved_modules(JSContext *ctx)
 {
     struct list_head *el, *el1;
     list_for_each_safe(el, el1, &ctx->loaded_modules) {
         JSModuleDef *m = list_entry(el, JSModuleDef, link);
-        if (flag == JS_FREE_MODULE_ALL ||
-            (flag == JS_FREE_MODULE_NOT_RESOLVED && !m->resolved)) {
+        if (!m->resolved)
             js_free_module_def(ctx, m);
-        }
     }
 }
 
@@ -3707,10 +3725,125 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
         mark_func(rt, &ctx->regexp_result_shape->header);
 }
 
+/* A REALM'S TEARDOWN IS SPLIT BY PHASE-SAFETY, exactly as free_object's is, and for the same reason: the last
+ * reference to a realm is normally released by the COLLECTOR — every C function object minted in a realm holds
+ * a counted reference to it (js_call_c_function reads `p->u.cfunc.realm`), so a realm whose page nothing points
+ * at any more is a CYCLE, and the cycle collector is what breaks it. free_object then reaches JS_FreeContext
+ * with JS_GC_PHASE_REMOVE_CYCLES in force, and in that phase JS_FreeValueRT does not free an object at all: it
+ * leaves it for the collector's own walk. So a teardown running there may RELEASE references (that is what the
+ * phase is designed to absorb) but must not free the memory the walk still owns.
+ *
+ * HALF ONE — every counted reference this realm holds. Safe in any phase, and it MUST run in the phase the
+ * collector is in rather than after it: the objects it releases are the ones the collection is freeing, so a
+ * release deferred past the collection would decrement a refcount inside memory the collector has reclaimed.
+ * The shapes are here for that reason too, though a shape is a table: js_free_shape0 releases the shape's PROTO
+ * and its property atoms, which makes the shape release a reference release wearing a table's name.
+ *
+ * HALF TWO — the tables, which own no JSValue: the modules' atoms and arrays, the class-proto array, the parked
+ * iterator array, and the realm's own memory. It runs from js_gc_sweep once the phase is over.
+ *
+ * ONE LAST THING BELONGS TO NEITHER: the realm's two list memberships. Both are unlinked at the end of half
+ * one, because a realm that has released its global is a realm no walk may still find — and because the sweep
+ * then has the GC header's `link` to park it by. */
+static void js_context_release_refs(JSRuntime *rt, JSContext *ctx)
+{
+    struct list_head *el;
+    int i;
+
+    DCHECK(!ctx->refs_released, "a realm released its references twice — JS_FreeContext reaches zero once");
+    DCHECK(JS_REF_COUNT(ctx) == 0,
+           "a realm was torn down while something still NAMED it. Every holder of a realm holds it by refcount, "
+           "including a flow parked inside it (its heap frames hold that realm's function objects, and those "
+           "hold the realm) — so a count above zero here is a live reference this teardown is about to dangle");
+    ctx->refs_released = 1;
+
+    /* THE HOST'S PER-REALM STATE GOES FIRST, while the realm is still whole. A host record hangs off the realm
+       (a Document, its tree, the wrappers it minted) and is reachable from nothing else, so this is the only
+       moment anything can release it — and what it does is release REFERENCES, which is why it belongs to this
+       half and may run inside a collection. It runs for EVERY realm, including one that never had a document:
+       a hook that had to be told which realms are interesting would be a list of them kept somewhere else. */
+    if (rt->ctx_teardown)
+        rt->ctx_teardown(rt, ctx);
+
+    list_for_each(el, &ctx->loaded_modules)
+        js_module_release_refs(ctx, list_entry(el, JSModuleDef, link));
+
+    JS_FreeValue(ctx, ctx->global_obj);
+    JS_FreeValue(ctx, ctx->global_var_obj);
+
+    JS_FreeValue(ctx, ctx->throw_type_error);
+    JS_FreeValue(ctx, ctx->legacy_reflect_get[0]);
+    JS_FreeValue(ctx, ctx->legacy_reflect_get[1]);
+    JS_FreeValue(ctx, ctx->legacy_reflect_set);
+    JS_FreeValue(ctx, ctx->eval_obj);
+
+    JS_FreeValue(ctx, ctx->array_proto_values);
+    for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
+        JS_FreeValue(ctx, ctx->native_error_proto[i]);
+    }
+    JS_FreeValue(ctx, ctx->error_ctor);
+    DCHECK(ctx->pending_import_cap == NULL, "a parked import capability outlived its context");
+    DCHECK(JS_IsUndefined(ctx->module_load_pending),
+           "a module load parked on a source promise that nothing ever took — the loader called "
+           "JS_ModuleLoadPending from a path that cannot wait for it");
+    DCHECK(ctx->pending_gp_unwind == NULL, "a parked keyed-operation unwind outlived its context");
+    while (ctx->pending_close_n > 0)   /* normally empty (drained at the exception label); free defensively */
+        JS_FreeValue(ctx, ctx->pending_close_iters[--ctx->pending_close_n]);
+    JS_FreeValue(ctx, ctx->oom_error);
+    JS_FreeValue(ctx, ctx->error_back_trace);
+    JS_FreeValue(ctx, ctx->error_prepare_stack);
+    JS_FreeValue(ctx, ctx->error_stack_trace_limit);
+    for(i = 0; i < rt->class_count; i++) {
+        JS_FreeValue(ctx, ctx->class_proto[i]);
+    }
+    JS_FreeValue(ctx, ctx->iterator_ctor);
+    JS_FreeValue(ctx, ctx->iterator_ctor_getset);
+    JS_FreeValue(ctx, ctx->async_iterator_proto);
+    JS_FreeValue(ctx, ctx->promise_ctor);
+    JS_FreeValue(ctx, ctx->array_ctor);
+    JS_FreeValue(ctx, ctx->regexp_ctor);
+    for (i = 0; i < RE_LEGACY_COUNT; i++)
+        JS_FreeValue(ctx, ctx->regexp_legacy[i]);
+    JS_FreeValue(ctx, ctx->regexp_builtin_exec);
+    JS_FreeValue(ctx, ctx->async_from_sync_next);
+    JS_FreeValue(ctx, ctx->function_ctor);
+    JS_FreeValue(ctx, ctx->function_proto);
+
+    js_free_shape_null(ctx->rt, ctx->array_shape);
+    js_free_shape_null(ctx->rt, ctx->arguments_shape);
+    js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
+    js_free_shape_null(ctx->rt, ctx->regexp_shape);
+    js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
+    ctx->array_shape = NULL;
+    ctx->arguments_shape = NULL;
+    ctx->mapped_arguments_shape = NULL;
+    ctx->regexp_shape = NULL;
+    ctx->regexp_result_shape = NULL;
+
+    list_del(&ctx->link);              /* rt->context_list — nothing may walk to a realm in this state */
+    remove_gc_object(&ctx->header);    /* and the sweep parks it by the link this frees */
+}
+
+static void js_context_free_tables(JSRuntime *rt, JSContext *ctx)
+{
+    struct list_head *el, *el1;
+
+    DCHECK(ctx->refs_released,
+           "a realm's tables were freed before its references were released — the two halves of a realm's "
+           "teardown are ordered, and this one frees the memory the other one reads");
+    DCHECK(rt->gc_phase == JS_GC_PHASE_NONE,
+           "a realm's tables were freed INSIDE a collection — this half frees the realm's own memory, which "
+           "the collector's walk may still be holding; it belongs to js_gc_sweep");
+    list_for_each_safe(el, el1, &ctx->loaded_modules)
+        js_module_free_tables(ctx, list_entry(el, JSModuleDef, link));
+    js_free_rt(rt, ctx->pending_close_iters);
+    js_free_rt(rt, ctx->class_proto);
+    js_free_rt(rt, ctx);
+}
+
 void JS_FreeContext(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
-    int i;
 
     if (--JS_REF_COUNT(ctx) > 0)
         return;
@@ -3745,65 +3878,33 @@ void JS_FreeContext(JSContext *ctx)
     }
 #endif
 
-    js_free_modules(ctx, JS_FREE_MODULE_ALL);
-
-    JS_FreeValue(ctx, ctx->global_obj);
-    JS_FreeValue(ctx, ctx->global_var_obj);
-
-    JS_FreeValue(ctx, ctx->throw_type_error);
-    JS_FreeValue(ctx, ctx->legacy_reflect_get[0]);
-    JS_FreeValue(ctx, ctx->legacy_reflect_get[1]);
-    JS_FreeValue(ctx, ctx->legacy_reflect_set);
-    JS_FreeValue(ctx, ctx->eval_obj);
-
-    JS_FreeValue(ctx, ctx->array_proto_values);
-    for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
-        JS_FreeValue(ctx, ctx->native_error_proto[i]);
-    }
-    JS_FreeValue(ctx, ctx->error_ctor);
-    DCHECK(ctx->pending_import_cap == NULL, "a parked import capability outlived its context");
-    DCHECK(JS_IsUndefined(ctx->module_load_pending),
-           "a module load parked on a source promise that nothing ever took — the loader called "
-           "JS_ModuleLoadPending from a path that cannot wait for it");
-    DCHECK(ctx->pending_gp_unwind == NULL, "a parked keyed-operation unwind outlived its context");
-    while (ctx->pending_close_n > 0)   /* normally empty (drained at the exception label); free defensively */
-        JS_FreeValue(ctx, ctx->pending_close_iters[--ctx->pending_close_n]);
-    js_free_rt(rt, ctx->pending_close_iters);
-    JS_FreeValue(ctx, ctx->oom_error);
-    JS_FreeValue(ctx, ctx->error_back_trace);
-    JS_FreeValue(ctx, ctx->error_prepare_stack);
-    JS_FreeValue(ctx, ctx->error_stack_trace_limit);
-    for(i = 0; i < rt->class_count; i++) {
-        JS_FreeValue(ctx, ctx->class_proto[i]);
-    }
-    js_free_rt(rt, ctx->class_proto);
-    JS_FreeValue(ctx, ctx->iterator_ctor);
-    JS_FreeValue(ctx, ctx->iterator_ctor_getset);
-    JS_FreeValue(ctx, ctx->async_iterator_proto);
-    JS_FreeValue(ctx, ctx->promise_ctor);
-    JS_FreeValue(ctx, ctx->array_ctor);
-    JS_FreeValue(ctx, ctx->regexp_ctor);
-    for (i = 0; i < RE_LEGACY_COUNT; i++)
-        JS_FreeValue(ctx, ctx->regexp_legacy[i]);
-    JS_FreeValue(ctx, ctx->regexp_builtin_exec);
-    JS_FreeValue(ctx, ctx->async_from_sync_next);
-    JS_FreeValue(ctx, ctx->function_ctor);
-    JS_FreeValue(ctx, ctx->function_proto);
-
-    js_free_shape_null(ctx->rt, ctx->array_shape);
-    js_free_shape_null(ctx->rt, ctx->arguments_shape);
-    js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
-    js_free_shape_null(ctx->rt, ctx->regexp_shape);
-    js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
-
-    list_del(&ctx->link);
-    remove_gc_object(&ctx->header);
-    js_free_rt(ctx->rt, ctx);
+    js_context_release_refs(rt, ctx);
+    /* THE MIRROR OF free_object'S LAST LINES. There it is `if the collector still owns this memory, park it on
+       gc_zero_ref_count_list; otherwise free it now`; here it is the same sentence with the realm's tables
+       attached, because a realm's memory is not one block. Outside a collection the second half runs on the
+       spot and this function reads exactly as it always did. */
+    if (rt->gc_phase == JS_GC_PHASE_NONE)
+        js_context_free_tables(rt, ctx);
+    else
+        list_add_tail(&ctx->header.link, &rt->gc_ctx_sweep_list);
 }
 
 JSRuntime *JS_GetRuntime(JSContext *ctx)
 {
     return ctx->rt;
+}
+
+void JS_SetContextTeardownHook(JSRuntime *rt, JSContextTeardownFunc *cb)
+{
+    DCHECK(rt->ctx_teardown == NULL || cb == NULL || rt->ctx_teardown == cb,
+           "a second realm-teardown hook was declared for one runtime — the hook is asked about every realm, "
+           "so two of them means one host's realms are being torn down by another host's answer");
+    rt->ctx_teardown = cb;
+}
+
+int JS_ContextRefCount(JSContext *ctx)
+{
+    return JS_REF_COUNT(ctx);
 }
 
 static void update_stack_limit(JSRuntime *rt)
@@ -8056,6 +8157,30 @@ static void free_zero_refcount(JSRuntime *rt)
         free_gc_object(rt, p);
     }
     rt->gc_phase = JS_GC_PHASE_NONE;
+    js_gc_sweep(rt);
+}
+
+/* THE POST-COLLECTION SWEEP — the one place work that a collection could not do gets done, and the COLLECTOR
+   runs it rather than a caller who remembered to. A realm whose last reference went away inside a collection
+   released its references there (js_context_release_refs, the phase-safe half) and left its tables and its own
+   memory for this, where freeing memory is ordinary again.
+   IT DRAINS BY POPPING THE HEAD, which is what makes it re-entrant: freeing a realm's tables releases atoms,
+   and a cascade that follows can end in another sweep. Every item is unlinked before it is used, so a nested
+   drain finds a list that never names an item twice. */
+static void js_gc_sweep(JSRuntime *rt)
+{
+    DCHECK(rt->gc_phase == JS_GC_PHASE_NONE,
+           "the post-collection sweep ran INSIDE a collection — it is the half of a teardown that the phase "
+           "made impossible, so running it there is running the thing the split exists to prevent");
+    for(;;) {
+        struct list_head *el = rt->gc_ctx_sweep_list.next;
+        JSContext *ctx;
+        if (el == &rt->gc_ctx_sweep_list)
+            break;
+        list_del(el);
+        ctx = list_entry(el, JSContext, header.link);
+        js_context_free_tables(rt, ctx);
+    }
 }
 
 /* called with the ref_count of 'v' reaches zero. */
@@ -8396,11 +8521,22 @@ static void gc_free_cycles(JSRuntime *rt)
 
     list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
         p = list_entry(el, JSGCObjectHeader, link);
-        DCHECK(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT || JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE, "JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT || JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE");
+        /* ONLY THE TWO KINDS THAT DEFER THEIR OWN MEMORY reach this raw free. Everything else on this list got
+           here from the walk above and is expected to have been unlinked by the teardown of whatever referenced
+           it — so a REALM still sitting here is one nothing released, which is not a spare pointer to free but
+           an entire realm (its global, its prototypes, its modules) about to go with no teardown at all. */
+        DCHECK(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT || JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE,
+               "a collected GC object of a kind that does not own its own deferred memory reached the raw free "
+               "at the end of a collection — for a realm that means nothing released its last reference "
+               "(js_context_release_refs never ran) and the whole realm is being dropped rather than torn down");
         js_free_rt(rt, p);
     }
 
     init_list_head(&rt->gc_zero_ref_count_list);
+    /* AFTER the zombie memory above, not before it: this sweep can run host code, host code can drop the last
+       reference to something, and a cascade reaching free_zero_refcount while those zombies were still on the
+       zero-ref list would free each of them a second time. */
+    js_gc_sweep(rt);
 }
 
 void JS_RunGC(JSRuntime *rt)
@@ -53718,23 +53854,64 @@ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
     JS_MarkValue(rt, m->private_value, mark_func);
 }
 
-static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
+/* A MODULE'S TEARDOWN, SPLIT THE WAY ITS REALM'S IS — see JS_FreeContext. The split is not a convenience for
+   that caller: it is what makes a module's teardown expressible at all when the realm holding it reaches zero
+   references INSIDE a collection. Deferring the WHOLE of it to after the collection would release the module's
+   JSValues onto objects the collection has already reclaimed, and running the whole of it inside would free the
+   module's memory while the collector may still be walking. So the halves are: the references, released where
+   the objects are still valid, and the tables, freed when the phase is over.
+   EACH HALF RUNS ONCE, and the first leaves nothing for the second to find: every released value is replaced by
+   JS_UNDEFINED, so a second release is a no-op the DCHECKs below would not need to catch. */
+static void js_module_release_refs(JSContext *ctx, JSModuleDef *m)
+{
+    int i;
+
+    for(i = 0; i < m->req_module_entries_count; i++) {
+        JSReqModuleEntry *rme = &m->req_module_entries[i];
+        JS_FreeValue(ctx, rme->attributes);
+        rme->attributes = JS_UNDEFINED;
+    }
+    for(i = 0; i < m->export_entries_count; i++) {
+        JSExportEntry *me = &m->export_entries[i];
+        if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
+            free_var_ref(ctx->rt, me->u.local.var_ref);
+            me->u.local.var_ref = NULL;
+        }
+    }
+    JS_FreeValue(ctx, m->module_ns);
+    JS_FreeValue(ctx, m->func_obj);
+    JS_FreeValue(ctx, m->eval_exception);
+    JS_FreeValue(ctx, m->meta_obj);
+    JS_FreeValue(ctx, m->promise);
+    JS_FreeValue(ctx, m->resolving_funcs[0]);
+    JS_FreeValue(ctx, m->resolving_funcs[1]);
+    JS_FreeValue(ctx, m->private_value);
+    m->module_ns = JS_UNDEFINED;
+    m->func_obj = JS_UNDEFINED;
+    m->eval_exception = JS_UNDEFINED;
+    m->meta_obj = JS_UNDEFINED;
+    m->promise = JS_UNDEFINED;
+    m->resolving_funcs[0] = JS_UNDEFINED;
+    m->resolving_funcs[1] = JS_UNDEFINED;
+    m->private_value = JS_UNDEFINED;
+}
+
+/* The atoms and the arrays — no JSValue is reachable from here, which is the property that lets this run after
+   the collection that freed the objects the half above released. */
+static void js_module_free_tables(JSContext *ctx, JSModuleDef *m)
 {
     int i;
 
     JS_FreeAtom(ctx, m->module_name);
-
-    for(i = 0; i < m->req_module_entries_count; i++) {
-        JSReqModuleEntry *rme = &m->req_module_entries[i];
-        JS_FreeAtom(ctx, rme->module_name);
-        JS_FreeValue(ctx, rme->attributes);
-    }
+    for(i = 0; i < m->req_module_entries_count; i++)
+        JS_FreeAtom(ctx, m->req_module_entries[i].module_name);
     js_free(ctx, m->req_module_entries);
 
     for(i = 0; i < m->export_entries_count; i++) {
         JSExportEntry *me = &m->export_entries[i];
-        if (me->export_type == JS_EXPORT_TYPE_LOCAL)
-            free_var_ref(ctx->rt, me->u.local.var_ref);
+        DCHECK(me->export_type != JS_EXPORT_TYPE_LOCAL || me->u.local.var_ref == NULL,
+               "a module's export tables were freed while a local export still held its var_ref — "
+               "js_module_release_refs is the half that releases it and it did not run");
         JS_FreeAtom(ctx, me->export_name);
         JS_FreeAtom(ctx, me->local_name);
     }
@@ -53748,17 +53925,14 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
     }
     js_free(ctx, m->import_entries);
     js_free(ctx, m->async_parent_modules);
-
-    JS_FreeValue(ctx, m->module_ns);
-    JS_FreeValue(ctx, m->func_obj);
-    JS_FreeValue(ctx, m->eval_exception);
-    JS_FreeValue(ctx, m->meta_obj);
-    JS_FreeValue(ctx, m->promise);
-    JS_FreeValue(ctx, m->resolving_funcs[0]);
-    JS_FreeValue(ctx, m->resolving_funcs[1]);
-    JS_FreeValue(ctx, m->private_value);
     list_del(&m->link);
     js_free(ctx, m);
+}
+
+static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
+{
+    js_module_release_refs(ctx, m);
+    js_module_free_tables(ctx, m);
 }
 
 #ifndef QJS_DISABLE_PARSER
@@ -55518,7 +55692,7 @@ static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
     JSValueConst func_data[3];
 
     if (js_resolve_module(ctx, m) < 0) {
-        js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
+        js_free_unresolved_modules(ctx);
         goto fail;
     }
     /* LINK, then take the capability, THEN evaluate — spelled as the three steps rather than as JS_EvalFunction
@@ -62088,7 +62262,7 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
         JSModuleDef *m = JS_VALUE_GET_PTR(obj);
         if (js_resolve_module(ctx, m) < 0) {
-            js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
+            js_free_unresolved_modules(ctx);
             return -1;
         }
     }
@@ -105128,6 +105302,7 @@ static void insert_weakref_record(JSValueConst target,
     wr->next_weak_ref = *pwr;
     *pwr = wr;
 }
+
 
 /* CallSite */
 

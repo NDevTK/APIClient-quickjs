@@ -547,6 +547,23 @@ JS_EXTERN JSContext *JS_DupContext(JSContext *ctx);
    hands out — it runs none of the page's code, which is what lets a C activation ask at all. */
 JS_EXTERN bool JS_IsOutOfMemoryError(JSContext *ctx, JSValueConst v);
 
+/* A REALM IS BEING TORN DOWN — the host's chance to release what it hung off that realm, called for EVERY
+ * realm of the runtime once its last reference is gone and before the realm releases any of its own.
+ *
+ * IT IS WHERE PER-REALM HOST STATE DIES because it is the only place that can be: a realm's last reference is
+ * normally released by the COLLECTOR (every C function object in a realm holds a counted reference to it, so a
+ * realm nothing points at is a cycle), which means no host call ever precedes it and no host list can be sure
+ * it still names a live realm. The hook may release JSValues and free its own records; it must not assume the
+ * collector is idle, since it can be running inside one.
+ * A realm that never held any host state is handed over too — a hook that had to be told which realms matter
+ * would be that list of them, kept in the place this exists to make unnecessary. */
+typedef void JSContextTeardownFunc(JSRuntime *rt, JSContext *ctx);
+JS_EXTERN void JS_SetContextTeardownHook(JSRuntime *rt, JSContextTeardownFunc *cb);
+
+/* A REALM'S REFERENCE COUNT, for stating an ownership invariant where one is being handed over. Not a decision
+ * input — a host that branches on this is guessing at a lifetime the collector owns. */
+JS_EXTERN int JS_ContextRefCount(JSContext *ctx);
+
 JS_EXTERN void *JS_GetContextOpaque(JSContext *ctx);
 JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
 JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);
