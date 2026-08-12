@@ -62400,6 +62400,11 @@ typedef enum BCTagEnum {
     BC_TAG_MAP,
     BC_TAG_SET,
     BC_TAG_SYMBOL,
+    /* HTML §2.7.7: a value the CALL named in its transfer list, reached from inside the message body. It
+       carries the index of its data holder and nothing else, because the holder's contents do not exist yet —
+       §2.7.7 serializes the body at step 3 and only runs the transfer steps at step 5. Readable only by a read
+       given the map that resolves it (JSTransferReadHook); every other read refuses the tag. */
+    BC_TAG_TRANSFER_REFERENCE,
 } BCTagEnum;
 
 /* 29: a regexp's compiled byte code changed shape — a capture or register index is a u32 where it was a
@@ -62458,6 +62463,10 @@ typedef struct BCWriterState {
     int sab_tab_size;
     /* list of referenced objects (used if allow_reference = true) */
     JSObjectList object_list;
+    /* HTML §2.7.7's seeded `memory`, or NULL for a write that is not a StructuredSerializeWithTransfer. It is
+       consulted BEFORE object_list, because §2.7.1 consults `memory` before it does anything else — and because
+       a transferable must not take a reference slot the reader will not fill. */
+    const JSTransferWriteHook *transfer;
     /* THE SERIALISER'S WORK STACK. The writer was a nine-function recursion whose depth the WRITTEN GRAPH
        picks — a nested array through JS_WriteObject threw between depth 5000 and 20000, measured — and the
        js_check_stack_overflow in front of it turned a graph the format can represent into a RangeError.
@@ -62495,6 +62504,7 @@ static const char * const bc_tag_str[] = {
     "Map",
     "Set",
     "Symbol",
+    "TransferReference",
 };
 
 static const char *bc_tag_name(uint8_t tag)
@@ -63179,6 +63189,19 @@ static int bcw_step_value(BCWriterState *s, JSValueConst obj)
             JSObject *p = JS_VALUE_GET_OBJ(obj);
             int ret, idx;
 
+            /* HTML §2.7.1 STEP 2, "if memory[value] exists, then return memory[value]" — asked FIRST, which is
+               where the standard asks it. A value the call put in its transfer list is not cloned here and not
+               refused below: it is written as the index of its data holder, and the reader turns that back into
+               the object §2.7.8's transfer-receiving steps built. Reached twice, it writes the same index
+               twice and comes back as one object, which is the identity `memory` exists to preserve. */
+            if (s->transfer) {
+                int ti = s->transfer->index_of(s->ctx, s->transfer->opaque, obj);
+                if (ti >= 0) {
+                    bc_put_u8(s, BC_TAG_TRANSFER_REFERENCE);
+                    bc_put_leb128(s, ti);
+                    break;
+                }
+            }
             if (s->allow_reference) {
                 idx = js_object_list_find(s->ctx, &s->object_list, p);
                 if (idx >= 0) {
@@ -63250,6 +63273,9 @@ static int bcw_step_value(BCWriterState *s, JSValueConst obj)
                 if (is_typed_array(p->class_id) || p->class_id == JS_CLASS_DATAVIEW) {
                     ret = JS_WriteTypedArray(s, obj);
                 } else {
+                    /* Everything left is a host object with no encoding, which HTML §2.7 refuses as a
+                       "DataCloneError". A TRANSFERABLE one never arrives here: the transfer map above answered
+                       for it, and if it did not, then the call did not name it and refusing it is the answer. */
                     JS_ThrowTypeError(s->ctx, "unsupported object class");
                     ret = -1;
                 }
@@ -63477,15 +63503,20 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
     return -1;
 }
 
-uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
-                         int flags, JSSABTab *psab_tab)
+uint8_t *JS_WriteObject3(JSContext *ctx, size_t *psize, JSValueConst obj,
+                         int flags, JSSABTab *psab_tab,
+                         const JSTransferWriteHook *transfer)
 {
     BCWriterState ss, *s = &ss;
     uint32_t h;
     DynBuf *d;
 
+    DCHECK(!transfer || transfer->index_of != NULL,
+           "a transfer map was supplied to the writer without the function that answers it — HTML §2.7.7's "
+           "`memory` IS that lookup, so a map that cannot be asked is not a seeded memory at all");
     memset(s, 0, sizeof(*s));
     s->ctx = ctx;
+    s->transfer = transfer;
     s->allow_bytecode = ((flags & JS_WRITE_OBJ_BYTECODE) != 0);
     s->allow_sab = ((flags & JS_WRITE_OBJ_SAB) != 0);
     s->allow_reference = ((flags & JS_WRITE_OBJ_REFERENCE) != 0);
@@ -63531,6 +63562,12 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
     return NULL;
 }
 
+uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
+                         int flags, JSSABTab *psab_tab)
+{
+    return JS_WriteObject3(ctx, psize, obj, flags, psab_tab, NULL);
+}
+
 uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
                         int flags)
 {
@@ -63567,6 +63604,10 @@ typedef struct BCReaderState {
     JSObject **objects;
     int objects_count;
     int objects_size;
+    /* HTML §2.7.8's `memory`, the [[TransferredValues]] its transfer-receiving steps built before this read
+       began, or NULL for a read that is not a StructuredDeserializeWithTransfer. A stream naming a transferred
+       value is refused outright without it — the tag has no meaning a reader may invent. */
+    const JSTransferReadHook *transfer;
     /* SAB references */
     uint8_t **sab_tab;
     int sab_tab_len;
@@ -64680,6 +64721,25 @@ static JSValue bcr_read_one(BCReaderState *s)
             obj = js_dup(JS_MKPTR(JS_TAG_OBJECT, s->objects[val]));
         }
         break;
+    case BC_TAG_TRANSFER_REFERENCE:
+        {
+            uint32_t val;
+            /* HTML §2.7.2 STEP 2 against §2.7.8's seeded `memory`. The answer is the object the receiving steps
+               ALREADY built and appended to [[TransferredValues]] — the same object, which is what makes a
+               moved port inside a message the port the receiver also gets in `ports`. */
+            if (!s->transfer)
+                return JS_ThrowSyntaxError(ctx, "a transferred value is named by a stream read with no "
+                                                "transfer map to resolve it against");
+            if (bc_get_leb128(s, &val))
+                return JS_EXCEPTION;
+            bc_read_trace(s, "%u\n", val);
+            if (val >= s->transfer->count) {
+                return JS_ThrowSyntaxError(ctx, "invalid transfer reference (%u >= %u)",
+                                           val, s->transfer->count);
+            }
+            obj = s->transfer->value_at(ctx, s->transfer->opaque, val);
+        }
+        break;
     case BC_TAG_MAP:
         obj = JS_ReadMap(s);
         break;
@@ -65017,8 +65077,9 @@ static void bc_reader_free(BCReaderState *s)
     js_free(s->ctx, s->objects);
 }
 
-JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
-                       int flags, JSSABTab *psab_tab)
+JSValue JS_ReadObject3(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                       int flags, JSSABTab *psab_tab,
+                       const JSTransferReadHook *transfer)
 {
     BCReaderState ss, *s = &ss;
     JSValue obj;
@@ -65026,8 +65087,12 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     ctx->binary_object_count += 1;
     ctx->binary_object_size += buf_len;
 
+    DCHECK(!transfer || transfer->value_at != NULL,
+           "a transfer map was supplied to the reader without the function that answers it — a map that cannot "
+           "be asked would let the tag through and then have nothing to resolve it to");
     memset(s, 0, sizeof(*s));
     s->ctx = ctx;
+    s->transfer = transfer;
     s->buf_start = buf;
     s->buf_end = buf + buf_len;
     s->ptr = buf;
@@ -65051,6 +65116,12 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     }
     bc_reader_free(s);
     return obj;
+}
+
+JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                       int flags, JSSABTab *psab_tab)
+{
+    return JS_ReadObject3(ctx, buf, buf_len, flags, psab_tab, NULL);
 }
 
 JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,

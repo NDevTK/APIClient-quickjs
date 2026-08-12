@@ -1706,6 +1706,40 @@ typedef struct JSSABTab {
     size_t len;
 } JSSABTab;
 
+/* HTML §2.7.7's `memory`, SEEDED WITH THE TRANSFER LIST — the one fact a serializer cannot derive from the
+ * graph it is walking, because it is a fact about the CALL and not about the value.
+ *
+ * §2.7.7 step 1 puts every entry of transferList into `memory` before StructuredSerializeInternal runs, and
+ * §2.7.1's first step is "if memory[value] exists, then return memory[value]" — so a transferable REACHED FROM
+ * INSIDE the message body serializes as its data holder rather than being cloned or refused. §2.7.8 is the
+ * mirror: it fills `memory` with the objects its transfer-receiving steps built and only then deserializes, and
+ * §2.7.2's first step reads that map, so such a reference comes back as THE SAME OBJECT as the corresponding
+ * entry of [[TransferredValues]] — not a copy of it. That identity is the whole point: it is what makes
+ * `port.postMessage({p: other}, [other])` deliver a message whose `p` IS the moved port.
+ *
+ * THE MAP IS A PARAMETER, NOT A SCOPE. It belongs to ONE serialization: a writer and a reader running in the
+ * same turn (a same-agent delivery) each carry their own, and neither can see the other's. A hook installed on
+ * the runtime would instead be one map answering for every serialization the agent ever performs.
+ *
+ * THE TWO HALVES SHARE ONE NUMBERING, and it is the transfer list's. §2.7.7 appends one data holder per list
+ * entry in list order; §2.7.8 appends one value per data holder in holder order. So the writer answers an index
+ * into the transfer list and the reader resolves that same index against [[TransferredValues]]. */
+typedef struct JSTransferWriteHook {
+    /* The index of `obj` in the transfer list, or -1 when it is not in it. Called for objects only. */
+    int (*index_of)(JSContext *ctx, void *opaque, JSValueConst obj);
+    void *opaque;
+} JSTransferWriteHook;
+
+typedef struct JSTransferReadHook {
+    /* [[TransferredValues]][index], owned by the caller. `count` is that list's length, and the reader refuses
+       a stream naming an index outside it rather than asking — an index it cannot resolve is a corrupt stream,
+       not a value. A stream carrying such a reference is likewise refused outright by a read given no hook:
+       the tag is readable only where the host supplied the map that gives it a meaning. */
+    JSValue (*value_at)(JSContext *ctx, void *opaque, uint32_t index);
+    uint32_t count;
+    void *opaque;
+} JSTransferReadHook;
+
 /* Object Writer/Reader (currently only used to handle precompiled code) */
 #define JS_WRITE_OBJ_BYTECODE  (1 << 0) /* allow function/module */
 #define JS_WRITE_OBJ_BSWAP     (0)      /* byte swapped output (obsolete, handled transparently) */
@@ -1716,6 +1750,11 @@ typedef struct JSSABTab {
 JS_EXTERN uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj, int flags);
 JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
                                    int flags, JSSABTab *psab_tab);
+/* ... and with §2.7.7's seeded `memory`. NULL is an unseeded one, which is every write that is not a
+   StructuredSerializeWithTransfer. */
+JS_EXTERN uint8_t *JS_WriteObject3(JSContext *ctx, size_t *psize, JSValueConst obj,
+                                   int flags, JSSABTab *psab_tab,
+                                   const JSTransferWriteHook *transfer);
 
 /* WARNING: only enable JS_READ_OBJ_BYTECODE on input from a trusted
    writer. The bytecode format is not designed to resist a hostile
@@ -1730,6 +1769,10 @@ JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst o
 JS_EXTERN JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len, int flags);
 JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                                  int flags, JSSABTab *psab_tab);
+/* ... and with §2.7.8's `memory`, the [[TransferredValues]] its transfer-receiving steps have already built. */
+JS_EXTERN JSValue JS_ReadObject3(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                                 int flags, JSSABTab *psab_tab,
+                                 const JSTransferReadHook *transfer);
 /* instantiate and evaluate a bytecode function. Only used when
    reading a script or module with JS_ReadObject() */
 JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
