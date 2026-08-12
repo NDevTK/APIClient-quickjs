@@ -1177,15 +1177,6 @@ typedef enum JSTypedArrayEnum {
     JS_TYPED_ARRAY_FLOAT64,
 } JSTypedArrayEnum;
 
-/* A DataView over a buffer the ENGINE already has, for a caller holding concrete numbers rather than a page's
-   arguments — the entry JS_NewTypedArray is for the other eleven BufferSources. It is not a shortcut past
-   %DataView%: that constructor is a step machine because 25.3.2.1 coerces two arguments and reads a subclass's
-   prototype, all of which run the page's code, and a caller with a byte offset and a byte length in hand runs
-   none of it. Every bounds and detached check of the constructor's tail is repeated here, because the buffer
-   can have been detached before the call. `byte_length` of (uint64_t)-1 means "to the end of the buffer", and
-   on a resizable buffer the view then tracks it. */
-JS_EXTERN JSValue JS_NewDataView(JSContext *ctx, JSValueConst buffer, uint64_t byte_offset,
-                                 uint64_t byte_length);
 JS_EXTERN JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
                                    JSTypedArrayEnum array_type);
 JS_EXTERN JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
