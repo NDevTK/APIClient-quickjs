@@ -130,80 +130,8 @@ static inline JSValueConst safe_const(JSValue v)
 #endif
 }
 
-enum {
-    /* classid tag        */    /* union usage   | properties */
-    JS_CLASS_OBJECT = 1,        /* must be first */
-    JS_CLASS_ARRAY,             /* u.array       | length */
-    JS_CLASS_ERROR,
-    JS_CLASS_NUMBER,            /* u.object_data */
-    JS_CLASS_STRING,            /* u.object_data */
-    JS_CLASS_BOOLEAN,           /* u.object_data */
-    JS_CLASS_SYMBOL,            /* u.object_data */
-    JS_CLASS_ARGUMENTS,         /* u.array       | length */
-    JS_CLASS_MAPPED_ARGUMENTS,  /*               | length */
-    JS_CLASS_DATE,              /* u.object_data */
-    JS_CLASS_MODULE_NS,
-    JS_CLASS_C_FUNCTION,        /* u.cfunc */
-    JS_CLASS_BYTECODE_FUNCTION, /* u.func */
-    JS_CLASS_BOUND_FUNCTION,    /* u.bound_function */
-    JS_CLASS_C_FUNCTION_DATA,   /* u.c_function_data_record */
-    JS_CLASS_C_CLOSURE,         /* u.c_closure_record */
-    JS_CLASS_GENERATOR_FUNCTION, /* u.func */
-    JS_CLASS_FOR_IN_ITERATOR,   /* u.for_in_iterator */
-    JS_CLASS_REGEXP,            /* u.regexp */
-    JS_CLASS_ARRAY_BUFFER,      /* u.array_buffer */
-    JS_CLASS_SHARED_ARRAY_BUFFER, /* u.array_buffer */
-    JS_CLASS_UINT8C_ARRAY,      /* u.array (typed_array) */
-    JS_CLASS_INT8_ARRAY,        /* u.array (typed_array) */
-    JS_CLASS_UINT8_ARRAY,       /* u.array (typed_array) */
-    JS_CLASS_INT16_ARRAY,       /* u.array (typed_array) */
-    JS_CLASS_UINT16_ARRAY,      /* u.array (typed_array) */
-    JS_CLASS_INT32_ARRAY,       /* u.array (typed_array) */
-    JS_CLASS_UINT32_ARRAY,      /* u.array (typed_array) */
-    JS_CLASS_BIG_INT64_ARRAY,   /* u.array (typed_array) */
-    JS_CLASS_BIG_UINT64_ARRAY,  /* u.array (typed_array) */
-    JS_CLASS_FLOAT16_ARRAY,     /* u.array (typed_array) */
-    JS_CLASS_FLOAT32_ARRAY,     /* u.array (typed_array) */
-    JS_CLASS_FLOAT64_ARRAY,     /* u.array (typed_array) */
-    JS_CLASS_DATAVIEW,          /* u.typed_array */
-    JS_CLASS_BIG_INT,           /* u.object_data */
-    JS_CLASS_MAP,               /* u.map_state */
-    JS_CLASS_SET,               /* u.map_state */
-    JS_CLASS_WEAKMAP,           /* u.map_state */
-    JS_CLASS_WEAKSET,           /* u.map_state */
-    JS_CLASS_ITERATOR,
-    JS_CLASS_ITERATOR_CONCAT,   /* u.iterator_concat_data */
-    JS_CLASS_ITERATOR_ZIP,      /* u.iterator_zip_data */
-    JS_CLASS_ITERATOR_HELPER,   /* u.iterator_helper_data */
-    JS_CLASS_ITERATOR_WRAP,     /* u.iterator_wrap_data */
-    JS_CLASS_MAP_ITERATOR,      /* u.map_iterator_data */
-    JS_CLASS_SET_ITERATOR,      /* u.map_iterator_data */
-    JS_CLASS_ARRAY_ITERATOR,    /* u.array_iterator_data */
-    JS_CLASS_STRING_ITERATOR,   /* u.array_iterator_data */
-    JS_CLASS_REGEXP_STRING_ITERATOR,   /* u.regexp_string_iterator_data */
-    JS_CLASS_GENERATOR,         /* u.generator_data */
-    JS_CLASS_DISPOSABLE_STACK,
-    JS_CLASS_PROXY,             /* u.proxy_data */
-    JS_CLASS_PROMISE,           /* u.promise_data */
-    JS_CLASS_PROMISE_RESOLVE_FUNCTION,  /* u.promise_function_data */
-    JS_CLASS_PROMISE_REJECT_FUNCTION,   /* u.promise_function_data */
-    JS_CLASS_ASYNC_FUNCTION,            /* u.func */
-    JS_CLASS_ASYNC_FUNCTION_RESOLVE,    /* u.async_function_data */
-    JS_CLASS_ASYNC_FUNCTION_REJECT,     /* u.async_function_data */
-    JS_CLASS_ASYNC_FROM_SYNC_ITERATOR,  /* u.async_from_sync_iterator_data */
-    JS_CLASS_ASYNC_GENERATOR_FUNCTION,  /* u.func */
-    JS_CLASS_ASYNC_GENERATOR,   /* u.async_generator_data */
-    JS_CLASS_ASYNC_DISPOSABLE_STACK,
-    JS_CLASS_WEAK_REF,
-    JS_CLASS_FINALIZATION_REGISTRY,
-    JS_CLASS_DOM_EXCEPTION,
-    JS_CLASS_CALL_SITE,
-    JS_CLASS_RAWJSON,
-    JS_CLASS_SHADOW_REALM,      /* u.shadow_realm_data */
-    JS_CLASS_WRAPPED_FUNCTION,  /* u.wrapped_function_data */
-
-    JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
-};
+/* The built-in class ids are declared in quickjs.h, beside JSClassID — a host reaching a realm's intrinsics
+   through JS_GetClassProto/JS_GetClassCtor has to be able to name them. */
 
 /* number of typed array types */
 #define JS_TYPED_ARRAY_COUNT  (JS_CLASS_FLOAT64_ARRAY - JS_CLASS_UINT8C_ARRAY + 1)
@@ -654,6 +582,16 @@ struct JSContext {
     JSShape *regexp_result_shape;  /* shape for regexp result objects */
 
     JSValue *class_proto;
+    /* THE INTRINSIC CONSTRUCTOR OF EACH CLASS, PER REALM — the exact mirror of class_proto, and for the same
+       reason §3.7 gives each realm its own prototypes. A spec step that says "! Construct(%DataView%, …)" names
+       the INTRINSIC, and the only other way to reach it from C is `class_proto[id].constructor`, which is a
+       page-WRITABLE property: a page that assigns `DataView.prototype.constructor = evil` would redirect an
+       internal construct that has nothing to do with it. This array is written where the pairing is DEFINED —
+       JS_SetConstructor2, the one function that makes an object a class's constructor — so a slot holds what
+       the realm was built with and cannot be reached by script.
+       It is NOT a named slot beside array_ctor/promise_ctor/regexp_ctor: those are a hand-picked list, and the
+       list is exactly what makes a component quietly missing from a realm. */
+    JSValue *class_ctor;
     JSValue function_proto;
     JSValue function_ctor;
     JSValue array_ctor;
@@ -3536,13 +3474,26 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->class_proto = js_malloc_rt(rt, sizeof(ctx->class_proto[0]) *
                                     rt->class_count);
     if (!ctx->class_proto) {
+        /* THE REALM IS ALREADY ON THE COLLECTOR'S LIST by the line above, so freeing it here without taking it
+           off leaves the gc_obj_list walk — and JS_FreeRuntime's leak report — holding freed memory. */
+        remove_gc_object(&ctx->header);
+        js_free_rt(rt, ctx);
+        return NULL;
+    }
+    ctx->class_ctor = js_malloc_rt(rt, sizeof(ctx->class_ctor[0]) *
+                                   rt->class_count);
+    if (!ctx->class_ctor) {
+        remove_gc_object(&ctx->header);
+        js_free_rt(rt, ctx->class_proto);
         js_free_rt(rt, ctx);
         return NULL;
     }
     ctx->rt = rt;
     list_add_tail(&ctx->link, &rt->context_list);
-    for(i = 0; i < rt->class_count; i++)
+    for(i = 0; i < rt->class_count; i++) {
         ctx->class_proto[i] = JS_NULL;
+        ctx->class_ctor[i] = JS_NULL;
+    }
     ctx->array_ctor = JS_NULL;
     ctx->iterator_ctor = JS_NULL;
     ctx->iterator_ctor_getset = JS_NULL;
@@ -3633,6 +3584,26 @@ JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id)
     return js_dup(ctx->class_proto[class_id]);
 }
 
+void JS_SetClassCtor(JSContext *ctx, JSClassID class_id, JSValue obj)
+{
+    DCHECK(class_id < ctx->rt->class_count,
+           "a class id past this runtime's class table asked for its intrinsic constructor slot");
+    set_value(ctx, &ctx->class_ctor[class_id], obj);
+}
+
+JSValue JS_GetClassCtor(JSContext *ctx, JSClassID class_id)
+{
+    DCHECK(class_id < ctx->rt->class_count,
+           "a class id past this runtime's class table asked for its intrinsic constructor");
+    /* AN UNPOPULATED SLOT IS A MISSING INTRINSIC, NOT A NULL ANSWER. A caller asking for %DataView% in a realm
+       that never ran JS_AddIntrinsicTypedArrays is asking a question that realm cannot answer, and handing it
+       JS_NULL would turn that into a construct of nothing several frames away. */
+    DCHECK(!JS_IsNull(ctx->class_ctor[class_id]),
+           "this realm has no intrinsic constructor for that class — the intrinsic that defines it was never "
+           "added to this realm, or its interface object was minted without JS_SetConstructor");
+    return js_dup(ctx->class_ctor[class_id]);
+}
+
 JSValue JS_GetFunctionProto(JSContext *ctx)
 {
     return js_dup(ctx->function_proto);
@@ -3695,6 +3666,7 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->error_stack_trace_limit, mark_func);
     for(i = 0; i < rt->class_count; i++) {
         JS_MarkValue(rt, ctx->class_proto[i], mark_func);
+        JS_MarkValue(rt, ctx->class_ctor[i], mark_func);
     }
     JS_MarkValue(rt, ctx->iterator_ctor, mark_func);
     JS_MarkValue(rt, ctx->iterator_ctor_getset, mark_func);
@@ -3795,6 +3767,7 @@ static void js_context_release_refs(JSRuntime *rt, JSContext *ctx)
     JS_FreeValue(ctx, ctx->error_stack_trace_limit);
     for(i = 0; i < rt->class_count; i++) {
         JS_FreeValue(ctx, ctx->class_proto[i]);
+        JS_FreeValue(ctx, ctx->class_ctor[i]);
     }
     JS_FreeValue(ctx, ctx->iterator_ctor);
     JS_FreeValue(ctx, ctx->iterator_ctor_getset);
@@ -3838,6 +3811,7 @@ static void js_context_free_tables(JSRuntime *rt, JSContext *ctx)
         js_module_free_tables(ctx, list_entry(el, JSModuleDef, link));
     js_free_rt(rt, ctx->pending_close_iters);
     js_free_rt(rt, ctx->class_proto);
+    js_free_rt(rt, ctx->class_ctor);
     js_free_rt(rt, ctx);
 }
 
@@ -5051,6 +5025,16 @@ static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
             for(i = rt->class_count; i < new_size; i++)
                 new_tab[i] = JS_NULL;
             ctx->class_proto = new_tab;
+            /* THE SAME GROWTH FOR THE CONSTRUCTOR TABLE — the two arrays are indexed by the same class id and
+               freed by the same loop, so a class table that grew one of them and not the other would leave
+               every mark and free past the old count reading off the end of the shorter one. */
+            new_tab = js_realloc_rt(rt, ctx->class_ctor,
+                                    sizeof(ctx->class_ctor[0]) * new_size);
+            if (!new_tab)
+                return -1;
+            for(i = rt->class_count; i < new_size; i++)
+                new_tab[i] = JS_NULL;
+            ctx->class_ctor = new_tab;
         }
         /* reallocate the class array */
         new_class_array = js_realloc_rt(rt, rt->class_array,
@@ -8652,9 +8636,9 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
     list_for_each(el, &rt->context_list) {
         JSContext *ctx = list_entry(el, JSContext, link);
         JSShape *sh = ctx->array_shape;
-        s->memory_used_count += 2; /* ctx + ctx->class_proto */
+        s->memory_used_count += 3; /* ctx + ctx->class_proto + ctx->class_ctor */
         s->memory_used_size += sizeof(JSContext) +
-            sizeof(JSValue) * rt->class_count;
+            2 * sizeof(JSValue) * rt->class_count;
         s->binary_object_count += ctx->binary_object_count;
         s->binary_object_size += ctx->binary_object_size;
 
@@ -10447,8 +10431,21 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                            finds, for ANY callable, and calls it on the tramp chain as a 0-arg method call.
                            The JS_CallFree that used to be here was measured over the whole corpus behind a
                            DCHECK and never reached, so it is deleted rather than left as a fallback. */
-                        DFAIL("JS_GetPropertyInternal reached a getter — route this read onto the tramp chain "
-                              "instead of running the getter from C");
+                        /* NAME THE PROPERTY. Without it the abort says only that SOME C read somewhere in the
+                           engine hit SOME accessor, and the caller is not in the report — the wasm stack is
+                           function indices — so whoever lands here has a search of every JS_GetProperty* call
+                           site in the browser half. The atom is in hand at the failure, and it is the whole of
+                           what identifies the read. */
+#if APICLIENT_DEV
+                        {
+                            char pbuf[ATOM_GET_STR_BUF_SIZE], why[256];
+                            snprintf(why, sizeof why,
+                                     "JS_GetPropertyInternal reached a getter for `%s` — route this read onto "
+                                     "the tramp chain instead of running the getter from C",
+                                     JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop));
+                            DFAIL(why);
+                        }
+#endif
                         return JS_ThrowTypeError(ctx, "getter");
                     }
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
@@ -65392,6 +65389,29 @@ int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
     return 0;
 }
 
+/* RECORD THE PAIRING IN class_ctor, FROM THE ONE PLACE THAT MAKES IT. Which class a constructor belongs to is
+   not something this function is told — but it does not have to be, because `class_proto` IS the relation:
+   the object being given a `constructor` property is the realm's prototype for exactly the class whose slot
+   holds it. Deriving the id from the data rather than from an argument is what makes this impossible to
+   forget: every spelling of "create a class's constructor" in the engine and in the host — JS_NewCConstructor,
+   JS_NewGlobalCConstructor and its Magic/Step siblings, and the host's idl_interface_object — reaches
+   JS_SetConstructor2, and none of them has a line to add.
+   A `proto` that is nobody's class prototype (a native error's, a plain interface object's) simply names no
+   slot; JS_GetClassCtor's own DCHECK is what makes reading such a slot fatal rather than silently null. */
+static void js_record_class_ctor(JSContext *ctx, JSValueConst func_obj, JSValueConst proto)
+{
+    int i;
+
+    if (!JS_IsObject(proto))
+        return;
+    /* EVERY slot naming this prototype, not the first: two class ids sharing one prototype object are two
+       internal representations of ONE interface, and one interface has one constructor — so both answer it. */
+    for (i = 0; i < ctx->rt->class_count; i++) {
+        if (js_same_value(ctx, ctx->class_proto[i], proto))
+            set_value(ctx, &ctx->class_ctor[i], js_dup(func_obj));
+    }
+}
+
 /* Note: 'func_obj' is not necessarily a constructor */
 static int JS_SetConstructor2(JSContext *ctx,
                               JSValueConst func_obj,
@@ -65404,6 +65424,7 @@ static int JS_SetConstructor2(JSContext *ctx,
     if (JS_DefinePropertyValue(ctx, proto, JS_ATOM_constructor,
                                js_dup(func_obj), ctor_flags) < 0)
         return -1;
+    js_record_class_ctor(ctx, func_obj, proto);
     return 0;
 }
 

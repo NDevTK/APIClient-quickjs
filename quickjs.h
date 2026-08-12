@@ -164,6 +164,87 @@ typedef struct JSClass JSClass;
 typedef uint32_t JSClassID;
 typedef uint32_t JSAtom;
 
+/* THE BUILT-IN CLASSES, IN THE SAME ID SPACE A HOST REGISTERS ITS OWN INTO. They are declared here rather than
+   inside quickjs.c because JS_GetClassProto and JS_GetClassCtor are the public way to reach a realm's
+   intrinsics, and a host that cannot NAME %DataView% cannot ask either of them for it — which left a browser
+   component reproducing an intrinsic constructor in C rather than constructing it. The comment beside an entry
+   is which arm of JSObject's union that class uses; that is the engine's own note and is why these are one
+   list rather than a second copy of the interesting few. */
+enum {
+    /* classid tag        */    /* union usage   | properties */
+    JS_CLASS_OBJECT = 1,        /* must be first */
+    JS_CLASS_ARRAY,             /* u.array       | length */
+    JS_CLASS_ERROR,
+    JS_CLASS_NUMBER,            /* u.object_data */
+    JS_CLASS_STRING,            /* u.object_data */
+    JS_CLASS_BOOLEAN,           /* u.object_data */
+    JS_CLASS_SYMBOL,            /* u.object_data */
+    JS_CLASS_ARGUMENTS,         /* u.array       | length */
+    JS_CLASS_MAPPED_ARGUMENTS,  /*               | length */
+    JS_CLASS_DATE,              /* u.object_data */
+    JS_CLASS_MODULE_NS,
+    JS_CLASS_C_FUNCTION,        /* u.cfunc */
+    JS_CLASS_BYTECODE_FUNCTION, /* u.func */
+    JS_CLASS_BOUND_FUNCTION,    /* u.bound_function */
+    JS_CLASS_C_FUNCTION_DATA,   /* u.c_function_data_record */
+    JS_CLASS_C_CLOSURE,         /* u.c_closure_record */
+    JS_CLASS_GENERATOR_FUNCTION, /* u.func */
+    JS_CLASS_FOR_IN_ITERATOR,   /* u.for_in_iterator */
+    JS_CLASS_REGEXP,            /* u.regexp */
+    JS_CLASS_ARRAY_BUFFER,      /* u.array_buffer */
+    JS_CLASS_SHARED_ARRAY_BUFFER, /* u.array_buffer */
+    JS_CLASS_UINT8C_ARRAY,      /* u.array (typed_array) */
+    JS_CLASS_INT8_ARRAY,        /* u.array (typed_array) */
+    JS_CLASS_UINT8_ARRAY,       /* u.array (typed_array) */
+    JS_CLASS_INT16_ARRAY,       /* u.array (typed_array) */
+    JS_CLASS_UINT16_ARRAY,      /* u.array (typed_array) */
+    JS_CLASS_INT32_ARRAY,       /* u.array (typed_array) */
+    JS_CLASS_UINT32_ARRAY,      /* u.array (typed_array) */
+    JS_CLASS_BIG_INT64_ARRAY,   /* u.array (typed_array) */
+    JS_CLASS_BIG_UINT64_ARRAY,  /* u.array (typed_array) */
+    JS_CLASS_FLOAT16_ARRAY,     /* u.array (typed_array) */
+    JS_CLASS_FLOAT32_ARRAY,     /* u.array (typed_array) */
+    JS_CLASS_FLOAT64_ARRAY,     /* u.array (typed_array) */
+    JS_CLASS_DATAVIEW,          /* u.typed_array */
+    JS_CLASS_BIG_INT,           /* u.object_data */
+    JS_CLASS_MAP,               /* u.map_state */
+    JS_CLASS_SET,               /* u.map_state */
+    JS_CLASS_WEAKMAP,           /* u.map_state */
+    JS_CLASS_WEAKSET,           /* u.map_state */
+    JS_CLASS_ITERATOR,
+    JS_CLASS_ITERATOR_CONCAT,   /* u.iterator_concat_data */
+    JS_CLASS_ITERATOR_ZIP,      /* u.iterator_zip_data */
+    JS_CLASS_ITERATOR_HELPER,   /* u.iterator_helper_data */
+    JS_CLASS_ITERATOR_WRAP,     /* u.iterator_wrap_data */
+    JS_CLASS_MAP_ITERATOR,      /* u.map_iterator_data */
+    JS_CLASS_SET_ITERATOR,      /* u.map_iterator_data */
+    JS_CLASS_ARRAY_ITERATOR,    /* u.array_iterator_data */
+    JS_CLASS_STRING_ITERATOR,   /* u.array_iterator_data */
+    JS_CLASS_REGEXP_STRING_ITERATOR,   /* u.regexp_string_iterator_data */
+    JS_CLASS_GENERATOR,         /* u.generator_data */
+    JS_CLASS_DISPOSABLE_STACK,
+    JS_CLASS_PROXY,             /* u.proxy_data */
+    JS_CLASS_PROMISE,           /* u.promise_data */
+    JS_CLASS_PROMISE_RESOLVE_FUNCTION,  /* u.promise_function_data */
+    JS_CLASS_PROMISE_REJECT_FUNCTION,   /* u.promise_function_data */
+    JS_CLASS_ASYNC_FUNCTION,            /* u.func */
+    JS_CLASS_ASYNC_FUNCTION_RESOLVE,    /* u.async_function_data */
+    JS_CLASS_ASYNC_FUNCTION_REJECT,     /* u.async_function_data */
+    JS_CLASS_ASYNC_FROM_SYNC_ITERATOR,  /* u.async_from_sync_iterator_data */
+    JS_CLASS_ASYNC_GENERATOR_FUNCTION,  /* u.func */
+    JS_CLASS_ASYNC_GENERATOR,   /* u.async_generator_data */
+    JS_CLASS_ASYNC_DISPOSABLE_STACK,
+    JS_CLASS_WEAK_REF,
+    JS_CLASS_FINALIZATION_REGISTRY,
+    JS_CLASS_DOM_EXCEPTION,
+    JS_CLASS_CALL_SITE,
+    JS_CLASS_RAWJSON,
+    JS_CLASS_SHADOW_REALM,      /* u.shadow_realm_data */
+    JS_CLASS_WRAPPED_FUNCTION,  /* u.wrapped_function_data */
+
+    JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
+};
+
 /* Unless documented otherwise, C string pointers (`char *` or `const char *`)
    are assumed to verify these constraints:
    - unless a length is passed separately, the string has a null terminator
@@ -569,6 +650,20 @@ JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
 JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);
 JS_EXTERN void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
 JS_EXTERN JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);
+/* THIS REALM'S INTRINSIC CONSTRUCTOR FOR A CLASS — the mirror of the two above, and the only sound way for C
+   to reach the object a spec step names as `%DataView%`, `%Map%` or `%URL%`. It is not `JS_GetClassProto(id)`'s
+   `constructor` property: that property is WRITABLE, so a page can redirect an internal `! Construct(…)` at
+   anything it likes, and an engine that read it would be running the page's code where the standard says the
+   step is infallible. And it is PER REALM for the same reason the prototype is — a C member runs in the realm
+   that defined it (js_call_c_function takes `ctx` from the function object), so one remembered constructor
+   would answer every document with the first realm's.
+   The engine populates a class's slot wherever the class's constructor is DEFINED (JS_SetConstructor and every
+   spelling that reaches it), so a host whose interface object goes through JS_SetConstructor has nothing to
+   declare. JS_SetClassCtor is for a host that mints an interface object some other way; `obj` is CONSUMED.
+   JS_GetClassCtor's answer is OWNED, and reading a slot this realm never populated is fatal in dev — a missing
+   intrinsic is a realm that was built without it, never a null to test for. */
+JS_EXTERN void JS_SetClassCtor(JSContext *ctx, JSClassID class_id, JSValue obj);
+JS_EXTERN JSValue JS_GetClassCtor(JSContext *ctx, JSClassID class_id);
 JS_EXTERN JSValue JS_GetFunctionProto(JSContext *ctx);
 
 /* the following functions are used to select the intrinsic object to
