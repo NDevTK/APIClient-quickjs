@@ -1144,6 +1144,13 @@ JS_EXTERN JSValue JS_NewProxy(JSContext *ctx, JSValueConst target,
 
 JS_EXTERN JSValue JS_NewDate(JSContext *ctx, double epoch_ms);
 JS_EXTERN bool JS_IsDate(JSValueConst v);
+/* A Date's [[DateValue]] — the READ half of JS_NewDate, and an INTERNAL SLOT rather than a method call. The
+   only other route to it from outside is `getTime`/`valueOf`, which are the PAGE's to replace and which are
+   step machines here precisely so that no C entry calls one; an algorithm defined over "the time represented by
+   input" (HTML §4.10.5.1.7's convert a Date object to a string is the first) means the slot and not the method.
+   NaN is a real answer — it is what an invalid Date holds — so the caller tests for it rather than for failure;
+   asking this of anything that is not a Date is fatal in dev, since JS_IsDate is how you find out. */
+JS_EXTERN double JS_GetDateValue(JSValueConst v);
 
 JS_EXTERN JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop);
 JS_EXTERN JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj,

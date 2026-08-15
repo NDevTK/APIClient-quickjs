@@ -99682,6 +99682,21 @@ bool JS_IsDate(JSValueConst v)
     return JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_DATE;
 }
 
+double JS_GetDateValue(JSValueConst v)
+{
+    JSObject *p;
+
+    DCHECK(JS_IsDate(v), "a [[DateValue]] was read off something that is not a Date — JS_IsDate is how a "
+                         "caller finds that out, and an object of another class has no such slot");
+    p = JS_VALUE_GET_OBJ(v);
+    DCHECK(JS_IsNumber(p->u.object_data), "a Date's [[DateValue]] is not a number — the slot is set to a "
+                                          "time-clipped double at construction and never to anything else");
+    /* An integral time value is stored with the INT tag by the float constructor's own normalisation, so both
+       tags are the one slot and reading only the float half would answer garbage for `new Date(0)`. */
+    return JS_VALUE_GET_TAG(p->u.object_data) == JS_TAG_INT ? (double)JS_VALUE_GET_INT(p->u.object_data)
+                                                            : JS_VALUE_GET_FLOAT64(p->u.object_data);
+}
+
 int JS_AddIntrinsicDate(JSContext *ctx)
 {
     JSValue obj;
