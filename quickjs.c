@@ -343,6 +343,15 @@ struct JSRuntime {
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
+    /* THE ALLOCATOR'S REFUSAL EDGE (quickjs.h's JSMemoryReclaimFunc) and the one-deep latch that keeps it from
+       re-entering itself. The callback runs inside a failing allocation and is allowed to free, and freeing can
+       allocate (a finalizer, the embedder's own bookkeeping); without the latch that second refusal would ask
+       the callback again from inside itself, and the recursion is unbounded on a C stack that cannot be
+       parked. One deep is the whole rule: the nested refusal is simply a refusal. */
+    JSMemoryReclaimFunc *mem_reclaim;
+    void *mem_reclaim_opaque;
+    bool in_mem_reclaim;
+
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
     // for smuggling the parent promise from js_promise_then
@@ -2310,9 +2319,34 @@ static void js_arena_free_all(JSRuntime *rt)
     }
 }
 
+/* ASK THE EMBEDDER FOR MEMORY BACK — see quickjs.h's JSMemoryReclaimFunc. Answers whether the caller should
+   retry, and decides NOTHING else: the two refusals below are properties of the RUNTIME's state, which the
+   embedder cannot see and must not be asked to reason about.
+   NOT WHILE THE COLLECTOR OWNS THE GRAPH. gc_phase is non-NONE exactly while the cycle collector is walking
+   gc_obj_list and dropping references; a callback that freed an object there would unlink a node out of the
+   list the walk is standing in, and the corruption surfaces later as a free of something already freed. An
+   allocation raised during a collection therefore fails as it always has. */
+static bool js_reclaim_memory(JSRuntime *rt, size_t wanted)
+{
+    bool freed;
+
+    if (!rt->mem_reclaim || rt->in_mem_reclaim || rt->gc_phase != JS_GC_PHASE_NONE || rt->in_free)
+        return false;
+    rt->in_mem_reclaim = true;
+    freed = rt->mem_reclaim(rt, rt->mem_reclaim_opaque, wanted) != 0;
+    rt->in_mem_reclaim = false;
+    return freed;
+}
+
+void JS_SetMemoryReclaimHook(JSRuntime *rt, JSMemoryReclaimFunc *cb, void *opaque)
+{
+    rt->mem_reclaim = cb;
+    rt->mem_reclaim_opaque = opaque;
+}
+
 void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
 {
-    void *ptr;
+    void *ptr = NULL;
     JSMallocState *s;
 
     /* Do not allocate zero bytes: behavior is platform dependent */
@@ -2323,13 +2357,20 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
             return NULL;
 
     s = &rt->malloc_state;
-    /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
-    if (unlikely(s->malloc_size + (count * size) > s->malloc_limit - 1))
-        return NULL;
-
-    ptr = js_arena_calloc(rt, count, size);
-    if (!ptr)
-        return NULL;
+    /* THE REFUSAL IS A LOOP, NOT A RETURN. Both ways this allocation can be refused — the runtime's own budget
+       and the backing allocator saying no — go through the same edge, and the loop ends when the embedder
+       answers that it has nothing left to give. It is not a retry COUNT: each pass frees something real (the
+       embedder said so) and the pass that frees nothing is the last one. */
+    for (;;) {
+        /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
+        if (likely(s->malloc_size + (count * size) <= s->malloc_limit - 1)) {
+            ptr = js_arena_calloc(rt, count, size);
+            if (likely(ptr != NULL))
+                break;
+        }
+        if (!js_reclaim_memory(rt, count * size))
+            return NULL;
+    }
 
     s->malloc_count++;
     s->malloc_size += js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
@@ -2338,7 +2379,7 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
 
 void *js_malloc_rt(JSRuntime *rt, size_t size)
 {
-    void *ptr;
+    void *ptr = NULL;
     JSMallocState *s;
 
     /* Do not allocate zero bytes: behavior is platform dependent */
@@ -2346,13 +2387,16 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
         return NULL;
 
     s = &rt->malloc_state;
-    /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
-    if (unlikely(s->malloc_size + size > s->malloc_limit - 1))
-        return NULL;
-
-    ptr = js_arena_malloc(rt, size);
-    if (!ptr)
-        return NULL;
+    for (;;) {   /* the refusal edge — see js_calloc_rt */
+        /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
+        if (likely(s->malloc_size + size <= s->malloc_limit - 1)) {
+            ptr = js_arena_malloc(rt, size);
+            if (likely(ptr != NULL))
+                break;
+        }
+        if (!js_reclaim_memory(rt, size))
+            return NULL;
+    }
 
     s->malloc_count++;
     s->malloc_size += js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
@@ -2393,13 +2437,17 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
     }
     old_size = js_arena_usable_size(rt, ptr);
     s = &rt->malloc_state;
-    /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
-    if (s->malloc_size + size - old_size > s->malloc_limit - 1)
-        return NULL;
-
-    ptr = js_arena_realloc(rt, ptr, size);
-    if (!ptr)
-        return NULL;
+    for (;;) {   /* the refusal edge — see js_calloc_rt. js_arena_realloc leaves `ptr` intact when it refuses,
+                    which is what makes retrying it sound rather than a second read of a moved block. */
+        void *np = NULL;
+        /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
+        if (likely(s->malloc_size + size - old_size <= s->malloc_limit - 1)) {
+            np = js_arena_realloc(rt, ptr, size);
+            if (likely(np != NULL)) { ptr = np; break; }
+        }
+        if (!js_reclaim_memory(rt, size))
+            return NULL;
+    }
 
     s->malloc_size += js_arena_usable_size(rt, ptr) - old_size;
     return ptr;

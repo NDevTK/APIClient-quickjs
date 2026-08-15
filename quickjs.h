@@ -1381,6 +1381,30 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
 
+/* THE ALLOCATOR'S REFUSAL EDGE — the embedder's last chance to give memory back before an allocation fails.
+ *
+ * WHY IT IS HERE AND NOT AT THE CALL SITES. An embedder that keeps a releasable working set (APIClient's
+ * frontier of parked flows, each a COW delta plus a suspended frame chain) has exactly one honest moment to
+ * page part of it out: the moment the runtime cannot satisfy a request. Anything earlier is a watermark — a
+ * number someone picked, which truncates work while memory remains — and anything later is a failed
+ * allocation the embedder never got to prevent. Every refusal inside js_malloc_rt / js_calloc_rt /
+ * js_realloc_rt asks this hook, so an embedder cannot be surprised by WHICH allocation happened to be the one
+ * that hit the floor; there is no list of sites to keep up to date.
+ *
+ * THE CONTRACT. `wanted` is the size the runtime is trying to obtain. Return non-zero if the callback FREED
+ * something, and the runtime retries the allocation — repeatedly, for as long as the callback keeps saying it
+ * freed something, so the loop's termination is the embedder's own "there is nothing left to give" and never a
+ * count of attempts. Return 0 for that answer, and the allocation fails exactly as it would with no hook
+ * installed. That is the physical floor.
+ *
+ * WHAT THE CALLBACK MAY DO. It runs INSIDE an allocation, so it may FREE (js_free_rt, JS_FreeValue) and it may
+ * allocate through the SYSTEM allocator, but it may not re-enter the runtime to run JS: a nested refusal is
+ * answered 0 without consulting the callback again, and a refusal raised while the collector owns the object
+ * graph (rt->gc_phase) is never offered to it at all. Both are enforced here rather than left to the embedder,
+ * because both are properties of the runtime's state and not of the callback's. */
+typedef int JSMemoryReclaimFunc(JSRuntime *rt, void *opaque, size_t wanted);
+JS_EXTERN void JS_SetMemoryReclaimHook(JSRuntime *rt, JSMemoryReclaimFunc *cb, void *opaque);
+
 /* APIClient forced-execution FLOW-CONTROL hooks — the scheduler's control over interpreter execution: the three
    points where the forced-exec engine steers a running flow. One concern, one owner (the scheduler), one
    registration (JS_SetFlowControlHooks); not optional, a NULL argument crashes.
