@@ -276,6 +276,114 @@ typedef struct JSTrampStepDef {
 #define JS_STEP_STAGE_ENUM(name, label)  name,
 #define JS_STEP_STAGE_LABEL(name, label) label,
 
+/* THE THIRD EXPANSION OF THE SAME ONE LIST — THE DISPATCH. A stage list that GREW while a control-flow test
+ * did not is the defect this removes, and it removes it at COMPILE TIME rather than by asking a body to be
+ * careful: the `case` arms are generated from the declaration, so a stage with no body does not link and a body
+ * naming no stage does not compile.
+ *
+ * TWO INSTANCES, FOUND BY READING, NEITHER CATCHABLE BY ANY RUNTIME GATE.
+ *   core/frame/history.c declared ONE stage. IDL_STEP_STAGE_BASE numbers a member's first constant at
+ * IDL_STEP_FIRST, which is the stage a declared member's body is ENTERED at — so `HPR_UPDATE` was not the
+ * second stage the guard `if (hdr->stage == HPR_UPDATE) goto update;` took it for, it was the first, and the
+ * guard fired on the FIRST entry. §7.2.5's serialization, its URL parse and BOTH of its SecurityError refusals
+ * were jumped over into a §7.4.4 work record nobody had begun. It compiled, and it would have aborted three
+ * files away in a DCHECK reading "no entry — _begin builds it and must run first", with nothing pointing here.
+ *   core/frame/session_history.c spelled its resume guard as a NEGATION — `if (a->stage != SH_APPLY_POPSTATE)`,
+ * "anything but the last stage". Correct while §7.4.6.1 had two rest points; it gained a third and the negation
+ * swallowed it, re-running ACTIVATE HISTORY ENTRY on every resume through the new stage. The symptom would have
+ * been WORSE than the bug: the afterPotentialUnloads DCHECK firing on the resume, reporting "a SECOND history
+ * step was applied across this one" and sending its reader to build §7.4.1.3's traversal queue for a race that
+ * never happened. A correct assert pointing confidently at the wrong subsystem.
+ *
+ * A RESUME GUARD SPELLED AS A NEGATION IS WRONG FOR EVERY STAGE ADDED AFTER IT, and a positive one that names
+ * only some of the stages is wrong for every stage added after it too — the arm it does not name falls into a
+ * neighbour, and the neighbour is a REAL body running at the wrong step, which is why neither instance looked
+ * like a bug at the site. So the body does not write the test at all:
+ *
+ *     STEP_DISPATCH(HPR_STAGES, hdr->stage, hdr->def->algorithm, JS_STEP_ABRUPT);
+ *
+ *     STEP_ARM(HPR_CHECKS);
+ *         ... steps 1-9 ...
+ *         STEP_GOTO(hdr->stage, HPR_UPDATE, NULL);
+ *         return JS_STEP_YIELD;
+ *
+ *     STEP_ARM(HPR_UPDATE);
+ *         ... step 10 ...
+ *
+ * WHAT IT MAKES IMPOSSIBLE, and each of these is a compiler diagnostic and not a runtime one:
+ *   - a stage added to the list with no arm — the generated `goto step_arm_<name>` names a label that does not
+ *     exist, which is a hard error in every C compiler regardless of the build's warning flags (this project
+ *     compiles with -Wno-unused, so an unused-label warning would have been silently discarded);
+ *   - an arm whose name is not a stage of this list — STEP_ARM evaluates the enumerator, so a typo is an
+ *     undeclared identifier;
+ *   - two stages sharing one constant — duplicate case value.
+ * AND WHAT IT MAKES UNWRITABLE IS THE PART THAT MATTERS: there is no `else`, so a stage's body cannot live in
+ * the un-named span between the function's first line and the first test. That span is where history.c's steps
+ * 1-9 were sitting, reachable only by falling past a guard, and it is the only place a stage's body can hide.
+ * Code that legitimately runs on EVERY entry stays above the dispatch, which is a statement about it rather
+ * than an accident of where the guards happened to land.
+ *
+ * A ONE-ENTRY STAGE LIST IS NOT REFUSED, and refusing it would be the wrong repair for that first instance. A
+ * machine whose algorithm IS one spec step has one rest point, and its suspensions are its REQUESTS, which
+ * resume at that same stage through their own two-phase cursor — so a second stage forced on it would be a
+ * label naming no step, which js_step_def_check exists to refuse. What was wrong in history.c was not the
+ * count: it was that step 10 was declared and steps 1-9 were not, while the guard read the one declared
+ * constant as though it were the SECOND of two. `stage == <the first constant>` is TRUE ON ENTRY and that is
+ * correct — the first stage IS the entry stage — so the question a machine can never answer from its stage is
+ * "have I started?", and a machine that needs one keeps its own byte (core/file/file_picker.c's `started`).
+ * The dispatch is what makes the confusion unwritable, because the arm the guard was really selecting against
+ * had nowhere left to live.
+ *
+ * IT IS NOT A SWITCH THE BODY WRITES. A hand-written `switch (hdr->stage)` over the same constants is the same
+ * shape one edit away from the same bug: it is a second statement of the stage list, and the list is what
+ * drifted in both instances. Generated from the declaration there is one list.
+ *
+ * `algorithm` IS THE MACHINE'S OWN NAME FOR ITSELF — `hdr->def->algorithm` wherever a header is in hand, so the
+ * abort names the algorithm without a second copy of the string. A WORK RECORD carrying its own stage
+ * (core/frame/session_history.c's SHApply, core/events/report_exception.c's) has no header and passes its
+ * algorithm's name directly; the macro takes the stage as an LVALUE EXPRESSION for the same reason STEP_GOTO
+ * does — the invariant is about the cursor, not about who owns it.
+ *
+ * `undeclared` IS WHAT A RELEASE BUILD RETURNS, and it is a parameter because omitting it is the bug wearing
+ * its own uniform: DFAIL compiles out in release, so a dispatch that merely aborted in dev would, in release,
+ * fall straight out of the switch into the FIRST ARM — a machine entered at a stage it does not declare running
+ * the body of a step it is not at. The macro returns instead, so the two builds disagree about the diagnostic
+ * and never about the control flow.
+ *
+ * A MACRO RATHER THAN A FUNCTION, for STEP_GOTO's reason: DCHECK/DFAIL stamp the file and line they are WRITTEN
+ * at, so a helper here would report this header at every abort and say nothing about which machine was entered
+ * where. DFAIL is therefore the CALLER's — engine/host/check.h in a host component, quickjs-check.h in the
+ * engine — which is also why this header must not include either. */
+#define JS_STEP_STAGE_CASE(name, label) case name: goto step_arm_##name;
+
+/* ONE STAGE'S BODY BEGINS HERE. Written as a statement (`STEP_ARM(FPK_ACCEPTS);`) rather than as a label with a
+   colon, because it is both: the label the dispatch jumps to, and an evaluation of the enumerator that makes a
+   name outside the declaration a compile error. Two arms may share one body by naming both in sequence, which
+   is `case A: case B:` and reads as it does. FALL-THROUGH BETWEEN ARMS IS STILL THE AUTHOR'S TO REFUSE — an arm
+   ends in a return, and one that sets its stage and runs on has crossed a boundary the driver never saw, so the
+   label claimed a rest point that does not exist. C offers nothing that forbids that; the declaration-generated
+   dispatch is what stops the OTHER half, which is a stage having no body at all. */
+#define STEP_ARM(name) step_arm_##name: (void)(name)
+
+#define STEP_DISPATCH(list, stage, algorithm, undeclared) do {                                          \
+        switch ((int)(stage)) {                                                                         \
+        list(JS_STEP_STAGE_CASE)                                                                        \
+        }                                                                                               \
+        {                                                                                               \
+            char step_dispatch_why_[400];                                                               \
+                                                                                                        \
+            snprintf(step_dispatch_why_, sizeof step_dispatch_why_,                                     \
+                     "%s was entered at stage %u, which its stage declaration does not name — a stage " \
+                     "a machine can be entered at and has no arm for is a rest point with no body, and "\
+                     "the arm it would otherwise have fallen into is another step of the algorithm "    \
+                     "entirely. Either the stage belongs to a different machine's declaration, or this "\
+                     "one was written to a stage number it does not own",                               \
+                     (algorithm), (unsigned)(stage));                                                   \
+            DFAIL(step_dispatch_why_);                                                                  \
+        }                                                                                               \
+        return (undeclared);                                                                            \
+    } while (0)
+
 typedef struct JSStepHdr {
     const JSTrampStepDef *def;
     /* THE RUNTIME'S CENSUS OF LIVE MACHINES — the same accounting gc_obj_list gives every GC object, given to
