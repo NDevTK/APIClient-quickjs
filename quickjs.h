@@ -1471,9 +1471,11 @@ JS_EXTERN void JS_SetFlowControlHooks(const JSFlowControlHooks *hooks);
    flow's delta. Two mutation classes cover the JS heap: a normal property write (obj[atom]) and a closure CELL
    write (a captured local's V8-Context cell — a JSVarRef, not a property, so it needs its own edge). Object
    CREATION needs no separate hook: prop_write also fires before a creating write, and the host records the slot
-   as "absent" so a rewind DELETES it. A flow-LOCAL object (created after the baseline, stamped via
-   JS_SetFlowLocalMark(1)) is never shared and is skipped in prop_write's gate, so a delta stays O(shared state
-   actually written). Install the whole boundary ONCE with JS_SetTimeTravelHooks at engine setup — it is not
+   as "absent" so a rewind DELETES it. A flow-LOCAL object (one stamped with a generation ABOVE the delta's
+   fork generation — see JS_SetFlowGen) is never shared and is skipped in prop_write's gate, so a delta stays
+   O(shared state actually written). The converse is what makes the skip sound and is the reason that stamp is
+   the scheduler's to bracket: an object created while NO flow is running is baseline, is shared by
+   construction, and must never be skipped by anybody. Install the whole boundary ONCE with JS_SetTimeTravelHooks at engine setup — it is not
    optional and a NULL argument crashes. Baseline setup runs uncaptured NOT by leaving the hooks unset but
    because there is no CURRENT flow to capture into yet (the host routes captures to the running flow's delta). */
 /* The generator-fork hook's type, named because the HOST's COW layer takes it as a parameter: the primitive
@@ -1544,7 +1546,14 @@ JS_EXTERN void *JS_AsyncStateClone(JSContext *ctx, void *blob);
 JS_EXTERN void  JS_AsyncStateFree(JSRuntime *rt, void *blob);
 #define JS_MAP_MUTATE_OVERWRITE 1
 #define JS_MAP_MUTATE_DELETE    2
-JS_EXTERN void JS_SetFlowLocalMark(int m);
+/* The FORK GENERATION stamped onto every object created from now on: 0 = no flow is running (baseline), else
+   the running flow's generation. The scheduler owns it at ONE bracket — it opens a slice with the generation
+   the previous slice left and suspends it to 0 before returning to the host, so an object the host creates
+   between two slices is baseline and its writes are captured by every flow that goes on to share it. It takes
+   a NUMBER and not a flag precisely so that bracket is expressible: the counter is monotonic across slices
+   (JS_FlowBumpGen moves it at each fork) and restarting it would make a later object compare as older than an
+   earlier fork. Replaced JS_SetFlowLocalMark(int), whose boolean nothing ever read. */
+JS_EXTERN void JS_SetFlowGen(uint32_t gen);
 /* Whether obj was created flow-local. The COW hook consults this: a never-forked flow skips its flow_local
    writes (truly private), but AFTER a fork those objects are shared with the snapshot sibling and must be captured. */
 JS_EXTERN int  JS_IsFlowLocal(JSValueConst obj);

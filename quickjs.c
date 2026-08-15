@@ -7069,11 +7069,19 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
-uint8_t g_flow_local_mark = 0;   /* forced-exec: stamps new objects baseline(0)/flow-local(1); see JS_SetFlowLocalMark */
-/* forced-exec: the current FORK GENERATION stamped onto new objects. 0 during setup (baseline). Set to 1 when
-   flows start (JS_SetFlowLocalMark(1)); INCREMENTED at every snapshot fork (JS_FlowBumpGen) so an object created
-   after a fork gets a strictly-higher generation than the fork's — marking it flow-private. Monotonic while flows
-   run (the mark only returns to 0 at final teardown). */
+/* DELETED: `uint8_t g_flow_local_mark`. It was WRITTEN AND NEVER READ — the mirror of CLAUDE.md's greppable
+   tell, and it concealed the same thing a defaulted field does: a reader (and every comment in this file, and
+   the header's prose) believed a BOOLEAN decided whether a new object is flow-local, while the fact that
+   actually decides it is the GENERATION below. `JS_SetFlowLocalMark`'s only real effect was on that. The
+   distinction is not pedantic: a boolean can be cleared and set again, and a generation cannot — clearing it is
+   how the monotonic counter every delta's fork_gen is compared against gets destroyed. Naming the API after the
+   fact it sets is what makes that impossible to write by accident. */
+/* forced-exec: the current FORK GENERATION stamped onto new objects. 0 = BASELINE, which is not only "setup
+   before flows start" but "NO FLOW IS RUNNING AT ALL" — the host's own time between two scheduler slices is
+   baseline in exactly the same sense, and that is what JS_SetFlowGen exists to say. Set to 1 when the first
+   slice opens; INCREMENTED at every snapshot fork (JS_FlowBumpGen) so an object created after a fork gets a
+   strictly-higher generation than the fork's — marking it flow-private. Monotonic ACROSS slices: the scheduler
+   suspends the stamp to 0 for the host's time and restores this same number, never restarts it. */
 uint32_t g_flow_gen = 0;
 uint32_t JS_FlowGen(void) { return g_flow_gen; }
 uint32_t JS_FlowBumpGen(void) { return ++g_flow_gen; }
@@ -26419,15 +26427,23 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
 #define CALL_YIELD_REQUEST()  FLOW_YIELD_REQUEST(JS_PREEMPT_CALL)
 
 /* Install the forced-execution hook interfaces — one registration per concern (see quickjs.h). Each installs
-   ONCE at engine setup; a NULL argument crashes (offensive: the interface is not optional). g_flow_local_mark
-   stamps every new object 0=baseline (during setup) / 1=flow-local (while a flow runs, discarded). */
-void JS_SetFlowLocalMark(int m) {
-    g_flow_local_mark = m ? 1 : 0;
-    /* Entering flow mode from baseline starts the generation at 1; staying in flow mode keeps the monotonic
-       counter (forks have bumped it); leaving (final teardown) resets to 0. */
-    if (m) { if (g_flow_gen == 0) g_flow_gen = 1; }
-    else   { g_flow_gen = 0; }
-}
+   ONCE at engine setup; a NULL argument crashes (offensive: the interface is not optional). */
+
+/* THE GENERATION EVERY OBJECT CREATED FROM NOW ON IS STAMPED WITH — 0 when NO FLOW IS RUNNING, else the
+   running flow's fork generation. It REPLACES JS_SetFlowLocalMark(int), and the rename is the fix rather than
+   tidying: the boolean that call set was never read, so its argument described a state this engine does not
+   have while its real effect — the generation — was a side effect nobody could see at the call site. That is
+   how a scheduler came to hold the stamp across a RETURN TO THE HOST: `SetFlowLocalMark(1)` at session start
+   and `(0)` at session end reads like a session-scoped flag, and it was one, so every object the host created
+   between two slices (a fetch reply parsed at the ABI edge, and then dup'd onto every parked flow's register)
+   was stamped with the LIVE generation and therefore skipped by `JS_ObjFlowGen(obj) > d->fork_gen` in every
+   delta forked before it. A later write to that shared object by any of those flows was recorded nowhere and
+   survived that flow's unapply — §State-isolation's load-bearing invariant broken silently, with refcounting
+   making sure nothing crashed.
+   TAKING A NUMBER IS WHAT MAKES THE BRACKET WRITABLE. The scheduler suspends the stamp to 0 for the host's own
+   time and RESTORES the same number when it resumes; a boolean could only be cleared and re-entered, which
+   restarted the counter at 1 and would have made a slice-2 object compare as older than a slice-1 fork. */
+void JS_SetFlowGen(uint32_t gen) { g_flow_gen = gen; }
 void JS_SetFlowControlHooks(const JSFlowControlHooks *h) { g_flow_control = *h; }
 void JS_SetTimeTravelHooks(const JSTimeTravelHooks *h) { g_time_travel = *h; }
 void JS_SetConcolicHooks(const JSConcolicHooks *h) { g_concolic = *h; }
