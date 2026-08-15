@@ -333,6 +333,44 @@ typedef struct JSStepHdr {
 } JSStepHdr;
 
 
+/* AN OWNERSHIP DECLARATION, AS A TYPE — JSTrampStepDef::visit's signature, and IdlStepDecl::visit's, and the
+   signature of every helper record's own (a request cursor, a work block, a queue). Named because the three
+   consumers below take one, and a type written out at each of them is a type that can drift at one of them. */
+typedef void (*JSStepVisitFn)(JSContext *ctx, void *state, JSStepVisit *v);
+
+/* THE FREEING CONSUMER OF A DECLARATION — release everything `visit` names, once.
+ *
+ * A state's `visit` is the ONE list of what it owns. Until this was exported, only quickjs.c could read it that
+ * way, so every host step machine wrote a SECOND list in its teardown: the same JSValues, by hand, in another
+ * function. That is precisely the pair this engine forbids — a field added to a state creates an obligation at
+ * the clone and at the teardown, and nothing catches the one that is missed. It had already been missed, in
+ * querySelectorAll: `visit` named the collected-matches array, the teardown named nothing, and every abandoned
+ * selector walk leaked its element wrappers.
+ *
+ * The visitor is IDEMPOTENT — a value slot is left JS_UNDEFINED, a pointer slot NULL, an atom JS_ATOM_NULL — so
+ * a state torn down through a nested declaration that has already been discharged frees nothing twice.
+ * JS_StepFreeVisitor is the same consumer for a helper record whose visit takes its own typed pointer rather
+ * than a `void *`; there is one implementation, spelled two ways because C cannot cast the function type
+ * without lying about it. */
+JS_EXTERN void JS_StepVisitFree(JSContext *ctx, JSStepVisitFn visit, void *state);
+JS_EXTERN JSStepVisit *JS_StepFreeVisitor(void);
+
+/* WHAT THE OTHER HALF OF A TEARDOWN MAY NOT TOUCH, AS A NUMBER.
+ *
+ * A host machine's teardown has two halves and the split between them is the whole point: the DECLARATION owns
+ * every reference (discharged by JS_StepVisitFree), and the component's own `release` owns what the declaration
+ * does not name — a lexbor handle, a foreign C allocation, a global flag the algorithm took and must give back
+ * (§4.13.4 step 14's "regardless of whether the above steps threw", HTML §4.10.22.3 step 8's). `release` runs
+ * FIRST and may READ an owned value, because those flags live on one.
+ *
+ * A `release` that FREES one is the second list growing back, and it is invisible either way it is written:
+ * free-and-null leaves the visit's free a no-op, free-without-null makes the visit's free a double free. So the
+ * teardown folds the declaration into this number before `release` and again after, and asserts they match.
+ * Only the reference-holding operations are folded (`val`, `atom`, and an `array`'s elements through their own
+ * element visit) — a `buf`/`shared`/`machine` pointer is exactly what `release` is allowed to own, so folding
+ * those would assert the opposite of the contract. Cheap, allocation-free, and dev-only at its call sites. */
+JS_EXTERN uint64_t JS_StepVisitOwnedFingerprint(JSContext *ctx, JSStepVisitFn visit, void *state);
+
 /* Register a host component's step machine; the return value is the id JS_CFUNC_STEP_DEF names it by. The
    definition is BORROWED and must outlive the runtime — static data, as the engine's own are. A machine with no
    `visit` is refused: it could not be forked, and a concolic branch inside its callback would hand two flows

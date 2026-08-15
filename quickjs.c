@@ -301,6 +301,13 @@ struct JSRuntime {
        reason gc_obj_list is — a leak report that exists only in some builds reports only some leaks. */
     struct JSStepHdr *step_census;
     int step_census_n;
+    /* JS_StepVisitOwnedFingerprint's accumulator. It lives on the RUNTIME rather than in a file static because
+       a file static is one number for however many corpus threads the harness runs, and the two healthy
+       runtimes would then fold into each other's answer — the same defect that made g_tramp_frames_live's
+       unwound-chain DCHECK fire on a race between two healthy threads. One runtime is one thread's, so this
+       is the narrowest place the accumulator can live and still be reachable from a visit operation, which is
+       handed nothing but a slot. */
+    uint64_t step_owned_fp;
     /* list of JSGCObjectHeader.link. List of allocated GC objects (used
        by the garbage collector) */
     struct list_head gc_obj_list;
@@ -20588,7 +20595,114 @@ static void tramp_step_visit_free(JSContext *ctx, void *st) {
     JSStepHdr *h = st;
     DCHECK(h->def->visit, "a machine whose teardown reads its ownership declaration must HAVE one — "
                           "without it the teardown frees nothing and every field the machine owns leaks");
-    h->def->visit(ctx, st, (JSStepVisit *)&js_step_visit_free);
+    JS_StepVisitFree(ctx, h->def->visit, st);
+}
+
+/* THE SAME CONSUMER, PUBLIC — because the list a HOST machine's teardown has to discharge is the same list, and
+ * it was reachable only from this file.
+ *
+ * The function above is `static`, so every one of the host's step machines had to write its own teardown: a
+ * second, hand-maintained list of the same JSValues its `visit` already names. That is the shape this file
+ * forbids everywhere else — a struct copied field-by-field must dup EVERY owned field, so a field added to a
+ * state creates an obligation at the clone AND at the teardown, and nothing catches the one that is missed.
+ * It had already been missed: querySelectorAll's collected-matches array was named by qs_visit and freed by
+ * nothing, so every abandoned selector walk leaked its element wrappers, and the fix was to hand-add the free
+ * to the second list — which leaves the next omission exactly as invisible.
+ *
+ * So the declaration is the ONE list on both sides of the boundary. A host teardown discharges it with
+ * JS_StepVisitFree and keeps its own `release` for what the declaration does NOT name: a lexbor handle, a
+ * foreign C allocation, a global flag its algorithm took and must give back. What separates the two is
+ * asserted, not documented — see JS_StepVisitOwnedFingerprint. */
+JSStepVisit *JS_StepFreeVisitor(void)
+{
+    return (JSStepVisit *)&js_step_visit_free;
+}
+
+void JS_StepVisitFree(JSContext *ctx, JSStepVisitFn visit, void *state)
+{
+    DCHECK(visit != NULL,
+           "a step state's teardown reads an ownership declaration it does not have — the `visit` IS the list "
+           "of what the state owns, and without it this teardown frees nothing and leaks all of it");
+    visit(ctx, state, (JSStepVisit *)&js_step_visit_free);
+}
+
+/* WHAT A TEARDOWN'S OTHER HALF IS FORBIDDEN TO TOUCH, MEASURED RATHER THAN TRUSTED.
+ *
+ * A `release` hook runs BEFORE the declaration is discharged — it has to, because the work it does is real
+ * algorithm work that READS: §4.13.4 step 14 lowers the registry's "element definition is running" flag off
+ * `s->registry`, and HTML §4.10.22.3 step 8 lowers the form's flag off `r->form`. Reading an owned value there
+ * is correct. FREEING one is the second list coming back, and it is silent both ways round: free-and-null and
+ * the visit's free is a no-op that leaks nothing and teaches nothing, while free-without-null makes the visit's
+ * free the SECOND one.
+ *
+ * So the teardown folds every value the declaration names into a number before `release` and again after, and
+ * the two must be equal. Both mistakes move it: nulling a slot changes the tag, and dropping a reference
+ * changes the count. Only `val` and `atom` are folded — the reference-holding half, which is the half the
+ * declaration owns; a `buf`/`array`/`shared` pointer is component-private storage whose release is exactly what
+ * the other hook is FOR, so folding those would assert the opposite of the contract.
+ *
+ * A value already freed to zero by the offending release is read here after its allocation is gone. That read
+ * is the diagnosis, not a new bug: the number will differ and this fires, which is the outcome either way. But
+ * UNDER ASan THE SANITIZER GETS THERE FIRST — the fold reads the arena header of a block that has been
+ * returned, so `node engine/build.mjs native address min` reports a use-after-free INSIDE this function rather
+ * than the @WHY below it. The report's allocation site is the value the offending `release` freed, and the
+ * culprit is the `release` that ran immediately before this fold; read the @WHY that names it, not this frame. */
+static void js_step_fp_fold(JSContext *ctx, uint64_t x)
+{
+    ctx->rt->step_owned_fp = (ctx->rt->step_owned_fp ^ x) * 1099511628211ULL;   /* FNV-1a's prime */
+}
+static void js_step_visit_fp_val(JSContext *ctx, JSValue *slot)
+{
+    js_step_fp_fold(ctx, (uint64_t)(JS_VALUE_GET_TAG(*slot) + 1));
+    /* The PAYLOAD is folded only when it is a pointer. A JSValue's union is written through its int32 member
+       for an immediate, so the rest of it is indeterminate bytes, and folding those would make the number
+       differ between two reads of one unchanged slot — a check that fires at random is worse than none. */
+    if (JS_VALUE_HAS_REF_COUNT(*slot)) {
+        void *p = JS_VALUE_GET_PTR(*slot);
+        /* The count through JS_REF_COUNT — the pair js_dup and JS_FreeValueRT use, under the same tag test, so
+           the set of tags this reads a header for is the set that HAS one by construction rather than by a
+           second judgement about which of them are arena allocations. */
+        js_step_fp_fold(ctx, (uint64_t)(uintptr_t)p);
+        js_step_fp_fold(ctx, (uint64_t)(uint32_t)JS_REF_COUNT(p));
+    }
+}
+static void js_step_visit_fp_atom(JSContext *ctx, JSAtom *slot) { js_step_fp_fold(ctx, (uint64_t)*slot); }
+static void js_step_visit_fp_strbuf(JSContext *ctx, StringBuffer *slot) { (void)ctx; (void)slot; }
+static void js_step_visit_fp_props(JSContext *ctx, JSPropertyEnum **slot, uint32_t n)
+{ (void)ctx; (void)slot; (void)n; }
+static void js_step_visit_fp_slots(JSContext *ctx, ValueSlot **slot, int64_t cap, int64_t from, int64_t to)
+{ (void)ctx; (void)slot; (void)cap; (void)from; (void)to; }
+static void js_step_visit_fp_buf(JSContext *ctx, void **slot, size_t bytes) { (void)ctx; (void)slot; (void)bytes; }
+static void js_step_visit_fp_machine(JSContext *ctx, void **slot) { (void)ctx; (void)slot; }
+static void js_step_visit_fp_shared(JSContext *ctx, void **slot, int *refs, void (*destroy)(JSContext *, void *))
+{ (void)ctx; (void)slot; (void)refs; (void)destroy; }
+static void js_step_visit_fp_maprec(JSContext *ctx, struct JSMapRecord **slot) { (void)ctx; (void)slot; }
+static void js_step_visit_fp_reexec(JSContext *ctx, REExecContext *ec, uint8_t **capture)
+{ (void)ctx; (void)ec; (void)capture; }
+static const JSStepVisit js_step_visit_fp;
+/* An array OF SUB-OBJECTS is walked, because its elements can be values — the element visit is the machine's
+   own and the fold has to reach through it exactly as the free and the clone do. */
+static void js_step_visit_fp_array(JSContext *ctx, void **slot, size_t size, int n, int cap,
+                                   void (*each)(JSContext *ctx, void *elem, JSStepVisit *v))
+{
+    uint8_t *a = *slot;
+    int i;
+    (void)cap;
+    if (!a) return;
+    for (i = 0; i < n; i++) each(ctx, a + size * (size_t)i, (JSStepVisit *)&js_step_visit_fp);
+}
+static const JSStepVisit js_step_visit_fp = { js_step_visit_fp_val, js_step_visit_fp_strbuf, js_step_visit_fp_props,
+                                              js_step_visit_fp_slots, js_step_visit_fp_buf,
+                                              js_step_visit_fp_atom, js_step_visit_fp_machine,
+                                              js_step_visit_fp_array, js_step_visit_fp_shared,
+                                              js_step_visit_fp_maprec, js_step_visit_fp_reexec };
+
+uint64_t JS_StepVisitOwnedFingerprint(JSContext *ctx, JSStepVisitFn visit, void *state)
+{
+    DCHECK(visit != NULL, "a step state's ownership declaration was fingerprinted and it has none");
+    ctx->rt->step_owned_fp = 1469598103934665603ULL;   /* FNV-1a's offset basis */
+    visit(ctx, state, (JSStepVisit *)&js_step_visit_fp);
+    return ctx->rt->step_owned_fp;
 }
 
 /* DEEP-FORK: the sibling flow gets its OWN machine. The generic half is here because it is the same at every
