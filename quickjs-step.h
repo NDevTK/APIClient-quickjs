@@ -167,9 +167,15 @@ typedef struct JSTrampStepDef {
      * same thing in the next session as in this one — which is what a cross-session resume of a suspended
      * machine requires and what a private counter can never give it.
      *
-     * NULL-terminated, indexed by stage, so a stage past the end is a machine that invented one. A definition
-     * that has not been converted yet declares neither, and the count of those is the conversion's work queue —
-     * see engine/build.mjs's step gate, which reports it.
+     * NULL-terminated, indexed by stage, so a stage past the end is a machine that invented one. BOTH ARE
+     * MANDATORY: this said "a definition that has not been converted yet declares neither, and the count of
+     * those is the conversion's work queue" and pointed at a build gate that reports it. The gate does not
+     * exist — it named one that had already been deleted — and the queue is empty, so what the sentence
+     * actually described was an exemption with nothing left to exempt and nothing watching it. Every definition
+     * now declares both, asserted where a def enters the runtime (JS_RegisterStepDef for a host component's,
+     * js_step_defs_check_table for the engine's own) rather than counted anywhere; the conditional that used to
+     * skip step_stage_check for an undeclared def is gone with it, because a guard whose false arm checks
+     * nothing is how a machine that LOSES its declaration goes on resting wherever it likes.
      *
      * THE LABEL IS THE STAGE'S IDENTITY; THE INDEX IS ONLY THIS BUILD'S NAME FOR IT — and that is why the two
      * are ONE declaration (JS_STEP_STAGES below) rather than an enum beside an array. Written apart they are

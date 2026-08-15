@@ -2649,10 +2649,17 @@ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
     return unlikely(sp < rt->stack_limit);
 }
 
+void js_step_defs_check_table(void); /* defined beside the table it walks; see js_step_def_check */
+
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 {
     JSRuntime *rt;
     JSMallocState ms;
+
+    /* Before anything can be driven: every built-in step machine declares what a rest point needs. Here rather
+       than at the first lookup because a machine nothing happens to call in this run is exactly the one whose
+       declaration rots unnoticed. */
+    js_step_defs_check_table();
 
     memset(&ms, 0, sizeof(ms));
     ms.opaque = opaque;
@@ -18984,15 +18991,15 @@ static void js_step_census_report(JSRuntime *rt)
         }
     }
     for (i = 0; i < nm; i++) {
-        const char *alg = m[i].def->algorithm ? m[i].def->algorithm : "(undeclared algorithm)";
-        const char *st = "(undeclared stages)";
-        if (m[i].def->steps) {
-            int k = 0;
-            while (k < m[i].stage && m[i].def->steps[k] != NULL) k++;
-            st = (k == m[i].stage && m[i].def->steps[k] != NULL)
-                 ? m[i].def->steps[k] : "(a stage past the declared list)";
-        }
-        fprintf(stderr, "[stepleak] %-44s x%-7d resting at %s\n", alg, m[i].n, st);
+        /* Both are declared — js_step_def_check refuses a def that lacks either — so the census names the leak
+           by its algorithm and the step it is resting at, never by a placeholder standing in for a declaration
+           that is missing. A stage past the declared list is still possible here, and is its own diagnosis. */
+        int k = 0;
+        const char *st;
+        while (k < m[i].stage && m[i].def->steps[k] != NULL) k++;
+        st = (k == m[i].stage && m[i].def->steps[k] != NULL)
+             ? m[i].def->steps[k] : "(a stage past the declared list)";
+        fprintf(stderr, "[stepleak] %-44s x%-7d resting at %s\n", m[i].def->algorithm, m[i].n, st);
     }
     fprintf(stderr, "[stepleak] %d live step machines at teardown\n", rt->step_census_n);
 }
@@ -19154,7 +19161,7 @@ static int step_getprop_done(JSContext *ctx, JSStepHdr *h, JSAtom atom, JSValue 
                  "sub-sequence keeps its phase until it returns 0; a machine that CATCHES an abrupt delivery "
                  "must still let the request END (call the helper, or take the -1 it reports) before starting "
                  "the next one",
-                 h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)", ag, aw);
+                 h->def->algorithm, ag, aw);
         DFAIL(why);
     }
 #endif
@@ -22050,13 +22057,21 @@ static int js_step_stage_from_label(const JSTrampStepDef *def, const char *label
 }
 #endif
 
-/* A DECLARED MACHINE RESTS ONLY AT A STEP OF ITS OWN ALGORITHM — see JSTrampStepDef.steps. Compiled out of
-   release with the DCHECK; a machine that has not been converted declares no steps and is not yet asked. */
+/* A MACHINE RESTS ONLY AT A STEP OF ITS OWN ALGORITHM — see JSTrampStepDef.steps. Compiled out of release with
+   the DCHECK.
+   THE UNDECLARED CASE IS NOT SKIPPED HERE, IT DOES NOT EXIST: this ran under `if (h->def->steps)` while the
+   conversion was in progress, and a guard whose false arm is "check nothing" is a silent exemption the moment
+   the last machine is converted — a def that lost its declaration in an edit would rest anywhere it liked and
+   this function would agree. Every def now declares both (js_step_def_check asserts it at the two points a def
+   enters the runtime), so the guard's only remaining job was to hide a regression. */
 static void step_stage_check(const JSStepHdr *h, const char *when)
 {
 #if APICLIENT_DEV
-    if (h->def->steps) {
+    {
         int n = 0;
+        DCHECK(h->def->steps != NULL && h->def->algorithm != NULL,
+               "a step machine rested at a stage while declaring no algorithm or no steps — a rest point that "
+               "names no spec step is one a park, a fork or a cross-session resume cannot restore");
         while (h->def->steps[n]) n++;
         if (h->stage >= (uint16_t)n) {
             char why[256];
@@ -22064,7 +22079,7 @@ static void step_stage_check(const JSStepHdr *h, const char *when)
                      "a step machine rested %s its step at stage %u, which %s does not declare — a suspension "
                      "point with no place in the algorithm is one a park, a fork or a cross-session resume "
                      "cannot name, and the stage numbers agree with themselves either way",
-                     when, (unsigned)h->stage, h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)");
+                     when, (unsigned)h->stage, h->def->algorithm);
             DFAIL(why);
         }
         /* THE ROUND TRIP, run at every rest because that is where a rest point becomes a thing to restore. The
@@ -22078,7 +22093,7 @@ static void step_stage_check(const JSStepHdr *h, const char *when)
                      "%s declares the step \"%s\" at more than one stage, so a machine parked there names a "
                      "rest point that resolves to two — a resume in a later build picks the first and continues "
                      "at the wrong step of the algorithm, which nothing downstream can tell from the right one",
-                     h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)", h->def->steps[h->stage]);
+                     h->def->algorithm, h->def->steps[h->stage]);
             DFAIL(why);
         }
     }
@@ -22115,13 +22130,14 @@ static void step_request_check(JSContext *ctx, const JSStepHdr *h, int st, bool 
 {
 #if APICLIENT_DEV
     if (abrupt_in && st > 0 && JS_HasException(ctx)) {
-        const char *label = "(a stage its definition does not declare)";
-        char why[420];
-        if (h->def->steps) {
-            int n = 0;
-            while (h->def->steps[n]) n++;
-            if (h->stage < (uint16_t)n) label = h->def->steps[h->stage];
-        }
+        /* The stage may still be past the end (that is step_stage_check's diagnosis, and this message should not
+           read as if it were the same fault), but the LIST is always there — js_step_def_check saw to that. */
+        const char *label = "(a stage past the end of its declared steps)";
+        char why[640];   /* the compiler knows the format's minimum length; a truncated DFAIL loses its tail,
+                            which is where every one of these names the capability to build */
+        int n = 0;
+        while (h->def->steps[n]) n++;
+        if (h->stage < (uint16_t)n) label = h->def->steps[h->stage];
         snprintf(why, sizeof why,
                  "%s asked for step code %d at stage %u (%s) with a throw still live in the context — an abrupt "
                  "request completion was delivered to this machine and never consumed, so the driver is about to "
@@ -22129,7 +22145,7 @@ static void step_request_check(JSContext *ctx, const JSStepHdr *h, int st, bool 
                  "is the hang this check exists for. Consume the abrupt where the request ENDS (the helper the "
                  "machine parked in), or take the exception; a request kind that cannot report one at all is the "
                  "capability to build",
-                 h->def->algorithm ? h->def->algorithm : "(unnamed algorithm)", st, (unsigned)h->stage, label);
+                 h->def->algorithm, st, (unsigned)h->stage, label);
         DFAIL(why);
     }
 #else
@@ -42028,7 +42044,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             } else {
                 /* The KIND is the one fact needed to act on this, so it is in the message. A DFAIL that says
                    "some other continuation" sends the reader back to a bisection to learn what it already knew. */
-                char why[192];
+                char why[320];   /* see step_request_check: sized past the format's minimum so the sentence
+                                    naming the arm to write is not the half that gets cut */
                 snprintf(why, sizeof why,
                          "clone_deep_flow: deep-fork of a C-continuation callback frame of kind %d — neither a "
                          "step machine nor a Promise executor. Give THAT continuation its own clone arm: the "
@@ -78233,12 +78250,29 @@ JSValue JS_PerformPromiseThen(JSContext *ctx, JSValueConst promise, JSValueConst
     return cap;
 }
 
+/* WHAT A DEFINITION MUST DECLARE BEFORE IT IS A MACHINE, asserted at the two points a def enters the runtime:
+   here for a host component's, and js_step_defs_check_table for the engine's own. Both lists exist because there
+   are two tables, not two rules — the rule is one, and a def that fails it is not a partially-converted machine,
+   it is one whose rest points cannot be named, forked or resumed. */
+static void js_step_def_check(const JSTrampStepDef *def)
+{
+    CHECK(def != NULL, "a step-def table row holds no definition");
+    CHECK(def->visit != NULL,
+          "a step machine with no visit cannot be forked — declare what it owns before registering it");
+    CHECK(def->algorithm != NULL,
+          "a step machine that names no algorithm cannot say what its stages are steps OF — a parked flow's rest "
+          "point is a label in an algorithm, and there is nothing here for it to be a label in");
+    CHECK(def->steps != NULL,
+          "a step machine that declares no steps rests at private integers — see JSTrampStepDef.steps: a stage "
+          "number that means nothing outside this build is one a cross-session resume continues at by guessing");
+    CHECK(def->steps[0] != NULL,
+          "a step machine declares an EMPTY step list, so every stage it rests at is past the end of it");
+}
+
 int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def)
 {
     const JSTrampStepDef **a;
-    CHECK(def != NULL, "JS_RegisterStepDef was handed no definition");
-    CHECK(def->visit != NULL,
-          "a step machine with no visit cannot be forked — declare what it owns before registering it");
+    js_step_def_check(def);
     a = js_realloc_rt(rt, rt->host_step_defs, sizeof(*a) * (size_t)(rt->host_step_def_count + 1));
     CHECK(a != NULL, "the host step-def table allocation failed");
     rt->host_step_defs = a;
@@ -78577,6 +78611,21 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_ARRAY_REDUCE]  = &js_array_reduce_def,  [STEPDEF_ARRAY_REDUCE_RIGHT] = &js_array_reduceR_def,
     [STEPDEF_TA_REDUCE]     = &js_ta_reduce_def,     [STEPDEF_TA_REDUCE_RIGHT]    = &js_ta_reduceR_def,
 };
+
+/* THE ENGINE'S OWN TABLE IS SUBJECT TO THE SAME RULE AS A HOST'S REGISTRATION, and it needs its own walk because
+   nothing hands these rows to anybody — a designated initializer that names no row leaves a NULL, and a def that
+   loses its `steps` in an edit is a compile-time-valid struct. Run once per runtime rather than at each lookup:
+   the table is a constant, so one pass proves it for every machine the runtime will ever drive. */
+void js_step_defs_check_table(void)
+{
+    int i;
+    for (i = 0; i < STEPDEF_COUNT; i++) {
+        DCHECK(js_tramp_step_defs[i] != NULL,
+               "a STEPDEF id has no table row — the enum names a machine the table never gave a definition, and "
+               "the lookup for it would return NULL to a driver that has nothing else to run");
+        js_step_def_check(js_tramp_step_defs[i]);
+    }
+}
 
 /* An OPCODE driver names a BUILT-IN machine by a literal STEPDEF_* — a host id never reaches here, and the
    range check says so rather than silently indexing past the table. */
