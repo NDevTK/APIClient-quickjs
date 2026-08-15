@@ -1090,10 +1090,14 @@ void update_exclude_dirs(void)
     int i, j, count;
     size_t include, exclude;
 
-    /* split directpries from exclude_list */
+    /* Split the PREFIX-matched entries out of exclude_list, which is otherwise matched by equality. A directory
+       (trailing '/') is one; so is every '!' RE-INCLUDE, whatever it names — the marker is what routes it here,
+       not the shape of the path. A '!' naming a single FILE is the point: without it the config can only re-admit
+       a whole tree, so a spec-true file sitting inside an excluded suite has no spelling at all and stays out of
+       the gate with nothing to say so — the excluded-test failure, one granularity down. */
     for (count = i = 0; i < ep->count; i++) {
         name = ep->array[i];
-        if (js__has_suffix(name, "/")) {
+        if (js__has_suffix(name, "/") || *name == '!') {
             namelist_add(dp, NULL, name);
             free(name);
         } else {
@@ -1110,10 +1114,16 @@ void update_exclude_dirs(void)
         include = exclude = 0;
         for (j = 0; j < dp->count; j++) {
             path = dp->array[j];
-            if (has_prefix(name, path))
+            if (*path == '!') {
+                /* A re-include is matched the way the thing it names is matched on the exclude side: a
+                   directory by prefix, a file by equality. Prefix-matching a file name would also re-admit
+                   every longer name it happens to start with. */
+                const char *incl = &path[1];
+                if (js__has_suffix(incl, "/") ? has_prefix(name, incl) : str_equal(name, incl))
+                    include = strlen(incl);
+            } else if (has_prefix(name, path)) {
                 exclude = strlen(path);
-            if (*path == '!' && has_prefix(name, &path[1]))
-                include = strlen(&path[1]);
+            }
         }
         // most specific include/exclude wins
         if (exclude > include) {
@@ -1276,7 +1286,22 @@ void load_config(const char *filename, const char *ignore)
                 continue;
             }
         case SECTION_EXCLUDE:
-            namelist_add(&exclude_list, base_name, p);
+            if (*p == '!') {
+                /* The '!' is a marker on the ENTRY, not the first character of the path, so the config file's
+                   own directory joins to what FOLLOWS it. Joining the marked string instead buries the '!'
+                   mid-path and the re-include silently matches nothing. */
+                char *joined = compose_path(base_name, p + 1);
+                char *marked = joined ? malloc(strlen(joined) + 2) : NULL;
+                if (!marked)
+                    fatal(1, "allocation failure\n");
+                marked[0] = '!';
+                strcpy(marked + 1, joined);
+                namelist_add(&exclude_list, NULL, marked);
+                free(marked);
+                free(joined);
+            } else {
+                namelist_add(&exclude_list, base_name, p);
+            }
             break;
         case SECTION_FEATURES:
             if (!q || str_equal(q, "yes") || (!CC_IS_TCC && str_equal(q, "!tcc")))

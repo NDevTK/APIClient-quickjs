@@ -46094,11 +46094,22 @@ static int add_func_var(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
     return idx;
 }
 
+/* The ONE place a function's varEnv `arguments` slot is minted, which is what makes "a function has at most one
+   of them" assertable. Nothing about a duplicate is loud: the prologue fills arguments_var_idx with the Arguments
+   object while every read resolves by NAME, so a second scope-0 var called `arguments` splits the binding in two
+   and leaves the var hash table deciding which half a read sees. */
 static int add_arguments_var(JSContext *ctx, JSFunctionDef *fd)
 {
     int idx = fd->arguments_var_idx;
-    if (idx < 0 && (idx = add_var(ctx, fd, JS_ATOM_arguments)) >= 0) {
-        fd->arguments_var_idx = idx;
+    if (idx < 0) {
+        /* define_var REUSES an existing slot for `var arguments` (and adopts it as arguments_var_idx), and
+           add_arguments_arg puts the parameter-scope binding at ARG_SCOPE_INDEX where find_var will not see it.
+           So a scope-0 hit at this point is a var somebody minted behind this function's back. */
+        DCHECK(find_var(ctx, fd, JS_ATOM_arguments) < 0 ||
+               (find_var(ctx, fd, JS_ATOM_arguments) & ARGUMENT_VAR_OFFSET),
+               "the function's varEnv `arguments` slot must be minted only here");
+        if ((idx = add_var(ctx, fd, JS_ATOM_arguments)) >= 0)
+            fd->arguments_var_idx = idx;
     }
     return idx;
 }
@@ -52861,22 +52872,12 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
         if (!f->st_fd->is_strict_mode
         && f->op == JS_FUNC_NORMAL
         &&  (lex_idx < 0 || lex_is_redefinable_func)
-        &&  !((f->st_pos_b = find_var(ctx, f->st_fd, f->st_idx)) >= 0 && (f->st_pos_b & ARGUMENT_VAR_OFFSET))
-        /* `function arguments(){}` in a block does NOT reach the enclosing binding, and the two engines
-           genuinely disagree about that — so this is worth stating precisely rather than by citation.
-           The condition B.3.2.1 ii tests is "parameterNames does not contain F". In the edition V8's test was
-           written against, FunctionDeclarationInstantiation step 22.f appended "arguments" to parameterNames,
-           which settles it directly. The CURRENT text does not: step 20.f builds a separate parameterBindings
-           list and leaves parameterNames alone, so the condition holds, step 2's own "F is not arguments"
-           carve-out skips only the binding CREATION, and step 3's assignment would still overwrite the
-           Arguments object at evaluation.
-           test262 proper still ships the older reading — annexB/language/function-code/block-decl-func-skip-
-           arguments asserts `arguments.toString()` is "[object Arguments]" after the block — and that file is
-           in the gate, so it is the oracle this follows. SpiderMonkey took the newer reading, which is what
-           sm/lexical-environment/block-scoped-functions-annex-b-arguments and sm/regress/regress-602621 assert;
-           both are in a suite this repo excludes for exactly this reason. If test262 proper ever changes side,
-           the change here is to drop this clause and let step 3 run — the surrounding code needs nothing. */
-        &&  !(f->st_idx == JS_ATOM_arguments && f->st_fd->has_arguments_binding)) {
+        /* "paramNames does not contain funcName", the other half of the condition. paramNames is the BoundNames
+           of the formals, so this is a formal-parameter test and nothing else: `function f(arguments){ {
+           function arguments(){} } }` is the ONE shape in which the name `arguments` fails the condition, and it
+           fails it for the same reason `function f(x){ { function x(){} } }` does. `arguments` is NOT otherwise
+           excluded here — see the store site, which is where 10.2.11 puts its carve-out. */
+        &&  !((f->st_pos_b = find_var(ctx, f->st_fd, f->st_idx)) >= 0 && (f->st_pos_b & ARGUMENT_VAR_OFFSET))) {
             f->st_b3 = true;
         }
         /* Create the lexical name here so that the function closure
@@ -53376,13 +53377,37 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
                     hf->scope_level = 0;
                     hf->force_init = s->cur_func->is_strict_mode;
                 } else {
-                    /* do not call define_var to bypass lexical scope check */
-                    f->st_pos_b = find_var(ctx, s->cur_func, f->st_idx);
-                    if (f->st_pos_b < 0) {
-                        f->st_pos_b = add_var(ctx, s->cur_func, f->st_idx);
+                    if (f->st_idx == JS_ATOM_arguments &&
+                        s->cur_func->has_arguments_binding) {
+                        /* 10.2.11 carves `arguments` out of the BINDING CREATION and out of nothing else. The
+                           two steps are SIBLINGS under the condition above, not nested:
+                             If instantiatedVariableNames does not contain funcName and funcName is not
+                             "arguments", then ... CreateMutableBinding / InitializeBinding(funcName, undefined)
+                             When the FunctionDeclaration funcDecl is evaluated, ... Let funcObj be !
+                             blockEnv.GetBindingValue(funcName, false). Perform !
+                             funcEnv.SetMutableBinding(funcName, funcObj, false).
+                           So the store DOES run for `arguments`, and the only thing skipped is creating a
+                           binding that already exists — creating it would re-initialise the Arguments object to
+                           undefined at entry, which is exactly what `if (0) { function arguments(){} }` must not
+                           do. Every read in this function resolves `arguments` to arguments_var_idx, so that is
+                           the slot the store has to name; adding a second var of the name would leave the
+                           prologue filling one slot and this store writing the other, with the var hash table
+                           deciding which one a read saw. */
+                        f->st_pos_b = add_arguments_var(ctx, s->cur_func);
+                    } else {
+                        /* do not call define_var to bypass lexical scope check */
+                        f->st_pos_b = find_var(ctx, s->cur_func, f->st_idx);
                         if (f->st_pos_b < 0)
-                            goto fd2_fail;
+                            f->st_pos_b = add_var(ctx, s->cur_func, f->st_idx);
                     }
+                    if (f->st_pos_b < 0)
+                        goto fd2_fail;
+                    /* The condition was decided on the way IN, against the enclosing def, and is consumed here
+                       with the whole function body parsed in between. An Annex B store names varEnv, so a
+                       parameter slot reaching this point means the two sites stopped agreeing about what
+                       "paramNames does not contain funcName" resolved to. */
+                    DCHECK(!(f->st_pos_b & ARGUMENT_VAR_OFFSET),
+                           "an Annex B var store must name a var in varEnv, never a formal parameter");
                 }
                 /* store directly into the var, bypassing the lexical scope. The store is PROVISIONAL: an
                    enclosing block may declare the name lexically LATER, and then the VariableStatement
