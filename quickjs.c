@@ -26090,8 +26090,20 @@ static _Thread_local JSAsyncFunctionState *g_flow_base_gen = NULL;
    `volatile` spelling did on every target this ships to, which is what keeps the per-opcode poll free. The
    lock-freedom is not assumed: it is a build failure below if it ever stops holding. Relaxed is the whole
    ordering needed — the handler runs on the polling thread, so there is nothing to synchronise WITH; the byte
-   is a request, never a handshake carrying data. */
-static _Thread_local volatile uint8_t g_flow_yield_req = 0;
+   is a request, never a handshake carrying data.
+   LOCK-FREEDOM IS ONLY HALF OF WHAT MAKES THAT STORE SAFE, AND THE OTHER HALF IS THE TLS MODEL — which is why
+   it is DECLARED here instead of argued about somewhere else. Reaching a thread-local through the general
+   dynamic model calls __tls_get_addr, which on first touch in a thread allocates and takes the dynamic-loader
+   lock; a signal handler that interrupted the interpreter mid-allocation would then deadlock against it, and no
+   amount of the object being a lock-free atomic would help, because the unsafe part happens before the store.
+   local-exec is the model with no call in it: a constant offset from the thread pointer. It was previously TRUE
+   of every build in this tree, for a reason no build file states — that quickjs.c is compiled straight into the
+   PROGRAM rather than into a dlopen'd object — so the property held by accident and its loss would have been
+   silent. Asked for explicitly it stops being an accident: a build that made the engine a dynamically-loaded
+   module now FAILS TO LINK (a TPOFF relocation in a shared object), naming the thing it broke, instead of
+   quietly emitting a call the handler must not make. (Wasm has only this model, so the attribute is what it
+   already does there.) */
+static _Thread_local volatile uint8_t g_flow_yield_req __attribute__((tls_model("local-exec"))) = 0;
 _Static_assert(__atomic_always_lock_free(sizeof(g_flow_yield_req), 0),
                "the yield request must be a LOCK-FREE atomic byte: the quantum's CPU-time edge raises it from a "
                "signal handler, and a handler that took a lock to store it could deadlock against the "
