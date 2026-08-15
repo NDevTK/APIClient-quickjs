@@ -89660,8 +89660,10 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 
 /* 'pr' can be NULL */
 
-/* ONE STEP of the parse. 0 = done (p->val is the result), 1 = MORE (the scheduler asked for the flow; call
-   again to continue at the exact point), -1 = threw. */
+/* ONE STEP of the parse — one completed VALUE. 0 = done (p->val is the result), 1 = MORE (a value completed
+   and the parse is offering the thread; call again to continue at the exact point), -1 = threw. The MORE is
+   unconditional: this machine offers, and whichever driver took it decides whether anything parks (see the
+   back-edge below). */
 static int json_parse_step(JSParseState *s, JSONParse *p)
 {
     JSContext *ctx = s->ctx;
@@ -89783,18 +89785,34 @@ static int json_parse_step(JSParseState *s, JSONParse *p)
     /* fall through: a completed value belongs to the frame below it, if there is one */
 
  value_done:
-    /* THE BACK-EDGE, once per completed value. Asking here rather than per token keeps the check off the
-       character loop while still bounding how long a parse can hold the flow: a value is the unit of progress. */
-    if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
-        p->resume = JPR_DONE_VALUE;
-        JSON_SAVE();
-        return 1;
-    }
+    /* THE BACK-EDGE, once per completed value: a value is the unit of progress, so the offer belongs here
+       rather than on the character loop.
+       IT OFFERS; IT DOES NOT DECIDE — and that is the correction this line carries. It used to ask
+       g_flow_control.preempt ITSELF and return MORE only when the answer was yes, which is a POLICY
+       consultation made inside a machine that cannot act on the answer, and both halves of that were wrong.
+       On the FLOW path the policy was asked twice per yielded value: once here, and again by the interpreter
+       at this machine's `st == 22`, which is the ask that actually parks — one budget consulted from two
+       places, which §scheduler forbids for exactly the reason it forbids two schedulers.
+       On the EMBEDDER path there is no flow at all. JS_ParseJSON_internal drives this same step from a C
+       activation on the HOST's own time — the shipped ABI parses the trusted zone's reply record with it
+       BETWEEN two scheduler steps (engine/host/main.c's qjs_provide, and engine_provide's own req2proto
+       learning under it) — where the scheduler holds no slice, nothing can park, and the answer is discarded
+       by a `while (r > 0)` that simply re-enters. Asking a flow's scheduling policy from there is asking about
+       a flow nobody is running, and solver/quantum.c's slice assertion is what said so: every reply the
+       shipped extension has ever delivered aborted at it.
+       So the machine yields at every completed value and the ONE consultation belongs to whichever driver
+       took the MORE — the interpreter asks the preempt hook and parks, the embedder's loop re-enters. That is
+       the contract every other step machine already has ("when nobody is waiting the machine is simply
+       re-entered, which costs one predicted call per back-edge and is why a machine may ask at every
+       iteration"), which is why this is a DELETION and not a guard: a guard would be a second predicate
+       deciding which of two behaviours a builtin gets. */
+    p->resume = JPR_DONE_VALUE;
+    JSON_SAVE();
+    return 1;
  value_done_resumed:
-    /* the RESUME lands BELOW the check. Landing on it re-asked the scheduler the instant the flow came back,
-       and with a preempt hook that keeps saying yes the parse yielded forever without consuming a token — a
-       live-lock, not a slow parse. A back-edge check belongs before the work of an iteration, and a resume
-       belongs after it. */
+    /* the RESUME lands BELOW the offer. Landing on it would re-offer the instant the flow came back, and a
+       driver that keeps taking the offer would never consume a token — a live-lock, not a slow parse. A
+       back-edge belongs before the work of an iteration, and a resume belongs after it. */
     if (sp == 0) {
         js_free(ctx, st);
         st = NULL;
@@ -89915,10 +89933,15 @@ static int json_parse_step(JSParseState *s, JSONParse *p)
 #undef JSON_SAVE
 }
 
-/* The C-API driver. JS_ParseJSON is an embedder entry with no flow to park into, so it runs the step to
-   completion — the same one implementation the JS-visible JSON.parse drives, differing only in that the other
-   one can hand a MORE back to the scheduler. That is the split the async generator already documents between
-   its tramp entry and its resume-as-flow driver; there is no second parser. */
+/* The C-API driver. JS_ParseJSON is an embedder entry with no flow to park into, so it TAKES every offer back:
+   the step yields once per completed value and this loop re-enters it at that exact value, which is the same
+   one implementation the JS-visible JSON.parse drives — that one hands the MORE to the interpreter, which asks
+   the scheduler whether to park. That is the split the async generator already documents between its tramp
+   entry and its resume-as-flow driver; there is no second parser.
+   AND THIS DRIVER ASKS THE SCHEDULER NOTHING, which is the property that makes it safe for a host to call on
+   its own time between two scheduler steps. It used to ask by proxy — the step consulted the preempt hook
+   itself — so an embedder parsing a reply record with no slice open was consulting the budget of a flow it was
+   not running. The offer is unconditional now and this loop is the answer to it. */
 static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf_len,
                                      const char *filename, JSONParseRecord *pr)
 {
@@ -103390,7 +103413,15 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
     JSTACtor *s = st;
     int r;
 
-    if (s->hdr.stage == TAC_START) {
+    /* THE ARMS FALL THROUGH ONE INTO THE NEXT, WHICH IS WHAT THIS ALGORITHM IS: each coercion that finds its
+       operand already primitive runs the next one in the same entry, and each that does not returns its request
+       and is re-entered at its own arm. That was a chain of `if (stage == X)` tests reading the stage the block
+       above had just written — the same list stated a second time, once per test — and the dispatch expresses it
+       with the list itself. */
+    STEP_DISPATCH(TACTOR_STAGES, s->hdr.stage, s->hdr.def->algorithm, -1);
+
+    STEP_ARM(TAC_START);
+    {
         int i;
         JS_FreeValue(ctx, cb_result);
         cb_result = JS_UNDEFINED;
@@ -103411,7 +103442,8 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         s->hdr.stage = TAC_PROTO_EARLY;
         cb_result = JS_UNDEFINED;
     }
-    if (s->hdr.stage == TAC_PROTO_EARLY) {
+    STEP_ARM(TAC_PROTO_EARLY);
+    {
         /* step 6.b.i AllocateTypedArray: NewTarget.prototype is an ordinary [[Get]] a Proxy traps, and for an
            object first argument it is the FIRST page code the constructor runs. */
         r = step_proto_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, s->hdr.arg, cb_result, &s->proto,
@@ -103427,7 +103459,8 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         r = step_toprim_run(ctx, &s->hdr, s->argp[1], HINT_NUMBER, JS_UNDEFINED, &cb_result, out_cb, out_argc);
         if (r) return r < 0 ? -1 : r;
     }
-    if (s->hdr.stage == TAC_OFFSET) {
+    STEP_ARM(TAC_OFFSET);
+    {
         JSValue prim = JS_UNDEFINED;
         r = step_toprim_run(ctx, &s->hdr, s->argp[1], HINT_NUMBER, cb_result, &prim, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -103446,7 +103479,8 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         r = step_toprim_run(ctx, &s->hdr, s->argp[2], HINT_NUMBER, JS_UNDEFINED, &cb_result, out_cb, out_argc);
         if (r) return r < 0 ? -1 : r;
     }
-    if (s->hdr.stage == TAC_LENGTH) {
+    STEP_ARM(TAC_LENGTH);
+    {
         JSValue prim = JS_UNDEFINED;
         r = step_toprim_run(ctx, &s->hdr, s->argp[2], HINT_NUMBER, cb_result, &prim, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -103455,14 +103489,16 @@ static int js_ta_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         s->argp[2] = prim;
     }
  have_length:
-    /* A RESUME lands here too — every stage above it is skipped — so the reset is guarded. Without the guard it
-       discarded the value the prototype read had just delivered, and 10.1.14's realm fallback then handed back the
-       intrinsic prototype: `Reflect.construct(BigInt64Array, [], customProto)` silently ignored the custom one.
-       State that must survive a suspension cannot be re-initialised on the path the suspension returns to. */
-    if (s->hdr.stage != TAC_PROTO) {
-        s->hdr.stage = TAC_PROTO;
-        cb_result = JS_UNDEFINED;
-    }
+    /* ARRIVING FROM ABOVE IS NOT THE SAME AS BEING RE-ENTERED HERE, and the arm is what says so. This was
+       `if (s->hdr.stage != TAC_PROTO)` around the reset — the negation asking "have I been here already", which
+       is the one question a machine can never answer from its stage. It is answered by WHERE the dispatch
+       enters instead: a resume at TAC_PROTO jumps past these two lines, so the value the prototype read has
+       just delivered is still in cb_result. Without that, 10.1.14's realm fallback handed back the intrinsic
+       prototype and `Reflect.construct(BigInt64Array, [], customProto)` silently ignored the custom one. State
+       that must survive a suspension cannot be re-initialised on the path the suspension returns to. */
+    s->hdr.stage = TAC_PROTO;
+    cb_result = JS_UNDEFINED;
+    STEP_ARM(TAC_PROTO);
     {
         /* Every operand is primitive now, so the plan's ToIndex and range checks invoke nothing and can run
            wherever the spec puts them: AFTER the allocation for an object first argument (the read already
