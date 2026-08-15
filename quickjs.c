@@ -26232,9 +26232,15 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
    answered before), and the point it offered is still offered — one opcode later, at the callee's first
    dispatch, which is a strictly better place because the callee's frame is already on the heap chain there, so
    the park is the ordinary deep park instead of a re-enter-at-the-opcode replay.
-   With this gone there is exactly ONE place in the interpreter that asks the preempt hook: do_yield_poll. That
-   is what makes "a new call opcode cannot forget to route" true of PARKING as well — it does not offer a
-   suspend point, so it cannot omit one; the dispatch offers it.
+   With this gone there is exactly ONE place in the BYTECODE interpreter that asks the preempt hook:
+   do_yield_poll. That is what makes "a new call opcode cannot forget to route" true of PARKING as well — an
+   opcode does not offer a suspend point, so it cannot omit one; the dispatch offers it.
+   The step driver in this same function asks it too, at JS_STEP_YIELD and at an outcome fork, and that is NOT a
+   second system to fold in: a stage boundary is a C machine's opcode boundary, declared by the spec algorithm
+   the machine implements (JSTrampStepDef.steps) rather than by the page's bytecode, so it is already on the
+   right side of "the engine decides where a flow may park". It asks directly instead of through the request bit
+   because its boundaries are rare — one per spec step, not one per opcode — so the ask is affordable there and
+   gating it would only make the forced-exploration policy unable to force it.
    A callee with no bytecode body (a C builtin) executes no dispatch, so its request stands until control
    returns to bytecode and is answered there. That is lossless, and it is also right: a step machine's own
    yield is where a long C builtin offers its points, and parking immediately BEFORE one would have been the
