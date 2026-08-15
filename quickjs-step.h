@@ -456,6 +456,51 @@ JS_EXTERN int step_construct_run(JSContext *ctx, uint8_t *phase, JSValue *cb, in
    fork never dups, and a fini one slot short leaks it. Derive the count from the array and there is one. */
 #define STEP_CB_FOREACH(arr, i) for ((i) = 0; (i) < STEP_CB_SLOTS(arr); (i)++)
 
+/* LEAVING A STAGE WITH A REQUEST STILL IN FLIGHT IS THE BUG THIS EXISTS FOR — every stage transition in a
+ * machine that owns a request buffer goes through here.
+ *
+ * A request is TWO-PHASE: the stage that issues it is re-entered with its cursor at 1 and MUST reach the SAME
+ * step_call_run / step_construct_run / step_getprop_run to collect the answer, because the cursor is what tells
+ * that call site "you are the resume, take the value" rather than "ask". A stage that re-evaluates its decision
+ * on the way back in can decide differently — Streams §4.2.4's shutdown did exactly that, since ISSUING the
+ * close is what made WritableStreamCloseQueuedOrInFlight true, so the resume took the "already closing" branch
+ * and walked away from its own call. The cursor stayed at 1, the NEXT stage's request read it as a resume and
+ * took the abandoned call's result as its own, and `writer.releaseLock()` was never called at all: the pipe
+ * fulfilled with the destination still locked. Nothing said so, because the value a stage received was a REAL
+ * value — the other request's. quickjs.c's step_getprop_done DFAILs on the same event one step LATER, and only
+ * when the two call sites happen to name DIFFERENT keys; when they name the same one it says nothing.
+ *
+ * The rule is structural, which is why it is a primitive and not a defence one component wrote for itself: a
+ * stage's DECISION is made once, with every cursor at rest, and a stage that holds a request does nothing but
+ * hold it. Aborting AT the transition names the stage that walked away, rather than the innocent stage three
+ * transitions later whose request silently answered without asking.
+ *
+ * THE CURSOR LIST IS NULL-TERMINATED AND NAMES EVERY SUB-SEQUENCE THIS MACHINE CAN HAVE IN FLIGHT — its own
+ * call/construct phase bytes, a sub-record's (`&s->w.phase`), and, for a machine whose requests are the keyed
+ * ones, the header's own `&h->get_phase`. Listing them is the machine's statement of what it owns, in the same
+ * spirit as `visit`: a machine that holds no request buffer at all lists none and assigns its stage directly,
+ * because there is no cursor to leave behind and a fabricated one would assert nothing. The list is where the
+ * cursor goes the day such a machine grows one.
+ *
+ * `dst` IS THE STAGE LVALUE, NOT A HEADER, because the invariant is about the cursor and not about who owns the
+ * stage: a WORK RECORD a machine suspends inside (AbortSignalWork's §3.2 walk, report_exception's) carries a
+ * stage and a phase of its own and needs exactly this over them.
+ *
+ * A MACRO RATHER THAN AN INLINE FUNCTION, for the reason the whole assert exists: DCHECK stamps the file and
+ * line it is WRITTEN at, so a function here would report this header at every abort and say nothing about which
+ * transition walked away. Expanding at the call site is what makes the message the answer. DCHECK itself is
+ * therefore the caller's — engine/host/check.h in a host component, quickjs-check.h in the engine — which is
+ * also why this header must not include either of them. */
+#define STEP_GOTO(dst, to, ...) do {                                                                    \
+        const uint8_t *const step_goto_rest_[] = { __VA_ARGS__ };                                       \
+        int step_goto_i_;                                                                               \
+        for (step_goto_i_ = 0; step_goto_rest_[step_goto_i_] != NULL; step_goto_i_++)                   \
+            DCHECK(*step_goto_rest_[step_goto_i_] == 0,                                                 \
+                   "a stage was left with a sub-sequence's request still in flight — the next stage's " \
+                   "request will collect this one's answer");                                           \
+        (dst) = (to);                                                                                   \
+    } while (0)
+
 /* A WELL-KNOWN SYMBOL'S ATOM. A host machine can read any NAMED property (step_getprop_run takes an atom, and
    JS_NewAtom makes one from a string), but a symbol-keyed one it could not name at all — and @@iterator is the
    discriminator Web IDL uses for every `sequence or record` union. Headers' fill is the first to need it: the
