@@ -1619,7 +1619,12 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     STEPDEF_ITER_ZIP, STEPDEF_ITER_ZIP_KEYED, STEPDEF_ITER_ZIP_NEXT, STEPDEF_ITER_ZIP_RETURN,
     STEPDEF_FUNCTION_CTOR, STEPDEF_GENERATOR_FUNCTION_CTOR,
     STEPDEF_ASYNC_FUNCTION_CTOR, STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR,
-    STEPDEF_DV_FIRST,
+    /* The DataView accessors are ONE id per (kind, direction) and there is no marker enumerator in front of
+       them. There was — STEPDEF_DV_FIRST — and it was a slot that named no machine: the whole file mentioned it
+       exactly once, at its own declaration, so js_tramp_step_defs had a NULL at its index and any call that
+       reached it would have handed the driver nothing to run. Nothing pointed at that hole until
+       js_step_defs_check_table walked the table, which found it on its first run. A "first" marker earns its id
+       only if something asks it a question; DV_STEPDEF_LIST is the list, and it is the one to extend. */
 #define DV_STEPDEF_LIST(F) F(INT8) F(UINT8) F(INT16) F(UINT16) F(INT32) F(UINT32) \
                            F(BIG_INT64) F(BIG_UINT64) F(FLOAT16) F(FLOAT32) F(FLOAT64)
 #define DV_STEPDEF_ID(N) STEPDEF_DV_GET_##N, STEPDEF_DV_SET_##N,
