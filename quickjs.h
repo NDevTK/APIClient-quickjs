@@ -1405,6 +1405,15 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
 typedef int JSMemoryReclaimFunc(JSRuntime *rt, void *opaque, size_t wanted);
 JS_EXTERN void JS_SetMemoryReclaimHook(JSRuntime *rt, JSMemoryReclaimFunc *cb, void *opaque);
 
+/* ASK THE EDGE DIRECTLY — for the OTHER allocators an embedder has. The runtime's own is not the only one that
+   can hit the floor: a host that parses HTML with lexbor, or links any library whose allocator it can replace,
+   reaches the wall in whichever allocator happens to ask first, and a refusal there is exactly as physical as a
+   refusal here. Routing it through this entry rather than calling the embedder's callback directly is what
+   keeps ONE mechanism: the same one-deep latch (so a free that allocates cannot recurse into the reclaim), the
+   same refusal while the collector owns the graph, and the same installed hook. Answers non-zero if the
+   callback freed something, i.e. whether the caller should retry its own allocation. */
+JS_EXTERN int JS_ReclaimMemory(JSRuntime *rt, size_t wanted);
+
 /* APIClient forced-execution FLOW-CONTROL hooks — the scheduler's control over interpreter execution: the three
    points where the forced-exec engine steers a running flow. One concern, one owner (the scheduler), one
    registration (JS_SetFlowControlHooks); not optional, a NULL argument crashes.

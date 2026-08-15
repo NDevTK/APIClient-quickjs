@@ -2326,12 +2326,17 @@ static void js_arena_free_all(JSRuntime *rt)
    gc_obj_list and dropping references; a callback that freed an object there would unlink a node out of the
    list the walk is standing in, and the corruption surfaces later as a free of something already freed. An
    allocation raised during a collection therefore fails as it always has. */
-static bool js_reclaim_memory(JSRuntime *rt, size_t wanted)
+/* PUBLIC, because the runtime's allocator is not the only one an embedder has. A host that also allocates
+   through a LIBRARY's allocator (APIClient parses HTML with lexbor, whose memory is a set of global function
+   pointers) has to be able to route that refusal into the SAME edge — one latch, one collector guard, one
+   hook — rather than build a second reclaimer beside this one that would have to re-derive both guards and
+   would not know when the other was running. */
+int JS_ReclaimMemory(JSRuntime *rt, size_t wanted)
 {
     bool freed;
 
     if (!rt->mem_reclaim || rt->in_mem_reclaim || rt->gc_phase != JS_GC_PHASE_NONE || rt->in_free)
-        return false;
+        return 0;
     rt->in_mem_reclaim = true;
     freed = rt->mem_reclaim(rt, rt->mem_reclaim_opaque, wanted) != 0;
     rt->in_mem_reclaim = false;
@@ -2368,7 +2373,7 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
             if (likely(ptr != NULL))
                 break;
         }
-        if (!js_reclaim_memory(rt, count * size))
+        if (!JS_ReclaimMemory(rt, count * size))
             return NULL;
     }
 
@@ -2394,7 +2399,7 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
             if (likely(ptr != NULL))
                 break;
         }
-        if (!js_reclaim_memory(rt, size))
+        if (!JS_ReclaimMemory(rt, size))
             return NULL;
     }
 
@@ -2445,7 +2450,7 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
             np = js_arena_realloc(rt, ptr, size);
             if (likely(np != NULL)) { ptr = np; break; }
         }
-        if (!js_reclaim_memory(rt, size))
+        if (!JS_ReclaimMemory(rt, size))
             return NULL;
     }
 
