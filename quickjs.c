@@ -20728,6 +20728,13 @@ static void *tramp_step_state_clone(JSContext *ctx, const void *src)
     DCHECK(o->outer == NULL && o->delegate == NULL,
            "deep-fork of a step machine that is nested (an outer machine waiting on it, or an inner it has not "
            "handed over) — the clone must walk the whole chain so the sibling's links point at its OWN copies");
+    /* AND WHETHER THIS STATE MAY BE FORKED AT ALL — see JSTrampStepDef.unforkable. Asked HERE, at the one
+       consumer the answer is about, rather than inside the machine's `visit`, which three consumers now drive.
+       The machine's own sentence is what aborts, so the report names the object with no halves. */
+    if (o->def->unforkable) {
+        const char *why = o->def->unforkable(o);
+        if (why) { DFAIL(why); return NULL; }
+    }
     if (!o->def->visit) return NULL;
     sz = STEP_ARGV_OFFSET(o->def->size) + sizeof(JSValue) * (size_t)(o->argc > 0 ? o->argc : 0);
     h = js_malloc(ctx, sz);

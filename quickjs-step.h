@@ -191,6 +191,29 @@ typedef struct JSTrampStepDef {
      * ANY machine changes, and §scheduler's frontier never drops a work item. */
     const char *algorithm;
     const char *const *steps;
+    /* WHY THIS MACHINE MUST NOT BE FORKED IN THE STATE IT IS IN NOW — the reason, or NULL when it may be.
+     *
+     * THIS CAPABILITY EXISTED AND WAS LOST, and getting it back is what this field is. `visit` used to carry
+     * it as a side effect of being optional: a machine that declared none could not be cloned, and the fork
+     * said so instead of handing two flows one state. Then the teardown started reading `visit` as the
+     * ownership list, which made it MANDATORY — and a machine that owns JSValues AND must not be forked in
+     * some states had no way left to say the second half.
+     *
+     * The two machines that need it hold a LEXBOR PARSER. "C state cannot be forked" is not the reason and is
+     * not true — cow_capture_host_record exists precisely so a component's C record time-travels. What has no
+     * halves is specifically a tokenizer: a selector walk mid-parse and a fragment parse mid-parse each hold
+     * one live parser with a position in it, and there is no meaningful copy to give a second arm.
+     *
+     * IT IS A PREDICATE AND NOT A FLAG because the answer is about the STATE, not the definition: the same
+     * machine is forkable before it builds its parser and unforkable while it holds one. And it is asked at
+     * the FORK, which is the only consumer the answer is about. It must NOT be asserted inside `visit` — see
+     * JSStepVisit's accumulator note: a machine must never learn which consumer is visiting it, and a `visit`
+     * that DCHECKs "I was forked" fires on the teardown and on the fingerprint too, reporting an ordinary
+     * abandoned walk as a fork. That is not hypothetical; it is what both of these did.
+     *
+     * The reason is the machine's own words and it is what the fork's abort prints, so the message names the
+     * object rather than the mechanism. Zero for a machine that may always be forked. */
+    const char *(*unforkable)(const void *state);
 } JSTrampStepDef;
 
 /* ONE DECLARATION OF A MACHINE'S STAGES — the enum and the labels, from one list, so neither can move without
