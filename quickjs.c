@@ -19902,6 +19902,23 @@ static int step_ta_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst exempl
    re-enters here, asks again, and reads its arm out of its own decision vector. */
 enum { FORK_PH_ASK = 0, FORK_PH_ANSWERED };
 
+/* THE ASKED QUESTION'S IDENTITY — see JSStepHdr::fork_ask_key for why it is the operation string's BYTES and
+   not its address. FNV-1a, which is what a content hash of a short ASCII key is everywhere else. A hash can
+   only ever fail to CATCH a mismatch, never invent one, which is the property a DCHECK standing over every
+   step machine in the engine has to have. */
+static uint32_t step_fork_key(const char *op)
+{
+    uint32_t k = 2166136261u;
+
+    if (op == NULL)
+        return 0;
+    while (*op) {
+        k ^= (unsigned char)*op++;
+        k *= 16777619u;
+    }
+    return k ? k : 1u;   /* 0 is reserved for "nothing asked", which a zeroed header already reads as */
+}
+
 int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int *parm)
 {
     (void)ctx;
@@ -19913,14 +19930,27 @@ int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *o
         h->fork_over = over;   /* BORROWED for the length of the request; the driver reads and resets it */
         h->fork_op = op;
         h->fork_n = n;
+        /* WRITTEN ON EVERY ASK, including the sibling's first one: a clone carries the key of the ask it was
+           forked at, and re-asking there overwrites it with the identical value. */
+        h->fork_ask_key = step_fork_key(op);
         return JS_STEP_FORK;
     }
     DCHECK(h->fork_phase == FORK_PH_ANSWERED, "a step machine's outcome fork resumed in no phase");
+    DCHECK(h->fork_ask_key == step_fork_key(op),
+           "an outcome fork's answer was delivered to a DIFFERENT question than the one that asked for it. The "
+           "machine resumed at a call site other than its outstanding ask, so the phase or stage it resumes on "
+           "does not tell the two apart — the usual cause is an algorithm that DELEGATES to another one through "
+           "the same phase byte while numbering its own phases in the same value space, which makes 'the inner "
+           "chain is parked at its second question' read as 'the outer one is at its own'. Nothing else catches "
+           "it: the arm is real and in range, and it was recorded under the ASKING operation's key, so consuming "
+           "it here files one question's world as another's. Number a delegating algorithm's phases ABOVE the "
+           "whole phase space of the one it delegates into");
     DCHECK(h->fork_arm >= 0 && h->fork_arm < n,
            "the outcome fork answered with a completion this machine did not declare");
     *parm = h->fork_arm;
     h->fork_phase = FORK_PH_ASK;   /* a machine may fork again — an iteration over unknown input does, per step */
     h->fork_arm = 0;
+    h->fork_ask_key = 0;
     return 0;
 }
 

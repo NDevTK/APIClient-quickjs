@@ -506,6 +506,18 @@ typedef struct JSStepHdr {
     int          fork_n;
     int          fork_arm;
     uint8_t      fork_phase;
+    /* WHICH QUESTION THE OUTSTANDING ANSWER BELONGS TO — the identity of the ask, so that the answer cannot be
+       consumed by a DIFFERENT call site. `fork_arm` alone says nothing about which fork it answers, and every
+       machine declares n == 2, so an answer delivered to the wrong ask passes every check there was: it is a
+       real arm, in range, recorded by the flow's decision vector under the ASKING operation's key and then read
+       as the answer to another operation's. That is silent, and it is the exact failure a delegating algorithm
+       produces when its phase space overlaps the one it delegates into.
+       IT IS A CONTENT HASH AND NOT THE POINTER, for the same reason the driver resets `fork_op` before it
+       snapshots: the op string commonly lives on the MACHINE'S OWN state (a per-position buffer that carries an
+       index), so the clone's copy is at a different address and a flow rebuilt from the cold tier has no
+       address at all. The bytes are the only thing that is the same question in every tier. Zero is "nothing
+       asked", which a js_mallocz'd state already reads as. */
+    uint32_t     fork_ask_key;
     /* the key a GETPROP sub-sequence is holding across its suspension. It is OWNED here because the driver
        BORROWS the atom the request carries, and released by the shared teardown so an abandon mid-read cannot
        leak it. JS_ATOM_NULL is zero, so a js_mallocz'd state already reads as "no read in flight". */
