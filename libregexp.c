@@ -4012,59 +4012,17 @@ const char *lre_get_groupnames(const uint8_t *bc_buf)
     return (const char *)(bc_buf + RE_HEADER_LEN + re_bytecode_len);
 }
 
-#ifdef TEST
-
-void *lre_realloc(void *opaque, void *ptr, size_t size)
-{
-    return realloc(ptr, size);
-}
-
-int main(int argc, char **argv)
-{
-    int len, flags, ret, i;
-    uint8_t *bc;
-    char error_msg[64];
-    uint8_t *capture;
-    const char *input;
-    int input_len, capture_count;
-    REExecContext ec;
-
-    if (argc < 4) {
-        printf("usage: %s regexp flags input\n", argv[0]);
-        return 1;
-    }
-    flags = atoi(argv[2]);
-    bc = lre_compile(&len, error_msg, sizeof(error_msg), argv[1],
-                     strlen(argv[1]), flags, NULL);
-    if (!bc) {
-        fprintf(stderr, "error: %s\n", error_msg);
-        exit(1);
-    }
-
-    input = argv[3];
-    input_len = strlen(input);
-
-    capture = malloc(sizeof(capture[0]) * lre_get_alloc_count(bc));
-    lre_exec_begin(&ec, capture, bc, (uint8_t *)input, 0, input_len, 0, NULL);
-    do {
-        ret = lre_exec_step(&ec);
-    } while (ret == LRE_RET_YIELD);
-    lre_exec_end(&ec);
-    printf("ret=%d\n", ret);
-    if (ret == 1) {
-        capture_count = lre_get_capture_count(bc);
-        for(i = 0; i < 2 * capture_count; i++) {
-            uint8_t *ptr;
-            ptr = capture[i];
-            printf("%d: ", i);
-            if (!ptr)
-                printf("<nil>");
-            else
-                printf("%u", (int)(ptr - (uint8_t *)input));
-            printf("\n");
-        }
-    }
-    free(capture);
-    return 0;
-}
-#endif
+/* DELETED: this file's `#ifdef TEST` main(). It was a second ENTRY POINT that no gate compiles — §Testing's own
+   defect, and one layer worse here than usual, because it had also ROTTED past linking: it supplied `main` and
+   `lre_realloc` and never supplied `lre_want_yield`, which lre_exec_backtrack has called at every back-edge
+   since the yield replaced lre_check_timeout. So `-DTEST` could not have produced a binary for some time and
+   nothing could say so.
+   AND IT WAS THE LAST DRIVER OF A MATCH OUTSIDE THE EXEC STEP MACHINE — a begin / `while (ret ==
+   LRE_RET_YIELD)` step / end loop, which is precisely the shape that answers the scheduler's back-edge question
+   by taking every offer back. With it gone, lre_exec_begin/step/end have exactly ONE caller in this engine
+   (quickjs.c's js_regexp_exec machine, driven by the step driver, reached only from a JS call), so "no host can
+   run a match on its own time between two scheduler steps" is a fact grep proves rather than one a reader has
+   to reconstruct. That matters because lre_want_yield consults the flow-control preempt policy directly: under
+   the machine the answer parks a flow, and on a host's own time there is no flow for it to be about — which
+   solver/engine.c's preempt_hook now aborts on, naming the entry. Dead code that LOOKS load-bearing is worse
+   than none, which is the same sentence the JS_RegExpDelete note carries. */
