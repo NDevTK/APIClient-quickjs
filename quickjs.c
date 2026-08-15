@@ -21212,7 +21212,15 @@ static TrampFrame *tramp_frame_new(JSRuntime *rt)
 {
     TrampFrame *tf = js_malloc_rt(rt, sizeof(TrampFrame));
     if (likely(tf != NULL)) {
-        tf->owns_func = 0;   /* the ONE field whose default has to be right at birth; the rest each site assigns */
+        tf->owns_func = 0;
+        /* THE CALLEE'S RECEIVER OPERANDS ARE BORN SAYING "NOBODY RECORDED ONE". js_malloc_rt does not zero, and
+           only the ordinary call/construct sites assign these two — a coroutine frame's receiver and new.target
+           live in its func_state, so its creator writes neither. The deep resume then had no way to tell an
+           unrecorded field from a recorded `undefined`, and read whatever the recycled block held; a zeroed
+           JSValue is JS_TAG_INT 0, which is the `0` an async arrow's `new.target` came back as. A sentinel is
+           what makes that state nameable, and the DCHECKs at the resume are what make it fatal. */
+        tf->this_val = JS_UNINITIALIZED;
+        tf->new_target = JS_UNINITIALIZED;
         g_tramp_frames_live++;
     }
     return tf;
@@ -26711,8 +26719,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_buf = dsf->arg_buf; var_buf = dsf->var_buf;
                 stack_buf = dsf->var_buf + b->var_count;
                 var_refs = dp->u.func.var_refs;
+                /* THE RECEIVER OPERANDS COME FROM WHICHEVER ACTIVATION OWNS THEM, and a coroutine's are not on
+                   this frame. `this_obj` asked; `new_target` did not, and read a field no coroutine creator ever
+                   writes — uninitialised js_malloc_rt memory, so a resumed async/generator body's `new.target`
+                   was whatever the recycled block held (0, a zeroed JSValue being JS_TAG_INT 0).
+                   It only ever bit where a park landed on the body's FIRST dispatch, before the prologue's
+                   OP_put_loc has stored new.target into the var an arrow closes over — so an async method that
+                   returns an async arrow reading `new.target` is the shape that reads it back, and the eight
+                   sibling tests that passed differ only in how many calls run before the sampled park, not in
+                   whether they are exposed. A park before the call could never reach it, which is why this
+                   surfaced when the suspend point became the callee's first opcode rather than the call.
+                   An async/generator body is never constructed, so its new.target is UNDEFINED — byte-identically
+                   what all four coroutine entries set on the way in. This is a resume, not a repair.
+                   Asserted from BOTH sides against the sentinel the frame is born with, because both mistakes are
+                   silent: a coroutine creator that starts recording one would have it ignored here, and an
+                   ordinary creator that forgets would have nothing restored. */
+                DCHECK(dfs ? JS_IsUninitialized(dtf->this_val) : !JS_IsUninitialized(dtf->this_val),
+                       "a heap call frame's receiver disagrees with the activation kind resuming it — a coroutine "
+                       "frame's `this` is in its func_state, an ordinary frame's is the one its creator recorded");
+                DCHECK(dfs ? JS_IsUninitialized(dtf->new_target) : !JS_IsUninitialized(dtf->new_target),
+                       "a heap call frame's new.target disagrees with the activation kind resuming it — a "
+                       "coroutine body is never constructed, an ordinary frame carries the one its creator "
+                       "recorded, and a frame that carries neither would resume with an unestablished value");
                 this_obj = dfs ? dfs->this_val : dtf->this_val;
-                new_target = dtf->new_target;
+                new_target = dfs ? JS_UNDEFINED : dtf->new_target;
                 arg_allocated_size = dfs ? dsf->arg_count : dtf->arg_allocated;
                 argc = dfs ? dfs->argc : dtf->callee_argc;
                 argv = (JSValueConst *)dsf->arg_buf;
