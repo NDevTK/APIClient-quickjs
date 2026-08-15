@@ -71597,7 +71597,11 @@ static const char *const js_fromasync_steps[] = { FALINK_STAGES(JS_STEP_STAGE_LA
 static int js_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSFromAsync *s = stt;
-    if (s->hdr.stage == FAL_ENTRY) {
+
+    STEP_DISPATCH(FALINK_STAGES, s->hdr.stage, s->hdr.def->algorithm, JS_STEP_ABRUPT);
+
+    STEP_ARM(FAL_ENTRY);
+    {
         JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
@@ -71605,10 +71609,19 @@ static int js_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result, JSVal
         s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
         s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
         fa_set(ctx, s->st, FA_PHASE, js_dup(rec->data[1]));
+        /* THE SETUP IS O(1) AND THE REST POINT IS INSIDE fa_advance, which is why this arm moves the stage and
+           runs on rather than yielding: the closure is AT its running stage from here, and what it is parked on
+           is FA_PHASE. A yield between the two would also have to re-derive the settled value at the new arm —
+           the reaction's argument is on the header, so it could, and a stage for that is what this would need
+           if the setup ever stopped being O(1). Assigned rather than STEP_GOTO'd because this machine holds no
+           two-phase request cursor: its requests are the raw step codes below, so there is no byte to leave
+           behind and quickjs-step.h names that as the case where a machine assigns its stage directly. */
         s->hdr.stage = FAL_RUN;
         /* the settled value the reaction was called with */
         return fa_advance(ctx, s, js_dup(step_arg(&s->hdr, 0)), out_cb, out_argc);
     }
+
+    STEP_ARM(FAL_RUN);
     return fa_advance(ctx, s, cb_result, out_cb, out_argc);
 }
 
@@ -71644,7 +71657,10 @@ static int js_array_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result,
 {
     JSFromAsync *s = stt;
 
-    if (s->hdr.stage == FAE_ENTRY) {
+    STEP_DISPATCH(FAENTRY_STAGES, s->hdr.stage, s->hdr.def->algorithm, JS_STEP_ABRUPT);
+
+    STEP_ARM(FAE_ENTRY);
+    {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
         s->st = JS_UNDEFINED;
@@ -71655,13 +71671,21 @@ static int js_array_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result,
         *out_cb = s->cb; *out_argc = 0;
         return 16;   /* CAPABILITY (step 2) */
     }
-    if (s->hdr.stage != FAE_CAP)
-        return fa_advance(ctx, s, cb_result, out_cb, out_argc);   /* a request answered; just continue */
+
+    /* STEPS 3-5, WHICH IS WHERE EVERY LATER DELIVERY LANDS. This was the `else` of `stage != FAE_CAP`, a
+       negation over three stages that answers for every stage added after it as well — and the answer it gives
+       is "hand it to the closure", which for a stage declared BEFORE the capability arrives would deliver a
+       request answer into a state that has not been built. Named, it is one arm of the declaration's own
+       dispatch and a fourth stage does not compile until it has a body. */
+    STEP_ARM(FAE_RUN);
+    return fa_advance(ctx, s, cb_result, out_cb, out_argc);   /* a request answered; just continue */
+
+    STEP_ARM(FAE_CAP);
     /* step 2 itself: there is no capability yet to reject with, so its failure is the ONE completion that
        propagates. Every later abrupt is inside the capability and settles it. */
     if (JS_IsException(cb_result))
         return -1;
-    /* stage 1 runs ONCE: the capability has arrived, so build the state and start the closure. Without a stage
+    /* FAE_CAP RUNS ONCE: the capability has arrived, so build the state and start the closure. Without a stage
        past it every request delivery re-ran this block and rebuilt the state at phase 0 forever. */
     s->hdr.stage = FAE_RUN;
     JS_FreeValue(ctx, cb_result);
