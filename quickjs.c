@@ -26002,7 +26002,16 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
                (write or delete) by either sibling post-fork is captured per-flow and swapped on context-switch.
                Verified by /api/floc (flocADMIN vs flocPUBLIC isolated across the two arms). */
             sf->cur_pc = if_pc; sf->cur_sp = sp;
-            if (g_flow_control.fork) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_flow_control.fork(ctx, cl); }
+            if (g_flow_control.fork) {
+                /* A SNAPSHOT THAT FAILED IS A DROPPED ARM, and the frontier never drops a work item — the same
+                   CHECK the outcome fork already makes, and the reason this one is not an `if`: the hook has
+                   already been told a sibling exists (it holds the prepared decision and pin blobs), so handing
+                   it NULL builds a flow with no frame that then REPLAYS the program it was supposed to resume. */
+                JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state);
+                CHECK(cl != NULL, "the branch fork could not snapshot the flow — the other arm would be dropped, "
+                                  "and the frontier never drops a work item");
+                g_flow_control.fork(ctx, cl);
+            }
             sf->cur_sp = NULL;
         } else if (gen_state == g_flow_base_gen) {
             /* BASE flow, DEEP: the branch is inside a called function on this flow's live tramp chain — an async
@@ -26016,7 +26025,12 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
                its OWN promise — no shared-promise conflict. A SNAPSHOT, never a re-run. */
             sf->cur_pc = if_pc; sf->cur_sp = sp;
             gen_state->tramp_top = (TrampFrame *)tf_top;
-            if (g_flow_control.fork) { JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state); g_flow_control.fork(ctx, cl); }
+            if (g_flow_control.fork) {
+                JSValue *cl = JS_FlowClone(ctx, (JSValue *)gen_state);
+                CHECK(cl != NULL, "the deep branch fork could not snapshot the chain — the other arm would be "
+                                  "dropped, and the frontier never drops a work item");
+                g_flow_control.fork(ctx, cl);
+            }
             gen_state->tramp_top = NULL;   /* the parent's chain is still live in tf_top, not stashed */
             sf->cur_sp = NULL;
         } else {
@@ -40350,6 +40364,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, ps->resolving_funcs[0]);
             JS_FreeValue(ctx, ps->resolving_funcs[1]);
             JS_FreeValue(ctx, ps->super_ref);   /* super() entry: the parent-class ref */
+            /* AND THE EXECUTOR THE STATE OWNS — the Reflect.construct spelling's argsList element, which the
+               NORMAL finish releases and this one did not. `new Promise(fn)` borrows its executor from a caller
+               operand and this is UNDEFINED; `Reflect.construct(Promise, [fn])` released the list before the
+               call and the state is the only owner, so a THROWING executor reached here and leaked fn and
+               everything its closure held. Two exits from one state must free the same list. */
+            JS_FreeValue(ctx, ps->executor_own);
+            DCHECK(ps->outer == NULL,
+                   "a Promise executor threw while a MACHINE was waiting for the promise — the requester is "
+                   "dropped here rather than delivered to, so this arm needs the finish's outer routing");
             js_free_rt(rt, ps);
             cargv = sp - cargc;
             for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
@@ -41305,6 +41328,8 @@ JSValue JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const cha
 static JSAsyncFunctionData *flow_async_data(JSAsyncFunctionState *s);
 static int  flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res);
 static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s);
+/* the snapshot's OTHER HALF, released — defined beside clone_deep_flow, which is the ownership list it mirrors */
+static void free_tramp_chain(JSContext *ctx, JSAsyncFunctionState *s);
 
 int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
@@ -41437,11 +41462,19 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
        link ran `JS_Call(m->func_obj, JS_TRUE)` with no flow live at all and was counted against this corpse. */
     if (g_flow_base_gen == s)
         g_flow_base_gen = NULL;
+    /* THE CHAIN COMES DOWN FIRST, BEFORE ANY BASE KIND IS ASKED ABOUT. A DEEP-suspended flow's live point is in
+       the chain and its base frame is dormant, so every base kind below is written for a flow whose live point
+       is its own — and each of them used to be handed a flow whose chain nobody had unwound. Releasing it here,
+       once, is what makes the three arms correct rather than three places to remember it: afterwards the base
+       carries the bottom frame's caller_sp as its cur_sp and IS base-suspended, which is the one shape they all
+       already handle. */
+    if (s->tramp_top != NULL)
+        free_tramp_chain(ctx, s);
     /* An ASYNC_CALL base is not this allocation's owner — the JSAsyncFunctionData around it is, and it holds the
        capability too. Releasing it through the container is the only teardown that frees both. */
     if (s->base_kind == FLOW_BASE_ASYNC_CALL) {
         JSAsyncFunctionData *d = flow_async_data(s);
-        if (s->frame.cur_sp == NULL && s->tramp_top == NULL)
+        if (s->frame.cur_sp == NULL)
             d->is_active = false;   /* completed via `done:`, which already released the frame's contents */
         js_async_function_free(ctx->rt, d);
         return;
@@ -41451,11 +41484,7 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
         return;
     }
     if (s->frame.cur_sp != NULL) {
-        async_func_free(ctx->rt, s);   /* never-run or BASE-suspended: full generator-frame cleanup */
-    } else if (s->tramp_top != NULL) {
-        /* DEEP-suspended (evicted mid-descent): the stashed TrampFrame chain must be torn down
-           (free_tramp_chain) — not yet built. Fail LOUD rather than leak the chain. */
-        DFAIL("JS_FlowFree: evicting a DEEP-suspended flow — free_tramp_chain not built");
+        async_func_free(ctx->rt, s);   /* never-run, BASE-suspended, or a chain just unwound into one */
     } else {
         /* COMPLETED via `done:` (NORMAL func_kind): the stack values + var_refs were freed inline there, but
            the heap frame buffer + cur_func + this_val were not (done: assumes an alloca'd frame). Free them. */
@@ -41471,7 +41500,10 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
    stack": the clone shares no frame state with the original — every live frame value is dup'd — and the two
    diverge, isolated by their own COW deltas (cloned separately by the host). NO FALLBACK: an un-handled shape
    is a not-yet-built capability that CRASHES LOUD (forcing the root fix), never a silent degrade to re-run.
-   Base-level closure-free frames are built; DEEP tramp chains + live var_refs are the next capability. */
+   Base frames, DEEP tramp chains and live var_refs are all built (this line said the last two were "the next
+   capability" long after clone_deep_flow below had them, which sends a reader to build what is already there).
+   What crashes is a FRAME KIND with no arm: an async generator body, and any C continuation not named below —
+   and free_tramp_chain refuses exactly the same set, because the two are one ownership list. */
 /* DEEP clone: a flow suspended INSIDE a called function (tramp_top holds the heap call chain). Clones the base
    frame (dormant, mid-call) + the tramp chain, relinking every caller_* pointer into the cloned frames, so the
    clone resumes at the deep branch and unwinds through its OWN chain. Refcount discipline: the base OWNS its
@@ -41937,6 +41969,16 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->resolving_funcs[0] = js_dup(os->resolving_funcs[0]);
                 ns->resolving_funcs[1] = js_dup(os->resolving_funcs[1]);
                 ns->super_ref = js_dup(os->super_ref);   /* each arm's continuation frees its own */
+                /* AND THE EXECUTOR, ON THE ONE SPELLING WHERE THE STATE OWNS IT. `new Promise(fn)` leaves the
+                   executor on the caller's operand stack (UNDEFINED here, and cb_args[1] borrows it); the
+                   Reflect.construct spelling takes it out of an argsList that is released before the call, so
+                   the state holds the only reference. The struct copy shared that one reference between two
+                   flows and both finishes free it — the field was simply missing from the list, which is the
+                   defect this whole clone is a list against. */
+                ns->executor_own = js_dup(os->executor_own);
+                DCHECK(os->outer == NULL,
+                       "clone_deep_flow: a Promise executor continuation with an OUTER requester under it — "
+                       "clone that kind through its own arm before this one adopts the pointer");
                 ns->cb_args[0] = JS_UNDEFINED;
                 ns->cb_args[1] = os->cb_args[1];   /* the executor: borrowed, kept alive by the cloned caller stack */
                 ns->cb_args[2] = ns->resolving_funcs[0];
@@ -42105,6 +42147,196 @@ static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s)
         return;
     async_func_free(rt, &s->func_state);
     s->state = JS_GENERATOR_STATE_COMPLETED;
+}
+
+/* THE C-CONTINUATION A FRAME CARRIES, RELEASED WITH NOBODY TO ANSWER TO. The interpreter's unwind hands an
+   abandoned machine's requester back to the OPCODE, because a combinator still owes its aggregate a rejection
+   and a consumer still owes IfAbruptCloseIterator — there is a program to finish. Here there is not: the flow
+   this chain belongs to is being destroyed, so the whole chain of waiting machines is released and the
+   completion nobody will observe is not computed. That is the ONE difference from tramp_chain_unwind, and it is
+   why this exists rather than a call to it.
+   The KIND LIST IS clone_deep_flow's LIST. A frame kind that can ride a parked chain must be answerable by
+   both — the clone takes a second reference to everything the frame owns and this releases one — so a kind
+   missing from either is the same defect, and the DFAIL below names it exactly as the clone's does. */
+static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (kind == CONT_NONE || !st)
+        return;
+    if (kind == CONT_STEP || kind == CONT_STEP_YIELD) {
+        /* the machine AND every machine waiting on it. What the walk does not own it REPORTS, and here that
+           report is the next iteration rather than a hand-back to the interpreter. */
+        uint8_t left = CONT_NONE;
+        void *rest = tramp_step_chain_free_upto(ctx, st, &left);
+        tramp_cont_free(ctx, rest, left);
+        return;
+    }
+    if (kind == CONT_ITER_CONSUME) {
+        js_iter_consume_end(ctx, (struct JSIterConsume *)st);
+        js_free_rt(rt, st);
+        return;
+    }
+    if (kind == CONT_PROMISE_ALL) {
+        js_promise_all_end(ctx, (struct JSPromiseAll *)st);
+        js_free_rt(rt, st);
+        return;
+    }
+    if (kind == CONT_ASYNC_FROM_SYNC) {
+        js_async_from_sync_end(ctx, (struct JSAsyncFromSync *)st);
+        js_free_rt(rt, st);
+        return;
+    }
+    if (kind == CONT_PROMISE_EXEC) {
+        JSPromiseExec *ps = (JSPromiseExec *)st;
+        DCHECK(ps->outer == NULL,
+               "tramp_cont_free: a Promise executor continuation with an OUTER requester under it — release that "
+               "kind through its own arm before this one drops the pointer");
+        JS_FreeValue(ctx, ps->promise);
+        JS_FreeValue(ctx, ps->resolving_funcs[0]);
+        JS_FreeValue(ctx, ps->resolving_funcs[1]);
+        JS_FreeValue(ctx, ps->super_ref);
+        JS_FreeValue(ctx, ps->executor_own);   /* the Reflect.construct spelling's argsList element */
+        js_free_rt(rt, ps);
+        return;
+    }
+    if (kind == CONT_CONSTRUCT) {
+        struct JSConstruct *cs = (struct JSConstruct *)st;
+        DCHECK(cs->outer == NULL,
+               "tramp_cont_free: a constructor continuation with an OUTER requester under it — release that kind "
+               "through its own arm before this one drops the pointer");
+        JS_FreeValue(ctx, cs->created_obj);
+        JS_FreeValue(ctx, cs->super_ref);
+        js_free_rt(rt, cs);
+        return;
+    }
+    {
+        char why[384];   /* see step_request_check */
+        snprintf(why, sizeof why,
+                 "tramp_cont_free: a parked C-continuation of kind %d is being destroyed with the flow that "
+                 "held it, and this walk does not know what it owns. Give THAT kind its arm here and in "
+                 "clone_deep_flow together: the two are one ownership list read in opposite directions",
+                 (int)kind);
+        DCHECK(kind == CONT_NONE, why);
+    }
+}
+
+/* TEAR DOWN A STASHED HEAP-FRAME CHAIN — the other half of the snapshot, and the operation JS_FlowFree used to
+ * DFAIL on.
+ *
+ * §Time-travel says a parked flow's snapshot is "its per-flow COW delta plus its suspended heap-frame chain", so
+ * a flow that cannot release the second half cannot be evicted, cannot be paged, and cannot even be freed: every
+ * flow the frontier still holds at teardown kept its whole activation graph — every local, every closure, every
+ * machine it was suspended inside — with nothing naming the owner.
+ *
+ * IT IS clone_deep_flow READ BACKWARDS, and that is the whole design rather than a remark. The clone walks this
+ * same chain taking a SECOND reference to everything a frame owns; this walk releases the FIRST. So the two
+ * functions are one ownership list, and a field added to a TrampFrame — or a continuation kind that starts
+ * riding one — creates an obligation in both, which is exactly the shape CLAUDE.md names ("a struct copied
+ * field-by-field must dup EVERY owned field, so adding a field creates an obligation at every clone/free/finish
+ * site"). Neither may quietly handle a case the other does not: both DFAIL by kind, with the same message.
+ *
+ * WHAT IS OWNED, per frame, and it is NOT every field. A TrampFrame BORROWS its caller's registers, its
+ * receiver, its new_target and (except on the owned-invocation-list path, which is what `owns_func` records) its
+ * callee. What it owns is: its own local buffer and the live values in it, the closed cells its frame array
+ * names, its async/generator body state, the reference it holds across a coroutine drive, and its C
+ * continuation. Anything else read here would be a second owner for something that already has one.
+ *
+ * THE LIVE END OF A FRAME IS THE NEXT FRAME'S caller_sp, never the frame's own cur_sp — only the DEEPEST frame
+ * is running, and do_preempt saves cur_sp for that one alone. A mid-call frame's cur_sp is NULL because it IS
+ * mid-call, and its live region ends where it stood when it made that call, which is the record its callee
+ * kept. Getting this from the wrong place would free the caller's operands twice (the callee's argument copies
+ * sit above caller_sp) or leak everything above it.
+ *
+ * AFTERWARDS THE BASE IS A BASE-SUSPENDED FLOW. The bottom frame's caller_sp is the base frame's live end, so
+ * writing it into frame.cur_sp turns a DEEP-suspended flow into exactly the shape async_func_free already
+ * handles — which is why this function does not free the base and no caller has to know which kind it had. */
+static void free_tramp_chain(JSContext *ctx, JSAsyncFunctionState *s)
+{
+    JSRuntime *rt = ctx->rt;
+    TrampFrame *t = (TrampFrame *)s->tramp_top;
+    JSValue *live_end;
+
+    DCHECK(t != NULL, "free_tramp_chain: no chain to tear down — the caller must ask whether the flow is "
+                      "DEEP-suspended before claiming it is");
+    DCHECK(s->frame.cur_sp == NULL,
+           "free_tramp_chain: the base frame saved a live stack position AND holds a chain — a deep suspend "
+           "leaves the base's cur_sp NULL because its live point is in the chain, so one of the two is stale");
+    /* The deepest frame is the RUNNING one, so its live end is its own saved position. A step anchor is the one
+       frame with no body at all — its sf is zeroed and this is NULL — and nothing below reads it, because a
+       frame with nothing to unwind has no live region to bound. */
+    live_end = tramp_live_sf(t)->cur_sp;
+
+    while (t) {
+        TrampFrame *up = t->up;
+        JSValue *caller_end = t->caller_sp;   /* …which is the CALLER's live end, read before this frame goes */
+        JSStackFrame *lsf = tramp_live_sf(t);
+
+        DCHECK(t->cont_kind != CONT_AGEN_CREATE && t->cont_kind != CONT_AGEN_DRIVE,
+               "free_tramp_chain: an ASYNC GENERATOR body on a parked chain — its frame, its request queue and "
+               "its settlement capability live in the JSAsyncGeneratorData, so it needs its own arm here exactly "
+               "as it needs one in clone_deep_flow, which refuses the same frame for the same reason");
+
+        /* the C continuation FIRST: a machine can own the buffer a frame's arg_buf is a borrowed view of, so
+           releasing it after the frame would read a freed view to decide what to free. */
+        tramp_cont_free(ctx, t->cont_state, t->cont_kind);
+        t->cont_state = NULL; t->cont_kind = CONT_NONE;
+
+        if (t->async_data) {
+            /* an async body: its buffers are its state's, and the state also owns the capability the body would
+               have settled. A mid-call activation is not running, so give it its live end the way the exception
+               unwind does before handing it to a teardown that walks arg_buf..cur_sp. */
+            if (lsf->cur_sp == NULL)
+                lsf->cur_sp = live_end;
+            js_async_function_free(rt, t->async_data);
+            t->async_data = NULL;
+        } else if (t->gen_data) {
+            /* a generator body. The STRUCT belongs to the generator OBJECT (or, for a per-flow clone, to the COW
+               delta that installed it) — only the frame inside it is this flow's, which is precisely the split
+               free_generator_stack_rt makes. `gen_magic == 0xFF` is the create whose params threw before the
+               object existed, so there is no owner and the orphan goes too, exactly as the unwind frees it. */
+            if (lsf->cur_sp == NULL)
+                lsf->cur_sp = live_end;
+            free_generator_stack_rt(rt, t->gen_data);
+            if (t->gen_magic == 0xFF)
+                js_free_rt(rt, t->gen_data);
+            t->gen_data = NULL;
+            JS_FreeValue(ctx, t->close_saved_exc);   /* the exception a close-during-unwind is holding back */
+            /* the machine that REQUESTED this drive by calling it, which only a coroutine frame records. */
+            if (t->seq_req_kind != CONT_NONE) {
+                js_create_requester_abandon(ctx, t->seq_req, t->seq_req_kind);
+                t->seq_req = NULL; t->seq_req_kind = CONT_NONE;
+            }
+        } else if (t->local_buf) {
+            /* an ordinary bytecode frame: its closed cells, then its live values, then its buffer — the same
+               three steps do_return performs, in the same order. A CONT_STEP_YIELD anchor has no body at all
+               (local_buf NULL) and carried nothing but the machine released above. */
+            DCHECK(live_end != NULL,
+                   "free_tramp_chain: a frame with a body has no live end — the deepest frame's own cur_sp is "
+                   "written by do_preempt and a caller's is the record its callee kept, so a NULL here means the "
+                   "chain was stashed by something that did neither");
+            if (lsf->var_ref_count != 0)
+                close_var_refs(rt, lsf);
+            for (JSValue *v = t->local_buf; v < live_end; v++)
+                JS_FreeValue(ctx, *v);
+            js_free_rt(rt, t->local_buf);
+            t->local_buf = NULL;
+        }
+        /* the reference held ACROSS the drive — an async frame's return promise, a direct generator drive's
+           receiver — and UNDEFINED on every frame that holds neither, which is why it is unconditional. */
+        JS_FreeValue(ctx, t->async_promise);
+        TRAMP_FRAME_RELEASE(rt, t);   /* …and the callee, on the one call path where the frame owns it */
+        tramp_frame_free(rt, t);
+
+        t = up;
+        live_end = caller_end;
+    }
+
+    DCHECK(live_end != NULL,
+           "free_tramp_chain: the bottom frame recorded no caller stack position — that is the BASE frame's live "
+           "end, and without it the base cannot be torn down at all");
+    s->tramp_top = NULL;
+    s->frame.cur_sp = live_end;   /* the bottom frame's caller_sp: the base is now BASE-suspended */
 }
 
 static void js_generator_finalizer(JSRuntime *rt, JSValueConst obj)
@@ -94915,10 +95147,15 @@ static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s)
            "a flow state that is not a STEP_ROOT was cast to JSReactionFlow — its resolve/reject live past the "
            "end of what was allocated for it");
     rf = (JSReactionFlow *)s;
+    /* A DEEP chain is already gone: JS_FlowFree — the ONLY caller of this — unwinds it before it asks what kind
+       of base it has, precisely so each base kind is written for a flow whose live point is its own. This says
+       so rather than testing for it, because a chain reaching here would mean a second entry into the base
+       teardowns that nothing tore the chain down for. */
+    DCHECK(rf->fs.tramp_top == NULL,
+           "a reaction flow reached its base teardown still holding a heap-frame chain — free_tramp_chain runs "
+           "at the top of JS_FlowFree, so a chain here came from a path that is not JS_FlowFree");
     if (rf->fs.frame.cur_sp != NULL)
         async_func_free(ctx->rt, &rf->fs);   /* suspended: full frame cleanup */
-    else if (rf->fs.tramp_top != NULL)
-        DFAIL("freeing a DEEP-suspended reaction flow — free_tramp_chain is not built");
     else if (rf->fs.frame.arg_buf) {
         js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
         JS_FreeValue(ctx, rf->fs.frame.cur_func);
