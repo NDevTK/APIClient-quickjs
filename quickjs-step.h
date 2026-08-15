@@ -161,6 +161,24 @@ typedef struct JSTrampStepDef {
      * exactly the skipped logic the design forbids, and nothing could see it because the machine's own numbers
      * were internally consistent either way.
      *
+     * AND THE PAGE IS NOT WHAT DECIDES WHICH STEPS MAY SHARE ONE. A stage boundary is a rest point because the
+     * ENGINE may need to park there — RAM pressure paging the low-value tail to the IDB cold tier, a
+     * cross-session resume, a flow that outranks this one — and not one of those events consults the page. So
+     * the page can neither create a rest point nor remove one, and "no page code can run between these steps"
+     * justifies NOTHING: a stage that bundles a span because the page happens to be quiet across it is a
+     * stretch of algorithm this engine cannot park inside, which is a cap wearing a justification. It is the
+     * same claim JS_STEP_YIELD already refuses one screen down — running no user code is not what makes a C
+     * body safe to leave un-parkable, being O(1) is.
+     * So a stage names ONE spec step. A label may name a RANGE only when the whole range is ONE O(1) ENGINE
+     * action — a computation nothing the page controls can grow — and then the label says the range in those
+     * terms. A span over anything of the PAGE'S SIZE (a list, a tree, a string, a collection, a parse) is not
+     * a range at all: it is a stage per step, and the stage that walks returns JS_STEP_YIELD at every turn, so
+     * the scheduler is ASKED at each one and answers from the frontier rather than from the algorithm.
+     * js_step_def_check holds a declaration to the half a declaration can be held to: a label may not argue
+     * from the page's code or the user's code at all. The label's job is to NAME the step, and the moment it
+     * argues that a span is one stage the page has become the criterion — which is the reasoning this forbids,
+     * and which every bundle found so far had written into its own label before it was acted on.
+     *
      * `steps[stage]` is the spec step that stage rests at, as the standard writes it ("22.2.7.2 step 2"). That
      * makes a resume point EXACT rather than approximate: the driver asserts that a machine only ever rests at
      * a step of its own algorithm, a parked machine can SAY where it is parked, and a stage number means the

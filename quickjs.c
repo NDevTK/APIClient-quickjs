@@ -26038,11 +26038,36 @@ static _Thread_local JSFlowControlHooks g_flow_control = { NULL, NULL, NULL };
    test's base its own; single-threaded it is just a global. */
 static _Thread_local JSAsyncFunctionState *g_flow_base_gen = NULL;
 
+/* THE YIELD REQUEST — the engine's ONE suspend-point mechanism, and the reason a suspend point is a property of
+   the ENGINE rather than of the page's bytecode.
+   It used to be neither. The preempt hook was consulted at a loop back-edge, at a call, and at a concolic fork:
+   three places chosen by what the PAGE happened to contain. A top-level bundle is thousands of straight-line
+   statements, so a flow could run for seconds without reaching any of them — measured at requested=1 fired=1
+   across five seconds, which is not a seam the scheduler declined, it is a seam it never reached. A getter, a
+   callback and a direct `eval` with no back-edge had the same property and nothing said so.
+   The mechanism is the one every engine uses for the same problem (V8's StackGuard interrupt request,
+   SpiderMonkey's interruptBits_): a REQUEST BIT that anything may raise, polled at every dispatch. The poll is a
+   thread-local byte load and a predicted-not-taken branch — it costs nothing when nobody wants the thread, which
+   is what lets the question be askable EVERYWHERE instead of only where a loop put it. It is NOT a counter:
+   nothing here counts opcodes and nothing bounds a flow. It answers YES only when something ASKED, and the whole
+   of "when" lives in the scheduler's policy on the other side of the hook.
+   The value it holds is WHO ASKED, biased by one so that zero means nobody: JS_PREEMPT_* + 1. Last raise wins,
+   which loses nothing — a raise from the interpreter is answered at the very next dispatch, so a standing
+   interpreter request cannot be overwritten by a later one, and an overwritten HOST request is still answered at
+   that same dispatch with a different name on it. */
+static _Thread_local volatile uint8_t g_flow_yield_req = 0;
+#define FLOW_YIELD_REQUEST(kind) do { g_flow_yield_req = (uint8_t)((kind) + 1); } while (0)
+void JS_RequestFlowYield(void) { FLOW_YIELD_REQUEST(JS_PREEMPT_HOST); }
+
 /* FEATURE-ENGAGEMENT COUNTERS — the honest anti-fake-green instrument. A test passing proves the RESULT is
-   spec-correct; it does NOT prove the time-travel feature ever RAN on that test's logic. So we count, per
-   back-edge where the scheduler REQUESTED a preempt: g_flow_preempt_requested (the suspend point was reached)
-   vs g_flow_preempt_fired (we actually parked+rebuilt the frame there). They diverge EXACTLY where the feature
-   is gated (a nested async/generator activation whose FUNC_RET_PREEMPT is not yet routable). The harness reads
+   spec-correct; it does NOT prove the time-travel feature ever RAN on that test's logic. So we count, per YIELD
+   POLL WHERE THE POLICY SAID PARK: g_flow_preempt_requested (the scheduler wanted this flow suspended here) vs
+   g_flow_preempt_fired (we actually parked+rebuilt the frame there). They diverge EXACTLY where the feature
+   is gated (a nested async/generator activation whose FUNC_RET_PREEMPT is not yet routable).
+   THE DENOMINATOR IS PREEMPTS WANTED, NOT POINTS OFFERED, and it always was — a policy that declines is never
+   counted. Points offered is now every opcode boundary and counting those would be a per-opcode increment for a
+   number nothing reads. What the ratio measures is unchanged by the move to a per-opcode poll: one entry per
+   forced loop back-edge, one per sampled call, one per fork, one per step-machine yield. The harness reads
    these (JS_FlowPreemptStats) and FAILS a run whose tests pass but whose engagement < 100% — so a category the
    feature silently skips can never masquerade as green, REGARDLESS of codebase state. This makes the gate a
    MEASURED gap, not a hidden one. */
@@ -26117,24 +26142,21 @@ uint64_t JS_SyncDriveToCompletionCount(void) { return __atomic_load_n(&g_sync_dr
    a sibling here. On a fork we snapshot the CURRENT frame AT the OP_if (cond still on the stack) so the
    sibling resumes HERE and replays the other arm — never a re-run. NO FALLBACK: a deep (tramp-chain) or
    nested (non-generator activation) branch is a not-yet-built capability that crashes loud. */
-/* A FORK IS A SUSPEND POINT — `*park_after` says so to the branch site.
-   The preempt hook was consulted only at loop back-edges, which is the right set for a program that LOOPS and
-   the empty set for one that does not. A page's top-level bundle is thousands of straight-line statements with a
-   concolic `if` at many of them, so the flow forked a sibling per branch for seconds on end without ever
-   reaching a suspend point: the scheduler could not interleave, could not re-rank against the siblings just
-   created, and could not honour its own quantum. Measured at requested=1 fired=1 across five seconds — the seam
-   was never broken, it was never REACHED.
-   §scheduler already names this yield: the value yield fires "on an emit/fork/suspension that changes ranks",
-   and a fork is precisely the event that changes them, since the sibling it just created may outrank the parent
-   immediately. Asking here is that clause, not a new bound: nothing is dropped or reordered, the flow resumes
-   byte-identically at the arm it took, and the sibling was already on the frontier either way.
-   Only where a preempt is routable — a fork in a non-base activation is the residual drive-to-completion the
-   DFAIL below already names, and parking it would be the second wrong answer to the same gap. */
+/* A FORK IS A RANK CHANGE, NOT A SUSPEND POINT — it RAISES the yield request and the next opcode answers it.
+   The difference is the whole point. When this asked the preempt hook HERE, parkability depended on the page
+   containing a concolic branch, exactly as the back-edge consultation made it depend on the page containing a
+   loop: a straight-line bundle with neither could not be parked at all, and one with a fork at every other
+   statement could only be parked at those statements. The fork is a REASON to re-rank — §scheduler's value yield
+   fires "on an emit/fork/suspension that changes ranks", and the sibling created a moment ago may outrank the
+   parent immediately — and a reason is not a place. Raising the request says so, and the poll at the next
+   dispatch decides it wherever the flow happens to be.
+   Nothing is dropped or reordered by the move: the next dispatch after this branch is the arm's first opcode,
+   which is byte-identically where the old `park_after` parked. The sibling was on the frontier either way.
+   The routability question that used to gate this ask is gone too, and correctly: every arm below that is NOT
+   the flow base DFAILs before it can return, so there was never a non-base fork for the gate to protect. */
 static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
-                           JSStackFrame *sf, JSValue *sp, void *tf_top, JSAsyncFunctionState *gen_state,
-                           int *park_after) {
+                           JSStackFrame *sf, JSValue *sp, void *tf_top, JSAsyncFunctionState *gen_state) {
     int harm = (g_flow_control.branch && JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) ? g_flow_control.branch(ctx, op1) : -1;
-    *park_after = 0;
     if (harm >= 0 && (harm & 0x100)) {
         harm &= 0xff;
         if (gen_state == g_flow_base_gen && tf_top == NULL) {
@@ -26190,44 +26212,34 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
                identity. Until then this CRASHES loud (replay is banned). */
             DFAIL("generator .next() driven off the tramp chain (C-builtin-internal drive of js_generator_next) — route it through do_generator_tramp; the js_generator_next drive-to-completion is the residue to delete");
         }
-        if (gen_state == g_flow_base_gen && g_flow_control.preempt != NULL && g_flow_control.preempt(JS_PREEMPT_FORK))
-            *park_after = 1;
+        DCHECK(gen_state == g_flow_base_gen,
+               "a snapshot fork returned from a non-base activation — every non-base arm above DFAILs, so the "
+               "sibling this raises a re-rank for would be rebuilt against the wrong base");
+        FLOW_YIELD_REQUEST(JS_PREEMPT_FORK);
     }
     return harm;
 }
 
-/* Preemption (JSFlowControlHooks.preempt): when it returns 1 at a yield point (a loop back-edge or a call),
+/* Preemption (JSFlowControlHooks.preempt): when the yield poll asks it at an opcode boundary and it says park,
    the interpreter unwinds the whole heap-frame chain into the generator base and returns FUNC_RET_PREEMPT, so
    the flow parks mid-execution at ANY depth. Resume rebuilds the chain. */
 
-/* A CALL IS A SUSPEND POINT — on every flow base, with no test for which kind it is.
-   That test used to be here and deleting it is the point, not a tidy-up. It read FLOW_BASE_BYTECODE only,
-   because offering call points on a reaction or an async base measurably reordered microtasks:
-   Promise/allSettled/resolved-sequence counted a step too many and Promise/race/reject-ignored-immed saw a
-   rejection that should have lost the race. The obvious reading was that those bases resume through the pump
-   and a pump resume is not transparent, so the restriction looked like an honest boundary.
-   That reading was wrong, and the tests were pointing at something else. Those bases resumed through the job
-   FIFO because the promise-reaction park called JS_EnqueueJob where the other two park paths call JS_ParkFlow —
-   a bug in the park, not a property of the base. With the park in the slot all three kinds are transparent, so
-   there is nothing left for a base-kind test to select and it is gone. What remains is the routability
-   condition the back-edge sites also carry: a preempt in an activation that is not the flow base cannot be
-   routed, which is a fact about the activation and not about the base's kind.
-   EVERY call entry records its opcode's address, including OP_using_dispose, which was thought not to be
-   re-enterable and is — see there. So there is no entry left that offers no point, and the condition that used
-   to allow one is a DCHECK instead: an entry that forgets crashes rather than quietly losing its suspend
-   point, which is the sort of gap that only shows up as a page that will not park. */
-#define CALL_SUSPEND_POINT() do {                                                        \
-        DCHECK(call_op_pc != NULL, "a call entry reached the shared dispatch without recording its opcode's  \
-               address — it cannot be re-entered, so its call would silently offer no suspend point");          \
-        if (unlikely(g_flow_control.preempt != NULL) &&                                  \
-            gen_state != NULL && gen_state == g_flow_base_gen &&                         \
-            g_flow_control.preempt(JS_PREEMPT_CALL)) {                                   \
-            FLOW_PREEMPT_COUNT(g_flow_preempt_requested);                                \
-            FLOW_PREEMPT_COUNT(g_flow_preempt_fired);                                    \
-            pc = call_op_pc;                                                             \
-            goto do_preempt;                                                             \
-        }                                                                                \
-    } while (0)
+/* A CALL IS A RANK-CHANGING EVENT, NOT A SUSPEND POINT — it raises the request; the poll answers it.
+   This used to be the interpreter's second consultation site, and with it a call was one of the three shapes a
+   page had to contain before its flow could be parked at all. Every reason it existed survives the move and
+   none of them needed a site: the entry into a callee is still where a policy that samples call frequency wants
+   to be asked (the kind rides the request, so run-test262's 1-in-64 call sampling answers exactly what it
+   answered before), and the point it offered is still offered — one opcode later, at the callee's first
+   dispatch, which is a strictly better place because the callee's frame is already on the heap chain there, so
+   the park is the ordinary deep park instead of a re-enter-at-the-opcode replay.
+   With this gone there is exactly ONE place in the interpreter that asks the preempt hook: do_yield_poll. That
+   is what makes "a new call opcode cannot forget to route" true of PARKING as well — it does not offer a
+   suspend point, so it cannot omit one; the dispatch offers it.
+   A callee with no bytecode body (a C builtin) executes no dispatch, so its request stands until control
+   returns to bytecode and is answered there. That is lossless, and it is also right: a step machine's own
+   yield is where a long C builtin offers its points, and parking immediately BEFORE one would have been the
+   scheduler taking the thread from a machine that was about to offer it anyway. */
+#define CALL_YIELD_REQUEST()  FLOW_YIELD_REQUEST(JS_PREEMPT_CALL)
 
 /* Install the forced-execution hook interfaces — one registration per concern (see quickjs.h). Each installs
    ONCE at engine setup; a NULL argument crashes (offensive: the interface is not optional). g_flow_local_mark
@@ -26314,7 +26326,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        Parking at the opcode's START is what makes it sound: nothing has been consumed, the operands sit on the
        stack exactly as the opcode expects, so the resume re-executes the call from scratch — the shape the
        OP_if fork snapshot already uses when it captures with the condition still on the stack. */
-    uint8_t *call_op_pc = NULL;
     /* constructor trampoline (do_construct_tramp): con_func/con_ntgt/con_args/con_argc + con_from_super are set
        by OP_call_constructor (new C()) or OP_init_ctor (super()) before the goto. */
     JSValueConst con_func = JS_UNDEFINED, con_ntgt = JS_UNDEFINED;
@@ -26555,8 +26566,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DUMP_BYTECODE_OR_DONT(pc)
 #endif
 
+/* THE PER-OPCODE SUSPEND POINT. Every dispatch — of every opcode, in every activation, boot included — polls the
+   yield request before it fetches. This is the whole of "where a flow may park": an opcode boundary is the state
+   the interpreter is already restartable from (pc names the next opcode, sp is the operand stack top, sf is the
+   running frame), which is exactly what do_preempt records and what `restart:` resumes into. Nothing about the
+   page's bytecode selects it, so a body with no loop, no call and no branch parks like any other.
+   The cost of asking everywhere is one thread-local byte load and a branch the predictor gets right forever —
+   the indirect jump on the next line dominates it. That is the trade this design turns on: make the TEST free so
+   the QUESTION can be universal, never narrow where the question is asked. */
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) \
+                        if (unlikely(g_flow_yield_req)) goto do_yield_poll; \
+                        switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -26578,7 +26599,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    "function"` left its OPERAND on the stack and the branch tested that instead, so a plain object took the
    `function` arm. The production wasm is built with ENABLE_DUMPS and test262 was not, which is why 43239 tests
    said nothing about it. Wrapping the dispatch in do/while is what makes the macro a statement. */
-#define DISPATCH()      do { DUMP_BYTECODE_OR_DONT(pc) goto *dispatch_table[opcode = *pc++]; } while (0)
+#define DISPATCH()      do { DUMP_BYTECODE_OR_DONT(pc)                              \
+                             if (unlikely(g_flow_yield_req)) goto do_yield_poll;    \
+                             goto *dispatch_table[opcode = *pc++]; } while (0)
 #define SWITCH(pc)      DISPATCH();
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
@@ -27173,18 +27196,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_call1):
         CASE(OP_call2):
         CASE(OP_call3):
-            call_op_pc = pc - 1;
             call_argc = opcode - OP_call0;
             goto has_call_argc;
         CASE(OP_call):
         CASE(OP_tail_call):
             {
-                call_op_pc = pc - 1;
                 call_argc = get_u16(pc);
                 pc += 2;
                 goto has_call_argc;
             has_call_argc:
-                CALL_SUSPEND_POINT();
+                CALL_YIELD_REQUEST();
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 TRAMP_BODY_DISPATCH(-1, opcode == OP_tail_call);   /* f() with a bytecode body -> that body on THIS chain */
@@ -27201,10 +27222,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_call_constructor):
             {
-                call_op_pc = pc - 1;
                 call_argc = get_u16(pc);
                 pc += 2;
-                CALL_SUSPEND_POINT();
+                CALL_YIELD_REQUEST();
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 con_func = call_argv[-2]; con_ntgt = call_argv[-1];
@@ -27216,11 +27236,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_call_method):
         CASE(OP_tail_call_method):
             {
-                call_op_pc = pc - 1;
                 call_argc = get_u16(pc);
                 pc += 2;
             has_method_call_argc:
-                CALL_SUSPEND_POINT();
+                CALL_YIELD_REQUEST();
                 /* Entry for an opcode that IS a method call but spells its operands differently (OP_using_dispose's
                    [value][method] is [this][f] with zero args). It must jump HERE and not re-derive the chain: the
                    chain below is bound functions, proxy [[Call]], the async-from-sync .next, the generator methods,
@@ -35975,9 +35994,52 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             goto done;
 
+        do_yield_poll:
+            /* THE ONE PLACE THE INTERPRETER ASKS WHETHER TO PARK. Reached from DISPATCH, so pc names the opcode
+               about to run, sp is the operand stack top and sf is the running frame — the state do_preempt
+               records and `restart:` resumes into, at EVERY opcode rather than at the three the page's shape
+               used to supply. Nothing counts and nothing is bounded here: this runs only because something
+               RAISED a request, and what to do about it is the scheduler's one policy on the far side of the
+               hook.
+               The request is consumed FIRST. Clearing it after the ask would leave it standing across a park and
+               make the resumed flow re-ask at its first opcode — a second consultation nobody requested, and the
+               one way this could spin. */
+            {
+                int ykind = (int)g_flow_yield_req - 1;
+                g_flow_yield_req = 0;
+                DCHECK(ykind >= 0, "the yield poll ran with no request standing — the poll is reached only from "
+                                   "DISPATCH under a raised request, so a zero here means something cleared the "
+                                   "request without taking the branch that owns it");
+                /* NO FLOW, NO PARK. g_flow_base_gen == NULL is baseline setup before any flow exists — the same
+                   exemption the drive-to-completion guards carry, and for the same reason: there is nothing to
+                   suspend, so the offer is answered by taking it back rather than by asking a policy about a
+                   flow that does not exist. A request raised there (or left standing by a flow that finished) is
+                   dropped HERE and nowhere else, which is what makes a stale request lossless. */
+                if (unlikely(g_flow_base_gen != NULL) && g_flow_control.preempt != NULL &&
+                    g_flow_control.preempt(ykind)) {
+                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                    if (likely(gen_state == g_flow_base_gen)) {
+                        FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                        goto do_preempt;
+                    }
+                    /* Name WHICH activation cannot park, so the missing driver is identified rather than
+                       guessed: a NON-coroutine frame (gen_state NULL — reached via a C entry that never
+                       established a flow base) needs its caller routed onto the tramp; a coroutine frame that
+                       simply is not the base needs its own resume-as-flow driver (park + re-enter via a
+                       resume job). */
+                    if (gen_state == NULL)
+                        DFAIL("preempted in a NON-coroutine activation (gen_state NULL): its C entry never became a flow base — route that caller onto the tramp chain");
+                    DFAIL("preempted in a coroutine activation that is not the flow base: give that resume path a resume-as-flow driver (park + resume job), never drive to completion");
+                }
+            }
+            BREAK;
+
         do_preempt:
-            /* Park this flow for the scheduler at a loop back-edge. Save the CURRENT (deepest) frame's
-               resume point; then either unwind the base (shallow) or stash the heap-frame chain (deep). */
+            /* Park this flow for the scheduler. Save the CURRENT (deepest) frame's resume point; then either
+               unwind the base (shallow) or stash the heap-frame chain (deep). */
+            DCHECK(gen_state != NULL,
+                   "a flow parked with no coroutine base to unwind into — do_preempt writes gen_state->tramp_top "
+                   "and returns FUNC_RET_PREEMPT to a driver that does not exist for a plain C activation");
             sf->cur_pc = pc; sf->cur_sp = sp;
             if (tf_top) {
                 /* DEEP: the loop is inside a called function. The whole TrampFrame chain is heap-resident,
@@ -36788,32 +36850,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += gdiff;
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
-                /* BACK-EDGE ONLY. A forward goto is not a loop iteration, and preempting one is not free: a park
-                   re-enters through the job pump, which INSERTS a microtask tick — observable ordering (the
-                   for-await-of ticks-with-* tests count them). "Preempt every loop back-edge" is the contract;
-                   firing on every jump was a strictly larger set that bought no coverage and reordered jobs,
-                   which the resume razor forbids. */
                 if (gdiff >= 0)
                     BREAK;
             }
-            /* forced-exec PREEMPTION at a loop back-edge. A preempt SUSPENDS this flow and YIELDS to the ONE
-               scheduler (JS_FlowResume), which resumes it when it is top-ranked again — suspend/resume at any
-               depth, NEVER drive-to-completion. The BASE activation (gen_state == g_flow_base_gen) yields
-               correctly: a base-level loop unwinds via done_generator; a loop inside a tramp-CALLED function
-               shares the base gen_state (tramp calls open no new func_state), so the whole TrampFrame chain
-               stashes into the base and rebuilds on resume — preemptible at ANY tramp depth. A NESTED activation
-               (a generator/async body, or a C-builtin callback run as a flow) has its OWN func_state; yielding it
-               to the scheduler — extend its func_state onto the caller's tramp chain so the whole nested flow
-               suspends as ONE snapshot and resumes at the same point — is the best-advanced-design mechanism being
-               built. Until it lands, a nested loop preempt CRASHES (never self-resumes it, which is the drive-to-
-               completion this forbids; never silently skips the feature). */
-            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
-                FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
-                if (gen_state == NULL)
-                    DFAIL("loop preempted in a NON-coroutine activation (gen_state NULL): its C entry never became a flow base — route that caller onto the tramp chain");
-                DFAIL("loop preempted in a coroutine activation that is not the flow base: give that resume path a resume-as-flow driver (park + resume job), never drive to completion");
-            }
+            /* A LOOP ITERATION IS A UNIT OF WORK, AND THIS RAISES A REQUEST FOR IT — it does NOT decide anything.
+               It used to be the only place in the interpreter that asked the preempt hook at all, which made
+               "where a flow may park" a fact about whether the PAGE contained a loop. That is gone: the poll at
+               every dispatch is the suspend point, and this is one of the things that can ask for it. The
+               forced-exploration policy answers this source at every iteration, which is what drives thousands of
+               suspend/rebuild cycles per test through the ONE mechanism.
+               A FORWARD goto raises nothing (above): it is not an iteration, so it is not this source's event,
+               and the poll offers a point there anyway.
+               Nothing is lost by raising instead of asking: the very next dispatch is the loop body's first
+               opcode, in this same activation, so the poll sees the identical (pc, sp, sf, gen_state) the ask saw
+               and parks in the identical place. */
+            FLOW_YIELD_REQUEST(JS_PREEMPT_BACKEDGE);
             BREAK;
         CASE(OP_goto16):
             {
@@ -36824,17 +36875,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (gdiff16 >= 0)
                     BREAK;   /* back-edge only — see OP_goto */
             }
-            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
-                FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
-                /* Name WHICH activation cannot park, so the missing driver is identified rather than guessed:
-                   a NON-coroutine frame (gen_state NULL — reached via a C entry that never established a flow
-                   base) needs its caller routed onto the tramp; a coroutine frame that simply is not the base
-                   needs its own resume-as-flow driver (park + re-enter via a resume job). */
-                if (gen_state == NULL)
-                    DFAIL("loop preempted in a NON-coroutine activation (gen_state NULL): its C entry never became a flow base — route that caller onto the tramp chain");
-                DFAIL("loop preempted in a coroutine activation that is not the flow base: give that resume path a resume-as-flow driver (park + resume job), never drive to completion");
-            }
+            FLOW_YIELD_REQUEST(JS_PREEMPT_BACKEDGE);   /* see OP_goto: a request, answered by the poll one opcode on */
             BREAK;
         CASE(OP_goto8):
             {
@@ -36845,28 +36886,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (gdiff8 >= 0)
                     BREAK;   /* back-edge only — see OP_goto */
             }
-            if (unlikely(g_flow_control.preempt != NULL) && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
-                FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                if (gen_state == g_flow_base_gen) { FLOW_PREEMPT_COUNT(g_flow_preempt_fired); goto do_preempt; }
-                /* Name WHICH activation cannot park, so the missing driver is identified rather than guessed:
-                   a NON-coroutine frame (gen_state NULL — reached via a C entry that never established a flow
-                   base) needs its caller routed onto the tramp; a coroutine frame that simply is not the base
-                   needs its own resume-as-flow driver (park + re-enter via a resume job). */
-                if (gen_state == NULL)
-                    DFAIL("loop preempted in a NON-coroutine activation (gen_state NULL): its C entry never became a flow base — route that caller onto the tramp chain");
-                DFAIL("loop preempted in a coroutine activation that is not the flow base: give that resume path a resume-as-flow driver (park + resume job), never drive to completion");
-            }
+            FLOW_YIELD_REQUEST(JS_PREEMPT_BACKEDGE);   /* see OP_goto: a request, answered by the poll one opcode on */
             BREAK;
         CASE(OP_if_true):
             {
-                int res, park_after;
+                int res;
                 JSValue op1;
 
                 uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 4;
                 {
-                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state, &park_after);
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -36874,15 +36905,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp--;
                 if (res) {
                     pc += (int32_t)get_u32(pc - 4) - 4;
-                }
-                /* The fork just changed the ranking; park at the arm this flow took, so the sibling created a
-                   moment ago can be scheduled against it. pc and sp are already at the continuation, which is
-                   the same shape a back-edge preempt parks in. Counted as requested AND fired: the point was
-                   reached and it did park, so engagement stays an honest ratio. */
-                if (unlikely(park_after)) {
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
-                    goto do_preempt;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
@@ -36890,14 +36912,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_if_false):
             {
-                int res, park_after;
+                int res;
                 JSValue op1;
 
                 uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 4;
                 {
-                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state, &park_after);
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -36906,29 +36928,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (!res) {
                     pc += (int32_t)get_u32(pc - 4) - 4;
                 }
-                /* The fork just changed the ranking; park at the arm this flow took, so the sibling created a
-                   moment ago can be scheduled against it. pc and sp are already at the continuation, which is
-                   the same shape a back-edge preempt parks in. Counted as requested AND fired: the point was
-                   reached and it did park, so engagement stays an honest ratio. */
-                if (unlikely(park_after)) {
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
-                    goto do_preempt;
-                }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
             }
             BREAK;
         CASE(OP_if_true8):
             {
-                int res, park_after;
+                int res;
                 JSValue op1;
 
                 uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 1;
                 {
-                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state, &park_after);
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -36937,29 +36950,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (res) {
                     pc += (int8_t)pc[-1] - 1;
                 }
-                /* The fork just changed the ranking; park at the arm this flow took, so the sibling created a
-                   moment ago can be scheduled against it. pc and sp are already at the continuation, which is
-                   the same shape a back-edge preempt parks in. Counted as requested AND fired: the point was
-                   reached and it did park, so engagement stays an honest ratio. */
-                if (unlikely(park_after)) {
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
-                    goto do_preempt;
-                }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
             }
             BREAK;
         CASE(OP_if_false8):
             {
-                int res, park_after;
+                int res;
                 JSValue op1;
 
                 uint8_t *if_pc = pc - 1;   /* the OP_if opcode — a forked sibling resumes HERE and replays the other arm */
                 op1 = sp[-1];
                 pc += 1;
                 {
-                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state, &park_after);
+                    int harm = branch_arm_fork(ctx, op1, if_pc, sf, sp, tf_top, gen_state);
                     if (harm >= 0) { res = harm; JS_FreeValue(ctx, op1); }
                     else if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) res = JS_VALUE_GET_INT(op1);
                     else res = JS_ToBoolFree(ctx, op1);
@@ -36967,15 +36971,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp--;
                 if (!res) {
                     pc += (int8_t)pc[-1] - 1;
-                }
-                /* The fork just changed the ranking; park at the arm this flow took, so the sibling created a
-                   moment ago can be scheduled against it. pc and sp are already at the continuation, which is
-                   the same shape a back-edge preempt parks in. Counted as requested AND fired: the point was
-                   reached and it did park, so engagement stays an honest ratio. */
-                if (unlikely(park_after)) {
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
-                    goto do_preempt;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
@@ -37471,17 +37466,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 call_argc = 0;
                 opcode = OP_call_method;   /* never a tail call: the result is dropped by the expansion */
-                /* RE-ENTERABLE, like every other call entry, and the note that used to sit here saying
-                   otherwise was simply a misreading of this code. It claimed the opcode "has already freed its
-                   operands and rewritten the stack into [this][f] before jumping here". It has not: `val` and
-                   `method` are read into locals and the frees belong to the null/undefined branch above, which
-                   BREAKs and never arrives at the shared label. On the path that does arrive, sp is untouched —
-                   [value][method] IS the [this][f] shape with zero args, which is the whole reason this opcode
-                   hands its operands over instead of calling.
-                   So re-entering at the opcode re-reads two unchanged slots and re-runs a pure test, which is
-                   the same idempotence every other entry relies on, and a `using` disposal parks at its call
-                   like any other. The gap was in the comment, not in the engine. */
-                call_op_pc = pc - 1;
+                /* sp is UNTOUCHED on the path that arrives here: [value][method] IS the [this][f] shape with
+                   zero args, which is the whole reason this opcode hands its operands over instead of calling
+                   (`val`/`method` are locals; the frees belong to the null/undefined branch above, which BREAKs).
+                   A `using` disposal therefore parks like any other call — at the dispose body's first dispatch. */
                 goto has_method_call_argc;
             }
 
@@ -68964,8 +68952,8 @@ static int prim_arg_check(JSContext *ctx, JSValueConst v, int hint)
                        "the spec performs BEFORE any coercion (the definition's `precheck`), then the padded " \
                        "argument vector") \
     X(PRIMARGS_COERCE, "7.1.1 step 2.a ToPrimitive(argument, hint) for each declared argument in argument " \
-                       "order, with the definition's `midcheck` interleaved after the first - then the body, " \
-                       "which over primitives reaches none of the page's code")
+                       "order, with the definition's `midcheck` interleaved after the first - and then the " \
+                       "definition's `body`, over the primitives this stage put in place")
 enum { PRIMARGS_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_primargs_steps[] = { PRIMARGS_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -74782,8 +74770,9 @@ static bool js_internal_array_includes(JSContext *ctx, JSValueConst arr, JSValue
     X(ASRCH_TOOBJECT,  TOOBJ) \
     X(ASRCH_LENGTH,    LEN) \
     X(ASRCH_FROMINDEX, FROM) \
-    X(ASRCH_DENSE,     "the dense prefix: SameValueZero or IsStrictlyEqual over a fast array's own slots, which " \
-                       "reaches none of the page's code and is therefore one step, not one per element") \
+    X(ASRCH_DENSE,     "the dense prefix, ONE of this array's own slots per entry: SameValueZero or " \
+                       "IsStrictlyEqual against the slot at k, then k advances and the scheduler is offered " \
+                       "the next one") \
     X(ASRCH_HAS,       HAS) \
     X(ASRCH_SKIP,      "the index advance after an absent element, which runs nothing") \
     X(ASRCH_GET,       GET)
@@ -74855,20 +74844,23 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     if (s->hdr.stage == ASRCH_DENSE) {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         s->val = JS_UNDEFINED;
-        /* The DENSE prefix. js_strict_eq2 over a fast array's own slots runs none of the page's code, so this is
-           the same comparison the routed loop below performs, reached without a round trip — not a second
-           implementation of the read, and not a path anything can silently fall back to. It is a stage of its
-           own because the routed loop suspends, and re-entering would otherwise re-scan it. */
-        if (s->len > 0) {
-            if (back) {
-                if (js_get_fast_array(ctx, s->obj, &arrp, &count) && count == s->len)
-                    for (; s->n >= 0; s->n--)
-                        if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
-            } else {
-                if (js_get_fast_array(ctx, s->obj, &arrp, &count))
-                    for (; s->n < count; s->n++)
-                        if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
-            }
+        /* The DENSE prefix — the same comparison the routed loop below performs, reached without a round trip:
+           not a second implementation of the read, and not a path anything can silently fall back to. It is a
+           stage of its own because the routed loop suspends, and re-entering would otherwise re-scan it.
+           ONE SLOT PER ENTRY. This was a C `for` over the whole prefix, on the ground that js_strict_eq2 over a
+           fast array's own slots reaches none of the page's code — which is the one ground that cannot decide a
+           rest point (JSTrampStepDef.steps): `[...].indexOf(x)` over an array the page grew is a walk of the
+           PAGE'S size, and a stage the engine cannot park inside for its whole length is a cap whatever runs
+           inside it. The cursor was already on the state, so the walk was already resumable and only the ask
+           was missing. The fast-array view is re-derived on every entry rather than held across the yield,
+           because a sibling flow that runs meanwhile may have reshaped the array — which is exactly the
+           interleaving the rest point exists to allow. */
+        if (s->len > 0 && js_get_fast_array(ctx, s->obj, &arrp, &count)
+            && (!back || count == s->len)
+            && (back ? s->n >= 0 : s->n < (int64_t)count)) {
+            if (js_strict_eq2(ctx, target, arrp[s->n], eq)) goto found;
+            s->n += back ? -1 : 1;
+            return JS_STEP_YIELD;
         }
         s->hdr.stage = ASRCH_HAS;
     }
@@ -78376,6 +78368,62 @@ JSValue JS_PerformPromiseThen(JSContext *ctx, JSValueConst promise, JSValueConst
     return cap;
 }
 
+/* A LABEL NAMES A STEP; IT DOES NOT ARGUE FROM THE PAGE — see JSTrampStepDef.steps for the rule this enforces.
+ *
+ * A stage is where a machine RESTS, and what makes a rest point necessary is the ENGINE: RAM pressure paging the
+ * low-value tail to the IDB cold tier, a cross-session resume, a flow that outranks this one. Not one of those
+ * consults the page, so the page can neither create a rest point nor remove one — and a label saying a span is
+ * one stage because none of the page's code runs across it has removed one on the single ground that cannot
+ * decide it. What remains is a stretch of algorithm this engine cannot park inside, which §scheduler's razor
+ * calls a cap however carefully the stage numbers agree with themselves.
+ *
+ * CHECKED ON THE TEXT, because the text is where the reasoning is written down before it is acted on: every
+ * bundle of this kind found so far had said so in its own label first — "one stage because none of them can
+ * reach the page's code", "reaches none of the page's code and is therefore one step, not one per element" —
+ * and the second of those was a walk of the page's own array with no rest point anywhere in it.
+ *
+ * IT BANS THE DENIAL AND NOTHING ELSE. A label saying a step IS the page's code is describing the step, which
+ * is what a label is for and is often the whole reason the stage exists (`then` reads, `toString`s, lifecycle
+ * callbacks). What cannot appear is the NEGATIVE claim, in either of the two vocabularies the tree uses for
+ * it, because that claim has only one use: to take a rest point away. A label that merely names its steps, or
+ * that says a range is one O(1) engine action, trips nothing here. */
+static void js_step_labels_check(const JSTrampStepDef *def)
+{
+#if APICLIENT_DEV
+    /* Inside the guard, because in release there is no reader for it and a file-scope table nobody names is the
+       unused-const the build treats as an error. */
+    static const char *const bans[] = {
+        "none of the page",    /* "... reaches none of the page's code and is therefore one step, not one per element" */
+        "can reach the page",  /* "... early return — one stage because none of them can reach the page's code" */
+        "no page code",
+        "no user code",
+        "nothing of the page",
+        NULL
+    };
+    int i, k;
+
+    for (i = 0; def->steps[i]; i++)
+        for (k = 0; bans[k]; k++)
+            if (strstr(def->steps[i], bans[k])) {
+                char why[640];   /* the tail is where this names what to build; a truncated DFAIL loses it */
+
+                snprintf(why, sizeof why,
+                         "%s's stage %d decides its rest point from the PAGE (\"%s\" in \"%s\") — a stage "
+                         "boundary is a rest point because the ENGINE may have to park there (RAM pressure "
+                         "paging the low-value tail to the cold tier, a cross-session resume, a flow that "
+                         "outranks this one), and none of those consult the page, so the page's quiet cannot "
+                         "buy a stage the right to span two steps. NAME the spec step; a range is admissible "
+                         "only when the whole of it is ONE O(1) engine action and the label says so in those "
+                         "terms, and a span of the PAGE'S size is a stage per step whose walking stage returns "
+                         "JS_STEP_YIELD at every turn",
+                         def->algorithm, i, bans[k], def->steps[i]);
+                DFAIL(why);
+            }
+#else
+    (void)def;
+#endif
+}
+
 /* WHAT A DEFINITION MUST DECLARE BEFORE IT IS A MACHINE, asserted at the two points a def enters the runtime:
    here for a host component's, and js_step_defs_check_table for the engine's own. Both lists exist because there
    are two tables, not two rules — the rule is one, and a def that fails it is not a partially-converted machine,
@@ -78393,6 +78441,7 @@ static void js_step_def_check(const JSTrampStepDef *def)
           "number that means nothing outside this build is one a cross-session resume continues at by guessing");
     CHECK(def->steps[0] != NULL,
           "a step machine declares an EMPTY step list, so every stage it rests at is past the end of it");
+    js_step_labels_check(def);
 }
 
 int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def)
@@ -80070,7 +80119,7 @@ static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result)
                      "ToIntegerOrInfinity(skipCount); newLen and its 2^53-1 check; A is ArrayCreate(newLen); " \
                      "i is 0; r is actualStart + actualSkipCount)") \
     X(ATSP_HEAD,     "23.1.3.35 step 16 (Repeat while i < actualStart: iValue is Get(O, Pi)) - and step 17, " \
-                     "the items, which read nothing of the page's") \
+                     "the copy of the inserted items") \
     X(ATSP_TAIL,     "23.1.3.35 step 18 (Repeat while i < newLen: fromValue is Get(O, from)) - and step 19, " \
                      "Return A")
 enum { ATSP_STAGES(JS_STEP_STAGE_ENUM) };
@@ -84440,7 +84489,7 @@ enum { SWF_STAGES(JS_STEP_STAGE_ENUM, 0) };
 static const char *const js_str_iswellformed_steps[] = {
     SWF_STAGES(JS_STEP_STAGE_LABEL,
         "22.1.3.10 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O)), then step 3 "
-        "(IsStringWellFormedUnicode(S), which reads nothing of the page's)")
+        "(IsStringWellFormedUnicode(S))")
     NULL };
 static const char *const js_str_towellformed_steps[] = {
     SWF_STAGES(JS_STEP_STAGE_LABEL,
@@ -86727,7 +86776,7 @@ static int js_is_regexp(JSContext *ctx, JSValueConst obj)
     X(RECTOR_PATSTR,   "22.2.4.1 step 8 -> 22.2.3.3 RegExpInitialize step 1 (P is ToString(pattern), or the " \
                        "empty String when it is undefined)") \
     X(RECTOR_FLAGSTR,  "22.2.4.1 step 8 -> 22.2.3.3 RegExpInitialize step 2 (F is ToString(flags)) - and steps " \
-                       "3-12, the parse and the compiled matcher, which run none of the page's code")
+                       "3-12, the parse of P and the compiled matcher")
 enum { RECTOR_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_re_ctor_steps[] = { RECTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -86933,8 +86982,8 @@ _Static_assert(offsetof(JSRegExpCompile, hdr) == 0, "JSStepHdr must be first in 
                   "proposal-regexp-legacy-features guards; P and F from a RegExp pattern's own slots or from " \
                   "the arguments)") \
     X(RC_PATTERN, "B.2.4.1 step 5 -> 22.2.3.3 RegExpInitialize step 1 (P is ToString(pattern))") \
-    X(RC_FLAGS,   "B.2.4.1 step 5 -> 22.2.3.3 RegExpInitialize step 2 (F is ToString(flags)) - and the " \
-                  "compile, which runs none of the page's code") \
+    X(RC_FLAGS,   "B.2.4.1 step 5 -> 22.2.3.3 RegExpInitialize step 2 (F is ToString(flags)) - and steps " \
+                  "3-9, the parse of P and the compiled matcher") \
     X(RC_BUILD,   "B.2.4.1 step 5 -> 22.2.3.3 RegExpInitialize steps 10-12 (the receiver is re-validated, its " \
                   "slots are rewritten and Set(obj, \"lastIndex\", +0, true) runs)")
 enum { RCOMPILE_STAGES(JS_STEP_STAGE_ENUM) };
@@ -92674,8 +92723,8 @@ _Static_assert(offsetof(JSSymbolFor, hdr) == 0, "JSStepHdr must be first in JSSy
 /* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). */
 #define SYMFOR_STAGES(X) \
     X(SYMFOR_ENTRY,    "20.4.2.2, entered: the machine has its key and nothing has been coerced yet") \
-    X(SYMFOR_TOSTRING, "20.4.2.2 step 1 (stringKey is ToString(key)) - and steps 2-5, the registry lookup and " \
-                       "the new Symbol, which run none of the page's code")
+    X(SYMFOR_TOSTRING, "20.4.2.2 step 1 (stringKey is ToString(key)) - and steps 2-5, the GlobalSymbolRegistry " \
+                       "lookup and the new Symbol it records")
 enum { SYMFOR_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_symbol_for_steps[] = { SYMFOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -98542,7 +98591,7 @@ static JSValue js_export_getter_body(JSContext *ctx, JSValueConst this_val, int 
                    "a [[ShadowRealm]]) - and the dispatch of step 3's ToString(specifier)") \
     X(SI_ST_SPEC,  "proposal-shadowrealm 3.3.2 ShadowRealm.prototype.importValue steps 3-5 (specifierString " \
                    "arrives; exportName must be a String) - and 3.2.2 ShadowRealmImportValue steps 1-9, whose " \
-                   "load is a JOB on the eval realm and whose PerformPromiseThen runs no page code")
+                   "load is a JOB on the eval realm and whose PerformPromiseThen attaches the ExportGetter")
 enum { SIMPORT_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_shadow_realm_importvalue_steps[] = { SIMPORT_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -103055,18 +103104,16 @@ enum { TAS_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
 static const char *const js_ta_sort_steps[] = {
     TAS_STAGES(JS_STEP_STAGE_LABEL,
         "23.2.3.29 steps 1-4 and 23.1.3.30.1 steps 1-3 (the comparator check; ValidateTypedArray; the whole "
-        "List is read before any comparison — no user code in any of it)",
+        "List is read before any comparison)",
         "23.2.4.7 step 2.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))",
-        "23.2.3.29 step 9.a (Set(obj, ToString(j), sortedList[j], true) — a typed-array element store runs no "
-        "user code, so the write-back is one pass)")
+        "23.2.3.29 step 9.a (Set(obj, ToString(j), sortedList[j], true), the whole write-back)")
     NULL };
 static const char *const js_ta_toSorted_steps[] = {
     TAS_STAGES(JS_STEP_STAGE_LABEL,
         "23.2.3.33 steps 1-5 and 23.1.3.30.1 steps 1-3 (the comparator check; ValidateTypedArray; A is "
-        "TypedArrayCreateSameType(O, <<len>>); the whole List is read — no user code in any of it)",
+        "TypedArrayCreateSameType(O, <<len>>); the whole List is read)",
         "23.2.4.7 step 2.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))",
-        "23.2.3.33 step 9.a (Set(A, ToString(j), sortedList[j], true) — a typed-array element store runs no "
-        "user code, so the write-back is one pass)")
+        "23.2.3.33 step 9.a (Set(A, ToString(j), sortedList[j], true), the whole write-back)")
     NULL };
 
 static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -104420,8 +104467,8 @@ static int js_atomics_access(JSContext *ctx, JSAtomics *s)
                      "TypedArrayLength(taRecord)) - both BEFORE the first coercion, which is why the length " \
                      "lives on the state") \
     X(ATOM_COERCE,   "25.4.3.2 steps 2-4 (accessIndex is ToIndex(requestIndex), tested against the captured " \
-                     "length) and the operation's own ToNumber/ToBigInt on each declared value argument - then " \
-                     "the body, which over primitives reaches none of the page's code")
+                     "length) and the operation's own ToNumber/ToBigInt on each declared value argument - and " \
+                     "then the operation's body, over the primitives this stage put in place")
 enum { ATOMICS_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_atomics_steps[] = { ATOMICS_STAGES(JS_STEP_STAGE_LABEL) NULL };
 

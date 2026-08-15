@@ -1389,9 +1389,13 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
                 frame-snapshot fork), or -1 if the value is not concolic (fall through to the normal ToBool).
      - fork:    the frame-snapshot fork. When branch returned arm | 0x100, the interpreter hands the host a
                 CLONE of the flow frame taken at the forking branch; the host builds the hot sibling from it.
-     - preempt: the preemption yield. A flow runs as a preemptible (heap-resident) async-function frame; when
-                preempt returns 1 at a yield point (loop back-edge / call), the flow parks and resumes later —
-                the substrate for the WFQ to interleave flows by value instead of running each to completion. */
+     - preempt: the preemption yield, and the ONE policy behind it. A flow runs as a preemptible (heap-resident)
+                async-function frame; the interpreter polls a yield request at EVERY opcode boundary
+                (JS_RequestFlowYield) and asks this hook there — nowhere else. Returning 1 parks the flow, which
+                resumes later at that exact opcode. Where a flow MAY park is the engine's business and is
+                universal; WHEN it should is this hook's, and nothing about the page's bytecode shape gates
+                either. The substrate for the WFQ to interleave flows by value instead of running each to
+                completion. */
 typedef struct JSFlowControlHooks {
     int  (*branch)(JSContext *ctx, JSValueConst cond);
     /* A NATIVE OPERATION WHOSE COMPLETION IS ONE OF N FEASIBLE OUTCOMES — the same decision `branch` makes,
@@ -1415,14 +1419,22 @@ typedef struct JSFlowControlHooks {
                                                            (The deleted `replay` hook re-ran a nested/deep flow from its
                                                            start — BANNED, not byte-identical; that fork now DFAILs until a
                                                            sound async-frame snapshot is built.) */
-    /* The KIND of suspend point being offered, so a policy can answer per kind. Parking is ONE mechanism —
-       this is not a selection between two of them — but "force every point" means wildly different amounts of
-       work at a back-edge (once per loop iteration) and at a call (millions of times), and a policy that cannot
-       tell them apart must answer the same for both. run-test262 forces every back-edge and samples calls for
-       exactly that reason; the solver's own policy is wall-clock and does not care which kind asked. */
+    /* WHAT RAISED the yield request this point is answering, so a policy can answer per source. Parking is ONE
+       mechanism and there is now exactly ONE place that asks this question — the per-opcode poll in the
+       interpreter's dispatch (see JS_RequestFlowYield). The kind is not where the flow may park (every opcode
+       boundary is), it is who wanted the thread, which is a real difference to a policy: "force every request"
+       means wildly different amounts of work when the source is a loop back-edge (once per iteration) and when
+       it is a call (millions of times), and a policy that cannot tell them apart must answer the same for both.
+       run-test262 forces every back-edge and samples calls for exactly that reason; the solver's own policy is
+       rank + wall-clock and does not care which source asked. */
 #define JS_PREEMPT_BACKEDGE 0
 #define JS_PREEMPT_FORK     1
 #define JS_PREEMPT_CALL     2
+/* THE HOST ASKED FOR THE THREAD — JS_RequestFlowYield, from outside the running flow's own code. This is the
+   source that has no bytecode shape behind it at all: the cooperative quantum expiring, a rank change on the
+   frontier (an emit, a sibling appearing, a flow blocking on the host), RAM pressure wanting the cold tail, a
+   cross-instance read needing the flow suspended. */
+#define JS_PREEMPT_HOST     3
     int  (*preempt)(int kind);
 } JSFlowControlHooks;
 JS_EXTERN void JS_SetFlowControlHooks(const JSFlowControlHooks *hooks);
@@ -1655,8 +1667,21 @@ JS_EXTERN JSValue  JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len
 #define JS_FLOW_DETACHED 2
 JS_EXTERN int      JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres);
 JS_EXTERN void     JS_FlowFree(JSContext *ctx, JSValue *flow);
-/* Feature-engagement counters (anti-fake-green): requested = back-edge preempt points reached; fired = actually
-   parked+rebuilt. requested>fired iff the feature is gated somewhere (nested async/generator activation). */
+/* ASK THE RUNNING FLOW FOR THE THREAD. Raises the YIELD REQUEST the interpreter polls at EVERY opcode boundary,
+   so the flow reaches a suspend point at the very next opcode it executes — in straight-line code, inside a
+   getter, inside a callback, inside a direct `eval`, in a body with no loop and no branch. WHERE a flow may
+   suspend is a property of the engine and nothing about the page's bytecode shape gates it; this is the call the
+   scheduler makes when the answer to "should this flow still hold the thread" has changed and only the scheduler
+   knows it: the cooperative quantum expiring, a rank change (an emit, a fork landing on the frontier, a flow
+   blocking on a host request), RAM pressure, a cross-instance read.
+   It does NOT decide to park — it makes the question askable. The poll clears the request and asks
+   JSFlowControlHooks.preempt (kind JS_PREEMPT_HOST), which is where the ONE policy lives.
+   Idempotent, cheap, and LOSSLESS: a request nothing consumes (raised while no flow is running, or while a C
+   builtin holds the thread) is answered at the next opcode whenever that is, and answering it late costs one
+   declined hook call. Per-thread, like the flow base it is about. */
+JS_EXTERN void     JS_RequestFlowYield(void);
+/* Feature-engagement counters (anti-fake-green): requested = yield polls where the policy asked to park; fired =
+   actually parked+rebuilt. requested>fired iff the feature is gated somewhere (nested async/generator activation). */
 JS_EXTERN void     JS_FlowPreemptStats(uint64_t *requested, uint64_t *fired);
 /* LIVE STEP MACHINES — the runtime's census (see JSStepHdr.census_prev). Every continuation-holding builtin a
    flow is currently suspended inside has one, and a machine nothing finishes is memory JS_ComputeMemoryUsage

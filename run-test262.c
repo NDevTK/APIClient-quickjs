@@ -1431,13 +1431,17 @@ int longest_match(const char *str, const char *find, int pos, int *ppos, int lin
    corrupted state — a fork-feature bug conformance testing can never surface. This is the point of test262 here:
    NOT "does QuickJS run JS" (known), but "does our time-travel preserve JS across thousands of suspend/resumes".
    Modules + async ($DONE) fall back to JS_Eval for now (JS_FlowNew is a global program; that surface is next). */
-/* EVERY back-edge and every fork, and calls SAMPLED. Forcing every call too is not a stronger test that was
-   declined — it is one the corpus cannot finish: a call is reached orders of magnitude more often than a loop
-   back-edge, and parking + rebuilding the heap-frame chain at each one timed built-ins/Array out on its own.
-   The stride keeps call-parking heavily exercised (the corpus makes hundreds of millions of calls, so 1-in-64
-   is still millions of forced call-parks) while leaving back-edge coverage exactly as strong. It samples WHEN
-   to force the seam; it is not a fallback to a second implementation, because a call the sample skips parks by
-   the same one mechanism the moment the sample selects it. */
+/* EVERY back-edge and every fork, and calls SAMPLED. The interpreter now offers a suspend point at every opcode
+   boundary and asks this hook only where something RAISED a yield request, so `kind` is the SOURCE that raised
+   it — which is exactly the distinction this policy has always needed.
+   Forcing every call too is not a stronger test that was declined — it is one the corpus cannot finish: a call
+   is reached orders of magnitude more often than a loop back-edge, and parking + rebuilding the heap-frame chain
+   at each one timed built-ins/Array out on its own. The stride keeps call-parking heavily exercised (the corpus
+   makes hundreds of millions of calls, so 1-in-64 is still millions of forced call-parks) while leaving
+   back-edge coverage exactly as strong. It samples WHEN to force the seam; it is not a fallback to a second
+   implementation, because a call the sample skips parks by the same one mechanism the moment the sample selects
+   it. JS_PREEMPT_HOST is forced like a back-edge: nothing in this harness raises one, so it costs nothing here,
+   and a policy that answered it differently from the source it cannot distinguish would be guessing. */
 static unsigned fork_call_stride = 0;
 static int fork_preempt_always(int kind) {
     if (kind == JS_PREEMPT_CALL) return (++fork_call_stride & 63) == 0;
@@ -2562,7 +2566,9 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "\n");
         /* FEATURE ENGAGEMENT (anti-fake-green): a passing result does NOT prove the time-travel feature ran on the
-           test's logic. requested = back-edge preempt points reached; fired = actually parked+rebuilt. They diverge
+           test's logic. requested = yield polls where this policy said PARK (one per forced back-edge, one per
+           sampled call, one per fork, one per step-machine yield — never a count of points OFFERED, which is now
+           every opcode boundary); fired = actually parked+rebuilt. They diverge
            EXACTLY where the feature is gated (nested async/generator activations), so <100% engagement means the
            run passed tests the feature silently skipped — a fake green the harness must flag, for ALL categories. */
         {
