@@ -441,9 +441,13 @@ JS_EXTERN JSStepVisit *JS_StepFreeVisitor(void);
  * A `release` that FREES one is the second list growing back, and it is invisible either way it is written:
  * free-and-null leaves the visit's free a no-op, free-without-null makes the visit's free a double free. So the
  * teardown folds the declaration into this number before `release` and again after, and asserts they match.
- * Only the reference-holding operations are folded (`val`, `atom`, and an `array`'s elements through their own
- * element visit) — a `buf`/`shared`/`machine` pointer is exactly what `release` is allowed to own, so folding
- * those would assert the opposite of the contract. Cheap, allocation-free, and dev-only at its call sites. */
+ *
+ * EVERY operation is folded, not only the reference-holding ones. What `release` may own is what the
+ * declaration does NOT name, and this walk reaches only what it DOES — so a `buf` named by the visit is the
+ * declaration's allocation exactly as a `val` is its reference: the fork copies it with js_malloc and the
+ * discharge frees it with js_free. Exempting those is how nine such buffers came to be freed by seven
+ * `release` hooks and grown with the C library's realloc, which a fork would then have handed to the wrong
+ * allocator. Pointers are folded, never dereferenced. Cheap, allocation-free, and dev-only at its call sites. */
 JS_EXTERN uint64_t JS_StepVisitOwnedFingerprint(JSContext *ctx, JSStepVisitFn visit, void *state);
 
 /* Register a host component's step machine; the return value is the id JS_CFUNC_STEP_DEF names it by. The

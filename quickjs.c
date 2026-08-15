@@ -20659,9 +20659,20 @@ void JS_StepVisitFree(JSContext *ctx, JSStepVisitFn visit, void *state)
  *
  * So the teardown folds every value the declaration names into a number before `release` and again after, and
  * the two must be equal. Both mistakes move it: nulling a slot changes the tag, and dropping a reference
- * changes the count. Only `val` and `atom` are folded — the reference-holding half, which is the half the
- * declaration owns; a `buf`/`array`/`shared` pointer is component-private storage whose release is exactly what
- * the other hook is FOR, so folding those would assert the opposite of the contract.
+ * changes the count.
+ *
+ * EVERY OPERATION IS FOLDED, NOT ONLY THE REFERENCE-HOLDING ONES. This used to fold `val` and `atom` alone,
+ * arguing that "a `buf`/`array`/`shared` pointer is what `release` is allowed to own, so folding those would
+ * assert the opposite of the contract" — and that reasoning is the wrong way round. What a `release` is allowed
+ * to own is what the declaration does NOT name, and this walk only ever reaches what it DOES: a buffer named by
+ * `v->buf` is the declaration's, the fork copies it with js_malloc and the discharge frees it with js_free, so
+ * a `release` that frees it is the same second list a freed JSValue is. That exemption was not hypothetical —
+ * NINE such buffers were being freed by seven `release` hooks (the Range stringifier's accumulator and its
+ * extract's frame stack, deleteContents' removal list, the clone's level stack, getElementById's id,
+ * textContent's accumulator, the fragment serializer's two, the sanitizer walk's stack), each of them grown
+ * with the C library's realloc BECAUSE nothing said the declaration already owned it. Folding the pointer is
+ * what makes the free-and-null spelling visible; the free-WITHOUT-null spelling leaves the pointer unchanged
+ * and is caught by the allocator itself when the discharge frees it a second time.
  *
  * A value already freed to zero by the offending release is read here after its allocation is gone. That read
  * is the diagnosis, not a new bug: the number will differ and this fires, which is the outcome either way. But
@@ -20689,18 +20700,53 @@ static void js_step_visit_fp_val(JSContext *ctx, JSValue *slot)
     }
 }
 static void js_step_visit_fp_atom(JSContext *ctx, JSAtom *slot) { js_step_fp_fold(ctx, (uint64_t)*slot); }
-static void js_step_visit_fp_strbuf(JSContext *ctx, StringBuffer *slot) { (void)ctx; (void)slot; }
+/* THE POINTER, WHICH IS THE WHOLE OF WHAT AN OWNED ALLOCATION IS TO THIS QUESTION. None of these reads the
+   storage: the fold asks "does the declaration still name the same allocation", and dereferencing a block a
+   misbehaving `release` has already returned would turn the diagnosis into a second fault. The accumulator is
+   the one that carries a length as well, because string_buffer_free leaves the buffer named and empty. */
+static void js_step_visit_fp_strbuf(JSContext *ctx, StringBuffer *slot)
+{
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)slot->str);
+    js_step_fp_fold(ctx, (uint64_t)(uint32_t)slot->len);
+}
 static void js_step_visit_fp_props(JSContext *ctx, JSPropertyEnum **slot, uint32_t n)
-{ (void)ctx; (void)slot; (void)n; }
+{
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*slot);
+    js_step_fp_fold(ctx, (uint64_t)n);
+}
+/* The slot ARRAY and the references its live range holds — both, because the free consumer does both. */
 static void js_step_visit_fp_slots(JSContext *ctx, ValueSlot **slot, int64_t cap, int64_t from, int64_t to)
-{ (void)ctx; (void)slot; (void)cap; (void)from; (void)to; }
-static void js_step_visit_fp_buf(JSContext *ctx, void **slot, size_t bytes) { (void)ctx; (void)slot; (void)bytes; }
-static void js_step_visit_fp_machine(JSContext *ctx, void **slot) { (void)ctx; (void)slot; }
+{
+    int64_t i;
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*slot);
+    js_step_fp_fold(ctx, (uint64_t)cap);
+    if (!*slot) return;
+    for (i = from; i < to; i++) js_step_visit_fp_val(ctx, &(*slot)[i].val);
+}
+static void js_step_visit_fp_buf(JSContext *ctx, void **slot, size_t bytes)
+{
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*slot);
+    js_step_fp_fold(ctx, (uint64_t)bytes);
+}
+static void js_step_visit_fp_machine(JSContext *ctx, void **slot)
+{ js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*slot); }
+/* The pointer AND the count, because dropping a reference to a shared record is the same mistake as dropping
+   one to a value: the record survives, and the arm that still names it frees it a second time at zero. */
 static void js_step_visit_fp_shared(JSContext *ctx, void **slot, int *refs, void (*destroy)(JSContext *, void *))
-{ (void)ctx; (void)slot; (void)refs; (void)destroy; }
-static void js_step_visit_fp_maprec(JSContext *ctx, struct JSMapRecord **slot) { (void)ctx; (void)slot; }
+{
+    (void)destroy;
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*slot);
+    js_step_fp_fold(ctx, (uint64_t)(uint32_t)(*slot && refs ? *refs : 0));
+}
+static void js_step_visit_fp_maprec(JSContext *ctx, struct JSMapRecord **slot)
+{ js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*slot); }
+/* The two allocations lre_exec_end owns, plus the machine's capture block, named as the executor holds them. */
 static void js_step_visit_fp_reexec(JSContext *ctx, REExecContext *ec, uint8_t **capture)
-{ (void)ctx; (void)ec; (void)capture; }
+{
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)ec->stack_buf);
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)ec->reach);
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)capture);
+}
 static const JSStepVisit js_step_visit_fp;
 /* An array OF SUB-OBJECTS is walked, because its elements can be values — the element visit is the machine's
    own and the fold has to reach through it exactly as the free and the clone do. */
