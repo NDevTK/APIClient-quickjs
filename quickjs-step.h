@@ -199,10 +199,19 @@ typedef struct JSTrampStepDef {
      * ownership list, which made it MANDATORY — and a machine that owns JSValues AND must not be forked in
      * some states had no way left to say the second half.
      *
-     * The two machines that need it hold a LEXBOR PARSER. "C state cannot be forked" is not the reason and is
-     * not true — cow_capture_host_record exists precisely so a component's C record time-travels. What has no
-     * halves is specifically a tokenizer: a selector walk mid-parse and a fragment parse mid-parse each hold
-     * one live parser with a position in it, and there is no meaningful copy to give a second arm.
+     * THE ONE MACHINE THAT NEEDS IT HOLDS A LEXBOR HTML PARSER. "C state cannot be forked" is not the reason
+     * and is not true — cow_capture_host_record exists precisely so a component's C record time-travels. What
+     * has no halves is specifically a tokenizer standing at a position, with an open-element stack and an
+     * insertion mode behind it, and lexbor exposes no copy of one.
+     *
+     * IT IS ALSO NOT A LICENCE, AND ITS ONLY CORRECT TRAJECTORY IS TO ZERO. There were two declarers; the
+     * selector walk was the other, and its reason turned out to be false — the CSS parser it held had finished
+     * compiling before the machine's first rest point, and the matching context it held cleans itself at the
+     * end of every match, so neither was state and neither belonged to the machine. Both moved to
+     * core/dom/selector_match.c and the declaration went with them. A reason phrased as "no page code can run
+     * here, so no fork can arrive" is the tell that the same mistake is being made again: parkability is a
+     * property of the ENGINE, and RAM pressure, cold-tier eviction and a cross-session resume never ask what
+     * the page is doing.
      *
      * IT IS A PREDICATE AND NOT A FLAG because the answer is about the STATE, not the definition: the same
      * machine is forkable before it builds its parser and unforkable while it holds one. And it is asked at
