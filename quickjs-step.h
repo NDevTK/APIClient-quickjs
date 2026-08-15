@@ -97,6 +97,19 @@ struct JSStepVisit {
 typedef struct JSTrampStepDef {
     size_t   size;
     int     (*step)(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
+    /* WHAT THIS MACHINE'S COMPLETION IS, and NOTHING ELSE — the teardown asks it that one question.
+     *
+     * It states the completion (take the result out of the state and hand it back, or hand a throw to the
+     * context) and performs whatever the algorithm owes on the way out: 7.4.11's deferred IteratorClose over
+     * the iterators the machine is still standing on, 25.5.2's frame unwind, a re-entrancy guard lowered.
+     * It does NOT release what `visit` names and it does NOT free the state block. Both of those are the SAME
+     * operation for every machine, so both live in tramp_step_state_free_1, which runs them AFTER this returns.
+     * A fini that frees a declared value is therefore a double free, and the free-and-null spelling of the same
+     * mistake is a leak of whatever the next field misses — which is exactly why the list is declared once.
+     *
+     * NULL when the machine's completion is undefined on every path (Map.prototype.forEach, a Promise resolving
+     * function, 27.3.3.3's dispose run). That is not an optional hook with a fallback behind it: there is one
+     * teardown, and a machine with no completion to state has nothing to say to it. */
     JSValue (*fini)(JSContext *ctx, void *st, bool take_result);
     int      arg;
     /* COERCE-THEN-COMPUTE machines only (js_primargs_step); zero for every other definition. Such a builtin's
@@ -145,6 +158,13 @@ typedef struct JSTrampStepDef {
        drifted twice in this file — a consume state co-owned `next` across two flows, and a for-await drive left
        three of its five fields borrowed — which is what ITERCONS_OWNED and AFS_OWNED were each written to stop
        locally and what this stops everywhere.
+       THE TEARDOWN DISCHARGES IT ITSELF — a machine never asks for that and never can. It used to: 137 engine
+       finis ended in a `tramp_step_visit_free(ctx, s)` and 46 host teardowns restated the whole list by hand,
+       which is 183 copies of one question, each of them a place for the answer to go missing (querySelectorAll's
+       collected matches were named here and freed by nothing, and every abandoned selector walk leaked its
+       element wrappers). The same move fixed a leak nothing could see: the engine's finis each freed the state
+       block and the host's never did, because a step state is plain memory that no gc walk and no refcount
+       report can name. One allocation site, one free site, one discharge.
        Only the fields the machine OWNS: a BORROWED view of its own cb array or of the header's captures is not
        visited, or the clone over-counts and the teardown over-frees. Ownership that is conditional is an `if`
        around the visit, which is why this is a function and not a table of offsets — the TypedArray-filter
@@ -396,6 +416,11 @@ typedef void (*JSStepVisitFn)(JSContext *ctx, void *state, JSStepVisit *v);
  * the clone and at the teardown, and nothing catches the one that is missed. It had already been missed, in
  * querySelectorAll: `visit` named the collected-matches array, the teardown named nothing, and every abandoned
  * selector walk leaked its element wrappers.
+ *
+ * A MACHINE'S OWN STATE NO LONGER COMES HERE FROM ITS TEARDOWN, and no machine may bring it: the driver
+ * discharges JSTrampStepDef::visit itself once `fini` has stated the completion. What is left for this is the
+ * EMBEDDED RECORD — a work block, a request cursor, a queue that a machine owns a field of and whose visit its
+ * own visit forwards to; that record's release is driven by the machine, so it needs the consumer by name.
  *
  * The visitor is IDEMPOTENT — a value slot is left JS_UNDEFINED, a pointer slot NULL, an atom JS_ATOM_NULL — so
  * a state torn down through a nested declaration that has already been discharged frees nothing twice.

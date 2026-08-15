@@ -20361,10 +20361,28 @@ static int step_length_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVal
    is detached before it is freed, so each link's release found nothing), but the pair still read as a cycle
    because nothing in the call graph says the detach empties the field first. Taking the chain in the wrapper
    below says it. The header release was also split out for a second consumer — the clone's failure path — that
-   no longer exists, so it is inlined here rather than kept as a one-caller function. */
+   no longer exists, so it is inlined here rather than kept as a one-caller function.
+
+   AND IT DISCHARGES THE DECLARATION AND FREES THE BLOCK, because those are the same two operations for every
+   machine and a per-machine copy of them is the second ownership list this engine forbids. `visit` is the ONE
+   list of what a state owns — the clone reads it to take a second reference to each field, and the teardown
+   reads it to release each — so a `fini` that restated it was that list written twice: 137 of the engine's own
+   finis carried `tramp_step_visit_free(ctx, s)` and 46 host machines carried the same list spelled out by hand,
+   and a field added to a state created an obligation in two places with nothing to catch the one that was
+   missed. It had already been missed in querySelectorAll (visit named the collected matches, the teardown named
+   nothing) and the fingerprint below exists because it had been missed the other way round too.
+
+   THE BLOCK FREE IS HERE FOR A SHARPER REASON THAN SYMMETRY: it was MISSING for every host machine. The engine's
+   own finis each ended `js_free(ctx, s)`; the 46 the host registers never did, because nothing said they had to
+   and nothing could see that they did not — a step state is plain js_malloc'd memory, so a block dropped here is
+   invisible to JS_FreeRuntime's gc_obj_list walk (it holds no GC header), invisible to the refcount report (the
+   host finis released every value by hand), and invisible to the census (its entry came off before fini ran).
+   Every dispatched event, every fetch, every stream read leaked its state. One allocation site (tramp_step_state_
+   new) now has one free site, which is what makes that impossible rather than merely fixed. */
 static JSValue tramp_step_state_free_1(JSContext *ctx, void *st, bool take_result)
 {
     JSStepHdr *h = st;
+    JSValue r;
     int i;
 
     DCHECK(h->delegate == NULL,
@@ -20388,11 +20406,19 @@ static JSValue tramp_step_state_free_1(JSContext *ctx, void *st, bool take_resul
     h->get_atom = JS_ATOM_NULL;
     for (i = 0; i < h->argc; i++)
         JS_FreeValue(ctx, h->argv[i]);
-    h->argc = 0;                     /* fini frees the block; nothing may read the captures after this */
+    h->argc = 0;                     /* the block is freed below; nothing may read the captures after this */
     h->this_val = JS_UNDEFINED;
     h->func_obj = JS_UNDEFINED;
-    js_step_census_remove(ctx->rt, h);   /* fini frees the block, so the census must let go of it first */
-    return h->def->fini(ctx, st, take_result);
+    /* THE COMPLETION, AND THEN THE ONE LIST — see the comment above this function's declaration.
+       `fini` states what this machine's COMPLETION is and performs whatever its algorithm owes on the way out
+       (7.4.11's deferred IteratorClose, 25.5.2's frame unwind, a throw handed to the context). It does not
+       release what the declaration names and it does not free the block: both of those are the same operation
+       for all 183 machines, so both are here. */
+    r = h->def->fini ? h->def->fini(ctx, st, take_result) : JS_UNDEFINED;
+    JS_StepVisitFree(ctx, h->def->visit, st);
+    js_step_census_remove(ctx->rt, h);   /* the block goes next, so the census must let go of it first */
+    js_free(ctx, st);
+    return r;
 }
 
 /* An inner machine built but never handed over (the outer threw between the two) is this state's to free — and
@@ -20583,36 +20609,32 @@ static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_
                                                 js_step_visit_free_atom, js_step_visit_free_machine,
                                                 js_step_visit_free_array, js_step_visit_free_shared,
                                                 js_step_visit_free_maprec, js_step_visit_free_reexec };
-/* A machine's teardown releases what it owns through the SAME declaration the clone reads, so the two cannot
-   disagree about which fields those are.
-   The declaration is REQUIRED here, not consulted: a teardown that calls this has no other release path, so a
-   missing visit is not "nothing to free" — it is EVERYTHING leaked, silently. That is not a hypothetical. The
-   shared coerce-then-compute and OrdinaryCreateFromConstructor teardowns were converted to read the declaration
-   while their definitions (built by PRIMARGS_DEF_FULL / CREATECTOR_DEF_FULL, which the attaching edit's pattern
-   never matched) still declared none, and the whole corpus leaked 41,820 objects while reporting zero errors.
-   A no-op `if` is what let that be silent, so the condition is an assertion instead. */
-static void tramp_step_visit_free(JSContext *ctx, void *st) {
-    JSStepHdr *h = st;
-    DCHECK(h->def->visit, "a machine whose teardown reads its ownership declaration must HAVE one — "
-                          "without it the teardown frees nothing and every field the machine owns leaks");
-    JS_StepVisitFree(ctx, h->def->visit, st);
-}
+/* DELETED: tramp_step_visit_free, the per-machine call that discharged the declaration. Every one of the 137
+   engine finis that called it — and the 46 host teardowns that spelled the same list out by hand — asked the
+   ONE question "release what this state owns", at 183 places, one per machine. It is asked once now, in
+   tramp_step_state_free_1, where the block free it always sat beside is asked once too. Its own DCHECK
+   ("a machine whose teardown reads its ownership declaration must HAVE one") went with it because it was the
+   weaker half of js_step_def_check's CHECK, which refuses such a definition at registration. */
 
-/* THE SAME CONSUMER, PUBLIC — because the list a HOST machine's teardown has to discharge is the same list, and
- * it was reachable only from this file.
+/* THE PUBLIC CONSUMER of a declaration, for the two callers that hold a state a driver does not: a HELPER
+ * RECORD's own visit (a request cursor, a work block, a queue), which belongs to whichever machine embeds it.
  *
- * The function above is `static`, so every one of the host's step machines had to write its own teardown: a
- * second, hand-maintained list of the same JSValues its `visit` already names. That is the shape this file
- * forbids everywhere else — a struct copied field-by-field must dup EVERY owned field, so a field added to a
- * state creates an obligation at the clone AND at the teardown, and nothing catches the one that is missed.
+ * It used to be needed for a whole second reason: the discharge above was `static`, so every one of the host's
+ * step machines wrote its own teardown — a second, hand-maintained list of the same JSValues its `visit` already
+ * names. That is the shape this file forbids everywhere else — a struct copied field-by-field must dup EVERY
+ * owned field, so a field added to a state creates an obligation at the clone AND at the teardown, and nothing
+ * catches the one that is missed.
  * It had already been missed: querySelectorAll's collected-matches array was named by qs_visit and freed by
  * nothing, so every abandoned selector walk leaked its element wrappers, and the fix was to hand-add the free
  * to the second list — which leaves the next omission exactly as invisible.
  *
- * So the declaration is the ONE list on both sides of the boundary. A host teardown discharges it with
- * JS_StepVisitFree and keeps its own `release` for what the declaration does NOT name: a lexbor handle, a
- * foreign C allocation, a global flag its algorithm took and must give back. What separates the two is
- * asserted, not documented — see JS_StepVisitOwnedFingerprint. */
+ * So the declaration is the ONE list on both sides of the boundary, and a MACHINE'S state no longer names it
+ * from either side: tramp_step_state_free_1 discharges it after the machine's `fini` has stated its completion.
+ * What is left here is the EMBEDDED record — a work block or a cursor a machine owns a field of — whose visit
+ * the machine's own visit forwards to and whose release the machine's own release drives. A host teardown keeps
+ * its `release` for what the declaration does NOT name: a lexbor handle, a foreign C allocation, a global flag
+ * its algorithm took and must give back. What separates the two is asserted, not documented — see
+ * JS_StepVisitOwnedFingerprint. */
 JSStepVisit *JS_StepFreeVisitor(void)
 {
     return (JSStepVisit *)&js_step_visit_free;
@@ -23505,7 +23527,6 @@ typedef struct JSArrayEvery {
    CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
    is a NORMAL frame carrying the state, so it runs with gen_state == the base and a callback BODY LOOP preempts
    the base flow — never a C-recursive JS_Call that could only drive to completion. */
-static void js_array_every_end(JSContext *ctx, struct JSArrayEvery *s, bool take_ret);
 /* reduce/reduceRight: the same continuation-holding shape as js_array_every, with the accumulator as the state. */
 typedef struct JSArrayReduce {
     JSStepHdr hdr;           /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -24007,7 +24028,6 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, J
 static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
-static void js_array_reduce_end(JSContext *ctx, struct JSArrayReduce *s, bool take_acc);
 /* arr.sort(cmpFn) with a NORMAL bytecode comparator: a SUSPENDABLE bottom-up (iterative) stable merge sort whose
    ONLY suspension point is cmp(array[l], array[r]) inside the inner merge. All algorithm state (width, block
    index, merge cursors) lives in the heap struct, so no C-stack recursion — a comparator body loop preempts and
@@ -25255,8 +25275,6 @@ static JSValue js_for_in_fini(JSContext *ctx, void *st, bool take_result)
     JSForIn *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -26062,9 +26080,25 @@ static _Thread_local JSAsyncFunctionState *g_flow_base_gen = NULL;
    The value it holds is WHO ASKED, biased by one so that zero means nobody: JS_PREEMPT_* + 1. Last raise wins,
    which loses nothing — a raise from the interpreter is answered at the very next dispatch, so a standing
    interpreter request cannot be overwritten by a later one, and an overwritten HOST request is still answered at
-   that same dispatch with a different name on it. */
+   that same dispatch with a different name on it.
+   IT IS A RELAXED LOCK-FREE ATOMIC, NOT MERELY `volatile`, AND THE REASON IS A SIGNAL HANDLER. The cooperative
+   quantum's edge (host solver/quantum.c) is a per-thread CPU timer whose handler raises this byte from an
+   ASYNCHRONOUS interrupt of the very thread running the interpreter. C11 §7.14.1.1 lets a handler touch exactly
+   two kinds of object: `volatile sig_atomic_t`, and a LOCK-FREE ATOMIC. `volatile uint8_t` is neither, and
+   `sig_atomic_t` is `int` — a wider object than the poll wants. A relaxed atomic byte is the second kind, is
+   what V8 and SpiderMonkey use for the same interrupt word, and compiles to the SAME plain load and store the
+   `volatile` spelling did on every target this ships to, which is what keeps the per-opcode poll free. The
+   lock-freedom is not assumed: it is a build failure below if it ever stops holding. Relaxed is the whole
+   ordering needed — the handler runs on the polling thread, so there is nothing to synchronise WITH; the byte
+   is a request, never a handshake carrying data. */
 static _Thread_local volatile uint8_t g_flow_yield_req = 0;
-#define FLOW_YIELD_REQUEST(kind) do { g_flow_yield_req = (uint8_t)((kind) + 1); } while (0)
+_Static_assert(__atomic_always_lock_free(sizeof(g_flow_yield_req), 0),
+               "the yield request must be a LOCK-FREE atomic byte: the quantum's CPU-time edge raises it from a "
+               "signal handler, and a handler that took a lock to store it could deadlock against the "
+               "interpreter it interrupted");
+#define FLOW_YIELD_READ()        __atomic_load_n(&g_flow_yield_req, __ATOMIC_RELAXED)
+#define FLOW_YIELD_SET(v)        __atomic_store_n(&g_flow_yield_req, (uint8_t)(v), __ATOMIC_RELAXED)
+#define FLOW_YIELD_REQUEST(kind) FLOW_YIELD_SET((kind) + 1)
 void JS_RequestFlowYield(void) { FLOW_YIELD_REQUEST(JS_PREEMPT_HOST); }
 
 /* FEATURE-ENGAGEMENT COUNTERS — the honest anti-fake-green instrument. A test passing proves the RESULT is
@@ -26590,7 +26624,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    the QUESTION can be universal, never narrow where the question is asked. */
 #if !DIRECT_DISPATCH
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) \
-                        if (unlikely(g_flow_yield_req)) goto do_yield_poll; \
+                        if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll; \
                         switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
@@ -26614,7 +26648,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    `function` arm. The production wasm is built with ENABLE_DUMPS and test262 was not, which is why 43239 tests
    said nothing about it. Wrapping the dispatch in do/while is what makes the macro a statement. */
 #define DISPATCH()      do { DUMP_BYTECODE_OR_DONT(pc)                              \
-                             if (unlikely(g_flow_yield_req)) goto do_yield_poll;    \
+                             if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll;    \
                              goto *dispatch_table[opcode = *pc++]; } while (0)
 #define SWITCH(pc)      DISPATCH();
 #define CASE(op)        case_ ## op
@@ -36041,8 +36075,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                make the resumed flow re-ask at its first opcode — a second consultation nobody requested, and the
                one way this could spin. */
             {
-                int ykind = (int)g_flow_yield_req - 1;
-                g_flow_yield_req = 0;
+                int ykind = (int)FLOW_YIELD_READ() - 1;
+                FLOW_YIELD_SET(0);
                 DCHECK(ykind >= 0, "the yield poll ran with no request standing — the poll is reached only from "
                                    "DISPATCH under a raised request, so a zero here means something cleared the "
                                    "request without taking the branch that owns it");
@@ -42948,8 +42982,6 @@ static JSValue js_async_await_fini(JSContext *ctx, void *st, bool take_result)
     JSAsyncAwait *m = st;
     JSValue r = take_result ? m->result : JS_UNDEFINED;
     if (take_result) m->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, m);
-    js_free_rt(ctx->rt, m);
     return r;
 }
 
@@ -43487,8 +43519,6 @@ static JSValue js_agen_await_ret_fini(JSContext *ctx, void *st, bool take_result
     JSAgenAwaitRet *m = st;
     JSValue r = take_result ? m->result : JS_UNDEFINED;
     if (take_result) m->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, m);
-    js_free_rt(ctx->rt, m);
     return r;
 }
 
@@ -56502,8 +56532,6 @@ static JSValue js_import_opts_fini(JSContext *ctx, void *st, bool take_result)
     JSImportOpts *s = st;
     JSValue r = take_result ? s->promise : JS_UNDEFINED;
     if (take_result) s->promise = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66040,8 +66068,6 @@ static JSValue js_global_eval_fini(JSContext *ctx, void *st, bool take_result)
     JSProgEval *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66075,8 +66101,6 @@ static JSValue js_coerce1_fini(JSContext *ctx, void *st, bool take_result)
     JSCoerce1 *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66364,8 +66388,6 @@ static JSValue js_parse_num_fini(JSContext *ctx, void *st, bool take_result)
     JSParseNum *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66467,8 +66489,6 @@ static JSValue js_obj_defprop_fini(JSContext *ctx, void *st, bool take_result)
     JSObjDefProp *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66538,8 +66558,6 @@ static JSValue js_has_own_enum_fini(JSContext *ctx, void *st, bool take_result)
     JSHasOwnEnum *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66634,8 +66652,6 @@ static JSValue js_obj_defaccessor_fini(JSContext *ctx, void *st, bool take_resul
     JSObjDefAccessor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66749,8 +66765,6 @@ static JSValue js_setproto_fini(JSContext *ctx, void *st, bool take_result)
     JSSetProto *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66828,8 +66842,6 @@ static JSValue js_extop_fini(JSContext *ctx, void *st, bool take_result)
     JSExtOp *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66889,8 +66901,6 @@ static JSValue js_getproto_fini(JSContext *ctx, void *st, bool take_result)
     JSGetProto *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -66971,8 +66981,6 @@ static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result)
     JSGopd *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -67456,8 +67464,6 @@ static JSValue js_prop_walk_fini(JSContext *ctx, void *st, bool take_result)
     JSPropWalk *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;   /* handed out, read above before the rest is released */
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -67564,8 +67570,6 @@ static JSValue js_ownkeys_fini(JSContext *ctx, void *st, bool take_result)
     JSOwnKeys *s = st;
     JSValue r = take_result ? s->keys : JS_UNDEFINED;
     if (take_result) s->keys = JS_UNDEFINED;   /* handed out, read above before this releases the rest */
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -67662,8 +67666,6 @@ static JSValue js_hasown_fini(JSContext *ctx, void *st, bool take_result)
     JSHasOwn *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -67780,8 +67782,6 @@ static JSValue js_object_tostring_fini(JSContext *ctx, void *st, bool take_resul
     JSObjToString *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -68030,8 +68030,6 @@ static JSValue js_object_tolocale_fini(JSContext *ctx, void *st, bool take_resul
     JSObjToLocale *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -68257,8 +68255,6 @@ static JSValue js_integrity_fini(JSContext *ctx, void *st, bool take_result)
     JSIntegrity *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -68466,8 +68462,6 @@ static JSValue js_proto_accessor_fini(JSContext *ctx, void *st, bool take_result
     JSProtoAccessor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -68539,8 +68533,6 @@ static JSValue js_proto_chain_fini(JSContext *ctx, void *st, bool take_result)
     JSProtoChain *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -68659,8 +68651,6 @@ static JSValue js_lookup_acc_fini(JSContext *ctx, void *st, bool take_result)
     JSLookupAcc *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -68897,8 +68887,6 @@ static JSValue js_dynfunc_fini(JSContext *ctx, void *st, bool take_result)
     JSDynFunc *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -69088,8 +69076,6 @@ static JSValue js_primargs_fini(JSContext *ctx, void *st, bool take_result)
     JSPrimArgs *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -69223,8 +69209,6 @@ static JSValue js_creatector_fini(JSContext *ctx, void *st, bool take_result)
     JSCreateCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -69275,8 +69259,6 @@ static JSValue js_function_call_fini(JSContext *ctx, void *st, bool take_result)
     JSFuncCall *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -69485,8 +69467,6 @@ static JSValue js_function_apply_fini(JSContext *ctx, void *st, bool take_result
     JSFuncApply *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -69655,8 +69635,6 @@ static JSValue js_func_bind_fini(JSContext *ctx, void *st, bool take_result)
     JSFuncBind *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -69989,8 +69967,6 @@ static JSValue js_instanceof_fini(JSContext *ctx, void *st, bool take_result)
     JSInstanceOf *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -70256,8 +70232,6 @@ static JSValue js_error_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSErrorCtor *s = st;
     JSValue r = take_result ? s->obj : JS_UNDEFINED;
     if (take_result) s->obj = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -70344,8 +70318,6 @@ static JSValue js_error_tostring_fini(JSContext *ctx, void *st, bool take_result
     JSErrToString *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -70496,8 +70468,6 @@ static JSValue js_error_get_stack_fini(JSContext *ctx, void *st, bool take_resul
     JSErrGetStack *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -71577,8 +71547,6 @@ static JSValue js_fromasync_fini(JSContext *ctx, void *ctx_st, bool take_result)
     JSFromAsync *s = ctx_st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -72713,8 +72681,6 @@ static JSValue js_array_of_fini(JSContext *ctx, void *st, bool take_result)
     JSArrayOf *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -72819,8 +72785,6 @@ static JSValue js_array_at_fini(JSContext *ctx, void *st, bool take_result)
     JSArrayAt *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -72952,8 +72916,6 @@ static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_resu
 {
     JSArrayCopyWithin *s = st;
     JSValue r = take_result ? js_dup(s->obj) : JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73078,8 +73040,6 @@ static JSValue js_date_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSDateCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73134,8 +73094,6 @@ static JSValue js_date_toprim_fini(JSContext *ctx, void *st, bool take_result)
     JSDateToPrim *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73209,8 +73167,6 @@ static JSValue js_date_tojson_fini(JSContext *ctx, void *st, bool take_result)
     JSDateToJSON *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73372,8 +73328,6 @@ static JSValue js_ab_slice_fini(JSContext *ctx, void *st, bool take_result)
     JSABSlice *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73513,8 +73467,6 @@ static JSValue js_ta_subarray_fini(JSContext *ctx, void *st, bool take_result)
     JSTASubarray *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73637,8 +73589,6 @@ static JSValue js_ta_coerce_fini(JSContext *ctx, void *st, bool take_result)
     JSTACoerce *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73703,8 +73653,6 @@ static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result)
     JSTAWith *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73781,8 +73729,6 @@ static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayFill *s = st;
     JSValue r = take_result ? js_dup(s->obj) : JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -73894,8 +73840,6 @@ static JSValue js_array_with_fini(JSContext *ctx, void *st, bool take_result)
     JSArrayWith *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -74056,8 +74000,6 @@ static JSValue js_array_concat_fini(JSContext *ctx, void *st, bool take_result)
     JSArrayConcat *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -74243,7 +74185,7 @@ static const char *const js_ta_filter_steps[] = {
     NULL };
 
 /* The PROLOGUE (obj/len/func/this_arg + the per-special `ret` seed), run as step 0. Returns 0 = ok,
-   -1 = exception (the state is safe to js_array_every_end either way). */
+   -1 = exception (the state is safe to tear down either way). */
 /* The receiver half of the prologue: a TypedArray validates and yields its length with no user code; a plain
    array-like needs LengthOfArrayLike, whose ToLength is a step, so the length arrives separately. */
 static int js_array_every_recv(JSContext *ctx, JSArrayEvery *s)
@@ -74324,14 +74266,6 @@ static void js_array_every_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->obj);
     v->val(ctx, &s->def_val);
     v->val(ctx, &s->ta_dest);
-}
-
-static void js_array_every_end(JSContext *ctx, JSArrayEvery *s, bool take_ret)
-{
-    /* the RESULT is handed to the caller rather than released, and everything else goes through the one
-       declaration above. */
-    if (take_ret) s->ret = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
 }
 
 /* every/some/forEach/map/filter (and their TypedArray twins) as a STEP builtin. js_array_every was ALREADY split
@@ -74532,8 +74466,7 @@ static JSValue js_array_every_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayEvery *s = st;
     JSValue r = take_result ? s->ret : JS_UNDEFINED;
-    js_array_every_end(ctx, s, take_result);
-    js_free(ctx, s);
+    if (take_result) s->ret = JS_UNDEFINED;   /* handed to the caller; the declaration releases everything else */
     return r;
 }
 
@@ -74628,12 +74561,6 @@ static void js_array_reduce_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->acc);
     v->val(ctx, &s->val);
     v->val(ctx, &s->obj);
-}
-
-static void js_array_reduce_end(JSContext *ctx, JSArrayReduce *s, bool take_acc)
-{
-    if (take_acc) s->acc = JS_UNDEFINED;   /* the accumulator IS the result: handed out, not released */
-    tramp_step_visit_free(ctx, s);
 }
 
 /* THE INDEX THIS CURSOR NAMES. `k` counts 0..len in both directions so the walk is one loop; reduceRight reads
@@ -74773,8 +74700,7 @@ static JSValue js_array_reduce_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayReduce *s = st;
     JSValue r = take_result ? s->acc : JS_UNDEFINED;
-    js_array_reduce_end(ctx, s, take_result);
-    js_free(ctx, s);
+    if (take_result) s->acc = JS_UNDEFINED;   /* the accumulator IS the result: handed out, not released */
     return r;
 }
 
@@ -74958,8 +74884,6 @@ static JSValue js_array_search_fini(JSContext *ctx, void *st, bool take_result)
     JSArraySearch *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -74979,12 +74903,6 @@ static void js_array_find_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->func);
     v->val(ctx, &s->this_arg);
     v->val(ctx, &s->val);
-}
-
-static void js_array_find_end(JSContext *ctx, JSArrayFind *s, bool take_result)
-{
-    if (take_result) s->result = JS_UNDEFINED;   /* handed to the caller, which read it before this ran */
-    tramp_step_visit_free(ctx, s);
 }
 
 /* find / findIndex / findLast / findLastIndex and their TypedArray twins: EIGHT algorithms whose whole body is
@@ -75156,8 +75074,7 @@ static JSValue js_array_find_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayFind *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
-    js_array_find_end(ctx, s, take_result);
-    js_free(ctx, s);
+    if (take_result) s->result = JS_UNDEFINED;   /* handed to the caller, which read it before this ran */
     return r;
 }
 
@@ -75633,8 +75550,6 @@ static JSValue js_iter_helper_return_fini(JSContext *ctx, void *st, bool take_re
     JSIterHelperReturn *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -75748,8 +75663,6 @@ static JSValue js_iter_setter_fini(JSContext *ctx, void *st, bool take_result)
     JSIterSetter *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -77596,8 +77509,6 @@ static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result)
     } else {
         s->result = JS_UNDEFINED;
     }
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -77908,8 +77819,6 @@ static JSValue js_iterator_zip_keyed_fini(JSContext *ctx, void *st, bool take_re
     } else {
         s->result = JS_UNDEFINED;
     }
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -78095,8 +78004,6 @@ static JSValue js_iter_zip_drive_fini(JSContext *ctx, void *st, bool take_result
             js_iter_zip_defer_closes(ctx, JS_GetOpaque(s->self, JS_CLASS_ITERATOR_ZIP), s->stepping);
         }
     }
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -78116,8 +78023,6 @@ static JSValue js_promise_resolve_fini(JSContext *ctx, void *st, bool take_resul
     JSPromiseResolveM *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -78193,8 +78098,6 @@ static JSValue js_promise_catch_fini(JSContext *ctx, void *st, bool take_result)
     JSPromiseCatch *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -79047,8 +78950,6 @@ static JSValue js_array_tostring_fini(JSContext *ctx, void *st, bool take_result
     JSArrayToString *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -79363,8 +79264,6 @@ static JSValue js_array_join_fini(JSContext *ctx, void *st, bool take_result)
     JSArrayJoin *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;   /* handed out, read above before the rest is released */
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -79520,8 +79419,6 @@ static JSValue js_array_pop_fini(JSContext *ctx, void *st, bool take_result)
     JSArrayPop *s = st;
     JSValue r = take_result ? s->res : JS_UNDEFINED;
     if (take_result) s->res = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -79658,8 +79555,6 @@ static JSValue js_array_push_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSArrayPush *s = st;
     JSValue r = take_result ? js_int64(s->newLen) : JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -79795,8 +79690,6 @@ static JSValue js_array_reverse_fini(JSContext *ctx, void *st, bool take_result)
     JSArrayReverse *s = st;
     JSValue r = take_result ? s->obj : JS_UNDEFINED;
     if (take_result) s->obj = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -79882,8 +79775,6 @@ static JSValue js_array_toreversed_fini(JSContext *ctx, void *st, bool take_resu
     JSArrayToReversed *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -80125,8 +80016,6 @@ static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result)
     JSArraySlice *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -80281,8 +80170,6 @@ static JSValue js_array_tospliced_fini(JSContext *ctx, void *st, bool take_resul
     JSArrayToSpliced *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -80421,8 +80308,6 @@ static JSValue js_array_fromlike_fini(JSContext *ctx, void *st, bool take_result
     JSArrayFromLike *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -80640,8 +80525,6 @@ static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result)
     JSArrayFlat *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 /* Array sort */
@@ -81086,8 +80969,6 @@ static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
     JSArraySort *s = st;
     JSValue r = take_result ? s->obj : JS_UNDEFINED;
     if (take_result) s->obj = JS_UNDEFINED;   /* handed out, read above before the rest is released */
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -81220,8 +81101,6 @@ static JSValue js_string_iterator_create_fini(JSContext *ctx, void *st, bool tak
     JSStrIterCreate *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -81327,8 +81206,6 @@ static JSValue js_array_iter_next_fini(JSContext *ctx, void *st, bool take_resul
     JSArrayIterNext *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -81445,8 +81322,6 @@ static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_resu
     JSIterWrapReturn *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -81695,8 +81570,6 @@ static JSValue js_iter_concat_next_fini(JSContext *ctx, void *st, bool take_resu
         DCHECK(it != NULL, "Iterator.concat: the receiver lost its data before its guard was lowered");
         it->running = false;
     }
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -81791,8 +81664,6 @@ static JSValue js_iter_concat_return_fini(JSContext *ctx, void *st, bool take_re
         DCHECK(it != NULL, "Iterator.concat: the receiver lost its data before its guard was lowered");
         it->running = false;
     }
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -81898,8 +81769,6 @@ static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_resul
     JSIterConcat *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -82093,8 +81962,6 @@ static JSValue js_iter_dispose_fini(JSContext *ctx, void *st, bool take_result)
     JSIterDispose *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -82345,8 +82212,6 @@ static JSValue js_iter_helper_new_fini(JSContext *ctx, void *st, bool take_resul
     JSIterHelperNew *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -82938,8 +82803,6 @@ static JSValue js_num_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSNumCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -83201,8 +83064,6 @@ static JSValue js_number_fmt_fini(JSContext *ctx, void *st, bool take_result)
     JSNumberFmt *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -83451,8 +83312,6 @@ static JSValue js_str_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSStrCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -83650,8 +83509,6 @@ static JSValue js_string_raw_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSStringRaw *s = st;
     JSValue r = take_result ? string_buffer_end(&s->b) : JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -84264,8 +84121,6 @@ static JSValue js_str_recv_fini(JSContext *ctx, void *st, bool take_result)
     JSStrRecv *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -84446,8 +84301,6 @@ static JSValue js_str_concat_fini(JSContext *ctx, void *st, bool take_result)
     JSStrConcat *s = st;
     JSValue r = take_result ? s->acc : JS_UNDEFINED;
     if (take_result) s->acc = JS_UNDEFINED;   /* handed out, read above before the rest is released */
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -84556,8 +84409,6 @@ static JSValue js_string_wellformed_fini(JSContext *ctx, void *st, bool take_res
     JSStrWellFormed *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -84753,8 +84604,6 @@ static JSValue js_string_includes_fini(JSContext *ctx, void *st, bool take_resul
     JSStrIncludes *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -85008,8 +84857,6 @@ static JSValue js_str_match_fini(JSContext *ctx, void *st, bool take_result)
     JSStrMatch *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -85559,15 +85406,12 @@ static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result)
         DCHECK(s->inner != NULL, "str.replace mode 3 without a delegated machine");
         r = tramp_step_state_free(ctx, s->inner, take_result);
         s->inner = NULL;
-        tramp_step_visit_free(ctx, s);
-        js_free(ctx, s);
         return r;
     }
     r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    s->gs.active = 0;
-    js_free(ctx, s);
+    /* `gs.active` is LEFT SET. js_getsubst_visit visits the substitution's accumulator only while it is, and
+       the discharge runs after this — clearing it here would hide that buffer from the one list that frees it. */
     return r;
 }
 
@@ -85715,8 +85559,6 @@ static JSValue js_str_split_fini(JSContext *ctx, void *st, bool take_result)
     JSStrSplit *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -86994,8 +86836,6 @@ static JSValue js_re_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSReCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -87122,8 +86962,6 @@ static JSValue js_regexp_compile_fini(JSContext *ctx, void *st, bool take_result
     JSRegExpCompile *m = st;
     JSValue r = take_result ? m->result : JS_UNDEFINED;
     if (take_result) m->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, m);
-    js_free_rt(ctx->rt, m);
     return r;
 }
 
@@ -87312,8 +87150,6 @@ static JSValue js_regexp_flags_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSRegExpFlags *s = st;
     JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -87406,8 +87242,6 @@ static JSValue js_regexp_tostring_fini(JSContext *ctx, void *st, bool take_resul
 {
     JSRegExpToString *s = st;
     JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -87979,8 +87813,6 @@ static JSValue js_regexp_exec_fini(JSContext *ctx, void *st, bool take_result)
     JSRegExpExec *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -88194,8 +88026,6 @@ static JSValue js_re_match_fini(JSContext *ctx, void *st, bool take_result)
     JSReMatch *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -88349,8 +88179,6 @@ static JSValue js_re_str_iter_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSReStrIter *s = st;
     JSValue r = take_result ? js_dup(s->result) : JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -88478,8 +88306,6 @@ static JSValue js_re_matchall_fini(JSContext *ctx, void *st, bool take_result)
     JSReMatchAll *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -88902,8 +88728,6 @@ static JSValue js_re_rep_fini(JSContext *ctx, void *st, bool take_result)
     JSReRep *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -89097,8 +88921,6 @@ static JSValue js_re_search_fini(JSContext *ctx, void *st, bool take_result)
     JSReSearch *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -89321,8 +89143,6 @@ static JSValue js_re_split_fini(JSContext *ctx, void *st, bool take_result)
     JSReSplit *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
     if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -89392,8 +89212,6 @@ static JSValue js_regexp_set_input_fini(JSContext *ctx, void *st, bool take_resu
     JSReSetInput *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -90110,7 +89928,7 @@ static int js_json_parse_finish(JSContext *ctx, JSJsonReviver *s)
 
 /* The machine is torn down with a parse still in flight — the flow parked at a completed value and was then
    discarded. This is the same release json_parse_step's own fail path performs, MINUS the parse records: those
-   hang off the reviver's root record, which js_json_reviver_end owns. Nothing here can fail. */
+   hang off the reviver's root record, which the ownership declaration releases. Nothing here can fail. */
 static void js_json_parse_abandon(JSContext *ctx, JSJsonReviver *s)
 {
     JSONParse *p = &s->jp;
@@ -90151,7 +89969,6 @@ enum { JSONPARSE_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_json_parse_steps[] = { JSONPARSE_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
 static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
-static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok);
 static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
 /* CAN A JSON TEXT BEGIN WITH THIS CHARACTER? 25.5.1's grammar is `JSONText : JSONValue` with insignificant
@@ -90338,26 +90155,19 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
 static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSJsonReviver *s = st;
-    /* TAKEN BEFORE EITHER TEARDOWN, because both of them free the state and one of them frees this field
-       through the ownership declaration. The derivation below is the last thing 25.5.1 does on this arm and it
-       needs the source that named it. */
+    /* TAKEN BEFORE THE DISCHARGE, which is what frees this field. The derivation below is the last thing
+       25.5.1 does on this arm and it needs the source that named it. */
     JSValue unknown = s->unknown;
     JSValue r;
     s->unknown = JS_UNDEFINED;
     if (s->parsing)
         js_json_parse_abandon(ctx, s);
-    JS_FreeValue(ctx, s->text_str);
-    s->text_str = JS_UNDEFINED;
-    if (s->early) {
-        if (s->text) { JS_FreeCString(ctx, s->text); s->text = NULL; }
-        r = take_result ? s->result : JS_UNDEFINED;
-        if (!take_result) JS_FreeValue(ctx, s->result);
-        js_free(ctx, s);
-    } else {
-        r = js_json_reviver_end(ctx, s, take_result);
-        js_free(ctx, s);
-        if (!take_result) { JS_FreeValue(ctx, r); r = JS_UNDEFINED; }
-    }
+    /* The C string is not a reference and no declaration names it; `text_str`, the frame stack and its `sp`
+       live frames, and `result` all are, and every one of them is left intact for the discharge — an
+       exception or a fork arriving from inside one of the walk's requests is released through that list. */
+    if (s->text) { JS_FreeCString(ctx, s->text); s->text = NULL; }
+    r = take_result ? s->result : JS_UNDEFINED;
+    if (take_result) s->result = JS_UNDEFINED;
     if (!JS_IsUndefined(unknown)) {
         /* THE COMPLETION OF THE PARSE ARM IS AN UNKNOWN DERIVED FROM THE TEXT, carrying whatever the REAL
            codec made of that source's example. Not the bare parsed value: the page is holding something it
@@ -90582,16 +90392,6 @@ static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->unknown);
 }
 
-static JSValue js_json_reviver_end(JSContext *ctx, JSJsonReviver *s, bool ok) {
-    JSValue r;
-    /* sp is the LIVE frame count the declaration reads, so it must still be intact here — every frame still
-       open (an exception, or a fork, arriving from inside one of its requests) is released through it. */
-    if (ok) { r = s->result; s->result = JS_UNDEFINED; } else r = JS_EXCEPTION;
-    tramp_step_visit_free(ctx, s);
-    s->sp = 0;
-    if (s->text) { JS_FreeCString(ctx, s->text); s->text = NULL; }
-    return r;
-}
 /* The JSON.parse recognizer is DELETED — it existed only to pick the suspendable walk over
    internalize_json_property, and that walker is gone. */
 
@@ -90696,8 +90496,6 @@ static JSValue js_json_raw_fini(JSContext *ctx, void *st, bool take_result)
     JSJsonRaw *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -91331,8 +91129,6 @@ static JSValue js_json_str_fini(JSContext *ctx, void *st, bool take_result)
        then does the declaration release everything, the frame array included. */
     while (s->sp > 0) sj_pop(ctx, s);
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -91471,8 +91267,6 @@ static JSValue js_reflect_prop_fini(JSContext *ctx, void *st, bool take_result)
     JSReflectProp *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -91730,8 +91524,6 @@ static JSValue js_proxy_construct_fini(JSContext *ctx, void *st, bool take_resul
     JSProxyConstruct *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -91756,8 +91548,6 @@ static JSValue js_proxy_call_fini(JSContext *ctx, void *st, bool take_result)
     JSProxyCall *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -92802,8 +92592,6 @@ static JSValue js_symbol_for_fini(JSContext *ctx, void *st, bool take_result)
     JSSymbolFor *m = st;
     JSValue r = take_result ? m->result : JS_UNDEFINED;
     if (take_result) m->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, m);
-    js_free_rt(ctx->rt, m);
     return r;
 }
 
@@ -93352,8 +93140,6 @@ static JSValue js_map_upsert_fini(JSContext *ctx, void *st, bool take_result)
     struct JSMapUpsert *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -93515,22 +93301,14 @@ static void js_map_foreach_visit(JSContext *ctx, void *st, JSStepVisit *v)
     for (i = 0; i < 5; i++) v->val(ctx, &m->cb[i]);
 }
 
-static JSValue js_map_foreach_fini(JSContext *ctx, void *st, bool take_result)
-{
-    JSMapForEach *m = st;
-    (void)take_result;
-    tramp_step_visit_free(ctx, m);
-    js_free(ctx, m);
-    return JS_UNDEFINED;   /* forEach returns undefined on every path */
-}
 
 static const JSTrampStepDef js_map_foreach_def = {
-    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, 0, .visit = js_map_foreach_visit,
+    sizeof(JSMapForEach), js_map_foreach_step, NULL, 0, .visit = js_map_foreach_visit,
     .algorithm = "24.1.3.5 Map.prototype.forEach",
     .steps = js_map_foreach_steps
 };
 static const JSTrampStepDef js_set_foreach_def = {
-    sizeof(JSMapForEach), js_map_foreach_step, js_map_foreach_fini, MAGIC_SET, .visit = js_map_foreach_visit,
+    sizeof(JSMapForEach), js_map_foreach_step, NULL, MAGIC_SET, .visit = js_map_foreach_visit,
     .algorithm = "24.2.4.7 Set.prototype.forEach",
     .steps = js_set_foreach_steps
 };
@@ -94136,16 +93914,9 @@ static void js_dispose_sync_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->error);
 }
 
-static JSValue js_dispose_sync_fini(JSContext *ctx, void *st, bool take_result)
-{
-    JSDisposeRun *s = st;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
-    return JS_UNDEFINED;   /* 27.3.3.3 returns undefined on every path */
-}
 
 static const JSTrampStepDef js_dispose_sync_def = {
-    sizeof(JSDisposeRun), js_dispose_sync_step, js_dispose_sync_fini, 0,
+    sizeof(JSDisposeRun), js_dispose_sync_step, NULL, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
     .catches_abrupt = 1,  /* step 3.d: a throwing dispose method is a VALUE — it becomes the SuppressedError */
     .visit = js_dispose_sync_visit,
@@ -94221,16 +93992,9 @@ static void js_sync_dispose_wrap_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->cb[0]); v->val(ctx, &s->cb[1]); v->val(ctx, &s->cb[2]);
 }
 
-static JSValue js_sync_dispose_wrap_fini(JSContext *ctx, void *st, bool take_result)
-{
-    JSSyncDisposeWrap *s = st;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
-    return JS_UNDEFINED;   /* the wrapper's value is always undefined */
-}
 
 static const JSTrampStepDef js_sync_dispose_wrap_def = {
-    sizeof(JSSyncDisposeWrap), js_sync_dispose_wrap_step, js_sync_dispose_wrap_fini, 0, .visit = js_sync_dispose_wrap_visit,
+    sizeof(JSSyncDisposeWrap), js_sync_dispose_wrap_step, NULL, 0, .visit = js_sync_dispose_wrap_visit,
     .algorithm = "GetDisposeMethod's sync-dispose wrapper (proposal-explicit-resource-management)",
     .steps = js_sync_dispose_wrap_steps
 };
@@ -94358,8 +94122,6 @@ static JSValue js_get_dispose_method_fini(JSContext *ctx, void *st, bool take_re
     JSGetDisposeMethod *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -94536,8 +94298,6 @@ static JSValue js_disposable_stack_use_fini(JSContext *ctx, void *st, bool take_
     JSDisposableUse *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -94729,8 +94489,6 @@ static JSValue js_async_dispose_link_fini(JSContext *ctx, void *st, bool take_re
     JSAsyncDisposeLink *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -94920,8 +94678,6 @@ static JSValue js_dispose_async_fini(JSContext *ctx, void *st, bool take_result)
     JSDisposeAsync *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -95917,16 +95673,9 @@ static void js_promise_resolvefn_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &m->cb[0]);
 }
 
-static JSValue js_promise_resolvefn_fini(JSContext *ctx, void *st, bool take_result)
-{
-    JSPromiseResolveFn *m = st;
-    tramp_step_visit_free(ctx, m);
-    js_free_rt(ctx->rt, m);
-    return JS_UNDEFINED;   /* a resolving function has no result of its own */
-}
 
 static const JSTrampStepDef js_promise_resolvefn_def = {
-    sizeof(JSPromiseResolveFn), js_promise_resolvefn_step, js_promise_resolvefn_fini, 0,
+    sizeof(JSPromiseResolveFn), js_promise_resolvefn_step, NULL, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
     .catches_abrupt = 1   /* step 10: a throwing `then` read REJECTS, it does not propagate */,
     .visit = js_promise_resolvefn_visit,
@@ -96286,8 +96035,6 @@ static JSValue js_promise_withresolvers_fini(JSContext *ctx, void *st, bool take
     JSPromiseWithResolvers *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -96480,16 +96227,9 @@ static void js_promise_resolve_elem_visit(JSContext *ctx, void *st, JSStepVisit 
     v->val(ctx, &s->cb_args[2]);
 }
 
-static JSValue js_promise_resolve_elem_fini(JSContext *ctx, void *st, bool take_result)
-{
-    JSPromiseResolveElem *s = st;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
-    return JS_UNDEFINED;
-}
 
 static const JSTrampStepDef js_promise_resolve_elem_def = {
-    sizeof(JSPromiseResolveElem), js_promise_resolve_elem_step, js_promise_resolve_elem_fini, 0, .visit = js_promise_resolve_elem_visit,
+    sizeof(JSPromiseResolveElem), js_promise_resolve_elem_step, NULL, 0, .visit = js_promise_resolve_elem_visit,
     .algorithm = "27.2.4.1.3 Promise.all / 27.2.4.2.2 and 27.2.4.2.3 Promise.allSettled / 27.2.4.3.2 Promise.any "
                  "Resolve and Reject Element Functions",
     .steps = js_promise_resolve_elem_steps
@@ -97112,8 +96852,6 @@ static JSValue js_promise_then_fini(JSContext *ctx, void *st, bool take_result)
     JSPromiseThen *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -97263,8 +97001,6 @@ static JSValue js_promise_then_finally_fini(JSContext *ctx, void *st, bool take_
     JSPromiseThenFinally *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -97403,8 +97139,6 @@ static JSValue js_promise_finally_fini(JSContext *ctx, void *st, bool take_resul
     JSPromiseFinally *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
@@ -97545,8 +97279,6 @@ static JSValue js_iter_close_throw_fini(JSContext *ctx, void *st, bool take_resu
        declaration below is what the OTHER consumer, the fork, reads. */
     JS_Throw(ctx, s->error);
     s->error = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return JS_EXCEPTION;
 }
 
@@ -97677,8 +97409,6 @@ static JSValue js_afs_cont_fini(JSContext *ctx, void *st, bool take_result)
     JSAfsCont *m = st;
     JSValue r = take_result ? m->result : JS_UNDEFINED;
     if (take_result) m->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, m);
-    js_free_rt(ctx->rt, m);
     return r;
 }
 
@@ -98306,8 +98036,6 @@ static JSValue js_wrapped_function_call_fini(JSContext *ctx, void *st, bool take
     JSWrappedCall *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -98491,8 +98219,6 @@ static JSValue js_shadow_realm_evaluate_fini(JSContext *ctx, void *st, bool take
     JSShadowEval *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -98595,8 +98321,6 @@ static JSValue js_export_getter_fini(JSContext *ctx, void *st, bool take_result)
     JSExportGetter *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -98741,8 +98465,6 @@ static JSValue js_shadow_realm_importvalue_fini(JSContext *ctx, void *st, bool t
     JSShadowImport *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -99441,8 +99163,6 @@ static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result)
     JSDateSet *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -101170,8 +100890,6 @@ static JSValue js_ab_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSABCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -102575,17 +102293,11 @@ static void js_ta_slice_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->cb_args[0]);
 }
 
-static void js_ta_slice_end(JSContext *ctx, JSTASlice *s, bool take_result)
-{
-    if (take_result) s->arr = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-}
-
 /* Request ToPrimitive on hdr.argv[i] when it is an object, so a user valueOf on `start` or `end` SUSPENDS.
    This is what init-as-step-0 buys: the coercions the spec puts in front of the copy are now ordinary steps.
    The request goes in the header's cb_coerce, NEVER in cb_args: cb_args[0] is the species constructor, which
-   js_ta_slice_end FREES as owned, so parking a borrowed operand there over-freed the caller's object the moment
-   the abrupt path started tearing the state down (it used to leak instead, which hid it). */
+   js_ta_slice_visit declares as owned, so parking a borrowed operand there over-freed the caller's object the
+   moment the abrupt path started tearing the state down (it used to leak instead, which hid it). */
 static bool ta_slice_toprim(JSTASlice *s, int i, JSValue **out_cb, int *out_argc)
 {
     JSValueConst v = step_arg(&s->hdr, i);
@@ -102747,8 +102459,7 @@ static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSTASlice *s = st;
     JSValue r = take_result ? s->arr : JS_UNDEFINED;
-    js_ta_slice_end(ctx, s, take_result);
-    js_free(ctx, s);
+    if (take_result) s->arr = JS_UNDEFINED;   /* handed to the caller; the declaration releases everything else */
     return r;
 }
 
@@ -102940,8 +102651,6 @@ static JSValue js_ta_idx_fini(JSContext *ctx, void *st, bool take_result)
     JSTAIdx *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -103312,8 +103021,6 @@ static JSValue js_ta_sort_vfini(JSContext *ctx, void *st, bool take_result)
     JSTASort *s = st;
     JSValue r = take_result ? s->obj : JS_UNDEFINED;
     if (take_result) s->obj = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -103669,8 +103376,6 @@ static JSValue js_ta_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSTACtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -103984,8 +103689,6 @@ static JSValue js_dataview_ctor_fini(JSContext *ctx, void *st, bool take_result)
     JSDataViewCtor *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -104584,8 +104287,6 @@ static JSValue js_atomics_fini(JSContext *ctx, void *st, bool take_result)
     JSAtomics *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free(ctx, s);
     return r;
 }
 
@@ -107261,8 +106962,6 @@ static JSValue js_b64op_fini(JSContext *ctx, void *st, bool take_result)
     JSB64Op *s = st;
     JSValue r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
-    tramp_step_visit_free(ctx, s);
-    js_free_rt(ctx->rt, s);
     return r;
 }
 
