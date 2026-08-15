@@ -552,13 +552,23 @@ JS_EXTERN int step_construct_run(JSContext *ctx, uint8_t *phase, JSValue *cb, in
  * transition walked away. Expanding at the call site is what makes the message the answer. DCHECK itself is
  * therefore the caller's — engine/host/check.h in a host component, quickjs-check.h in the engine — which is
  * also why this header must not include either of them. */
+/* IT ASKS ABOUT A TRANSITION, AND A WRITE THAT CHANGES NOTHING IS NOT ONE. The invariant is that the NEXT
+ * stage's request site must not collect THIS one's answer; when the stage does not move there is no next site,
+ * the same site resumes and collects its own. Restricting the question that way is not a softening — it is the
+ * invariant stated exactly — and the case it admits is the ordinary shape of a machine that loops over a pair:
+ * readable_stream.c's tee derives its index FROM the stage (`i = s->hdr.stage == TS_B1`) and re-enters the loop
+ * body on every resume, so its first statement rewrote the stage it already held while `tee_ctrl_run`'s cursor
+ * was legitimately mid-flight. That fired on the smoke fixture, and the machine was right: nothing had moved.
+ * Written as a comparison against `to` rather than as a "resuming?" flag, because a flag would be the machine
+ * telling the assert when not to run, which is the recognizer shape this file bans everywhere else. */
 #define STEP_GOTO(dst, to, ...) do {                                                                    \
         const uint8_t *const step_goto_rest_[] = { __VA_ARGS__ };                                       \
         int step_goto_i_;                                                                               \
-        for (step_goto_i_ = 0; step_goto_rest_[step_goto_i_] != NULL; step_goto_i_++)                   \
-            DCHECK(*step_goto_rest_[step_goto_i_] == 0,                                                 \
-                   "a stage was left with a sub-sequence's request still in flight — the next stage's " \
-                   "request will collect this one's answer");                                           \
+        if ((dst) != (to))                                                                              \
+            for (step_goto_i_ = 0; step_goto_rest_[step_goto_i_] != NULL; step_goto_i_++)               \
+                DCHECK(*step_goto_rest_[step_goto_i_] == 0,                                             \
+                       "a stage was left with a sub-sequence's request still in flight — the next "     \
+                       "stage's request will collect this one's answer");                               \
         (dst) = (to);                                                                                   \
     } while (0)
 
