@@ -22284,20 +22284,13 @@ static void step_stage_check(const JSStepHdr *h, const char *when)
                      when, (unsigned)h->stage, h->def->algorithm);
             DFAIL(why);
         }
-        /* THE ROUND TRIP, run at every rest because that is where a rest point becomes a thing to restore. The
-           label is what a parked machine holds across a session, so resolving it back has to land on the stage
-           it came from; two stages declaring the SAME spec step make that resolution a guess, and the resume
-           would silently continue at the first of them. Checked here rather than once at registration because
-           this is the set of stages the machine actually rests at. */
-        if (js_step_stage_from_label(h->def, h->def->steps[h->stage]) != (int)h->stage) {
-            char why[320];
-            snprintf(why, sizeof why,
-                     "%s declares the step \"%s\" at more than one stage, so a machine parked there names a "
-                     "rest point that resolves to two — a resume in a later build picks the first and continues "
-                     "at the wrong step of the algorithm, which nothing downstream can tell from the right one",
-                     h->def->algorithm, h->def->steps[h->stage]);
-            DFAIL(why);
-        }
+        /* THE ROUND TRIP IS NOT ASKED HERE ANY MORE. It used to be, "because this is the set of stages the
+           machine actually rests at" — and that reason was exactly backwards: a label naming two stages is
+           ambiguous whether or not a flow ever parks at it, so waiting for a rest left the defect sitting in
+           the definition until some later build ran the one test that reached it. js_step_labels_check now asks
+           it of EVERY stage where a definition enters the runtime, which is total and eager, so a rest can no
+           longer be the first to find out. What stays here is the part that IS dynamic: the stage a machine
+           chose. */
     }
 #else
     (void)h; (void)when;
@@ -78416,6 +78409,42 @@ static void js_step_labels_check(const JSTrampStepDef *def)
                          def->algorithm, i, bans[k], def->steps[i]);
                 DFAIL(why);
             }
+
+    /* AND NO LABEL MAY RESOLVE TO TWO STAGES — js_step_stage_from_label is the operation a RESUME performs, so
+     * this asks the resume's own question of every stage the definition declares, and a stage that cannot
+     * answer with itself is one a parked flow resolves back to a guess.
+     *
+     * ASKED HERE, OF THE WHOLE LIST, RATHER THAN AT A REST. step_stage_check used to be the only place this was
+     * checked, which meant a duplicate sat silently in a definition until the one flow that happened to park at
+     * it — a build later than the edit that caused it, in a category nobody was running, and its cost is a
+     * cross-session resume continuing at the FIRST of the two with nothing downstream able to tell it from the
+     * right one. A step list is fixed once its definition is declared, so asking once here is TOTAL: it covers
+     * the stages this build's tests never reach as well as the ones they do, and it names both offenders while
+     * the person who wrote them is still standing there.
+     *
+     * IT IS ALSO WHERE A JOIN IS CAUGHT. A component's stages are concatenated onto a hosting algorithm's
+     * (Web IDL §3.7.10.2's next/return under core/idl_async_iter.c, a member's own onto the argument prologue's
+     * and the custom-element epilogue's under core/idl_args.c), and a collision is BORN at that join — where
+     * neither side alone can see it, because each half is distinct on its own. This is the one point both
+     * halves have arrived, which is why the check belongs to the definition rather than to either joiner. */
+    for (i = 0; def->steps[i]; i++) {
+        char why[640];   /* the tail names what to fix; a truncated DFAIL loses it */
+
+        if (js_step_stage_from_label(def, def->steps[i]) == i)
+            continue;
+        /* The only way a stage fails to resolve to itself is a twin later in the list, so this finds it to
+           NAME it: "declared twice" without both numbers sends the reader to search the list by hand. */
+        for (k = i + 1; def->steps[k] && strcmp(def->steps[i], def->steps[k]); k++)
+            ;
+        snprintf(why, sizeof why,
+                 "%s declares the step \"%s\" at both stage %d and stage %d — a parked machine holds its LABEL "
+                 "and not its index (the index means nothing to the build that resumes it), so one label naming "
+                 "two stages makes the resume a guess and it continues at the first of them. Name the two steps "
+                 "apart: where a component's stages are JOINED onto a hosting algorithm's, the component's "
+                 "label must name ITS standard's step rather than restate the step that RUNS it",
+                 def->algorithm, def->steps[i], i, k);
+        DFAIL(why);
+    }
 #else
     (void)def;
 #endif

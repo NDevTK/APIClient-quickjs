@@ -224,7 +224,9 @@ typedef struct JSTrampStepDef {
      * ACROSS BUILDS the index cannot be the identity at all: a flow parked at stage 5 and resumed by a build
      * whose stages moved resumes at a different step of its algorithm, silently. So a parked machine's rest
      * point is its LABEL, and a resume RESOLVES that label back to an index in the build doing the resuming —
-     * which is also why two stages may not declare the same label, asserted at every rest (step_stage_check).
+     * which is also why two stages may not declare the same label — asserted over the WHOLE list where a
+     * definition enters the runtime (js_step_labels_check), and not at a rest, because a duplicate is ambiguous
+     * whether or not a flow ever parks at it and asking only at a rest leaves it silent until one does.
      * A build-version stamp is the wrong answer to the same question: it rejects every parked snapshot whenever
      * ANY machine changes, and §scheduler's frontier never drops a work item. */
     const char *algorithm;
