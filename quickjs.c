@@ -11935,9 +11935,22 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
         uint32_t old_len = p->u.array.count;
         if (len < old_len) {
             for(i = len; i < old_len; i++) {
+                /* forced-exec TIME-TRAVEL: A SHRINK REMOVES ELEMENTS, and removing one is a shared-state
+                   mutation exactly as writing one is. This free reaches neither JS_SetPropertyInternal2 nor
+                   set_fast_array_element, so `arr.length = 0` on a SHARED array captured the length slot at
+                   the caller and NOT one of the values it drops: the unapply put the length back and the
+                   elements stayed gone, for this flow and for every sibling. The SLOW-array arm below has
+                   always captured them, because it removes each index through delete_property, whose own
+                   capture is right there -- so this is the two arms of one operation agreeing rather than a
+                   new rule. Captured per index, since that is what a slot is. */
+                cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32((uint32_t)i));
                 JS_FreeValue(ctx, p->u.array.u.values[i]);
                 p->u.array.u.values[i] = JS_UNDEFINED;
             }
+            DCHECK(p->u.array.count == old_len,
+                   "the dense part moved while its removed elements were being captured — a capture may grow "
+                   "the host's delta and a growth may release a PARKED flow, which is why it may never revert "
+                   "the running flow's heap");
             p->u.array.count = len;
         }
         p->prop[0].u.value = js_uint32(len);
