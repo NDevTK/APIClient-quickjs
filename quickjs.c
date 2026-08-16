@@ -1377,15 +1377,23 @@ struct JSObject {
             JSCFunctionType c_function;
             uint8_t length;
             uint8_t cproto;
-            /* WHICH NATIVE MACHINE drives this builtin — NATIVE_* + 1, or 0 for the builtins that are just
-               their C body. It is the same thing JS_CFUNC_STEP_DEF says with `magic`, for the machines that are
-               not JSTrampStepDef step machines: a consuming constructor's walk, and the promise builtins whose
-               reject-and-yield needs a CONT kind of its own. It exists as a FIELD because `magic` is already
-               taken for every one of them — a constructor's carries MAGIC_SET/MAGIC_WEAK or IS a class id and
-               its body is additionally called straight from C with that raw kind, and Promise.all's selects
-               all/allSettled/any. It is not a pointer in JSCFunctionType, which holds function pointers only
-               (data there is the strict-aliasing violation that passes at -O0 and segfaults at -O1). It costs
-               nothing: this struct is 20 bytes inside a 24-byte union. */
+            /* THE SECOND CARRIER of a machine id, for the builtins that cannot spell one in `magic` — and the
+               only builtins in that position are CONSTRUCTORS. There is ONE id namespace (the ITERCONS_* /
+               NATIVE_* block by JSIterConsume); what differs is where a callee writes its id down. An ordinary
+               builtin writes it in `magic` and says so in `cproto` (JS_CFUNC_STEP_DEF, JS_CFUNC_CONSUME_DEF); a
+               constructor cannot, because its cproto is spent saying "constructor" and its magic IS the class id
+               or the STEPDEF id its create-from-ctor machine runs on. Map and TypedArray each declare BOTH — a
+               create machine in `magic` and a consume walk here — because 24.1.1.1 and 23.2.5.1 are single
+               algorithms whose ARGUMENT chooses between two continuations, and the dispatch's arms ask that
+               argument question. 0 = this callee declares no machine here.
+               It is NOT a pointer in JSCFunctionType, which holds function pointers only (data there is the
+               strict-aliasing violation that passes at -O0 and segfaults at -O1). It costs nothing: this struct
+               is 20 bytes inside a 24-byte union.
+               It is not a fallback selector and never was: what a read of it picks between is several algorithms
+               the SPEC distinguishes, and the C bodies those arms decline to are DFAILs or the argument branches
+               that invoke nothing (24.1.1.1 step 4's empty collection, 23.2.5.1 step 6.b's view over a buffer,
+               27.5.3.1 step 2's non-callable executor). Deleting any of those leaves the field still needed to
+               say WHICH machine runs — which is the test that separates routing from a fallback. */
             uint8_t native_machine;
             int16_t magic;
         } cfunc;
@@ -23746,16 +23754,27 @@ typedef struct {
    class. That is a builtin declaring itself and its argument, not a table of who is special. */
 #define ITERCONS_SETMAP_CTOR_BASE 32   /* + (0 Map | MAGIC_SET | MAGIC_WEAK): new Map/Set/WeakMap/WeakSet(iterable) */
 #define ITERCONS_TA_CTOR_BASE     40   /* + (class_id - JS_CLASS_UINT8C_ARRAY): new Uint8Array(iterable) etc. */
-#define NATIVE_PROMISE_TRY        52   /* Promise.try(fn, ...args) — CONT_PROMISE_TRY, not a walk at all. The
-                                          field says WHICH MACHINE, and a walk was only the first kind of answer
-                                          it had to give. */
-#define NATIVE_PROMISE_EXEC       53   /* new Promise(executor) — CONT_PROMISE_EXEC */
-#define NATIVE_PROMISE_ALL_BASE   56   /* + PROMISE_MAGIC_*: all / allSettled / any / race, one walk, four rules */
-#define NATIVE_PROMISE_KEYED_BASE 60   /* + PROMISE_MAGIC_all|allSettled: allKeyed / allSettledKeyed. The SAME
+/* Which SETTLEMENT RULE one of the four combinator walks applies. Hoisted from the Promise implementation to
+   here because it is now half of an id in the namespace above — the base names the SOURCE, the offset the rule —
+   and an id has to be writable at the registration table that declares it. */
+#define PROMISE_MAGIC_all        0
+#define PROMISE_MAGIC_allSettled 1
+#define PROMISE_MAGIC_any        2
+#define PROMISE_MAGIC_race       3   /* not a settlement rule with a per-element closure — a CONT_PROMISE_ALL
+                                        sentinel for Promise.race, which aggregates nothing */
+#define ITERCONS_PROMISE_TRY      52   /* Promise.try(fn, ...args) — CONT_PROMISE_TRY, not a walk at all. These
+                                          ids name WHICH MACHINE, and a walk was only the first kind of answer
+                                          the namespace had to give. */
+#define ITERCONS_PROMISE_ALL_BASE   56   /* + PROMISE_MAGIC_*: all / allSettled / any / race, one walk, four rules */
+#define ITERCONS_PROMISE_KEYED_BASE 60   /* + PROMISE_MAGIC_all|allSettled: allKeyed / allSettledKeyed. The SAME
                                           machine with the SAME settlement rules and a different element SOURCE,
-                                          which is why the id says "keyed" and the magic still says which rule —
+                                          which is why the id says "keyed" and the offset still says which rule —
                                           a fifth and sixth PROMISE_MAGIC would have collided with the `| 4`
                                           the allSettled reject closure already spends. */
+/* new Promise(executor) — CONT_PROMISE_EXEC — is the one id in this namespace that CANNOT ride a builtin's
+   `magic`: it is a CONSTRUCTOR, so its cproto is spent saying so and its magic is the class id. It rides
+   u.cfunc.native_machine, which is that carrier and nothing else. */
+#define NATIVE_PROMISE_EXEC       53
 #define ITERCONS_ITERTERM_BASE 16
 #define ITERCONS_TA_FROM 10 /* %TypedArray%.from(source, mapfn?, thisArg?) — do_ta_consume_tramp's `from` shape */
 #define ITERCONS_TA_OF   11 /* %TypedArray%.of(...items) — the same create+set phases with the argument LIST as
@@ -24033,7 +24052,6 @@ static int js_promise_all_step(JSContext *ctx, struct JSPromiseAll *s, JSValue r
 static int js_promise_all_attach_args(JSContext *ctx, struct JSPromiseAll *s, int index,
                                       JSValue *out_re, JSValue *out_rj);
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
-static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, int *out_keyed, JSValue *out_getiter);   /* the machine is DECLARED; this asks about the receiver and the argument */
 
 /* A COROUTINE CREATE (generator or async generator) that fails BEFORE its frame exists must abandon the machine
    that asked for the coroutine: that machine can never be re-entered, and nothing else holds it — the create took
@@ -24154,8 +24172,6 @@ static JSValue js_new_afs_cont(JSContext *ctx, JSValueConst sync_iter, JSValueCo
 static const JSTrampStepDef js_afs_cont_def;
 static void js_async_from_sync_end(JSContext *ctx, struct JSAsyncFromSync *s);
 static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
-static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
-static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
 /* arr.sort(cmpFn) with a NORMAL bytecode comparator: a SUSPENDABLE bottom-up (iterative) stable merge sort whose
@@ -28818,17 +28834,64 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                `Array.from(gen)` did not. */
             {
                 crecv = (tramp_first == -2) ? call_argv[-2] : JS_UNDEFINED;
-                {   /* THE declared-capability arm. A builtin that consumes an iterator says so at its own
-                       definition (JS_CFUNC_CONSUME_DEF) and carries its sink, so this asks ONE question for all
-                       of them instead of one identity test per builtin. The recognizers below are the ones whose
-                       legacy body still exists to be chosen against; each conversion moves one up here. */
+                {   /* THE DECLARED-CAPABILITY ARM, and now the WHOLE of this dispatch. A builtin with no C body
+                       names its machine at its own definition (JS_CFUNC_CONSUME_DEF) and carries the id, so this
+                       asks ONE question for all of them instead of one identity test per builtin. Below it there
+                       used to stand the recognizers whose legacy body still existed to be chosen against, and
+                       the comment here promised that each conversion would move one up; the last two (the
+                       promise combinators and Promise.try) are in the chain below and NOTHING follows it. */
                     int csink = tramp_consume_sink_of(call_argv[-1]);
                     if (csink >= 0) {
-                        /* The @@iterator PROBE belongs only to the walks that acquire one. A set-operation takes
-                           its iterator from setlike.keys() and a terminal from GetIteratorDirect(this), so both
-                           would strand the probe's value — setop overwrote tramp_iter_getiter with `keys` and
-                           leaked what was in it. Those two answer first, before anything is read. */
+                        /* THE @@ITERATOR PROBE BELONGS ONLY TO THE WALKS THAT ACQUIRE ONE, which is why the
+                           arms are ordered around it rather than by id. A set-operation takes its iterator from
+                           setlike.keys(), a terminal from GetIteratorDirect(this), Promise.try from nothing and
+                           the keyed combinators from own keys — each would strand the probe's value, and setop
+                           did exactly that once (it overwrote tramp_iter_getiter with `keys` and leaked what was
+                           in it). Every one of those answers above the probe.
+                           THE PROMISE COMBINATORS also answer first among THOSE, because the id namespace is one
+                           and theirs is its highest range: every open-ended `>=` test below would swallow them.
+                           These were the last two recognizers on this side: one asked promise_all_ready which
+                           C function the callee WAS, the other compared it against a machine id in a second
+                           carrier. Both are gone — Promise.all/allSettled/any/race/allKeyed/allSettledKeyed and
+                           Promise.try declare their machine at their own registration entry like every other
+                           bodyless builtin, and their C bodies (which held only the receiver check and a DFAIL)
+                           went with the question. */
+                        if (csink == ITERCONS_PROMISE_TRY)
+                            goto do_promise_try_tramp;   /* 27.5.4.8 step 2 is that machine's own prologue */
+                        if (csink >= ITERCONS_PROMISE_ALL_BASE) {
+                            /* 27.5.4.1/.2/.3/.5 step 2: `? NewPromiseCapability(ctor)`. A primitive receiver
+                               cannot be a constructor, so that `?` throws before anything is read — decided
+                               here, ahead of the probe, exactly where the spec puts it. It used to be a
+                               condition of the recognizer, so `Promise.all.call(5, x)` was DECLINED into a C
+                               body whose whole remaining job was to throw this. An Object that is not a
+                               constructor still routes: do_promise_cap_tramp's Construct is what rejects it,
+                               and that is one implementation rather than a second copy of IsConstructor. */
+                            if (JS_VALUE_GET_TAG(crecv) != JS_TAG_OBJECT) {
+                                JS_ThrowTypeErrorNotAnObject(ctx);
+                                goto exception;
+                            }
+                            pa_keyed = (csink >= ITERCONS_PROMISE_KEYED_BASE);
+                            pa_magic = csink - (pa_keyed ? ITERCONS_PROMISE_KEYED_BASE
+                                                         : ITERCONS_PROMISE_ALL_BASE);
+                            DCHECK(pa_magic >= 0 &&
+                                   (pa_keyed ? pa_magic <= PROMISE_MAGIC_allSettled
+                                             : pa_magic <= PROMISE_MAGIC_race),
+                                   "a promise-combinator consume id names a settlement rule its base does not "
+                                   "have — the id and the walk's rules are declared together");
+                            /* the probe belongs to the ITERATOR source alone: the keyed walk never acquires one.
+                               It only INSPECTS the @@iterator descriptor, and 27.5.4.1 reads `.resolve` before
+                               @@iterator, so doing it here is unobservable — the observable GetMethod happens
+                               later, in do_consume_acquire_iterator. */
+                            if (!pa_keyed)
+                                iter_data_at_iterator(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED,
+                                                      &tramp_iter_getiter);
+                            goto do_promise_all_consume_tramp;
+                        }
                         if (csink >= ITERCONS_SETOP_BASE) {
+                            DCHECK(csink - ITERCONS_SETOP_BASE <= SETOP_DIFF,
+                                   "a consume id above the set-operation range reached the set-operation arm — "
+                                   "the id namespace is ONE, so a base added above it must be answered before "
+                                   "this open-ended test, never after it");
                             /* 24.2.4.x step 2: RequireInternalSlot(O, [[SetData]]), then GetSetRecord(other)
                                step 1's "other must be an Object". Both are validation with no user code in them.
                                The recognizer declined them AND declined call_argc != 1 — but arity is not a spec
@@ -28911,11 +28974,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_iter_consume_tramp;
                     }
                 }
-                if (promise_all_ready(ctx, call_argv[-1], crecv, vc(call_argv), call_argc, &pa_magic, &pa_keyed, &tramp_iter_getiter))
-                    goto do_promise_all_consume_tramp;          /* Promise.all/allSettled/any/race(iterable) */
-                if (tramp_native_machine_of(call_argv[-1]) == NATIVE_PROMISE_TRY)
-                    goto do_promise_try_tramp;                  /* Promise.try(fn, ...args) */
-                /* no consumer matched: fall into the step/generic convergence below */
+                /* NOTHING IS ASKED HERE ANY MORE. What stood below the declared-capability arm was the pair of
+                   recognizers the arm's own comment called "the ones whose legacy body still exists to be chosen
+                   against" — and neither body did: js_promise_try was a bare DFAIL and js_promise_all held one
+                   receiver check. So the callee is no longer asked WHAT IT IS; it declares WHICH MACHINE it runs
+                   at its registration entry, and the arm above reads that declaration like every other walk's.
+                   No consumer matched: fall into the step/generic convergence below. */
             }
 
         do_generic_callee:
@@ -33197,6 +33261,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst thisv = crecv;
                 JSPromiseAll *s;
                 JSValue rp;
+                /* the other half of the arm's assertion: the receiver check lives THERE, ahead of the probe, so
+                   this states what it guarantees rather than re-deciding it. A filter that threw for everything
+                   passes a test that only checks the throw. */
+                DCHECK(JS_VALUE_GET_TAG(thisv) == JS_TAG_OBJECT,
+                       "a promise combinator reached its walk with a primitive receiver — 27.5.4.1 step 2's "
+                       "NewPromiseCapability throws before anything is read, in the dispatch arm");
+                DCHECK(pa_keyed ? (pa_magic == PROMISE_MAGIC_all || pa_magic == PROMISE_MAGIC_allSettled)
+                                : (pa_magic >= 0 && pa_magic <= PROMISE_MAGIC_race),
+                       "a promise combinator reached its walk with a settlement rule its source does not have");
                 s = js_mallocz(ctx, sizeof(*s));
                 if (unlikely(!s)) { JS_FreeValue(ctx, tramp_iter_getiter); tramp_iter_getiter = JS_UNDEFINED; JS_ThrowOutOfMemory(ctx); goto exception; }
                 s->result_promise = JS_UNDEFINED;
@@ -80802,73 +80875,14 @@ static JSValue js_array_flat_fini(JSContext *ctx, void *st, bool take_result)
 
 /* DEFINED at its sort machine, above — hoisted so the ownership visitor can release a slot. */
 
-struct array_sort_context {
-    JSContext *ctx;
-    int exception;
-    int has_method;
-    JSValueConst method;
-};
-
-static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
-    struct array_sort_context *psc = opaque;
-    JSContext *ctx = psc->ctx;
-    JSValueConst argv[2];
-    JSValue res;
-    ValueSlot *ap = (ValueSlot *)(void *)a;
-    ValueSlot *bp = (ValueSlot *)(void *)b;
-    int cmp;
-
-    if (psc->exception)
-        return 0;
-
-    if (psc->has_method) {
-        /* custom sort function is specified as returning 0 for identical
-         * objects: avoid method call overhead.
-         */
-        if (!memcmp(&ap->val, &bp->val, sizeof(ap->val)))
-            goto cmp_same;
-        argv[0] = ap->val;
-        argv[1] = bp->val;
-        res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
-        if (JS_IsException(res))
-            goto exception;
-        if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
-            int val = JS_VALUE_GET_INT(res);
-            cmp = (val > 0) - (val < 0);
-        } else {
-            double val;
-            if (JS_ToFloat64Free(ctx, &val, res) < 0)
-                goto exception;
-            cmp = (val > 0) - (val < 0);
-        }
-    } else {
-        /* Not supposed to bypass ToString even for identical objects as
-         * tested in test262/test/built-ins/Array/prototype/sort/bug_596_1.js
-         */
-        if (!ap->str) {
-            JSValue str = JS_ToString(ctx, ap->val);
-            if (JS_IsException(str))
-                goto exception;
-            ap->str = JS_VALUE_GET_STRING(str);
-        }
-        if (!bp->str) {
-            JSValue str = JS_ToString(ctx, bp->val);
-            if (JS_IsException(str))
-                goto exception;
-            bp->str = JS_VALUE_GET_STRING(str);
-        }
-        cmp = js_string_compare(ap->str, bp->str);
-    }
-    if (cmp != 0)
-        return cmp;
-cmp_same:
-    /* make sort stable: compare array offsets */
-    return (ap->pos > bp->pos) - (ap->pos < bp->pos);
-
-exception:
-    psc->exception = 1;
-    return 0;
-}
+/* DELETED: struct array_sort_context and js_array_cmp_generic — the SECOND half of the rqsort-based sort, left
+   behind when its first half went. The TypedArray twin was deleted whole (see the note at js_ta_rawcmp: the
+   context existed only to smuggle a JSContext, an array and a comparator through rqsort's void*), and this one
+   was not: nothing had called it since js_array_sort became a step machine, so it sat here as a C recursion
+   holding the page's comparator over a JS_Call — the exact shape the machine exists to abolish — indexed by a
+   census of this file's JS_Call sites rather than by anything that could fail. A caller-less function is not
+   unused code, it is code no gate can reach, and the next reader classifying these call sites would have had to
+   re-derive that it is dead. */
 
 /* sort and toSorted are ONE machine over two algorithms, so ONE stage list expanded twice with each one's own
    step text — see ACB_STAGES. THE STAGES WERE 0,1,2,10,11,6,3,7,8,9 in that execution order: the out-of-sequence
@@ -96337,13 +96351,11 @@ static const JSTrampStepDef js_promise_withresolvers_def = {
     .algorithm = "27.2.4.9 Promise.withResolvers", .steps = js_promise_withresolvers_steps
 };
 
-static JSValue js_promise_try(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
-{
-    DFAIL("Promise.try reached its C entry — route that call site onto the capability machine "
-          "(do_promise_try_tramp); there is no second driver");
-    return JS_EXCEPTION;
-}
+/* DELETED: js_promise_try. It was a bare DFAIL standing in for a C entry that no longer had an algorithm, and a
+   DFAIL is a body — while it existed the callee had to be RECOGNIZED so the dispatch could avoid it. Promise.try
+   declares ITERCONS_PROMISE_TRY at its registration entry now, so a call reaching a C entry is impossible by
+   construction: JS_CFUNC_consume installs no function pointer, and js_call_c_function's own consume arm is the
+   one backstop that names an unrouted call site. */
 
 static __exception int remainingElementsCount_add(JSContext *ctx,
                                                   JSValueConst resolve_element_env,
@@ -96363,11 +96375,6 @@ static __exception int remainingElementsCount_add(JSContext *ctx,
         return -1;
     return (remainingElementsCount == 0);
 }
-
-#define PROMISE_MAGIC_all        0
-#define PROMISE_MAGIC_allSettled 1
-#define PROMISE_MAGIC_any        2
-#define PROMISE_MAGIC_race       3   /* not a js_promise_all magic — a CONT_PROMISE_ALL sentinel for Promise.race (no aggregation) */
 
 /* Shared prep for a Promise combinator resolve/reject element reaction: record this element's value (or, for
    allSettled, its {status,value|reason}) into `values`, decrement the remaining count, and report whether THIS
@@ -96563,24 +96570,15 @@ static JSValue js_promise_all_resolve_element(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
-/* magic = 0: Promise.all 1: Promise.allSettled */
-/* 27.2.4.1/.2/.3 Promise.all / allSettled / any, and 27.2.4.5 race below, have NO iteration left here. Every
-   call with an object receiver is routed onto the consume machine at do_consumer_dispatch — one question, asked
-   once, so `.call`/`.apply`/a spread/a bound spelling and any argument count all reach it — and that machine
-   drives the source's @@iterator and .next() on the tramp. What is gone is the `for(;;) JS_IteratorNext` this ran
-   from C, where a .next() with a loop in it had no flow base and aborted at its back-edge.
-   The receiver check is what remains: NewPromiseCapability(C) requires an Object and 27.2.4.1 step 2 throws that
-   TypeError BEFORE any iteration, so it is decided here and the route declines on it. Anything else reaching this
-   entry is an unrouted call site — there is no second driver. */
-static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv, int magic)
-{
-    if (!JS_IsObject(this_val))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    DFAIL("Promise.all/allSettled/any reached its C entry with an object receiver — route that call site onto "
-          "the consume machine (do_consumer_dispatch); there is no second driver");
-    return JS_EXCEPTION;
-}
+/* DELETED: js_promise_all, and js_promise_race below it. 27.5.4.1/.2/.3/.5 have no iteration left anywhere in C
+   — the `for(;;) JS_IteratorNext` they ran from an activation with no flow base is gone, so a .next() holding a
+   loop parks instead of aborting at its back-edge — and what was left of the two bodies was one receiver check
+   plus a DFAIL. That check is 27.5.4.1 step 2's `? NewPromiseCapability`, validation with no user code in it, so
+   it moved into the dispatch arm where the spec puts it; and with the bodies gone there is nothing for the
+   dispatch to choose against. Each combinator declares its walk-plus-rule at its own registration entry
+   (JS_CFUNC_CONSUME_DEF, ITERCONS_PROMISE_ALL_BASE + PROMISE_MAGIC_*), which is how every other bodyless builtin
+   in this file says the same thing, so `.call`/`.apply`/a spread/a bound spelling/any argument count all reach
+   the one machine because none of them is asked anything. */
 
 /* Advance Promise.all(gen): `res` = the previous .next() result {value,done} (UNINITIALIZED on the first step).
    Returns 1 = drive the next .next(), 0 = DONE (s->result_promise settled/settling), -1 = exception. Consumes res.
@@ -96888,60 +96886,17 @@ static void js_promise_all_end(JSContext *ctx, JSPromiseAll *s)
     JS_FreeAtom(ctx, s->cur_atom);
 }
 
-/* Route Promise.all / allSettled / any over a GENERATOR-BACKED iterable (its .next() must run on the tramp); `race`
-   and every other shape stay on the normal C path, which drives them correctly. */
-static bool promise_all_ready(JSContext *ctx, JSValueConst func, JSValueConst recv, JSValueConst *call_argv, int call_argc, int *out_magic, int *out_keyed, JSValue *out_getiter)
-{
-    JSObject *fp;
-    int magic;
-    *out_getiter = JS_UNDEFINED;
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
-    fp = JS_VALUE_GET_OBJ(func);
-    if (fp->class_id != JS_CLASS_C_FUNCTION) return false;
-    /* ONE recognizer for all four combinators. all/allSettled/any share js_promise_all (magic selects); race is
-       a distinct C function (js_promise_race, no magic) but consumes its iterable through the SAME tramp path
-       (do_promise_all_step branches on s->magic == PROMISE_MAGIC_race), so it belongs here, not in a second
-       recognizer with its own generator-only narrowing. */
-    magic = tramp_native_machine_of(func) - NATIVE_PROMISE_ALL_BASE;
-    if (magic < 0 || magic > PROMISE_MAGIC_race) {
-        /* the KEYED pair: the same machine, so the same recognizer — what differs is the source, which the
-           caller reads out of *out_keyed and nothing else here has to know about. */
-        magic = tramp_native_machine_of(func) - NATIVE_PROMISE_KEYED_BASE;
-        if (magic != PROMISE_MAGIC_all && magic != PROMISE_MAGIC_allSettled) return false;
-        *out_keyed = 1;
-    } else {
-        *out_keyed = 0;
-    }
-    /* the receiver (the constructor `this`) must be an Object — NewPromiseCapability(C) requires it. A non-object
-       (Promise.all.call(5, x)) is rejected here so the C entry throws TypeErrorNotAnObject in spec order, BEFORE
-       any iteration; a side-effect-free tag check, so probing it changes nothing. The RESOLVED receiver is
-       passed in: a plain -1 call (`var f = Promise.all; f(x)`) has no receiver operand at all, so reading
-       call_argv[-2] read whatever sat below the callee. */
-    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) return false;
-    /* ANY argument, including a non-object and a non-iterable. The tag check was the last iterability gate: it
-       handed Promise.all(1) / Promise.all(undefined) to the C body, whose whole remaining job there was to reject
-       the aggregate with a TypeError — which do_consume_acquire_iterator now does itself, on the tramp.
-       The probe only INSPECTS the @@iterator descriptor (never runs a getter) and Promise.all reads .resolve
-       BEFORE @@iterator, so probing here is unobservable — the observable @@iterator CALL happens later in
-       do_consume_acquire_iterator. There is nothing left to SELECT: the probe's result is passed along for the
-       acquire to use, and its ABSENCE is the acquire's TypeError, not a reason to refuse the route. */
-    /* ANY ARGUMENT COUNT. These take exactly one parameter, so extra arguments are ignored and a missing one is
-       undefined — neither is a fact about the CALLEE, and requiring exactly 1 sent `Promise.all(iter, "extra")`
-       and `Promise.all()` to the C body, whose .next() loop cannot suspend. */
-    /* the @@iterator PROBE belongs to the iterator source alone: the keyed walk never acquires one, and probing
-       for it would strand the method the probe leaves behind. */
-    if (!*out_keyed)
-        iter_data_at_iterator(ctx, (call_argc >= 1) ? call_argv[0] : JS_UNDEFINED, out_getiter);   /* JS_UNDEFINED when absent/uncallable => acquire throws */
-    *out_magic = magic;
-    return true;
-}
+/* DELETED: promise_all_ready. It was the LAST identity test on the call side — it read the callee's class, then
+   its machine id out of a second carrier, to answer a question the callee can simply DECLARE. Its two remaining
+   conditions were not about the callee at all: the receiver's tag (27.5.4.1 step 2, now decided in the dispatch
+   arm where the spec puts it) and the @@iterator probe (an unobservable descriptor read the acquire may reuse,
+   which the arm performs for the iterator-sourced walks only). Every narrowing it once had — generator-backed
+   sources, exactly one argument, an iterable-tagged argument — was a silent hand-off to a C body that no longer
+   exists, which is why `Promise.all(iter, "extra")`, `Promise.all()` and `Promise.any.call(P, iter)` each had a
+   spelling that reached the deleted loop. */
 
-/* `new Promise(executor)` where the executor is a plain bytecode function: run its body on the tramp chain.
-   A non-callable executor is NOT recognized — it must reach js_promise_constructor so step 2 throws the TypeError
-   in spec order, BEFORE step 3 creates anything. A C/bound executor is not recognized either: it has no
-   preemptible body, so the ordinary C path is already correct for it. */
 /* `new Promise(executor)` reaches its machine by DECLARATION (NATIVE_PROMISE_EXEC); what is left to ask is
-   about the ARGUMENT. A non-callable executor is 27.2.3.1 step 2's TypeError, thrown by the C entry in spec
+   about the ARGUMENT. A non-callable executor is 27.5.3.1 step 2's TypeError, thrown by the C entry in spec
    order, and it iterates nothing — a different algorithm, not a fallback for this one. */
 static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc)
 {
@@ -96950,23 +96905,13 @@ static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call
     return JS_IsFunction(ctx, call_argv[0]);
 }
 
-/* Promise.try(fn, ...args): fn is called SYNCHRONOUSLY, so a loop in it must park. This asks ONE question — is
-   the callee Promise.try — and everything it used to ALSO ask was a silent fallback to a C body that is now
-   deleted. The claim that stood here, that a C or bound fn has "no preemptible body" so the C path was correct
-   for it, was false three ways: a BOUND function's target is bytecode and loops, a PROXY's apply trap is a
-   function and loops, and a GENERATOR fn creates a coroutine that then resumed off the chain. All three aborted
-   (two @WHY preempt-in-a-non-coroutine, one drive-to-completion). The receiver and arity conditions were pure
-   VALIDATION, which moved into the machine's prologue where the spec puts them. */
-
-static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
-{
-    if (!JS_IsObject(this_val))
-        return JS_ThrowTypeErrorNotAnObject(ctx);
-    DFAIL("Promise.race reached its C entry with an object receiver — route that call site onto the consume "
-          "machine (do_consumer_dispatch); there is no second driver");
-    return JS_EXCEPTION;
-}
+/* Promise.try(fn, ...args) calls fn SYNCHRONOUSLY, so a loop in it must park. The question that used to stand
+   here — is the callee Promise.try — is gone with everything it ALSO asked, each of which was a silent fallback
+   to a C body: the claim that a C or bound fn has "no preemptible body" was false three ways (a BOUND function's
+   target is bytecode and loops, a PROXY's apply trap is a function and loops, and a GENERATOR fn creates a
+   coroutine that then resumed off the chain — two @WHY preempt-in-a-non-coroutine and one drive-to-completion).
+   The receiver and arity conditions were pure VALIDATION, and live in the machine's prologue where the spec
+   puts them. */
 
 static __exception int perform_promise_then(JSContext *ctx,
                                             JSValueConst promise,
@@ -97444,15 +97389,22 @@ static const JSTrampStepDef js_promise_finally_def = {
 static const JSCFunctionListEntry js_promise_funcs[] = {
     JS_CFUNC_STEP_DEF("resolve", 1, STEPDEF_PROMISE_RESOLVE ),
     JS_CFUNC_STEP_DEF("reject", 1, STEPDEF_PROMISE_REJECT ),
-    JS_CFUNC_MAGIC_DEF("all", 1, js_promise_all, PROMISE_MAGIC_all ),
-    JS_CFUNC_MAGIC_DEF("allSettled", 1, js_promise_all, PROMISE_MAGIC_allSettled ),
-    JS_CFUNC_MAGIC_DEF("any", 1, js_promise_all, PROMISE_MAGIC_any ),
-    /* proposal-await-dictionary. Same C residue as their iterable twins: the body is a DFAIL, because the call
-       is routed to the machine before it can reach one. */
-    JS_CFUNC_MAGIC_DEF("allKeyed", 1, js_promise_all, PROMISE_MAGIC_all ),
-    JS_CFUNC_MAGIC_DEF("allSettledKeyed", 1, js_promise_all, PROMISE_MAGIC_allSettled ),
-    JS_CFUNC_DEF("try", 1, js_promise_try ),   /* declared a machine in JS_AddIntrinsicPromise */
-    JS_CFUNC_DEF("race", 1, js_promise_race ),
+    /* 27.5.4.1/.2/.3/.5: ONE walk, four settlement rules, each naming itself here. They were four rows pointing
+       at two C functions whose bodies were a DFAIL and a receiver check, plus a SECOND table two hundred lines
+       below that re-found them BY NAME with JS_GetPropertyStr to declare their machine — a hand-copied list of
+       who is special, and one a new combinator could be left out of with nothing to say so. The declaration is
+       the row. */
+    JS_CFUNC_CONSUME_DEF("all", 1, ITERCONS_PROMISE_ALL_BASE + PROMISE_MAGIC_all ),
+    JS_CFUNC_CONSUME_DEF("allSettled", 1, ITERCONS_PROMISE_ALL_BASE + PROMISE_MAGIC_allSettled ),
+    JS_CFUNC_CONSUME_DEF("any", 1, ITERCONS_PROMISE_ALL_BASE + PROMISE_MAGIC_any ),
+    JS_CFUNC_CONSUME_DEF("race", 1, ITERCONS_PROMISE_ALL_BASE + PROMISE_MAGIC_race ),
+    /* proposal-await-dictionary: the SAME machine and the same two settlement rules over a different element
+       SOURCE, which is what the second base says. */
+    JS_CFUNC_CONSUME_DEF("allKeyed", 1, ITERCONS_PROMISE_KEYED_BASE + PROMISE_MAGIC_all ),
+    JS_CFUNC_CONSUME_DEF("allSettledKeyed", 1, ITERCONS_PROMISE_KEYED_BASE + PROMISE_MAGIC_allSettled ),
+    /* 27.5.4.8 Promise.try: not a walk at all — it takes a callback and drives it on the chain — but the id
+       namespace names WHICH MACHINE, and a bodyless builtin says its id in exactly this place. */
+    JS_CFUNC_CONSUME_DEF("try", 1, ITERCONS_PROMISE_TRY ),
     JS_CFUNC_STEP_DEF("withResolvers", 0, STEPDEF_PROMISE_WITHRESOLVERS ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL),
 };
@@ -97878,30 +97830,13 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
     if (JS_IsException(obj1))
         return -1;
     ctx->promise_ctor = obj1;
-    /* THE PROMISE MACHINES, each declared on the builtin it implements. Every one of these C bodies is residue —
-       js_promise_try is a bare DFAIL and the others have no algorithm left — so the address comparisons that used
-       to find them were choosing against nothing, which is this project's definition of a recognizer that has
-       become pure residue. */
+    /* 27.5.3.1's executor machine, and it is the ONLY promise declaration that belongs here: the constructor's
+       cproto says "constructor" and its magic is the class id, so this second carrier is the only place its id
+       can live. The seven METHOD machines used to be declared here too, by a static name->id table that
+       JS_GetPropertyStr'd each one back off the object — a hand-copied list of who is special, sitting two
+       hundred lines from the rows it was about, and materializing seven lazily-defined properties on the way.
+       They declare themselves in js_promise_funcs[] now, so a combinator added there cannot be forgotten here. */
     js_declare_native_machine(obj1, NATIVE_PROMISE_EXEC);   /* new Promise(executor) */
-    {
-        static const struct { const char *name; int id; } promise_machines[] = {
-            { "try",        NATIVE_PROMISE_TRY },
-            { "all",        NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_all },
-            { "allSettled", NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_allSettled },
-            { "any",        NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_any },
-            { "race",       NATIVE_PROMISE_ALL_BASE + PROMISE_MAGIC_race },
-            { "allKeyed",        NATIVE_PROMISE_KEYED_BASE + PROMISE_MAGIC_all },
-            { "allSettledKeyed", NATIVE_PROMISE_KEYED_BASE + PROMISE_MAGIC_allSettled },
-        };
-        size_t mi;
-        for (mi = 0; mi < countof(promise_machines); mi++) {
-            JSValue m = JS_GetPropertyStr(ctx, obj1, promise_machines[mi].name);
-            if (JS_IsException(m))
-                return -1;
-            js_declare_native_machine(m, promise_machines[mi].id);
-            JS_FreeValue(ctx, m);
-        }
-    }
 
     /* AsyncFunction */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_ASYNC_FUNCTION, "AsyncFunction",

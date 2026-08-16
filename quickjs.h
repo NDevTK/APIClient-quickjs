@@ -1974,10 +1974,16 @@ typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
        cannot be parked. So the builtin IS a step machine — there is no JS_Call loop version of it to fall back
        to — and `magic` indexes its row in the step table. */
     JS_CFUNC_step,
-    JS_CFUNC_consume,     /* a builtin that CONSUMES an iterator in a loop. The sink (ITERCONS_*) is in magic, so
-                             the callee CARRIES which walk it wants and the interpreter asks ONE question instead
+    JS_CFUNC_consume,     /* a builtin with NO C BODY whose machine is named by an ITERCONS_* id in magic, so the
+                             callee CARRIES which machine it wants and the interpreter asks ONE question instead
                              of a per-builtin identity test. Same shape as JS_CFUNC_step: the function pointer is
-                             unused, because there is no C body left to call. */
+                             unused, because there is no C body left to call.
+                             Named for what nearly all of them do — CONSUME an iterator in a loop — but the id
+                             namespace answers WHICH MACHINE, and several of its members are not walks over an
+                             iterator at all: Array.from over an array-like (length + indices, no @@iterator),
+                             Iterator.from, the keyed promise combinators (own keys), and Promise.try (a
+                             callback). Those are different ALGORITHMS reached through one declaration, never
+                             fallbacks for the walk. */
     JS_CFUNC_iterdrive,   /* a lazy Iterator Helper's own .next(): the DRIVE is a coroutine on the tramp
                              (do_iter_helper_step), and there is no C body left to call. It needs a cproto of its
                              own rather than JS_CFUNC_step because its DELIVERY has modes — the same drive
