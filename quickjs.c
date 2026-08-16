@@ -1781,11 +1781,12 @@ static JSValue JS_ToObjectFree(JSContext *ctx, JSValue val);
 static JSProperty *add_property(JSContext *ctx,
                                 JSObject *p, JSAtom prop, int prop_flags);
 static void free_property(JSRuntime *rt, JSProperty *pr, int prop_flags);
-/* the three SLOT halves JS_SetOwnSlot is assembled from — each defined beside the operation it was split out
+/* the four SLOT halves JS_SetOwnSlotDesc is assembled from — each defined beside the operation it was split out
    of, and declared here because the slot write belongs beside its read twin rather than beside the array. */
-static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len);
+static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len, bool as_slot);
 static int array_grow_dense_to(JSContext *ctx, JSObject *p, uint32_t idx);
 static void set_fast_array_element(JSContext *ctx, JSObject *p, uint32_t idx, JSValue val);
+static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom, bool as_slot);
 static int JS_ToBigInt64Free(JSContext *ctx, int64_t *pres, JSValue val);
 static JSValue JS_ThrowStackOverflow(JSContext *ctx);
 static JSValue JS_ThrowTypeErrorRevokedProxy(JSContext *ctx);
@@ -1886,6 +1887,8 @@ static void js_free_shape(JSRuntime *rt, JSShape *sh);
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
+static int js_update_property_flags(JSContext *ctx, JSObject *p,
+                                    JSShapeProperty **pprs, int flags);
 static int init_shape_hash(JSRuntime *rt);
 static __exception int js_get_length32(JSContext *ctx, uint32_t *pres,
                                        JSValueConst obj);
@@ -7336,7 +7339,7 @@ static void cow_capture_bytes(JSContext *ctx, JSObject *p)
    guess. [[DefineOwnProperty]] and its create half are the obvious two; `delete ta[0]` captures before it learns
    what the slot is, `Reflect.set(ta, 0, v)` walks in through JS_SetPropertyInternal2's head with an atom that is
    a tagged int, and the interpreter's own put-field fast path is a fourth. Each produced an entry over storage
-   that is not a slot at all, which JS_GetOwnSlot and JS_SetOwnSlot now both refuse — so the router is what makes
+   that is not a slot at all, which JS_GetOwnSlotDesc and JS_SetOwnSlotDesc now both refuse — so the router is what makes
    those two asserts statements about the engine's own logic rather than about ordinary JS. */
 static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
     JSObject *p;
@@ -7384,15 +7387,25 @@ int JS_IsArrayIndexSlot(JSValueConst obj, JSAtom atom, uint32_t *idx) {
     return 0;
 }
 /* Host COW helper: the array `length` SLOT written (truncating a fast array frees the tail's elements). Used by
-   cow_unapply to remove a flow-created append without a fast-array->slow conversion. It is JS_SetOwnSlot and not
-   a [[Set]] for the reason JS_SetOwnSlot exists at all: the flow whose append is being taken back out may also
-   be the flow that froze the array, and `JS_SetProperty` — which is what stood here — then refused by throwing
-   a TypeError inside a context switch with no flow base to run it on. The host cannot spell JS_ATOM_length, so
-   the atom is supplied here rather than the operation. */
+   cow_unapply to remove a flow-created append without a fast-array->slow conversion. It reaches the shrink
+   DIRECTLY rather than through the slot write, because it is not restoring a captured DESCRIPTOR: the length's
+   attributes belong to the length's own entry when a flow touched them, and this call is about the elements
+   above `len`. The host cannot spell JS_ATOM_length, so the length lives here rather than at the caller. */
 void JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len) {
+    JSObject *p;
+    uint32_t reached;
+
     DCHECK(len <= (uint32_t)INT32_MAX, "an array length slot write above INT32_MAX — the length slot stores a "
                                        "tagged int and a fast array can hold no more");
-    JS_SetOwnSlot(ctx, obj, JS_ATOM_length, js_uint32(len));
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
+           JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_ARRAY,
+           "an array length slot write on something that is not an Array");
+    p = JS_VALUE_GET_OBJ(obj);
+    reached = array_set_length_slot(ctx, p, len, /*as_slot*/true);
+    DCHECK(reached == len,
+           "an array length slot write did not reach the length it was given — the SLOT shrink removes an index "
+           "whatever its attributes, so nothing this flow defined above the baseline length can block it");
+    (void)reached;
 }
 
 /* Time-travel capture for a CLOSURE CELL: a captured local is a shared JSVarRef, not a property, so a write to
@@ -11524,21 +11537,27 @@ static int JS_GetOwnPropertyFlagsInternal(JSContext *ctx, int *pflags,
     return JS_GetOwnPropertyInternal2(ctx, NULL, p, prop, pflags);
 }
 
-/* The COW delta's own-property read: a SLOT's stored value, never an operation.
+/* The COW delta's own-property read: a SLOT's whole state, never an operation.
    A delta is captured and swapped by the SCHEDULER — cow_capture runs inside a write hook, and unapply/apply run
    between two flows — so anything here that could reach the page's code would run it with no flow base and in
-   the middle of a context switch. Two shapes could: a Proxy, whose every own-property query is a trap, and an
-   ACCESSOR slot, whose baseline is a getter rather than a value and whose restore would invoke a setter. Neither
-   is reachable, and this ASSERTS that rather than saying it — which is also what guards the restore, because
-   every entry is read here before it is written back.
-   1 = own property (*pval owned), 0 = absent, -1 = threw. */
-int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop)
+   the middle of a context switch. A PROXY could: its every own-property query is a trap, and that stays a refusal.
+   AN ACCESSOR NO LONGER DOES, and that is the whole of this change. It used to abort here, because what an entry
+   held was a VALUE: §6.2.6 makes a property descriptor one record with two shapes — {[[Value]],[[Writable]]}
+   XOR {[[Get]],[[Set]]}, both carrying [[Enumerable]] and [[Configurable]] — and half a record cannot say which
+   shape a slot is in, so an accessor could only be refused and an attribute change could not be recorded at all.
+   Reading the descriptor is what closes both, and it runs no page code: the getter and setter are handed over as
+   FUNCTION OBJECTS, exactly as [[GetOwnProperty]] hands them to `Object.getOwnPropertyDescriptor`, and neither
+   is called here or at the restore.
+   1 = own property (*pd owned: flags, and value XOR getter/setter), 0 = absent, -1 = threw. */
+int JS_GetOwnSlotDesc(JSContext *ctx, JSPropertyDescriptor *pd, JSValueConst obj, JSAtom prop)
 {
-    JSPropertyDescriptor pd;
     JSObject *p;
     int has;
 
-    *pval = JS_UNDEFINED;
+    pd->flags = 0;
+    pd->value = JS_UNDEFINED;
+    pd->getter = JS_UNDEFINED;
+    pd->setter = JS_UNDEFINED;
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
         JS_ThrowTypeErrorNotAnObject(ctx);
         return -1;
@@ -11548,23 +11567,66 @@ int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop)
            "a COW delta holds a Proxy: capturing or swapping it would run the page's traps mid-context-switch");
     /* The read twin refuses what the write twin refuses, and this one fires at the CAPTURE rather than at the
        swap — cow_capture_hook reads through here before it appends the entry, so a typed-array index routed to
-       cow_capture instead of cow_capture_bytes aborts where it was written down. See JS_SetOwnSlot. */
+       cow_capture instead of cow_capture_bytes aborts where it was written down. See JS_SetOwnSlotDesc. */
     DCHECK(!(is_typed_array(p->class_id) && __JS_AtomIsTaggedInt(prop)),
            "a COW delta is capturing a typed-array element as a property SLOT: its storage is the buffer's "
            "BYTES, which no JSValue round-trips (a NaN payload normalises), so route this capture through "
            "cow_capture_bytes");
-    has = JS_GetOwnPropertyInternal(ctx, &pd, p, prop);
+    has = JS_GetOwnPropertyInternal(ctx, pd, p, prop);
     if (has <= 0)
         return has;
-    DCHECK(!(pd.flags & JS_PROP_GETSET),
-           "a COW delta holds an ACCESSOR slot: its baseline is a getter and its restore would run a setter");
-    *pval = pd.value;
-    JS_FreeValue(ctx, pd.getter);
-    JS_FreeValue(ctx, pd.setter);
+    DCHECK(!(pd->flags & JS_PROP_GETSET) ||
+           ((JS_IsObject(pd->getter) || JS_IsUndefined(pd->getter)) &&
+            (JS_IsObject(pd->setter) || JS_IsUndefined(pd->setter))),
+           "an accessor slot answered with a half that is neither a function object nor absent — the write twin "
+           "installs those two halves as shape storage and has nothing else to put there");
     return 1;
 }
 
-/* THE WRITE TWIN OF JS_GetOwnSlot — a SLOT's stored value PUT BACK, never an operation, and it CANNOT FAIL.
+/* THE VALUE PROJECTION of the read above, for the ~90 component readers that reach a slot THEY created — an
+   idl_slots record, a listener map, an IndexedDB key path's next step. They want the stored value and nothing
+   else, and for them an ACCESSOR is still a refusal, but for a different reason than the COW round trip's used
+   to be: a component's own internal slot is one nothing else can define, so an accessor there means the read
+   walked onto an object that is not the one it thought it had. That is a statement about the CALLER, which is
+   why it lives on this side of the projection and not inside the descriptor read.
+   1 = own data property (*pval owned), 0 = absent, -1 = threw. */
+int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop)
+{
+    JSPropertyDescriptor pd;
+    int has;
+
+    *pval = JS_UNDEFINED;
+    has = JS_GetOwnSlotDesc(ctx, &pd, obj, prop);
+    if (has <= 0)
+        return has;
+    if (pd.flags & JS_PROP_GETSET) {
+        JS_FreeValue(ctx, pd.getter);
+        JS_FreeValue(ctx, pd.setter);
+        DFAIL("an own-slot VALUE read landed on an ACCESSOR: the slot this component created holds a stored "
+              "value, so the object reached here is not the one the caller named — and calling the getter to "
+              "find out would be the page's code from C with no flow base");
+        return 0;
+    }
+    *pval = pd.value;
+    return 1;
+}
+
+/* THE ACCESSOR PAIR, INSTALLED AS SHAPE STORAGE — the getset half of the slot write, taking the descriptor's two
+   references and leaving it holding neither. An ABSENT half is a NULL pointer in the shape, which is exactly
+   what the read twin answers as JS_UNDEFINED, so the round trip is closed on both halves rather than on one. */
+static void js_set_own_slot_getset(JSContext *ctx, JSProperty *pr, JSPropertyDescriptor *pd)
+{
+    if (pr->u.getset.getter)
+        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter));
+    if (pr->u.getset.setter)
+        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter));
+    pr->u.getset.getter = JS_IsObject(pd->getter) ? JS_VALUE_GET_OBJ(pd->getter) : NULL;
+    pr->u.getset.setter = JS_IsObject(pd->setter) ? JS_VALUE_GET_OBJ(pd->setter) : NULL;
+    pd->getter = JS_UNDEFINED;   /* the descriptor's references have transferred into the shape */
+    pd->setter = JS_UNDEFINED;
+}
+
+/* THE WRITE TWIN OF JS_GetOwnSlotDesc — a SLOT's whole state PUT BACK, never an operation, and it CANNOT FAIL.
  *
  * The read side has drawn this line since it was written and the write side never did: cow_restore_base put a
  * captured baseline value back with JS_SetProperty, a [[Set]], which walks the prototype chain, calls a setter,
@@ -11576,25 +11638,45 @@ int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop)
  * write, and comes back here to put back a value the slot never stopped holding. None of the three can arise
  * now, because none of the three questions is asked: the scheduler is not the page, and a swap writes storage.
  *
- * IT MIRRORS EVERY KIND ITS TWIN ANSWERS, which is what makes the round trip closed rather than nearly closed:
- * a data slot, a VARREF (a mapped-`arguments` element or a module-namespace export, whose storage IS a closure
- * cell), an AUTOINIT (instantiated on the way, exactly as the read instantiates it), a fast-array element, the
- * array `length` PAIR (through array_set_length_slot, so the elements above it go with it — a raw prop[0] write
- * would leave a dense count the length no longer describes), and a typed-array element. An ACCESSOR is refused
- * on this side too, because an entry records a VALUE and never the getter/setter pair — that is the descriptor
- * entry, and it is the next thing to build.
+ * AND IT IS NOT A DEFINE EITHER, WHICH IS THE SAME SENTENCE ONE LAYER OUT. [[DefineOwnProperty]] would look
+ * like the operation that "puts a descriptor back", and 10.1.6.3 ValidateAndApplyPropertyDescriptor is exactly
+ * what makes it the wrong one: step 4 REFUSES every change to a non-configurable slot, and a slot the flow made
+ * non-configurable is precisely the slot this write exists to widen back. `Object.defineProperty(shared,"x",{})`
+ * defaults C/W/E to false, so the commonest define a page makes is one no define can undo. A restore that can
+ * be refused is a restore that leaves a pending TypeError belonging to no flow — and JS_DefineProperty would
+ * also run the exotic define hook and, on a Proxy, the page's own trap. So this writes STORAGE: the shape's
+ * flag word and the property's union, asking nothing.
  *
- * Consumes `val`. There is no status to return: a slot write is refused by nothing, and the only way it can not
- * happen is an allocation failure, which is a CHECK at the origin rather than a code the caller might default. */
-void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val)
+ * IT MIRRORS EVERY KIND ITS TWIN ANSWERS, which is what makes the round trip closed rather than nearly closed:
+ * a data slot, an ACCESSOR (its getter/setter pair, and the data<->accessor conversion in either direction — a
+ * §6.2.6 descriptor is one record with two shapes and a slot can be restored across them), a VARREF (a
+ * mapped-`arguments` element or a module-namespace export, whose storage IS a closure cell), an AUTOINIT
+ * (instantiated on the way, exactly as the read instantiates it), a fast-array element, the array `length` PAIR
+ * (through array_set_length_slot, so the elements above it go with it — a raw prop[0] write would leave a dense
+ * count the length no longer describes), and a typed-array element, which is the one refusal left because its
+ * storage is the BUFFER's bytes and the byte entry owns them.
+ * THE ATTRIBUTES ARE PART OF THE STATE, not a second operation on it: C/W/E come off the descriptor and land in
+ * the shape here, which is what makes a flow's `Object.freeze` on shared state something the swap can take back.
+ *
+ * Consumes the descriptor's values. There is no status to return: a slot write is refused by nothing, and the
+ * only way it can not happen is an allocation failure, which is a CHECK at the origin rather than a code the
+ * caller might default. */
+void JS_SetOwnSlotDesc(JSContext *ctx, JSValueConst obj, JSAtom prop, JSPropertyDescriptor *pd)
 {
     JSShapeProperty *prs;
     JSProperty *pr;
     JSObject *p;
     uint32_t idx;
+    bool want_getset = (pd->flags & JS_PROP_GETSET) != 0;
 
     DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
            "a COW delta holds a slot on something that is not an object");
+    DCHECK((pd->flags & ~(JS_PROP_C_W_E | JS_PROP_GETSET)) == 0,
+           "a COW slot restore was handed flags outside the §6.2.6 descriptor: the read twin answers C/W/E and "
+           "the accessor bit, and an internal bit written from here would name storage the entry never read");
+    DCHECK(!want_getset || (JS_IsUndefined(pd->value) && !(pd->flags & JS_PROP_WRITABLE)),
+           "a COW slot restore holds BOTH descriptor shapes at once — §6.2.6 makes them exclusive, so one of "
+           "the two was written by something that did not read it back off a slot");
     p = JS_VALUE_GET_OBJ(obj);
     DCHECK(p->class_id != JS_CLASS_PROXY,
            "a COW delta holds a Proxy: capturing or swapping it would run the page's traps mid-context-switch");
@@ -11604,18 +11686,34 @@ void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val)
     if (prs) {
         switch (prs->flags & JS_PROP_TMASK) {
         case JS_PROP_GETSET:
-            JS_FreeValue(ctx, val);
-            DFAIL("a COW delta is putting a VALUE back over an ACCESSOR slot: an entry records a slot's value "
-                  "and never its getter/setter pair, so build the DESCRIPTOR entry (the C/W/E flags and the "
-                  "accessor pair) beside the value — the read twin refuses the same slot on the other side");
-            return;
+            if (want_getset) {
+                js_set_own_slot_getset(ctx, pr, pd);
+            } else {
+                /* ACCESSOR -> DATA. The slot the flow left is an accessor and the state being put back is a
+                   value, so the pair is dropped and the union becomes a value; the shape's kind bits go with
+                   it, and the C/W/E tail below then writes the descriptor's own attributes over them. */
+                if (js_shape_prepare_update(ctx, p, &prs))
+                    CHECK_FAIL("a COW slot restore could not reshape an accessor slot back into a data slot");
+                if (pr->u.getset.getter)
+                    JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter));
+                if (pr->u.getset.setter)
+                    JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter));
+                prs->flags &= ~(JS_PROP_TMASK | JS_PROP_WRITABLE);
+                pr->u.value = pd->value;
+                pd->value = JS_UNDEFINED;
+            }
+            break;
         case JS_PROP_VARREF:
             /* the slot's storage is the CELL, which is what the read twin read through. A module namespace's
                export is write-protected to the PAGE and this is not the page: the entry exists because
                delete_property captures before it learns the slot is non-configurable, and putting the same
                value back through the cell is the no-op that spurious capture asks for. */
-            set_value(ctx, pr->u.var_ref->pvalue, val);
-            return;
+            DCHECK(!want_getset,
+                   "a COW slot restore is putting an ACCESSOR over a VARREF slot: the cell IS the storage and "
+                   "an accessor has none, so the two sides of this entry name different slots");
+            set_value(ctx, pr->u.var_ref->pvalue, pd->value);
+            pd->value = JS_UNDEFINED;
+            break;
         case JS_PROP_AUTOINIT:
             /* instantiate and retry — the read twin does exactly this, so by the time an entry exists the slot
                is a data slot; a lazy intrinsic that a flow has not yet touched can still be one here. */
@@ -11624,39 +11722,73 @@ void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val)
                            "write leaks one flow's state into every sibling");
             goto retry;
         default:
-            if (prs->flags & JS_PROP_LENGTH) {
+            if (want_getset) {
+                /* DATA -> ACCESSOR: the mirror of the conversion above, and the reason the entry is one record
+                   rather than a value plus a flag — a slot can be restored across the two shapes in either
+                   direction, and neither direction is the "normal" one. */
+                DCHECK(!(prs->flags & JS_PROP_LENGTH),
+                       "a COW slot restore is putting an ACCESSOR over an Array's `length`: 10.4.2 makes that "
+                       "slot non-configurable, so no define can have turned it into one and the entry that "
+                       "says otherwise was not read off this slot");
+                if (js_shape_prepare_update(ctx, p, &prs))
+                    CHECK_FAIL("a COW slot restore could not reshape a data slot into an accessor slot");
+                JS_FreeValue(ctx, pr->u.value);
+                prs->flags = (prs->flags & ~(JS_PROP_TMASK | JS_PROP_WRITABLE)) | JS_PROP_GETSET;
+                pr->u.getset.getter = NULL;
+                pr->u.getset.setter = NULL;
+                js_set_own_slot_getset(ctx, pr, pd);
+            } else if (prs->flags & JS_PROP_LENGTH) {
                 /* the array `length` is a PAIR — the stored number and the elements it bounds — so it is put
                    back through the same slot write that removes them; a raw prop[0] store would leave a dense
-                   count the length no longer describes. `val` came off the read twin, which answers this slot
-                   as the number the slot STORES (an int, or a double above INT32_MAX), so the conversion below
-                   runs no page code. */
-                uint32_t len;
+                   count the length no longer describes. The value came off the read twin, which answers this
+                   slot as the number the slot STORES (an int, or a double above INT32_MAX), so the conversion
+                   below runs no page code. */
+                uint32_t len, reached;
                 DCHECK(p->class_id == JS_CLASS_ARRAY,
                        "a JS_PROP_LENGTH slot on a class that is not Array");
-                DCHECK(JS_IsNumber(val),
+                DCHECK(JS_IsNumber(pd->value),
                        "an Array length slot restore was handed something that is not the number the read twin "
                        "answers with — a coercion here would be the page's valueOf with no flow under it");
-                JS_ToUint32(ctx, &len, val);
-                JS_FreeValue(ctx, val);
-                idx = array_set_length_slot(ctx, p, len);   /* the length actually REACHED */
-                DCHECK(idx == len,
-                       "an Array length slot restore was blocked by a NON-CONFIGURABLE index this flow defined "
-                       "above the baseline length — build the descriptor entry so the define comes back out");
-                return;
+                JS_ToUint32(ctx, &len, pd->value);
+                JS_FreeValue(ctx, pd->value);
+                pd->value = JS_UNDEFINED;
+                reached = array_set_length_slot(ctx, p, len, /*as_slot*/true);   /* the length actually REACHED */
+                DCHECK(reached == len,
+                       "an Array length slot restore did not reach the length it was given — the SLOT shrink "
+                       "removes an index whatever its attributes, so nothing can block it");
+                (void)reached;
+            } else {
+                set_value(ctx, &pr->u.value, pd->value);
+                pd->value = JS_UNDEFINED;
             }
-            set_value(ctx, &pr->u.value, val);
-            return;
+            break;
         }
+        /* THE ATTRIBUTES, LAST AND FROM THE SAME RECORD. The payload write above can RESHAPE the object — both
+           conversions clone the shape, and the length shrink deletes indices — so `prs` is re-found rather than
+           carried across it, which is the bug a single stale pointer would have written into the shape. */
+        prs = find_own_property(&pr, p, prop);
+        DCHECK(prs != NULL,
+               "a COW slot restore lost the slot it had just written into — the payload write removed the "
+               "property whose attributes were about to be put back");
+        if (js_update_property_flags(ctx, p, &prs,
+                                     (prs->flags & ~JS_PROP_C_W_E) | (pd->flags & JS_PROP_C_W_E)))
+            CHECK_FAIL("a COW slot restore could not reshape the object to put a slot's ATTRIBUTES back: a "
+                       "baseline descriptor left narrowed leaks one flow's freeze into every sibling");
+        goto done;
     }
 
     if (p->fast_array && __JS_AtomIsTaggedInt(prop)) {
         idx = __JS_AtomToUInt32(prop);
+        DCHECK(!want_getset,
+               "a COW slot restore is putting an ACCESSOR into a dense array element: making an index an "
+               "accessor converts the array to a slow one, so no dense element can ever have been read as one");
         if (p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
             DCHECK(idx < p->u.array.count,
                    "a mapped-arguments element slot outside the dense part: the mapped part is fixed at "
                    "creation and a delete converts the object to a slow array first");
-            set_value(ctx, p->u.array.u.var_refs[idx]->pvalue, val);
-            return;
+            set_value(ctx, p->u.array.u.var_refs[idx]->pvalue, pd->value);
+            pd->value = JS_UNDEFINED;
+            goto done;
         }
         if (is_typed_array(p->class_id)) {
             /* DELETED: the typed-array element restore. It re-issued JS_SetPropertyValue to put the NUMBER the
@@ -11671,35 +11803,57 @@ void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val)
                index to the bytes, so every site that captures a slot is covered by that one decision. Reaching
                here means a capture went around cow_capture and made a slot entry for storage the byte entry
                owns; the read twin refuses the same thing one step earlier, at the capture. */
-            JS_FreeValue(ctx, val);
             DFAIL("a COW delta holds a typed-array element as a property SLOT: its storage is the buffer's "
                   "BYTES and the byte entry owns it, so route the capture that made this entry through "
                   "cow_capture_bytes");
-            return;
+            goto done;
         }
+        DCHECK((pd->flags & JS_PROP_C_W_E) == JS_PROP_C_W_E,
+               "a COW slot restore is putting NARROWED attributes onto a dense array element: a dense element "
+               "is always C/W/E and narrowing one converts the array to a slow one, so the descriptor and the "
+               "storage disagree about which object this is");
         if (idx >= p->u.array.count && array_grow_dense_to(ctx, p, idx))
             CHECK_FAIL("a COW slot restore could not grow an array's dense part back over the tail this flow "
                        "truncated: a dropped baseline element leaks one flow's state into every sibling");
-        set_fast_array_element(ctx, p, idx, val);
-        return;
+        set_fast_array_element(ctx, p, idx, pd->value);
+        pd->value = JS_UNDEFINED;
+        goto done;
     }
 
     /* THE SLOT IS ABSENT: this flow DELETED a baseline one and the restore has to put it back. Not
        JS_CreateProperty, which is [[DefineOwnProperty]]'s create half — it consults `extensible`, runs the
        exotic define_own_property hook, and refuses a typed array's numeric index, and the first of those is
        precisely the `Object.preventExtensions(o); delete o.x` that used to throw mid-switch.
-       C_W_E is what the entry can express: it records the slot's VALUE and never its attributes, so a baseline
-       slot that was not C_W_E comes back with the wrong ones. That is the DESCRIPTOR entry, named by the assert
-       cow_apply_entries makes when the same gap blocks a re-delete. */
+       THE ATTRIBUTES COME OFF THE DESCRIPTOR, which is what this line could not do while an entry held only a
+       value: it created every re-instated slot C_W_E, so a baseline `{writable:false}` or a non-enumerable
+       method came back writable and enumerable and no sibling could tell. */
     DCHECK(!(p->class_id == JS_CLASS_STRING && __JS_AtomIsTaggedInt(prop) &&
              JS_VALUE_GET_TAG(p->u.object_data) == JS_TAG_STRING &&
              __JS_AtomToUInt32(prop) < JS_VALUE_GET_STRING(p->u.object_data)->len),
            "a COW delta holds a String object's index slot: the read twin answers it out of the string's own "
            "characters, which are non-writable and non-configurable, so no flow can have written or deleted one");
-    pr = add_property(ctx, p, prop, JS_PROP_C_W_E);
+    pr = add_property(ctx, p, prop, pd->flags & (JS_PROP_C_W_E | JS_PROP_GETSET));
     CHECK(pr, "a COW slot restore could not re-create a slot this flow deleted: a dropped baseline write leaks "
               "one flow's state into every sibling");
-    pr->u.value = val;
+    if (want_getset) {
+        pr->u.getset.getter = NULL;
+        pr->u.getset.setter = NULL;
+        js_set_own_slot_getset(ctx, pr, pd);
+    } else {
+        pr->u.value = pd->value;
+        pd->value = JS_UNDEFINED;
+    }
+
+ done:
+    /* THE DESCRIPTOR IS CONSUMED, and what is freed here is the half the slot did not take — a data restore's
+       empty accessor pair, an accessor restore's empty value, and everything a DFAIL'd arm still held. Each arm
+       above hands its own field over by clearing it, so this frees exactly what nothing adopted. */
+    JS_FreeValue(ctx, pd->value);
+    JS_FreeValue(ctx, pd->getter);
+    JS_FreeValue(ctx, pd->setter);
+    pd->value = JS_UNDEFINED;
+    pd->getter = JS_UNDEFINED;
+    pd->setter = JS_UNDEFINED;
 }
 
 void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
@@ -12103,7 +12257,16 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
     return 0;
 }
 
-static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
+/* THE OPERATION AND THE STORAGE, ONE BODY, and `as_slot` says which of the two this call is.
+   10.1.10.1 OrdinaryDelete asks whether the slot is CONFIGURABLE and hands an exotic object its own handler;
+   a COW restore asks NEITHER. It removes storage the running flow created, and the flow that created it is
+   very often the flow that made it non-configurable with a define — `Object.defineProperty(shared,"x",{value:1})`
+   defaults C/W/E to false — so a removal that consults the flow's own attributes is a removal that REFUSES,
+   and a refusal in a context switch has no flow to report to. That is the same line JS_SetOwnSlotDesc draws on
+   the write side and JS_GetOwnSlotDesc on the read side: the scheduler is not the page, and a swap moves
+   storage. The capture is likewise the OPERATION's — a slot removal made by the swap is not a write of the
+   page's that any delta records. */
+static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom, bool as_slot)
 {
     JSShape *sh;
     JSShapeProperty *pr, *lpr, *prop;
@@ -12118,7 +12281,8 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
        walk below knows whether the slot is there at all, so an absent one is captured too, and the same
        absent-side record is what keeps apply from inventing a property out of it. Gated by the hook
        (flow-local + not-installed skip). */
-    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), atom);
+    if (!as_slot)
+        cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), atom);
 
  redo:
     sh = p->shape;
@@ -12131,7 +12295,7 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
         pr = &prop[h - 1];
         if (likely(pr->atom == atom)) {
             /* found ! */
-            if (!(pr->flags & JS_PROP_CONFIGURABLE))
+            if (!(pr->flags & JS_PROP_CONFIGURABLE) && !as_slot)
                 return false;
             /* realloc the shape if needed */
             if (lpr)
@@ -12185,12 +12349,38 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
         } else {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->delete_property) {
+                DCHECK(!as_slot,
+                       "a COW slot removal reached an exotic [[Delete]] handler: a Proxy's trap is the page's "
+                       "own code and a String object's index is non-configurable storage, so neither is a slot "
+                       "a flow can have created — the delta names an object it must never have captured");
                 return em->delete_property(ctx, JS_MKPTR(JS_TAG_OBJECT, p), atom);
             }
         }
     }
     /* not found */
     return true;
+}
+
+/* THE SLOT-LEVEL REMOVAL — see quickjs.h. It CANNOT FAIL, for the reason JS_SetOwnSlotDesc cannot: the only
+   two ways it could are a refusal (which the `as_slot` body does not make) and an allocation failure, which is
+   a CHECK at its origin rather than a status a caller might default. */
+void JS_DeleteOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+    JSObject *p;
+    int res;
+
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+           "a COW delta holds a slot on something that is not an object");
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id != JS_CLASS_PROXY,
+           "a COW delta holds a Proxy: capturing or swapping it would run the page's traps mid-context-switch");
+    res = delete_property(ctx, p, prop, /*as_slot*/true);
+    CHECK(res >= 0, "a COW slot removal could not reshape the object: a slot this flow created would stand in "
+                    "the baseline for every sibling with nothing left that could take it out");
+    DCHECK(res > 0,
+           "a COW slot removal was refused by a fast-array class that owns no removable index — a typed array's "
+           "elements are the buffer's BYTES and the byte entry owns them, so route the capture that made this "
+           "entry through cow_capture_bytes");
 }
 
 static int call_setter(JSContext *ctx, JSObject *setter,
@@ -12220,14 +12410,17 @@ static int call_setter(JSContext *ctx, JSObject *setter,
 }
 
 /* THE LENGTH SLOT, WRITTEN — 10.4.2.4 steps 15-17 with neither its coercion (steps 3-4) nor its read-only test
-   (step 12). The elements at or above `len` are removed and prop[0] is set to the length actually REACHED, which
-   is `len` for a dense array and can be higher for a slow one whose shrink a non-configurable index blocked; the
-   caller compares and decides what that means.
-   Split out of set_array_length for the write that is NOT the operation. JS_SetOwnSlot restores a captured
+   (step 12). The elements at or above `len` are removed and prop[0] is set to the length actually REACHED.
+   Split out of set_array_length for the write that is NOT the operation. JS_SetOwnSlotDesc restores a captured
    `length` during a context switch, and it must not consult `writable`, because the flow whose baseline is being
    put back is very often the flow that froze the array. A restore that consults the flow's own attributes is a
-   restore that refuses, and a refusal here has no flow to throw on — see the read twin. */
-static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len)
+   restore that refuses, and a refusal here has no flow to throw on — see the read twin.
+   `as_slot` carries that same distinction DOWN INTO THE SHRINK, which is where it had been dropped: the shrink
+   removes indices through delete_property, and the OPERATION's delete refuses a non-configurable one, so a
+   restore to the baseline length was blocked by exactly the define this flow had made above it. The slot form
+   removes the index whatever its attributes, so the reached length IS `len`; the operation form still stops at
+   the highest non-configurable index and 10.4.2.4 step 17.b's TypeError is the caller's. */
+static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len, bool as_slot)
 {
     uint32_t idx, cur_len;
     int i, ret;
@@ -12245,7 +12438,8 @@ static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len)
                    always captured them, because it removes each index through delete_property, whose own
                    capture is right there -- so this is the two arms of one operation agreeing rather than a
                    new rule. Captured per index, since that is what a slot is. */
-                cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32((uint32_t)i));
+                if (!as_slot)
+                    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32((uint32_t)i));
                 JS_FreeValue(ctx, p->u.array.u.values[i]);
                 p->u.array.u.values[i] = JS_UNDEFINED;
             }
@@ -12273,7 +12467,7 @@ static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len)
                 /* faster to iterate */
                 while (cur_len > len) {
                     atom = JS_NewAtomUInt32(ctx, cur_len - 1);
-                    ret = delete_property(ctx, p, atom);
+                    ret = delete_property(ctx, p, atom, as_slot);
                     JS_FreeAtom(ctx, atom);
                     if (unlikely(!ret)) {
                         /* unlikely case: property is not
@@ -12291,7 +12485,7 @@ static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len)
                     i++, pr++) {
                     if (pr->atom != JS_ATOM_NULL &&
                         JS_AtomIsArrayIndex(ctx, &idx, pr->atom)) {
-                        if (idx >= cur_len &&
+                        if (idx >= cur_len && !as_slot &&
                             !(pr->flags & JS_PROP_CONFIGURABLE)) {
                             cur_len = idx + 1;
                         }
@@ -12304,7 +12498,7 @@ static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len)
                         JS_AtomIsArrayIndex(ctx, &idx, pr->atom)) {
                         if (idx >= cur_len) {
                             /* remove the property */
-                            delete_property(ctx, p, pr->atom);
+                            delete_property(ctx, p, pr->atom, as_slot);
                             /* WARNING: the shape may have been modified */
                             sh = p->shape;
                             pr = &get_shape_prop(sh)[i];
@@ -12344,7 +12538,7 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
     if (unlikely(!(get_shape_prop(p->shape)[0].flags & JS_PROP_WRITABLE)))
         return JS_ThrowTypeErrorReadOnly(ctx, flags, JS_ATOM_length);
 
-    cur_len = array_set_length_slot(ctx, p, len);
+    cur_len = array_set_length_slot(ctx, p, len, /*as_slot*/false);
     if (unlikely(cur_len > len))
         return JS_ThrowTypeErrorOrFalse(ctx, flags, "not configurable");
     return true;
@@ -12379,7 +12573,7 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
 }
 
 /* THE DENSE PART GROWN BACK OVER A TRUNCATED TAIL — the inverse of array_set_length_slot's shrink, and its only
-   caller is the one that has to undo one: JS_SetOwnSlot putting back a baseline element that the running flow's
+   caller is the one that has to undo one: JS_SetOwnSlotDesc putting back a baseline element that the running flow's
    `arr.length = n` removed. The slots between the current count and `idx` are holes here and are filled by the
    entries restored AFTER this one (a segment restores highest-index-first, so the run walks back down to the
    baseline length exactly as the appends walked up from it).
@@ -13284,12 +13478,12 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
        ONE capture at the OPERATION rather than one per arm, for the reason a dense element is captured inside
        set_fast_array_element rather than at its seven writers: a record the delta must see cannot be a line each
        arm remembers.
-       WHAT AN ENTRY CANNOT YET HOLD IS ASSERTED RATHER THAN ASSUMED. An entry records a slot's VALUE and never
-       its ATTRIBUTES, and JS_GetOwnSlot refuses an ACCESSOR slot on BOTH sides of the round trip -- the
-       baseline read this capture makes, and the flow-side read cow_save_cur makes when the flow is switched out
-       -- so a define that redefines an accessor or leaves one behind aborts naming the descriptor entry to
-       build. A define that only narrows `writable` is caught on the other side, by the assert cow_restore_base
-       makes on the value it puts back.
+       WHAT THE ENTRY HOLDS IS THE WHOLE §6.2.6 DESCRIPTOR, which is what a define needs and a [[Set]] did not:
+       this operation changes a slot's ATTRIBUTES and can change its SHAPE (data <-> accessor), so an entry that
+       recorded only a value could express neither and had to abort on both. JS_GetOwnSlotDesc reads the pair or
+       the value with its C/W/E on both sides of the round trip -- the baseline read this capture makes, and the
+       flow-side read cow_save_cur makes when the flow is switched out -- and JS_SetOwnSlotDesc puts back
+       whichever shape it was given.
        A TYPED ARRAY'S NUMERIC INDEX carries itself to the BYTES from inside cow_capture — 10.4.5.3's define
        delegates to TypedArraySetElement, which is JS_SetPropertyValue's typed-array arm and writes the buffer,
        so an entry naming (view, index) would be a second and weaker record of storage the byte entry owns. That
@@ -13865,7 +14059,7 @@ int JS_DeleteProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, int flags)
     if (JS_IsException(obj1))
         return -1;
     p = JS_VALUE_GET_OBJ(obj1);
-    res = delete_property(ctx, p, prop);
+    res = delete_property(ctx, p, prop, /*as_slot*/false);
     JS_FreeValue(ctx, obj1);
     if (res != false)
         return res;
@@ -39178,11 +39372,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                    base — which is the drive-to-completion the build's ratchet counts. The
                                    question is only "did a write through this same source leave a value in
                                    this object's own slot", and a stored value answers it. */
-                                JSValue own;
-                                int r = JS_GetOwnSlot(ctx, &own, sp[-2], na);
+                                JSPropertyDescriptor own;
+                                int r = JS_GetOwnSlotDesc(ctx, &own, sp[-2], na);
                                 JS_FreeAtom(ctx, na);
                                 if (r < 0) goto exception;
-                                if (r > 0) kv = own;
+                                if (r > 0) {
+                                    /* AN ACCESSOR STORES NOTHING, so it answers this question with "no" rather
+                                       than with a getter: the question is whether a write through this same
+                                       source LEFT A VALUE in the slot, and calling the getter to find out
+                                       would be the page's code from C with no flow base. The concolic read
+                                       below then answers, which is the right answer for a slot whose value is
+                                       computed rather than stored. */
+                                    if (own.flags & JS_PROP_GETSET) {
+                                        JS_FreeValue(ctx, own.getter);
+                                        JS_FreeValue(ctx, own.setter);
+                                    } else {
+                                        kv = own.value;
+                                    }
+                                }
                             }
                         }
                     }
@@ -102461,7 +102668,7 @@ uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj)
 
 /* THE BUFFER'S BYTES, READ — see quickjs.h. NOT JS_GetArrayBuffer, which is an operation: it THROWS on a
    detached buffer and on a non-buffer, and the COW swap that calls this has no flow base to run an exception on,
-   exactly as JS_GetOwnSlot is not [[GetOwnProperty]]. A DETACHED buffer answers NULL/0 rather than aborting,
+   exactly as JS_GetOwnSlotDesc is not [[GetOwnProperty]]. A DETACHED buffer answers NULL/0 rather than aborting,
    because a detached buffer holds no bytes and there is nothing for a flow to have written. */
 const uint8_t *JS_GetBufferBytes(JSValueConst obj, uint32_t *plen)
 {
@@ -102483,7 +102690,7 @@ const uint8_t *JS_GetBufferBytes(JSValueConst obj, uint32_t *plen)
     return abuf->data;
 }
 
-/* ITS WRITE TWIN — see quickjs.h. It CANNOT FAIL for the reason JS_SetOwnSlot cannot, and the two ways it could
+/* ITS WRITE TWIN — see quickjs.h. It CANNOT FAIL for the reason JS_SetOwnSlotDesc cannot, and the two ways it could
    not land are both mutations of the buffer OBJECT rather than of its contents, which is precisely what this
    entry cannot express: a DETACH (transfer / structuredClone) frees the storage, and a RESIZE reallocates it to
    a different length. Both abort here naming the buffer-lifetime entry to build, rather than writing bytes into

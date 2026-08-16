@@ -1246,20 +1246,41 @@ JS_EXTERN int JS_SetLength(JSContext *ctx, JSValueConst obj, int64_t len);
 JS_EXTERN int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
                                      uint32_t *plen, JSValueConst obj,
                                      int flags);
-/* The COW delta's own-property read: the SLOT's stored value. NOT [[GetOwnProperty]] — it asserts that neither a
-   Proxy nor an accessor is reachable, because a delta is swapped by the scheduler and either would run the page's
-   code mid-context-switch. 1 = own property (*pval owned), 0 = absent, -1 = threw. */
+/* The COW delta's own-property read: the SLOT's whole state, as a §6.2.6 PROPERTY DESCRIPTOR — {[[Value]],
+   [[Writable]]} XOR {[[Get]],[[Set]]}, both carrying [[Enumerable]] and [[Configurable]]. It is one record and
+   not a value plus a side-flag because the spec makes it one: the accessor bit in `flags` IS the kind field, so
+   there is no second spelling of "which shape is this slot in" to drift from the first.
+   NOT [[GetOwnProperty]] — it asserts that no Proxy is reachable, because a delta is swapped by the scheduler
+   and a trap would run the page's code mid-context-switch. An ACCESSOR is answered rather than refused: the
+   getter and setter are handed over as function OBJECTS, exactly as they are handed to
+   Object.getOwnPropertyDescriptor, and neither is ever called by the read or by the restore.
+   1 = own property (*pd owned), 0 = absent, -1 = threw. */
+JS_EXTERN int JS_GetOwnSlotDesc(JSContext *ctx, JSPropertyDescriptor *pd, JSValueConst obj, JSAtom prop);
+/* Its VALUE projection, for a component reading a slot IT created (an idl_slots record, a listener map, a key
+   path's next step). An accessor is refused on this side — a component's own internal slot is one nothing else
+   can define, so an accessor there says the read landed on an object that is not the one it named.
+   1 = own data property (*pval owned), 0 = absent, -1 = threw. */
 JS_EXTERN int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop);
-/* Its WRITE twin: the SLOT's stored value put back. NOT [[Set]] — no prototype walk, no setter, no `writable`
-   and no `extensible`, because a delta is swapped by the scheduler and every one of those refuses by THROWING
-   with no flow base to run the exception on. Mirrors every kind the read answers (data, VARREF, AUTOINIT, dense
-   element, the array `length` pair) and CANNOT FAIL — an accessor slot and an allocation
-   failure both abort at the origin, so there is no status a caller could default. Consumes `val`. */
-JS_EXTERN void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val);
+/* Its WRITE twin: the SLOT's whole state put back, attributes included. NOT [[Set]] — no prototype walk, no
+   setter, no `writable` and no `extensible`; and NOT [[DefineOwnProperty]] either, which is the trap this
+   signature exists to avoid: 10.1.6.3 step 4 refuses every change to a NON-CONFIGURABLE slot, and a slot the
+   flow made non-configurable is exactly the slot a restore has to widen back. Every one of those refuses by
+   THROWING with no flow base to run the exception on, so this writes STORAGE — the shape's flag word and the
+   property's union. Mirrors every kind the read answers (data, accessor and the conversion in either direction,
+   VARREF, AUTOINIT, dense element, the array `length` pair) and CANNOT FAIL — a typed-array element and an
+   allocation failure both abort at the origin, so there is no status a caller could default.
+   Consumes the descriptor's values (and clears them). */
+JS_EXTERN void JS_SetOwnSlotDesc(JSContext *ctx, JSValueConst obj, JSAtom prop, JSPropertyDescriptor *pd);
+/* And its REMOVAL: the slot taken out, whatever its attributes. 10.1.10.1 OrdinaryDelete returns false for a
+   non-configurable slot and hands an exotic object its own handler; a swap asks neither, because the slot it is
+   removing is one the running flow CREATED and `Object.defineProperty(o,"x",{value:1})` — whose C/W/E all
+   default to false — is the commonest way a flow creates one. CANNOT FAIL, for the same reason the write
+   cannot. */
+JS_EXTERN void JS_DeleteOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop);
 /* THE BUFFER'S BYTES, READ AND PUT BACK — the byte twin of the slot pair above, and the reason it is a separate
    pair rather than one more kind of slot is JSTimeTravelHooks.buf_write's: a view's element is not what the page
    wrote, the storage is. `obj` is the ArrayBuffer/SharedArrayBuffer OBJECT.
-   Neither takes a JSContext and neither can throw, for the same reason JS_SetOwnSlot cannot: they run inside a
+   Neither takes a JSContext and neither can throw, for the same reason JS_SetOwnSlotDesc cannot: they run inside a
    context switch that has no flow base to receive an exception. The read answers NULL with *plen 0 for a
    DETACHED buffer — a positive statement, not a failure: a detached buffer holds no bytes, so there is nothing a
    flow could have changed. The write asserts the length it is handed is still the buffer's; a flow that RESIZED
