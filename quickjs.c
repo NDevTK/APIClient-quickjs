@@ -1892,7 +1892,7 @@ static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len);
 static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab);
 static bool js_get_fast_array_element(JSContext *ctx, JSObject *p, uint32_t idx, JSValue *pval);
 static bool js_get_fast_array(JSContext *ctx, JSValue obj,
-                              JSValue **arrpp, uint32_t *countp);
+                              const JSValue **arrpp, uint32_t *countp);
 static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len);
 static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
                                               JSValue sync_iter, JSValue next_method, JSValue *pnext);
@@ -12063,6 +12063,34 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
     return true;
 }
 
+/* THE ONE IN-BOUNDS DENSE-ELEMENT STORE — the overwrite twin of add_fast_array_element above.
+ *
+ * A dense element lives in u.array.u.values and not in the shape, so a write to one reaches neither
+ * JS_SetPropertyInternal2 nor add_property, and therefore neither COW capture. There were EIGHT such writes in
+ * this file and exactly ONE of them captured — JS_SetPropertyValue's ARRAY arm, which is the one somebody
+ * happened to look at. The other seven wrote straight into the slot: JS_SetPropertyValue's ARGUMENTS arm;
+ * JS_DefineProperty's in-bounds arm, where every Object/Reflect.defineProperty on an existing index lands and
+ * where JS_DefinePropertyValueUint32 takes every C caller; OP_put_array_el's overwrite fast path, which is
+ * `a[i] = v` and so the commonest element write there is; OP_put_array_el's append fast path; copyWithin's
+ * dense span; reverse's dense swap; and pop/shift's memmove. Each left one flow's mutation of a SHARED array
+ * standing in the baseline for every sibling, and standing through the unapply whose whole job is to take it
+ * back out — which is the isolation the whole scheduler rests on.
+ *
+ * The capture is therefore not a line each site remembers — the store IS this function. A dense element is
+ * written in exactly three ways now: this one (in-bounds, on a possibly-shared object), add_fast_array_element
+ * (the append, captured as a created slot), and arr_dense_put (a result array the engine allocated and no page
+ * can see, which asserts that privacy). js_get_fast_array hands out a `const` pointer so a fourth cannot be
+ * written without saying so. Consumes `val`. */
+static void set_fast_array_element(JSContext *ctx, JSObject *p, uint32_t idx, JSValue val)
+{
+    DCHECK(p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS,
+           "a dense-element store on a class whose u.array holds something that is not a JSValue array");
+    DCHECK(p->fast_array, "a dense-element store on an array already converted to slow properties");
+    DCHECK(idx < p->u.array.count, "a dense-element store outside the array's dense part");
+    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32(idx));
+    set_value(ctx, &p->u.array.u.values[idx], val);
+}
+
 /* Allocate a new fast array initialized to JS_UNDEFINED. Its maximum
    size is 2^31-1 elements. For convenience, 'len' is a 64 bit
    integer. */
@@ -12452,21 +12480,21 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 /* add element */
                 return add_fast_array_element(ctx, p, val, flags);
             }
-            /* Forced-exec COW: OVERWRITE of an existing fast-array element writes values[] directly, bypassing the
-               property-set capture. Record the slot's baseline (existed=1, old value) so a shared array's per-flow
-               element write is isolated — unapply restores the old value. (An APPEND above is captured O(1) inside
-               add_fast_array_element; this is the in-bounds overwrite path.) */
-            cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32(idx));
-            set_value(ctx, &p->u.array.u.values[idx], val);
+            set_fast_array_element(ctx, p, idx, val);
             break;
         case JS_CLASS_ARGUMENTS:
             if (unlikely(idx >= (uint32_t)p->u.array.count))
                 goto slow_path;
-            set_value(ctx, &p->u.array.u.values[idx], val);
+            set_fast_array_element(ctx, p, idx, val);
             break;
         case JS_CLASS_MAPPED_ARGUMENTS:
             if (unlikely(idx >= (uint32_t)p->u.array.count))
                 goto slow_path;
+            /* a MAPPED arguments element IS the function's local slot, so its storage is a closure CELL and the
+               capture is the cell's, not the element's — the one dense write in this switch that
+               set_fast_array_element must not take. Without it a flow that assigns `arguments[0]` mutates the
+               shared cell for every sibling, exactly as an uncaptured element write does. */
+            cow_capture_vr(ctx, p->u.array.u.var_refs[idx]);
             set_value(ctx, p->u.array.u.var_refs[idx]->pvalue, val);
             break;
         case JS_CLASS_UINT8C_ARRAY:
@@ -13041,7 +13069,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                             goto redo_prop_update;
                     }
                     if (flags & JS_PROP_HAS_VALUE) {
-                        set_value(ctx, &p->u.array.u.values[idx], js_dup(val));
+                        set_fast_array_element(ctx, p, idx, js_dup(val));
                     }
                     return true;
                 }
@@ -18621,8 +18649,14 @@ static bool js_is_fast_array(JSContext *ctx, JSValue obj)
 }
 
 /* Access an Array's internal JSValue array if available */
+/* THE DENSE STORAGE, FOR READING — `const` is the enforcement, not a decoration. This hands out a raw pointer
+   into u.array.u.values, which is the one way code outside the two store functions above can reach an element,
+   and Array.prototype.reverse took it: it swapped the slots through this pointer, so the COW capture that makes
+   an element write per-flow had nothing to run at. A store is set_fast_array_element / add_fast_array_element,
+   and a caller that means to write now fails to COMPILE here rather than silently leaking a flow's mutation
+   into every sibling. */
 static bool js_get_fast_array(JSContext *ctx, JSValue obj,
-                              JSValue **arrpp, uint32_t *countp)
+                              const JSValue **arrpp, uint32_t *countp)
 {
     /* Try and handle fast arrays explicitly */
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
@@ -23167,7 +23201,7 @@ static int js_append_fast_array(JSContext *ctx, JSValue *sp)
 {
     JSCFunctionType at_it = { .generic_magic = js_create_array_iterator };
     JSValue m, it;
-    JSValue *arrp;
+    const JSValue *arrp;
     uint32_t i, count32, len, pos;
     bool pristine;
 
@@ -38974,7 +39008,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         p = JS_VALUE_GET_OBJ(sp[-3]);
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
                                    idx < (uint32_t)p->u.array.count)) {
-                            set_value(ctx, &p->u.array.u.values[idx], val);
+                            /* `idx < count` is only ever true of a fast array — convert_fast_array_to_array
+                               zeroes the count — so this is the dense store and nothing else. */
+                            set_fast_array_element(ctx, p, idx, val);
                             JS_FreeValue(ctx, sp[-3]);
                             sp -= 3;
                             BREAK;
@@ -38985,21 +39021,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                    p->extensible &&
                                    p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
                                    ctx->std_array_prototype)) {
-                            /* fast path to add an element */
-                            uint32_t array_len;
-                            if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT)) {
-                                uint32_t new_len = idx + 1;
-                                array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
-                                if (likely(new_len <= p->u.array.u1.size)) {
-                                    p->u.array.u.values[idx] = val;
-                                    p->u.array.count = new_len;
-                                    if (new_len > array_len)
-                                        p->prop[0].u.value = js_int32(new_len);
-                                    JS_FreeValue(ctx, sp[-3]);
-                                    sp -= 3;
-                                    BREAK;
-                                }
-                            }
+                            /* THE APPEND IS add_fast_array_element'S — this opcode used to re-implement it (the
+                               slot, the count and the length in three lines) and so captured none of it, which
+                               made `a[a.length] = v` on a shared array a creation no sibling's unapply could
+                               remove. The re-implementation was also missing the not-writable-`length` throw and
+                               the expansion, so it fell to the slow path for both; routing here is what deletes
+                               all three differences at once. */
+                            sf->cur_pc = pc;   /* it can throw now (a non-writable `length`) — name the line */
+                            ret = add_fast_array_element(ctx, p, val, JS_PROP_THROW_STRICT);
+                            JS_FreeValue(ctx, sp[-3]);
+                            sp -= 3;
+                            if (unlikely(ret < 0))
+                                goto exception;
+                            BREAK;
                         }
                     }
                 }
@@ -71624,12 +71658,12 @@ static int step_copysub_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj,
                     l = min_int64(l, from + 1);
                     l = min_int64(l, to + 1);
                     for (j = 0; j < l; j++)
-                        set_value(ctx, &p->u.array.u.values[to - j], js_dup(p->u.array.u.values[from - j]));
+                        set_fast_array_element(ctx, p, (uint32_t)(to - j), js_dup(p->u.array.u.values[from - j]));
                 } else {
                     l = min_int64(l, len - from);
                     l = min_int64(l, len - to);
                     for (j = 0; j < l; j++)
-                        set_value(ctx, &p->u.array.u.values[to + j], js_dup(p->u.array.u.values[from + j]));
+                        set_fast_array_element(ctx, p, (uint32_t)(to + j), js_dup(p->u.array.u.values[from + j]));
                 }
                 *pi += l;
                 continue;
@@ -74786,7 +74820,7 @@ static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         s->hdr.stage = AWITH_CREATE;
     }
     if (s->hdr.stage == AWITH_CREATE) {
-        JSValue *arrp;
+        const JSValue *arrp;
         uint32_t count32;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         if (s->idx < 0) s->idx = s->len + s->idx;
@@ -74801,12 +74835,10 @@ static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         /* the DENSE source: slots copied across with the one replacement, invoking nothing. Whether the copy
            applies is decided without running anything, so asking costs no semantics. */
         if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
-            JSValue *pval = JS_VALUE_GET_OBJ(s->arr)->u.array.u.values;
             int64_t k;
-            for (k = 0; k < s->len; k++, pval++) {
-                JS_FreeValue(ctx, *pval);   /* the allocator's undefined */
-                *pval = (k == s->idx) ? js_dup(step_arg(&s->hdr, 1)) : js_dup(arrp[k]);
-            }
+            for (k = 0; k < s->len; k++)
+                arr_dense_put(ctx, s->arr, k,
+                              (k == s->idx) ? js_dup(step_arg(&s->hdr, 1)) : js_dup(arrp[k]));
             return 0;
         }
         s->i = 0;
@@ -75724,7 +75756,7 @@ static JSValue js_array_reduce_vfini(JSContext *ctx, void *st, bool take_result)
    so it is not debt to retire — reusing the builtin here was the accident. */
 static bool js_internal_array_includes(JSContext *ctx, JSValueConst arr, JSValueConst val)
 {
-    JSValue *arrp;
+    const JSValue *arrp;
     uint32_t count, i;
     if (!js_get_fast_array(ctx, arr, &arrp, &count)) {
         DFAIL("an engine-owned array must be a fast array");
@@ -75780,7 +75812,7 @@ static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSV
     JSValueConst target = step_arg(&s->hdr, 0);
     int mode = s->hdr.arg;
     int back = (mode == SEARCH_LASTINDEXOF);
-    JSValue *arrp;
+    const JSValue *arrp;
     uint32_t count;
     int r, eq = (mode == SEARCH_INCLUDES) ? JS_EQ_SAME_VALUE_ZERO : JS_EQ_STRICT;
 
@@ -80382,8 +80414,6 @@ static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
 {
     JSArrayPop *s = st;
     int shift = (s->hdr.arg != 0);
-    JSValue *arrp;
-    uint32_t count32;
     int r;
 
     if (s->hdr.stage == APOP_TOOBJECT) {
@@ -80403,18 +80433,16 @@ static int js_array_pop_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         s->hdr.stage = APOP_SETLEN;
         if (s->len > 0) {
             s->newLen = s->len - 1;
-            if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
-                JSObject *p = JS_VALUE_GET_OBJ(s->obj);
-                if (shift) {
-                    s->res = arrp[0];
-                    memmove(arrp, arrp + 1, (count32 - 1) * sizeof(*arrp));
-                } else {
-                    s->res = arrp[count32 - 1];
-                }
-                p->u.array.count--;
-            } else {
-                s->hdr.stage = APOP_GET;
-            }
+            /* DELETED: the dense fast path. It read the element out of the slot without a dup, memmove'd the tail
+               down over the raw storage and decremented the count — a whole re-implementation of steps 4-8 that
+               is right below it, and one that captured none of what it did, so `shared.shift()` reordered a
+               baseline array for every sibling and `shared.pop()` shortened it. The general path performs the
+               same work through operations the COW delta already sees: the tail move is step_copysub_run, whose
+               dense span goes through set_fast_array_element, and the removal is step_delidx_run's
+               DeletePropertyOrThrow, which delete_property captures. It is also the spec's algorithm rather than
+               a copy of it, and it costs the same — pop is still one Get and one Delete, shift is still one
+               memmove-shaped span. */
+            s->hdr.stage = APOP_GET;
         }
     }
     if (s->hdr.stage == APOP_GET) {
@@ -80623,7 +80651,7 @@ static const char *const js_array_reverse_steps[] = { AREV_STAGES(JS_STEP_STAGE_
 static int js_array_reverse_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayReverse *s = st;
-    JSValue *arrp;
+    const JSValue *arrp;
     uint32_t count32;
     int r;
 
@@ -80642,11 +80670,17 @@ static int js_array_reverse_step(JSContext *ctx, void *st, JSValue cb_result, JS
         if (r) return r < 0 ? -1 : r;
         if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
             uint32_t ll, hh;
+            JSObject *p = JS_VALUE_GET_OBJ(s->obj);
             if (count32 > 1) {
                 for (ll = 0, hh = count32 - 1; ll < hh; ll++, hh--) {
-                    JSValue t = arrp[ll];
-                    arrp[ll] = arrp[hh];
-                    arrp[hh] = t;
+                    /* the swap is TWO dense stores, not a pointer shuffle: `sharedArr.reverse()` moved every
+                       element of a baseline array with nothing recorded, so the reversal stood for every
+                       sibling. Both values are lifted out first — the second store's source is the slot the
+                       first one overwrites. */
+                    JSValue lo = js_dup(p->u.array.u.values[ll]);
+                    JSValue hi = js_dup(p->u.array.u.values[hh]);
+                    set_fast_array_element(ctx, p, ll, hi);
+                    set_fast_array_element(ctx, p, hh, lo);
                 }
             }
             return 0;
@@ -80752,7 +80786,7 @@ static const char *const js_array_toreversed_steps[] = { ATOREV_STAGES(JS_STEP_S
 static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayToReversed *s = st;
-    JSValue *arrp;
+    const JSValue *arrp;
     uint32_t count32;
     int r;
 
@@ -80775,10 +80809,9 @@ static int js_array_toreversed_step(JSContext *ctx, void *st, JSValue cb_result,
         if (JS_IsException(s->arr)) { s->arr = JS_UNDEFINED; return -1; }
         if (s->len <= 0) return 0;
         if (js_get_fast_array(ctx, s->obj, &arrp, &count32) && count32 == s->len) {
-            JSValue *pval = JS_VALUE_GET_OBJ(s->arr)->u.array.u.values;
             int64_t i;
-            for (i = s->len - 1; i >= 0; i--, pval++)
-                *pval = js_dup(arrp[i]);
+            for (i = 0; i < s->len; i++)
+                arr_dense_put(ctx, s->arr, i, js_dup(arrp[s->len - 1 - i]));
             return 0;
         }
         s->hdr.stage = ATOREV_GET;
@@ -80888,7 +80921,7 @@ static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
 {
     JSArraySlice *s = st;
     int splice = (s->hdr.arg != 0);
-    JSValue *arrp;
+    const JSValue *arrp;
     uint32_t count32;
     int r;
 
@@ -81089,7 +81122,7 @@ static const char *const js_array_tospliced_steps[] = { ATSP_STAGES(JS_STEP_STAG
 static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSArrayToSpliced *s = st;
-    JSValue *arrp;
+    const JSValue *arrp;
     uint32_t count32;
     int r;
 
