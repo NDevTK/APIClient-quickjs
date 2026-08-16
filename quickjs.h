@@ -1621,6 +1621,13 @@ typedef struct JSTimeTravelHooks {
        `pos` is WHERE the inverse must put the record back: the number of LIVE records preceding it for a DELETE,
        and JS_MAP_POS_TAIL for an OVERWRITE, whose inverse creates nothing and therefore places nothing. */
     void (*map_mutate)(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst old_val, JSValueConst val, int op, int pos);
+    /* Before a flow changes a shared object's OWN STATE — the state that is neither a property slot nor the
+       class's opaque record: its EXTENSIBLE bit, its PROTOTYPE, and its [[PrimitiveValue]]/[[DateValue]]/
+       [[ErrorData]] internal slot. No property hook and no engine hook could see any of them, so
+       `Object.freeze(sharedCfg)`, `Object.setPrototypeOf(shared, x)` and `d.setHours(0)` on a baseline Date
+       were each permanent for every sibling. One hook for the three because they are one object; the host
+       captures per object and puts back what it saved (JS_ObjStateSave / Restore / Free). */
+    void (*obj_state)(JSContext *ctx, JSValueConst obj);
     /* Before a flow changes the ASYNC STATE of a shared object: a promise leaving PENDING, a REACTION being
        attached to one that is still pending, or a resolving-function pair latching already_resolved. The
        reaction list belongs here for the same reason the settlement does — `if (flag) p.then(h1); else
@@ -1754,6 +1761,14 @@ JS_EXTERN void    JS_VarRefSetValue(JSContext *ctx, void *cell, JSValue val);
 #define JS_MAP_POS_TAIL (-1)
 JS_EXTERN void JS_MapAddRecord(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val, int pos);
 JS_EXTERN void JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst key);
+
+/* A shared object's OWN state (JSTimeTravelHooks.obj_state), saved into an engine-owned blob and put back on a
+   context switch. The blob holds a reference on each owned half, so the same one restores any number of times.
+   The restore is a SLOT WRITE and never [[SetPrototypeOf]]: its immutable-prototype refusal, its extensible
+   test and its cycle check would each refuse inside a context switch with no flow to throw on. */
+JS_EXTERN void *JS_ObjStateSave(JSContext *ctx, JSValueConst obj);
+JS_EXTERN void  JS_ObjStateRestore(JSContext *ctx, JSValueConst obj, void *blob);
+JS_EXTERN void  JS_ObjStateFree(JSRuntime *rt, void *blob);
 
 /* APIClient forced-execution CONCOLIC-VALUE hooks — how a concolic (symbolic + carried example) value
    PROPAGATES through the two interpreter operators that must carry it. One concern, one owner (the concolic

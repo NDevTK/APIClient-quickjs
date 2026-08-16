@@ -7452,6 +7452,37 @@ void JS_ArrayTruncateDense(JSContext *ctx, JSValueConst obj, uint32_t count) {
     array_dense_truncate(ctx, p, count, /*as_slot*/true);
 }
 
+/* WHICH CLASSES KEEP THEIR INTERNAL SLOT IN `u.object_data` — one list, asked rather than repeated. `p->u` is
+   a UNION, so reading object_data on an Array reads u.array's bits as a JSValue; every reader of that field
+   that is not inside a class-specific function has to ask this first. It is the same list the initialiser
+   above writes and the GC walk marks, which is why it lives beside them. */
+static inline bool js_class_has_object_data(JSClassID class_id) {
+    switch (class_id) {
+    case JS_CLASS_ERROR: case JS_CLASS_NUMBER: case JS_CLASS_STRING: case JS_CLASS_BOOLEAN:
+    case JS_CLASS_SYMBOL: case JS_CLASS_DATE: case JS_CLASS_BIG_INT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* A JSObject'S OWN STATE — the state that is neither a property SLOT nor the class's opaque RECORD, and which
+ * therefore reached no capture at all: whether the object is EXTENSIBLE, what its PROTOTYPE is, and its
+ * [[PrimitiveValue]] / [[DateValue]] / [[ErrorData]] internal slot. Each was permanent for every sibling the
+ * moment one flow wrote it — `Object.freeze(sharedCfg)`, `Object.setPrototypeOf(shared, x)`, `d.setHours(0)`
+ * on a baseline Date — and the prototype one is not only a fidelity gap: an exploration arm's `__proto__`
+ * write is a PROTOTYPE-POLLUTION gadget the solver is supposed to run in isolation from the arm that must not
+ * see it.
+ * ONE entry for the three, because they are one concept — "the object itself, before this flow changed it" —
+ * and because a flow that reaches any of them may write any of them; the capture is per OBJECT, deduped, and
+ * the restore puts back what it saved whichever field the write was. Splitting them would be three entry
+ * kinds whose save/restore/free arms are the same four lines. What is NOT here is the class's own record
+ * (cow_capture_host_record) and the slots (prop_write): those have their own units. */
+static inline void cow_capture_obj(JSContext *ctx, JSObject *p) {
+    if (g_time_travel.obj_state)
+        g_time_travel.obj_state(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+}
+
 /* Time-travel capture for a CLOSURE CELL: a captured local is a shared JSVarRef, not a property, so a write to
    it (OP_put_var_ref / OP_*_loc_ref) bypasses cow_capture above. cell_write records the cell's pre-write value
    into the running flow's delta so a snapshot-forked sibling sharing the cell stays isolated. The cell is opaque
@@ -7560,6 +7591,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     case JS_CLASS_BIG_INT:
         p->u.object_data = JS_UNDEFINED;
         goto set_exotic;
+/* --- the same list, asked as a question. See js_class_has_object_data below. --- */
     case JS_CLASS_SHADOW_REALM:
     case JS_CLASS_WRAPPED_FUNCTION:
         /* NULL for the reason RegExp's two slots are: the object exists before its data does, so a throw or an
@@ -7647,6 +7679,7 @@ static int JS_SetObjectData(JSContext *ctx, JSValueConst obj, JSValue val)
         case JS_CLASS_SYMBOL:
         case JS_CLASS_DATE:
         case JS_CLASS_BIG_INT:
+            cow_capture_obj(ctx, p);   /* forced-exec: the internal slot is per-flow state like any other */
             JS_FreeValue(ctx, p->u.object_data);
             p->u.object_data = val; /* for JS_CLASS_STRING, 'val' must
                                        be JS_TAG_STRING (and not a rope) */
@@ -10246,6 +10279,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     } else if (can_store_error_stack(error_obj)) {
         /* genuine Error instance: store as the [[ErrorData]] stack value */
         p = JS_VALUE_GET_OBJ(error_obj);
+        cow_capture_obj(ctx, p);   /* forced-exec: [[ErrorData]] is the object's own state */
         JS_FreeValue(ctx, p->u.object_data);
         p->u.object_data = stack;
     } else if (can_add_backtrace(error_obj)) {
@@ -10651,6 +10685,10 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         js_dup(proto_val);
     }
 
+    /* forced-exec: the object's own state, before this flow changes it. Here rather than earlier because every
+       refusal above is a write that does not happen; `sh` is re-read below anyway, which it must be — a capture
+       can grow the host's delta and a growth can reshape. */
+    cow_capture_obj(ctx, p);
     if (js_shape_prepare_update(ctx, p, NULL))
         return -1;
     sh = p->shape;
@@ -10666,6 +10704,85 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         }
     }
     return true;
+}
+
+/* THE OBJECT'S OWN STATE, SAVED AND PUT BACK — the three halves of one COW entry (see cow_capture_obj). It is
+   engine-internal because two of the three are: `extensible` is a bit on the JSObject, the prototype lives on
+   the SHAPE and is an owned reference, and `u.object_data` is a union member only some classes have. The blob
+   holds a reference on each owned half, exactly as the record arm's does, because the same blob is restored
+   more than once — a re-apply that had given its only reference away would be putting back freed values.
+   THE RESTORE IS A SLOT WRITE AND NOT THE OPERATION, which is the same distinction JS_SetOwnSlotDesc draws:
+   10.4.7.1's immutable-prototype refusal, 10.1.2's extensible test and the cycle check all belong to
+   [[SetPrototypeOf]], and every one of them would REFUSE inside a context switch that has no flow to throw on —
+   the flow whose baseline is being put back is very often the flow that froze the object. */
+typedef struct JSObjState {
+    uint8_t extensible;
+    uint8_t has_data;      /* the class keeps an internal slot in u.object_data — never inferred from the value */
+    JSObject *proto;       /* owned (NULL is a real prototype: Object.create(null)) */
+    JSValue object_data;   /* owned; JS_UNDEFINED and unread when !has_data */
+} JSObjState;
+
+void *JS_ObjStateSave(JSContext *ctx, JSValueConst obj)
+{
+    JSObject *p;
+    JSObjState *st;
+
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT, "an object-state capture on something that is not an object");
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id != JS_CLASS_PROXY,
+           "a COW delta is capturing a Proxy's own state: its prototype and its extensibility are TRAPS, so "
+           "reading either here would run the page's code mid-context-switch with no flow base");
+    st = js_malloc(ctx, sizeof(*st));
+    if (!st)
+        return NULL;
+    st->extensible = p->extensible;
+    st->proto = p->shape->proto;
+    if (st->proto)
+        js_dup(JS_MKPTR(JS_TAG_OBJECT, st->proto));
+    st->has_data = js_class_has_object_data(p->class_id);
+    st->object_data = st->has_data ? js_dup(p->u.object_data) : JS_UNDEFINED;
+    return st;
+}
+
+void JS_ObjStateRestore(JSContext *ctx, JSValueConst obj, void *blob)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    const JSObjState *st = blob;
+
+    DCHECK(st != NULL, "an object's own state was re-applied before any unapply had recorded one — the context "
+                       "switch that parked this flow did not run");
+    DCHECK(st->has_data == js_class_has_object_data(p->class_id),
+           "an object's captured state disagrees with its class about whether it keeps an internal slot — a "
+           "JSObject does not change class, so the entry was read off a different object than it names");
+    p->extensible = st->extensible;
+    if (p->shape->proto != st->proto) {
+        JSShape *sh;
+        if (js_shape_prepare_update(ctx, p, NULL))
+            CHECK_FAIL("a COW object-state restore could not reshape an object to put its PROTOTYPE back: a "
+                       "dropped baseline prototype leaves one flow's __proto__ write standing for every sibling");
+        sh = p->shape;
+        if (st->proto)
+            js_dup(JS_MKPTR(JS_TAG_OBJECT, st->proto));
+        if (sh->proto)
+            JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
+        sh->proto = st->proto;
+        if (st->proto)
+            st->proto->is_prototype = true;
+    }
+    if (st->has_data)
+        set_value(ctx, &p->u.object_data, js_dup(st->object_data));
+}
+
+void JS_ObjStateFree(JSRuntime *rt, void *blob)
+{
+    JSObjState *st = blob;
+
+    if (!st)
+        return;
+    if (st->proto)
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, st->proto));
+    JS_FreeValueRT(rt, st->object_data);
+    js_free_rt(rt, st);
 }
 
 /* return -1 (exception) or true/false */
@@ -11955,6 +12072,7 @@ int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
        into 7.3.15's TypeError, Reflect.preventExtensions reports it. */
     if (unlikely(is_typed_array(p->class_id)) && !typed_array_is_fixed_length(p))
         return false;
+    cow_capture_obj(ctx, p);   /* forced-exec: `Object.freeze(shared)` in one flow was permanent for every sibling */
     p->extensible = false;
     return true;
 }
@@ -72168,6 +72286,9 @@ static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
             if (JS_IsException(s->result))
                 return -1;
             if (memoize) {
+                /* forced-exec: a MEMOISATION is a shared-state write — one flow reading `err.stack` fixed the
+                   formatted value for every sibling. */
+                cow_capture_obj(ctx, p);
                 JS_FreeValue(ctx, p->u.object_data);
                 p->u.object_data = js_dup(s->result);
             }
@@ -72184,6 +72305,7 @@ static int js_error_get_stack_step(JSContext *ctx, void *st, JSValue cb_result,
     p = JS_VALUE_GET_OBJ(s->hdr.this_val);
     DCHECK(p->class_id == JS_CLASS_ERROR && js_error_stack_is_pending(p->u.object_data),
            "the Error whose stack was being formatted stopped being one mid-call");
+    cow_capture_obj(ctx, p);                      /* forced-exec: the memoisation is a shared-state write */
     JS_FreeValue(ctx, p->u.object_data);
     p->u.object_data = cb_result;                 /* memoized: the hook runs once per error */
     s->result = js_dup(p->u.object_data);
@@ -100626,6 +100748,9 @@ static JSValue JS_SetThisTimeValue(JSContext *ctx, JSValueConst this_val, double
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
         if (p->class_id == JS_CLASS_DATE) {
+            /* forced-exec: [[DateValue]] is the object's own state and this writes it straight through the
+               union, so `d.setHours(0)` on a baseline Date moved it for every sibling. */
+            cow_capture_obj(ctx, p);
             JS_FreeValue(ctx, p->u.object_data);
             p->u.object_data = js_float64(v);
             return js_dup(p->u.object_data);
