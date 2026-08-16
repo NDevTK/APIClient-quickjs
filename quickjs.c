@@ -3462,19 +3462,32 @@ void JS_FreeRuntime(JSRuntime *rt)
        earlier reports several hundred healthy class names as leaks; and the object census cannot come down to
        join it, because it reads class_array to name what it counts. */
     {
-        char why[512] = "";
+        char why[1024] = "";
         JSAtom first = JS_ATOM_NULL;
         const char *first_kind = "";
-        int n_leaked = 0;
+        bool first_builtin = false;
+        int n_leaked = 0, n_builtin = 0;
 
         for(i = 0; i < rt->atom_size; i++) {
             JSAtomStruct *p = rt->atom_array[i];
+            /* THE TWO POPULATIONS NAME TWO DIFFERENT BUGS, which is why the report separates them rather than
+               leaving the reader to know where JS_ATOM_END is. A BUILT-IN name cannot leak an ATOM reference
+               at all: __JS_NewAtom does not increment when the name it found is const, and JS_DupAtom /
+               JS_FreeAtom return immediately — so interning "size" takes nothing and adding a JS_FreeAtom for
+               it gives nothing back. The ONE path that raises a built-in's refcount is __JS_AtomToValue, which
+               hands the struct out as a STRING VALUE and dups it unguarded, because a string value is
+               refcounted like any other. So a built-in above baseline means a leaked JSValue and a missing
+               JS_FreeValue. An id at or above JS_ATOM_END is a runtime-interned name or Symbol, where the
+               refcount IS a reference taken by JS_NewAtom/JS_DupAtom and owed back to JS_FreeAtom.
+               Not stating this cost real work once: a reader who found a built-in here went looking for the
+               missing JS_FreeAtom and added one that compiles to nothing. */
+            bool builtin = i < JS_ATOM_END;
             const char *kind;
 
             if (atom_is_free(p))
                 continue;
-            /* only the atoms JS_InitAtoms() defined should be left, each held by the atom table alone */
-            if (i < JS_ATOM_END && JS_REF_COUNT(p) == 1)
+            /* only the atoms JS_InitAtoms() defined should be left, each at the baseline that function asserts */
+            if (builtin && JS_REF_COUNT(p) == 1)
                 continue;
             /* THE KIND IS HALF THE IDENTIFICATION. A private Symbol and an interned string carrying the same
                description are leaked by different code — one is an interface's internal-slot key and names the
@@ -3499,15 +3512,18 @@ void JS_FreeRuntime(JSRuntime *rt)
                       "value for this field to hold");
                 break;
             }
+            n_builtin += builtin;
             if (n_leaked++ == 0) {
                 first = i;
                 first_kind = kind;
+                first_builtin = builtin;
             }
             /* EVERY LINE CARRIES THE TAG, like js_gc_object_census's and for its reason: a driver collecting
                this report out of a mixed stream filters by line, so a header plus indented rows is a report
                whose rows are invisible to the thing that quotes it. On stdout, where the rest of quickjs's
                dump infra writes, so the two halves of one report cannot arrive in two files. */
-            printf("[atomleak] id %-6u refcount %-6u %-10s ", i, JS_REF_COUNT(p), kind);
+            printf("[atomleak] id %-6u refcount %-6u %-8s %-10s ", i, JS_REF_COUNT(p),
+                   builtin ? "builtin" : "interned", kind);
             JS_DumpString(rt, p);
             printf("\n");
         }
@@ -3517,14 +3533,22 @@ void JS_FreeRuntime(JSRuntime *rt)
             fflush(stdout);   /* the DCHECK below aborts, and an unflushed report is no report */
             leak = true;
             snprintf(why, sizeof(why),
-                     "the runtime went down with %d ATOM%s still interned — the first is %s(%s) at id %u, "
-                     "refcount %u. An atom is not a GC object, so the `[gcleak]` walk above cannot report one: "
-                     "a survivor here is a reference some component took and never dropped, and a Private one "
-                     "is an interface's internal-slot key whose release its host never calls. `[atomleak]` "
-                     "above names every one of them",
-                     n_leaked, n_leaked == 1 ? "" : "S", first_kind,
+                     "the runtime went down with %d ATOM%s above baseline, %d of them BUILT-IN names — the "
+                     "first is %s(%s) at id %u, refcount %u. An atom is not a GC object, so the `[gcleak]` "
+                     "walk above cannot report one; `[atomleak]` above lists every survivor. %s",
+                     n_leaked, n_leaked == 1 ? "" : "S", n_builtin, first_kind,
                      JS_AtomGetStrRT(rt, abuf, sizeof(abuf), first), first,
-                     JS_REF_COUNT(rt->atom_array[first]));
+                     JS_REF_COUNT(rt->atom_array[first]),
+                     first_builtin ?
+                     "THIS ONE IS A BUILT-IN (id < JS_ATOM_END) AND THE FIX IS NOT A JS_FreeAtom. A built-in "
+                     "cannot leak an atom reference: __JS_NewAtom does not increment for a const atom and "
+                     "JS_DupAtom/JS_FreeAtom return immediately, so interning it took nothing and releasing it "
+                     "gives nothing back. The only path that raises this refcount is __JS_AtomToValue handing "
+                     "the struct out as a STRING VALUE — so what leaked is a JSValue, and the missing call is "
+                     "JS_FreeValue at whatever holds it." :
+                     "This one is runtime-interned (id >= JS_ATOM_END), so its refcount IS a reference some "
+                     "component took with JS_NewAtom/JS_DupAtom and never returned with JS_FreeAtom; a Private "
+                     "one is an interface's internal-slot key whose release its host never calls.");
         }
         DCHECK(n_leaked == 0, why);
     }
@@ -4371,6 +4395,33 @@ static int JS_InitAtoms(JSRuntime *rt)
             return -1;
         p = p + len + 1;
     }
+    /* THE BASELINE THE TEARDOWN CENSUS COMPARES AGAINST, ASSERTED WHERE IT IS ESTABLISHED. JS_FreeRuntime's
+       atom walk judges a BUILT-IN name by `refcount == 1`, and that constant is correct only because every
+       atom-API path is const-guarded — __JS_NewAtom does not increment when the name it found is below
+       JS_ATOM_END, and JS_DupAtom / JS_DupAtomRT / JS_FreeAtom / JS_FreeAtomRT all return immediately — so
+       nothing that happens after this function can move it. What CAN break it is a change HERE: one init-time
+       dup of a predefined atom and that name is reported as leaked by every teardown this engine ever performs,
+       with the report naming a healthy atom and nothing to say so. Asserting it at the origin is one pass over
+       ~500 entries, once per runtime, and it turns the census's constant from an assumption into a fact — which
+       is also the answer to "is the baseline uniform across the atom kinds": it is, and this is what says so.
+       Index 0 is included deliberately: __JS_NewAtom's growth path builds the JS_ATOM_NULL entry at refcount 1
+       and calls it "not refcounted", which is the same statement this makes about every entry beside it.
+       Dev-only because the message is composed at the failure, and a message nobody reads is not worth a
+       snprintf on the init path of every runtime in a release build. */
+#if APICLIENT_DEV
+    for(i = 0; i < JS_ATOM_END; i++) {
+        if (JS_REF_COUNT(rt->atom_array[i]) != 1) {
+            char abuf[ATOM_GET_STR_BUF_SIZE], why[320];
+
+            snprintf(why, sizeof(why),
+                     "the predefined atom `%s` (id %d) left JS_InitAtoms at refcount %d rather than 1 — "
+                     "JS_FreeRuntime's atom census judges every built-in name against that baseline, so this "
+                     "one is now reported as a leak on every teardown for the rest of this engine's life",
+                     JS_AtomGetStrRT(rt, abuf, sizeof(abuf), i), i, JS_REF_COUNT(rt->atom_array[i]));
+            DFAIL(why);
+        }
+    }
+#endif
     return 0;
 }
 
