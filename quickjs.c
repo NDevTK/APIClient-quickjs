@@ -95914,6 +95914,21 @@ void JS_AsyncStateFree(JSRuntime *rt, void *blob)
 typedef struct JSReactionFlow {
     JSAsyncFunctionState fs;
     JSValue resolve, reject;   /* the derived promise's capability (owned; may be undefined) */
+    /* THE EMBEDDER'S BEFORE/AFTER BRACKET, HELD BY THE FLOW (27.2.2.2 step 1.b; quickjs.h says the hook runs
+       "right before/after promise.then is invoked"). This is promiseToResolve, owned, for the flow that fired
+       BEFORE; JS_UNDEFINED when no bracket is open, which is every reaction flow except
+       PromiseResolveThenableJob's under an installed hook.
+       IT CANNOT LIVE ON THE C STACK. A bracket around one C activation is a bracket around one JS_Call, and a
+       JS_Call is what this job stopped being: the `then` is the PAGE's, it holds loops and awaits, and the
+       whole of it — parks included — is the invocation the hook is about. Held on the stack, the bracket would
+       close at the first park with most of the call still to come, so "the hook needs one synchronous call" was
+       never a reason to keep a JS_Call; it was a reason to move the bracket onto the thing that survives a park.
+       The capability path already keeps the hook's PARENT link this way (JSPromiseCap.link/linked) across a
+       suspended subclass constructor, for exactly this reason.
+       EVERY construction site MUST WRITE THIS FIELD: an allocator's zero bytes are the INTEGER 0, not
+       JS_UNDEFINED, so a site that left it would fire AFTER with a non-promise. reaction_flow_hook_after
+       DCHECKs precisely that. */
+    JSValue hook_promise;
     /* The SETTLE is a second phase of the same flow, not a JS_Call from C. A capability's resolve is page code
        twice over — a subclass may wrap it, and the NATIVE one is a step machine whose `then` read on a thenable
        result is itself a request — so settling from C ran that read with no flow base. Phase 1 re-uses the very
@@ -95981,8 +95996,34 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
 
 static void reaction_flow_free(JSContext *ctx, JSReactionFlow *rf)
 {
+    /* An OPEN bracket reaching here is a flow that was abandoned rather than completed — a forked arm the
+       scheduler dropped, or teardown — so there is no AFTER to fire: the invocation it would report never
+       finished. The promise it named is still owned, and is released here. */
+    JS_FreeValue(ctx, rf->hook_promise);
     JS_FreeValue(ctx, rf->resolve); JS_FreeValue(ctx, rf->reject);
     js_free_rt(ctx->rt, rf);
+}
+
+/* CLOSE the embedder's bracket: the phase-0 call has completed, which is what "right after promise.then is
+   invoked" names. This is called from reaction_flow_settle_start — the ONE point every phase-0 completion goes
+   through, whether the flow finished inside reaction_flow_step or came back through flow_reaction_complete after
+   a park — so there is no second place a bracket could be left open, and the AFTER lands before 27.2.2.2 step
+   1.c's reject exactly as it did when the two sat around a JS_Call.
+   rt->promise_hook is RE-READ because the embedder may have cleared it while the flow was parked; the C-stack
+   version re-read it across its one call for the same reason. */
+static void reaction_flow_hook_after(JSContext *ctx, JSReactionFlow *rf)
+{
+    JSRuntime *rt = ctx->rt;
+    DCHECK(JS_IsUndefined(rf->hook_promise) || JS_IsObject(rf->hook_promise),
+           "a reaction flow's hook_promise is neither undefined nor the promise its BEFORE hook named — a "
+           "construction site left the field at its allocator's zero bytes, which is the integer 0");
+    if (JS_IsUndefined(rf->hook_promise))
+        return;
+    if (rt->promise_hook)
+        rt->promise_hook(ctx, JS_PROMISE_HOOK_AFTER, rf->hook_promise, JS_UNDEFINED,
+                         rt->promise_hook_opaque);
+    JS_FreeValue(ctx, rf->hook_promise);
+    rf->hook_promise = JS_UNDEFINED;
 }
 
 /* Hand the handler's completion `res` (consumed) to the derived promise's capability. The call becomes PHASE 1 of
@@ -95994,6 +96035,7 @@ static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValu
     JSValueConst func;
     bool is_reject = JS_IsException(res);
 
+    reaction_flow_hook_after(ctx, rf);   /* phase 0 has completed: this IS "right after .then is invoked" */
     if (is_reject) {
         if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
             JS_FreeValue(ctx, res);
@@ -96020,6 +96062,12 @@ static JSAsyncFunctionState *flow_reaction_clone_alloc(JSContext *ctx, JSAsyncFu
     /* the sibling settles the SAME derived promise, whose settlement the COW delta captures per flow */
     c->resolve = js_dup(sr->resolve);
     c->reject = js_dup(sr->reject);
+    /* THE BRACKET IS NOT INHERITED. It is a pair the embedder counts — an async-context tracker pushes on
+       BEFORE and pops on AFTER — so a clone that inherited it would pop twice for one push and underflow that
+       stack. One BEFORE, one AFTER: the bracket belongs to the timeline that opened it, and the forked arm runs
+       outside it. A fork is a world the embedder's model has no way to name; corrupting the model to mention it
+       is worse than the arm going unreported. */
+    c->hook_promise = JS_UNDEFINED;
     c->phase = sr->phase;
     return &c->fs;
 }
@@ -96151,6 +96199,7 @@ static int js_settle_as_flow(JSContext *ctx, JSValueConst func, JSValueConst val
     if (unlikely(!rf)) { JS_ThrowOutOfMemory(ctx); return -1; }
     rf->resolve = js_dup(func);
     rf->reject = JS_UNDEFINED;
+    rf->hook_promise = JS_UNDEFINED;   /* no .then invocation here, so no BEFORE/AFTER bracket to close */
     rf->phase = 1;   /* there is no handler phase: the settle is the entire flow */
     if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&value)) < 0) { reaction_flow_free(ctx, rf); return -1; }
     return JS_IsException(reaction_flow_step(ctx, rf)) ? -1 : 0;
@@ -96206,6 +96255,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
         }
         rf->resolve = js_dup(argv[0]);
         rf->reject = js_dup(argv[1]);
+        rf->hook_promise = JS_UNDEFINED;   /* 27.2.2.1 is not bracketed: the hook names a .then invocation */
         return reaction_flow_step(ctx, rf);
     }
     is_reject = JS_IsException(res);
@@ -96254,6 +96304,7 @@ static JSValue host_call_job(JSContext *ctx, int argc, JSValueConst *argv)
     }
     rf->resolve = JS_UNDEFINED;   /* nothing settles when this returns */
     rf->reject = JS_UNDEFINED;
+    rf->hook_promise = JS_UNDEFINED;   /* a host callback is not a .then invocation: no bracket */
     /* PHASE 1: there is no handler phase here either — the whole flow is this one call, so its result is
        discarded and its THROW is the job's completion. At phase 0 the completion would have been offered to a
        capability, found both halves undefined, and DROPPED it: a queueMicrotask callback or a
@@ -96361,8 +96412,9 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
                                                int argc, JSValueConst *argv)
 {
     JSValueConst promise, thenable, then;
-    JSValue args[2], res;
+    JSValue args[2];
     JSRuntime *rt;
+    JSReactionFlow *rf;
 
     promise_trace(ctx, "js_promise_resolve_thenable_job\n");
 
@@ -96370,46 +96422,45 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
     promise = argv[0];
     thenable = argv[1];
     then = argv[2];
-    if (js_create_resolving_functions(ctx, args, promise) < 0)
+    if (js_create_resolving_functions(ctx, args, promise) < 0)   /* 27.2.2.2 step 1.a */
         return JS_EXCEPTION;
     rt = ctx->rt;
-    if (!rt->promise_hook) {
-        /* the thenable's .then is the PAGE's — run then.call(thenable, resolve, reject) as a call-root FLOW so it
-           parks into the job pump, never a JS_Call to completion. This also asked whether `then` was plain
-           BYTECODE, which handed a bound, proxied, C or step-machine `.then` to the same JS_Call the reaction
-           job used to fall to; the call root routes every kind through the convergence point instead.
-           On success the result is DISCARDED (the .then already settled the promise via resolve/reject); on
-           throw, reaction_flow_settle calls rf->reject, which is PromiseResolveThenableJob's abrupt step. The
-           BEFORE/AFTER promise hooks must bracket ONE synchronous call — an embedder contract, not a claim about
-           the callee — so a hook still forces the inline path below. */
-        JSReactionFlow *rf = js_malloc(ctx, sizeof(*rf));
-        if (unlikely(!rf)) { JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); return JS_EXCEPTION; }
-        memset(rf, 0, sizeof(*rf));
-        if (reaction_call_flow_init(ctx, &rf->fs, thenable, then, 2, vc(args))) {
-            js_free_rt(rt, rf); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); return JS_EXCEPTION;
-        }
-        rf->resolve = JS_UNDEFINED;     /* success: discard the .then result */
-        rf->reject = js_dup(args[1]);   /* throw: reject the promise */
-        JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]);
-        return reaction_flow_step(ctx, rf);
+    /* 27.2.2.2 step 1.b — the thenable's `then` is the PAGE's, so then.call(thenable, resolve, reject) runs as a
+       CALL-ROOT FLOW: it parks into the job pump and is never a JS_Call driven to completion. This also asked
+       whether `then` was plain BYTECODE, which handed a bound, proxied, C or step-machine `.then` to that same
+       JS_Call; the call root routes every kind through the convergence point instead.
+       On a normal completion the result is DISCARDED (step 1.d's value is not observable — the `.then` already
+       settled the promise through the resolving functions); on an abrupt one reaction_flow_settle_start calls
+       rf->reject, which is step 1.c.i.
+       AN INSTALLED PROMISE HOOK USED TO FORCE THE JS_CALL, on the claim that BEFORE/AFTER must bracket one
+       synchronous call. That claim was a fallback wearing an embedder contract: quickjs.h asks for a bracket
+       around the `.then` INVOCATION, and the invocation is this flow — a `then` holding a loop or an `await` is
+       not one C activation, so the stack could not have bracketed it even when it tried. The bracket therefore
+       rides the flow (JSReactionFlow.hook_promise) and closes at the phase-0 completion, and the legacy body it
+       used to select is gone. */
+    rf = js_mallocz(ctx, sizeof(*rf));   /* js_mallocz has already thrown the OOM when it returns NULL */
+    if (unlikely(!rf))
+        goto fail;
+    /* EVERY owned field is on the state BEFORE reaction_call_flow_init, the first operation here that can fail:
+       the failure path tears the state down through reaction_flow_free, which frees exactly what the state
+       holds. A field handed over after it would leak, and the resolving function this one holds is the whole
+       rejection half of step 1.c. */
+    rf->resolve = JS_UNDEFINED;                                        /* success: discard the .then result */
+    rf->reject = js_dup(args[1]);                                      /* throw: reject promiseToResolve */
+    rf->hook_promise = rt->promise_hook ? js_dup(promise) : JS_UNDEFINED;
+    if (reaction_call_flow_init(ctx, &rf->fs, thenable, then, 2, vc(args)) < 0) {
+        reaction_flow_free(ctx, rf);
+        goto fail;
     }
-    if (rt->promise_hook) {
-        rt->promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, promise, JS_UNDEFINED,
-                         rt->promise_hook_opaque);
-    }
-    res = JS_Call(ctx, then, thenable, 2, vc(args));
-    if (rt->promise_hook) {
-        rt->promise_hook(ctx, JS_PROMISE_HOOK_AFTER, promise, JS_UNDEFINED,
-                         rt->promise_hook_opaque);
-    }
-    if (JS_IsException(res)) {
-        JSValue error = JS_GetException(ctx);
-        res = JS_Call(ctx, args[1], JS_UNDEFINED, 1, vc(&error));
-        JS_FreeValue(ctx, error);
-    }
-    JS_FreeValue(ctx, args[0]);
-    JS_FreeValue(ctx, args[1]);
-    return res;
+    JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]);
+    /* OPEN the bracket only once the flow exists to close it — a BEFORE fired on a path that then returns an
+       exception is a push the embedder never gets a pop for. */
+    if (!JS_IsUndefined(rf->hook_promise))
+        rt->promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, promise, JS_UNDEFINED, rt->promise_hook_opaque);
+    return reaction_flow_step(ctx, rf);
+ fail:
+    JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]);
+    return JS_EXCEPTION;
 }
 
 static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
