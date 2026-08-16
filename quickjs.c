@@ -267,6 +267,10 @@ typedef struct JSValueLink {
 } JSValueLink;
 
 typedef struct JSTrampStepDef JSTrampStepDef;   /* quickjs-step.h, included below with the rest of the surface */
+/* The spec algorithm a step def names. js_call_c_function_data's backstop belongs beside the closure
+   constructor, which is thousands of lines ABOVE that include, so the struct is still incomplete there and the
+   field is read through this instead of by widening the forward declaration. */
+static const char *js_step_def_algorithm(const JSTrampStepDef *def);
 struct JSRuntime {
     /* HOST-REGISTERED STEP MACHINES. JS_CFUNC_STEP_DEF names its machine by an id; the built-in ids index a
        static table and a host component's id continues past STEPDEF_COUNT into this array. It is on the RUNTIME
@@ -7740,6 +7744,28 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
     if (!s)
         return JS_EXCEPTION; // can't really happen
+    if (unlikely(s->step_def != NULL)) {
+        /* THE BACKSTOP FOR A CLOSURE STEP MACHINE — the exact twin of js_call_c_function's JS_CFUNC_step case,
+           asked at the one point every off-tramp call to a closure converges on (JS_CallInternal's class-call
+           dispatch). There is no body to run: a step closure carries no `func`, so its algorithm exists only as
+           the machine, and arriving here is a CALL SHAPE THAT WAS NEVER ROUTED, not a slower path. Ten closures
+           used to say this each in their own `_c_entry` stub; a machine added without one would have called
+           through NULL instead of naming itself. NAME the closure, for the reason the JS_CFUNC_step backstop
+           does: without it the abort starts a bisect instead of ending one. */
+        char why[224];
+        const char *nm = NULL;
+        JSValue nv = JS_GetProperty(ctx, func_obj, JS_ATOM_name);
+        if (!JS_IsException(nv)) nm = JS_ToCString(ctx, nv);
+        snprintf(why, sizeof(why),
+                 "the step closure `%s` (%s) reached its C entry — it has no body; route that call site onto "
+                 "do_step_tramp, there is no second driver",
+                 (nm && *nm) ? nm : "?", js_step_def_algorithm(s->step_def));
+        DFAIL(why);
+        /* release: the capability is not supportable off the chain, so the call fails rather than segfaulting. */
+        JS_FreeCString(ctx, nm);
+        JS_FreeValue(ctx, nv);
+        return JS_ThrowTypeError(ctx, "a step closure reached its C entry: unrouted call shape");
+    }
     arg_buf = argv;
     arg_count = s->length;
     if (unlikely(argc < arg_count)) {
@@ -7764,21 +7790,42 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->cur_func = unsafe_unconst(func_obj);
     sf->this_val = this_val;
     sf->arg_count = argc;
+    DCHECK(s->func != NULL, "an ordinary closure with no C body: js_new_c_function_data's exclusive-alternatives "
+                            "DCHECK and the step backstop above are what make this unreachable, so a NULL here "
+                            "means one of them was bypassed");
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
     return ret;
 }
 
-JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
-                             const char *name,
-                             int length, int magic, int data_len,
-                             JSValueConst *data)
+/* A CLOSURE IS EITHER A C BODY OR A STEP MACHINE, AND WHICH ONE IS DECIDED AT CREATION.
+ *
+ * `step_def` used to be written AFTER the object existed, by a promise_closure_set_step() the caller was trusted
+ * to remember, and that post-hoc annotation is what let the last true twin in this file exist: the Promise.all
+ * resolve/reject element was built around a live C body AND then told it was a machine, so ONE algorithm had two
+ * implementations and which one ran depended on which dispatch reached the closure. Ten other closures wrote a
+ * hand-rolled `_c_entry` that only DFAILed, to fill the function-pointer slot they had no body for — the
+ * hand-copied list of who is special, and one that a new machine forgetting to write it would have fallen
+ * straight through.
+ *
+ * So the two are EXCLUSIVE ALTERNATIVES of one constructor, and the DCHECK below is the whole mechanism: a
+ * closure with both is the twin, and a closure with neither calls through a NULL pointer at
+ * js_call_c_function_data. Neither state is representable any more, so there is no window to get wrong. */
+static JSValue js_new_c_function_data(JSContext *ctx, JSCFunctionData *func,
+                                      const JSTrampStepDef *step_def,
+                                      const char *name,
+                                      int length, int magic, int data_len,
+                                      JSValueConst *data)
 {
     JSCFunctionDataRecord *s;
     JSAtom name_atom;
     JSValue func_obj;
     int i;
 
+    DCHECK((func != NULL) != (step_def != NULL),
+           "a C-function-data closure is EITHER an ordinary C body OR a bodyless step machine, never both "
+           "(that is one algorithm with two implementations, chosen by whichever dispatch arrived) and never "
+           "neither (js_call_c_function_data would call through a NULL function pointer)");
     func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
                                       JS_CLASS_C_FUNCTION_DATA);
     if (JS_IsException(func_obj))
@@ -7792,7 +7839,7 @@ JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
     s->length = length;
     s->data_len = data_len;
     s->magic = magic;
-    s->step_def = NULL;   /* ordinary closure; a step-machine reaction sets this after creation */
+    s->step_def = step_def;
     s->realm = JS_DupContext(ctx);
     for(i = 0; i < data_len; i++)
         s->data[i] = js_dup(data[i]);
@@ -7810,11 +7857,29 @@ JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
     return func_obj;
 }
 
+/* A CLOSURE WITH NO C BODY: captured values plus a step machine, which is the shape a Promise reaction has to
+   be. Its algorithm lives in exactly one place — `def` — so every call shape must reach it through
+   do_step_tramp; js_call_c_function_data names the closure and aborts for any that does not. */
+static JSValue js_new_step_closure(JSContext *ctx, const JSTrampStepDef *def,
+                                   int length, int magic, int data_len,
+                                   JSValueConst *data)
+{
+    return js_new_c_function_data(ctx, NULL, def, NULL, length, magic, data_len, data);
+}
+
+JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
+                             const char *name,
+                             int length, int magic, int data_len,
+                             JSValueConst *data)
+{
+    return js_new_c_function_data(ctx, func, NULL, name, length, magic, data_len, data);
+}
+
 JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                             int length, int magic, int data_len,
                             JSValueConst *data)
 {
-    return JS_NewCFunctionData2(ctx, func, NULL, length, magic, data_len, data);
+    return js_new_c_function_data(ctx, func, NULL, NULL, length, magic, data_len, data);
 }
 
 static JSContext *js_autoinit_get_realm(JSProperty *pr)
@@ -10552,34 +10617,18 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                            finds, for ANY callable, and calls it on the tramp chain as a 0-arg method call.
                            The JS_CallFree that used to be here was measured over the whole corpus behind a
                            DCHECK and never reached, so it is deleted rather than left as a fallback. */
-                        /* NAME THE PROPERTY *AND WHOSE*. The atom alone is not enough to identify the read, and
-                           that shortfall cost a real session: `name` is an accessor on FOUR unrelated things in
-                           this engine — Window (§7.1's `window.name`), DOMException, Attr, and any page object
-                           whose config the browser half reads — so four completely different bugs printed the
-                           identical line, and the search the atom was added to prevent happened anyway, one
-                           layer in. The caller is still not in the report (the wasm stack is function indices),
-                           but the RECEIVER'S CLASS plus the HOLDER'S CLASS narrow it to one component: a
-                           `name` on JS_CLASS_DOMEXCEPTION is an error-report path, on the global it is an
-                           attacker-source read, on JS_CLASS_OBJECT it is a page config.
-                           The two classes are separate because the getter is normally found on a PROTOTYPE, so
-                           the holder names the interface and the receiver names the instance the read was
-                           actually made on — and when they differ, that difference is the identification. */
+                        /* NAME THE PROPERTY. Without it the abort says only that SOME C read somewhere in the
+                           engine hit SOME accessor, and the caller is not in the report — the wasm stack is
+                           function indices — so whoever lands here has a search of every JS_GetProperty* call
+                           site in the browser half. The atom is in hand at the failure, and it is the whole of
+                           what identifies the read. */
 #if APICLIENT_DEV
                         {
-                            char pbuf[ATOM_GET_STR_BUF_SIZE], hbuf[ATOM_GET_STR_BUF_SIZE];
-                            char rbuf[ATOM_GET_STR_BUF_SIZE], why[320];
-                            JSRuntime *rt0 = ctx->rt;
-                            const char *rcls = "a primitive";
-                            if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
-                                rcls = JS_AtomGetStr(ctx, rbuf, sizeof(rbuf),
-                                                     rt0->class_array[JS_VALUE_GET_OBJ(obj)->class_id].class_name);
+                            char pbuf[ATOM_GET_STR_BUF_SIZE], why[256];
                             snprintf(why, sizeof why,
-                                     "JS_GetPropertyInternal reached a getter for `%s` on %s (the accessor is "
-                                     "held by %s) — route this read onto the tramp chain instead of running the "
-                                     "getter from C",
-                                     JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop), rcls,
-                                     JS_AtomGetStr(ctx, hbuf, sizeof(hbuf),
-                                                   rt0->class_array[p->class_id].class_name));
+                                     "JS_GetPropertyInternal reached a getter for `%s` — route this read onto "
+                                     "the tramp chain instead of running the getter from C",
+                                     JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop));
                             DFAIL(why);
                         }
 #endif
@@ -18983,6 +19032,16 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
    the clone dups the slot in the fresh byte-copy, the teardown releases it. A machine calls it per owned field
    and never asks which consumer it is talking to. */
 #include "quickjs-step.h"
+
+/* Declared beside the JSTrampStepDef forward declaration; see there for why the field is not read directly. */
+static const char *js_step_def_algorithm(const JSTrampStepDef *def)
+{
+    DCHECK(def != NULL, "a step def was asked for its algorithm with no def to read");
+    DCHECK(def->algorithm != NULL, "a step machine with no `.algorithm`: a def names the spec operation it "
+                                   "implements, and an abort that cannot say which one starts a bisect");
+    return def->algorithm;
+}
+
 /* HOISTED to here, for the reason JSStepHdr is: the visitor above names it and the machine that owns one is
    thousands of lines below. A sorted element carries the value AND the string a default comparison coerced it
    to, which is why a slot is a struct and its release is not a JS_FreeValue. */
@@ -19043,7 +19102,6 @@ static void js_declare_native_machine(JSValueConst func_obj, int id)
     DCHECK(id >= 0 && id < 255, "a native-machine id outside the field's range");
     fp->u.cfunc.native_machine = (uint8_t)(id + 1);
 }
-static void promise_closure_set_step(JSValueConst closure, const JSTrampStepDef *def);
 static const JSTrampStepDef *tramp_step_def_of(JSValueConst func);
 static const JSTrampStepDef *tramp_step_ctor_def_of(JSValueConst func);
 /* the def a STEPDEF_* id names. A CALL reaches its def through the callee object; an OPCODE that drives a machine
@@ -21212,33 +21270,21 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                length, `slice` clamping its indices — user code reached from C before the state existed, with no
                step to route it to. There is no init any more: the driver allocates the state and the prologue is
                step 0, so a coercion in a prologue requests a TOPRIMITIVE step exactly like one in a body. */
-            /* NAME the builtin — from its DEF, never from a property read. This read the `name` property with
-               JS_GetProperty and justified it as "safe because the very next statement is abort()". That claim
-               is false in three ways and each one is a defect an abort path must not have. (1) A property read
-               runs the property machinery, which has asserts of its own: a receiver whose `name` is an ACCESSOR
-               aborts inside JS_GetPropertyInternal's own getter DFAIL, so the report names the wrong failure
-               entirely and the mechanism this assert exists to name is never printed — an assert that fires
-               about itself. (2) A getter IS page code, which is the one thing this engine forbids reaching from
-               a C activation, so the diagnostic for a missing flow base was itself running without one.
-               (3) DFAIL compiles out in release while the read does not, so a release build ran the getter and
-               leaked both the JSValue and the CString on a path that then returned an exception nobody set.
-               The def is the honest source and a better one: `.algorithm` is a static string naming the SPEC
-               ALGORITHM, which is what a reader needs, where `name` is a page-writable property that any bundle
-               can redefine. The whole block is dev-only, so release neither formats nor reads anything. */
-#if APICLIENT_DEV
-            {
-                const JSTrampStepDef *sdef = tramp_step_def_of(func_obj);
-                char why[256];
-                DCHECK(sdef && sdef->algorithm,
-                       "a JS_CFUNC_step callee carries no step def to name it — the cproto and the def are set "
-                       "together at the declaration, so one without the other is a half-finished registration");
+            {   /* NAME the builtin. Without it the abort says only "a step builtin", and finding WHICH one meant
+                   bisecting the corpus a directory at a time — the assert is supposed to name the exact unbuilt
+                   mechanism, not start a search. The STEPDEF id identifies the def uniquely; the `name` property
+                   is what a reader recognises, and reading it here is safe because the very next statement is
+                   abort(). */
+                char why[192];
+                const char *nm = NULL;
+                JSValue nv = JS_GetProperty(ctx, func_obj, JS_ATOM_name);
+                if (!JS_IsException(nv)) nm = JS_ToCString(ctx, nv);
                 snprintf(why, sizeof(why),
-                         "the step machine for %s (STEPDEF id %d) was invoked outside the interpreter's "
-                         "dispatch — route that call site onto do_step_tramp; there is no second driver",
-                         sdef->algorithm, p->u.cfunc.magic);
+                         "the step builtin `%s` (STEPDEF id %d) was invoked outside the interpreter's dispatch — "
+                         "route that call site onto do_step_tramp; there is no second driver",
+                         nm ? nm : "?", p->u.cfunc.magic);
                 DFAIL(why);
             }
-#endif
             ret_val = JS_EXCEPTION;
         }
         break;
@@ -24233,7 +24279,6 @@ static JSValue js_new_afs_cont(JSContext *ctx, JSValueConst sync_iter, JSValueCo
 static const JSTrampStepDef js_afs_cont_def;
 static void js_async_from_sync_end(JSContext *ctx, struct JSAsyncFromSync *s);
 static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
-static JSValue js_promise_all_resolve_element(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
 /* arr.sort(cmpFn) with a NORMAL bytecode comparator: a SUSPENDABLE bottom-up (iterative) stable merge sort whose
    ONLY suspension point is cmp(array[l], array[r]) inside the inner merge. All algorithm state (width, block
@@ -43335,13 +43380,6 @@ static const JSTrampStepDef js_async_await_def = {
     .catches_abrupt = 1, .visit = js_async_await_visit,
     .algorithm = "27.7.5.3 Await", .steps = js_async_await_steps };
 
-static JSValue js_async_await_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
-                                      JSValueConst *argv, int magic, JSValueConst *func_data)
-{
-    DFAIL("an async Await reached its C entry — route that call shape onto do_step_tramp");
-    return JS_ThrowTypeError(ctx, "async Await reached its C entry");
-}
-
 /* THE ONE construction site: building the closure IS declaring it a machine, and both routes reach the
    algorithm through it. `s` is BORROWED — the handle takes its own reference. */
 static JSValue js_new_async_await(JSContext *ctx, JSAsyncFunctionData *s)
@@ -43351,11 +43389,8 @@ static JSValue js_new_async_await(JSContext *ctx, JSAsyncFunctionData *s)
     if (JS_IsException(handle))
         return handle;
     data[0] = handle;
-    f = JS_NewCFunctionData(ctx, js_async_await_c_entry, 1, 0, 1, data);
+    f = js_new_step_closure(ctx, &js_async_await_def, 1, 0, 1, data);
     JS_FreeValue(ctx, handle);
-    if (JS_IsException(f))
-        return f;
-    promise_closure_set_step(f, &js_async_await_def);
     return f;
 }
 
@@ -43878,22 +43913,12 @@ static const JSTrampStepDef js_agen_await_def = {
     .catches_abrupt = 1, .visit = js_agen_await_ret_visit,
     .algorithm = "27.7.5.3 Await (an async generator body's)", .steps = js_agen_await_steps };
 
-static JSValue js_agen_await_ret_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
-                                         JSValueConst *argv, int magic, JSValueConst *func_data)
-{
-    DFAIL("AsyncGeneratorAwaitReturn reached its C entry — route that call shape onto do_step_tramp");
-    return JS_ThrowTypeError(ctx, "AsyncGeneratorAwaitReturn reached its C entry");
-}
-
 /* THE ONE construction site: building the closure IS declaring it a machine, and the two drivers reach the
    algorithm through it — the interpreter as the state's func_obj, the reaction driver as a call-root callee. */
 static JSValue js_new_agen_await_ret(JSContext *ctx, JSValueConst generator, bool is_await)
 {
-    JSValue f = JS_NewCFunctionData(ctx, js_agen_await_ret_c_entry, 1, 0, 1, &generator);
-    if (JS_IsException(f))
-        return f;
-    promise_closure_set_step(f, is_await ? &js_agen_await_def : &js_agen_await_ret_def);
-    return f;
+    return js_new_step_closure(ctx, is_await ? &js_agen_await_def : &js_agen_await_ret_def,
+                               1, 0, 1, &generator);
 }
 
 static void js_async_generator_resume_next(JSContext *ctx, JSAsyncGeneratorData *s);
@@ -71744,16 +71769,6 @@ static int64_t fa_get_int(JSContext *ctx, JSValueConst st, int i)
     return r;
 }
 
-/* The closure's C entry. It exists only because JS_NewCFunctionData takes a function pointer; the
-   implementation is js_fromasync_def, and both dispatches reach it — the tramp's and the job pump's reaction
-   dispatch, which runs a handler as a call-root flow. Arriving here is a call shape that was never routed. */
-static JSValue js_fromasync_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
-                                    JSValueConst *argv, int magic, JSValueConst *func_data)
-{
-    DFAIL("an Array.fromAsync continuation reached its C entry — route that call shape onto do_step_tramp");
-    return JS_ThrowTypeError(ctx, "Array.fromAsync continuation reached its C entry");
-}
-
 /* One resumption point, as a promise-reaction closure that shares the state array. `phase` says where it
    continues — including WHICH half it is, because the fulfil and reject halves of an Await do not always differ
    by a flag: the mapped value's rejection closes the iterator and the close's own Await discards both. */
@@ -71762,11 +71777,8 @@ static JSValue fa_link(JSContext *ctx, JSValueConst st, int phase)
     JSValueConst data[2];
     JSValue ph = js_int32(phase), f;
     data[0] = st; data[1] = ph;
-    f = JS_NewCFunctionData(ctx, js_fromasync_c_entry, 1, 0, 2, data);
+    f = js_new_step_closure(ctx, &js_fromasync_def, 1, 0, 2, data);
     JS_FreeValue(ctx, ph);
-    if (JS_IsException(f))
-        return f;
-    promise_closure_set_step(f, &js_fromasync_def);
     return f;
 }
 
@@ -79101,26 +79113,14 @@ typedef struct JSSyncDisposeWrap {
  * The engine's own Await is built exactly this way (js_new_async_await), so this opens a door rather than adding
  * a mechanism: the closure is a C_FUNCTION_DATA whose record names a step def, and tramp_step_def_of already
  * drives it through do_step_tramp like any other machine. `stepid` is what JS_RegisterStepDef handed out. */
-static JSValue js_host_step_closure_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
-                                            JSValueConst *argv, int magic, JSValueConst *func_data)
-{
-    (void)this_val; (void)argc; (void)argv; (void)magic; (void)func_data;
-    DFAIL("a host step closure reached its C entry — every call shape must route onto do_step_tramp");
-    return JS_ThrowTypeError(ctx, "a host step closure reached its C entry");
-}
-
 JSValue JS_NewStepClosure(JSContext *ctx, int stepid, int length, int data_len, JSValueConst *data)
 {
     JSRuntime *rt = ctx->rt;
-    JSValue f;
 
     CHECK(stepid >= STEPDEF_COUNT && stepid - STEPDEF_COUNT < rt->host_step_def_count,
           "JS_NewStepClosure was given an id JS_RegisterStepDef never handed out");
-    f = JS_NewCFunctionData(ctx, js_host_step_closure_c_entry, length, 0, data_len, data);
-    if (JS_IsException(f))
-        return f;
-    promise_closure_set_step(f, rt->host_step_defs[stepid - STEPDEF_COUNT]);
-    return f;
+    return js_new_step_closure(ctx, rt->host_step_defs[stepid - STEPDEF_COUNT],
+                               length, 0, data_len, data);
 }
 
 JSValueConst JS_StepClosureData(const JSStepHdr *h, int i)
@@ -94863,26 +94863,13 @@ static const JSTrampStepDef js_sync_dispose_wrap_def = {
     .steps = js_sync_dispose_wrap_steps
 };
 
-/* The wrapper's C entry, for the reason the chain link has one: JS_NewCFunctionData takes a function pointer and
-   the implementation is the machine above. */
-static JSValue js_sync_dispose_wrapper(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv,
-                                       int magic, JSValueConst *func_data)
-{
-    DFAIL("a sync-dispose wrapper reached its C entry — route that call shape onto do_step_tramp");
-    return JS_ThrowTypeError(ctx, "sync-dispose wrapper reached its C entry");
-}
-
 static JSValue js_new_sync_dispose_wrapper(JSContext *ctx, JSValue method)
 {
     JSValueConst data[1];
     JSValue wrapped;
     data[0] = method;
-    wrapped = JS_NewCFunctionData(ctx, js_sync_dispose_wrapper, 0, 0, 1, data);
+    wrapped = js_new_step_closure(ctx, &js_sync_dispose_wrap_def, 0, 0, 1, data);
     JS_FreeValue(ctx, method);
-    if (JS_IsException(wrapped))
-        return wrapped;
-    promise_closure_set_step(wrapped, &js_sync_dispose_wrap_def);
     return wrapped;
 }
 
@@ -95240,18 +95227,6 @@ static JSValue js_async_dispose_rethrow(JSContext *ctx, JSValueConst this_val,
     }
 }
 
-/* The chain closure's C entry. It exists only because JS_NewCFunctionData takes a function pointer: the
-   implementation is js_async_dispose_link_def, and both dispatches reach it — the tramp's, and the job pump's,
-   which runs a reaction handler as a call-root flow through JS_CallInternal. Arriving here is a call shape that
-   was never routed, not a slower path. */
-static JSValue js_async_dispose_step(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv,
-                                     int magic, JSValueConst *func_data)
-{
-    DFAIL("an async-dispose chain link reached its C entry — route that call shape onto do_step_tramp");
-    return JS_ThrowTypeError(ctx, "async-dispose chain link reached its C entry");
-}
-
 /* ONE link of disposeAsync's chain: dispose this resource, then Await its result. `func_data` is
    [value, method, hint] and the magic says whether a previous link already failed (so this one's completion is a
    SuppressedError). The dispose method is the page's code, so it is a CALL request rather than a JS_Call — the
@@ -95373,8 +95348,8 @@ static int js_async_dispose_link_new(JSContext *ctx, JSValue value, JSValue meth
     JSValueConst data[3];
     JSValue hint_val = JS_NewInt32(ctx, hint);
     data[0] = value; data[1] = method; data[2] = hint_val;
-    *out_resolve = JS_NewCFunctionData(ctx, js_async_dispose_step, 0, 0, 3, data);
-    *out_reject  = JS_NewCFunctionData(ctx, js_async_dispose_step, 0, 1, 3, data);
+    *out_resolve = js_new_step_closure(ctx, &js_async_dispose_link_def, 0, 0, 3, data);
+    *out_reject  = js_new_step_closure(ctx, &js_async_dispose_link_def, 0, 1, 3, data);
     JS_FreeValue(ctx, hint_val);
     JS_FreeValue(ctx, value);
     JS_FreeValue(ctx, method);
@@ -95383,8 +95358,6 @@ static int js_async_dispose_link_new(JSContext *ctx, JSValue value, JSValue meth
         *out_resolve = JS_UNDEFINED; *out_reject = JS_UNDEFINED;
         return -1;
     }
-    promise_closure_set_step(*out_resolve, &js_async_dispose_link_def);
-    promise_closure_set_step(*out_reject,  &js_async_dispose_link_def);
     return 0;
 }
 
@@ -97127,39 +97100,20 @@ static const JSTrampStepDef js_promise_resolve_elem_def = {
     .steps = js_promise_resolve_elem_steps
 };
 
-/* Mark a freshly-created resolve/reject element closure as a step machine, so its synchronous (thenable-driven)
-   dispatch runs on the tramp. The async job-queue dispatch still enters the C body below (js_call_c_function_data
-   does not consult step_def) — a different entry point, not a fallback; converting the job queue to flows is the
-   next build and will let that body delete. */
-static void promise_closure_set_step(JSValueConst closure, const JSTrampStepDef *def)
-{
-    JSObject *fp = JS_VALUE_GET_OBJ(closure);
-    DCHECK(fp->class_id == JS_CLASS_C_FUNCTION_DATA && fp->u.c_function_data_record,
-           "promise_closure_set_step: not a C-function-data closure");
-    fp->u.c_function_data_record->step_def = def;
-}
-#define promise_reaction_set_step(closure) promise_closure_set_step((closure), &js_promise_resolve_elem_def)
-
-/* The C-body dispatch of the reaction — reached via the job queue (JS_Call from C, not the bytecode tramp). Shares
-   prep with the step machine; only the settle dispatch differs (JS_Call to completion vs tramp drive). */
-static JSValue js_promise_all_resolve_element(JSContext *ctx,
-                                              JSValueConst this_val,
-                                              int argc, JSValueConst *argv,
-                                              int magic,
-                                              JSValueConst *func_data)
-{
-    JSValue resolve, arg, ret; int fire;
-    if (promise_resolve_elem_prep(ctx, magic, func_data, argc, argv, &resolve, &arg, &fire) < 0)
-        return JS_EXCEPTION;
-    if (fire) {
-        ret = JS_Call(ctx, resolve, JS_UNDEFINED, 1, vc(&arg));
-        JS_FreeValue(ctx, resolve); JS_FreeValue(ctx, arg);
-        if (JS_IsException(ret))
-            return ret;
-        JS_FreeValue(ctx, ret);
-    }
-    return JS_UNDEFINED;
-}
+/* DELETED: js_promise_all_resolve_element, the C body of this reaction, and promise_closure_set_step, the
+   post-hoc annotation that let it coexist with the machine above.
+ *
+ * The element closure was built around that body and THEN told it was a step machine, so the one algorithm had
+ * two implementations — the C body settling the aggregate with a JS_Call to completion, and this machine driving
+ * the same settle on the tramp — and which of them ran was decided by which dispatch happened to arrive. The
+ * comment here used to say so, and named the job queue as the body's caller: that stopped being true when
+ * promise_reaction_job made EVERY handler a call-root flow (it asks nothing about the handler's kind, so the
+ * closure reaches do_generic_callee like every other callee and routes to do_step_tramp). The body was then
+ * reachable only from a call shape nobody had routed, which is a `@WHY`, not a second entry point.
+ *
+ * The closure is now built by js_new_step_closure: no function pointer, so there is nothing to fall back to and
+ * nothing to select between. A stray off-tramp call lands on the one backstop in js_call_c_function_data, which
+ * names this machine's algorithm. */
 
 /* DELETED: js_promise_all, and js_promise_race below it. 27.5.4.1/.2/.3/.5 have no iteration left anywhere in C
    — the `for(;;) JS_IteratorNext` they ran from an activation with no flow base is gone, so a .next() holding a
@@ -97237,18 +97191,16 @@ static int js_promise_all_attach_args(JSContext *ctx, JSPromiseAll *s, int index
     resolve_element_data[3] = s->resolving_funcs[s->magic == PROMISE_MAGIC_any ? 1 : 0];   /* any: the aggregate REJECT (called when all reject); all/allSettled: resolve */
     resolve_element_data[4] = s->resolve_element_env;
     resolve_element_data[5] = s->keyed ? (JSValueConst)s->keys : JS_UNDEFINED;
-    resolve_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
+    resolve_element = js_new_step_closure(ctx, &js_promise_resolve_elem_def, 1,
                                           s->magic, 6, resolve_element_data);
     /* the closures DUP what they capture, so the holder's own reference is this function's to release — on
        every exit below, which is why it is released here rather than at four returns. */
     if (JS_IsException(resolve_element)) { JS_FreeValue(ctx, already_called); return -1; }
-    promise_reaction_set_step(resolve_element);
     if (s->magic == PROMISE_MAGIC_allSettled) {
         /* allSettled: a rejection is ALSO recorded (as {status:'rejected', reason}) — a second element closure. */
-        reject_element = JS_NewCFunctionData(ctx, js_promise_all_resolve_element, 1,
+        reject_element = js_new_step_closure(ctx, &js_promise_resolve_elem_def, 1,
                                              s->magic | 4, 6, resolve_element_data);
         if (JS_IsException(reject_element)) { JS_FreeValue(ctx, resolve_element); JS_FreeValue(ctx, already_called); return -1; }
-        promise_reaction_set_step(reject_element);
     } else if (s->magic == PROMISE_MAGIC_any) {
         /* any: the element CLOSURE is the REJECT handler (records the error at index); a FULFILLMENT resolves the
            aggregate directly. Pre-fill values[index] so a later rejection has a slot. */
@@ -97710,8 +97662,7 @@ static JSValue js_promise_finally_thrower(JSContext *ctx, JSValueConst this_val,
    are BOTH user code that can loop (rejected-observable-then-calls-argument's loop is in the .then), so both are
    driven on the tramp and park. Phase 0 drives onFinally(); phase 1 drives promise.then(thunk/thrower); phase 2 is
    done, the .then's result IS the derived promise. Dispatched as a call-root flow by promise_reaction_job, like
-   resolve_element. The C body (js_promise_then_finally_func, the job path with no step routing) drives both
-   inline. */
+   resolve_element — which asks nothing about the handler's kind, so every dispatch reaches this one machine. */
 typedef struct JSPromiseThenFinally {
     JSStepHdr hdr;         /* MUST be first */
     JSValue cbres;         /* owned: step 6.a.i's result, held until 6.a.ii consumes it */
@@ -97841,22 +97792,6 @@ static const JSTrampStepDef js_promise_then_finally_def = {
     .steps = js_promise_then_finally_steps
 };
 
-/* The wrapper's C entry. It exists only because JS_NewCFunctionData takes a function pointer: the
-   implementation is js_promise_then_finally_def, which the closure declares beside it, and both dispatches
-   reach that — the tramp's, and the job pump's, which runs a reaction handler as a call-root flow.
-   IT USED TO BE THE OTHER IMPLEMENTATION. It called onFinally with JS_Call and then Invoked `then`, both
-   inline, both the page's code, both able to loop — a second, non-suspending copy of the machine sitting
-   beside it and picked by whichever path arrived. Its own first line said so. That is the dual system: the
-   fix is not a predicate that chooses better, it is that there is nothing left to choose. Arriving here is a
-   call shape that was never routed, not a slower path. */
-static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_val,
-                                            int argc, JSValueConst *argv,
-                                            int magic, JSValueConst *func_data)
-{
-    DFAIL("Promise.prototype.finally's reaction reached its C entry — route that call shape onto do_step_tramp");
-    return JS_ThrowTypeError(ctx, "finally reaction reached its C entry");
-}
-
 /* Promise.prototype.finally (27.2.5.3) as a STEP MACHINE. Three of its steps are the page's code:
    SpeciesConstructor's `constructor` and @@species reads, and Invoke(promise, "then", …) — whose own READ and
    CALL are both user code. JS_SpeciesConstructor and JS_Invoke performed all four from C. */
@@ -97923,13 +97858,13 @@ static int js_promise_finally_step(JSContext *ctx, void *st, JSValue cb_result, 
                 func_data[0] = s->ctor;
                 func_data[1] = onFinally;
                 for (i = 0; i < 2; i++) {
-                    s->fin[i] = JS_NewCFunctionData(ctx, js_promise_then_finally_func, 1, i, 2, func_data);
+                    /* onFinally parks on the tramp: the closure has no body, only the machine. */
+                    s->fin[i] = js_new_step_closure(ctx, &js_promise_then_finally_def, 1, i, 2, func_data);
                     if (JS_IsException(s->fin[i])) {
                         s->fin[i] = JS_UNDEFINED;
                         JS_FreeValue(ctx, cb_result);
                         return -1;
                     }
-                    promise_closure_set_step(s->fin[i], &js_promise_then_finally_def);   /* onFinally parks on the tramp */
                 }
             }
         }
@@ -98125,23 +98060,10 @@ static const JSTrampStepDef js_iter_close_throw_def = {
 };
 
 /* The closure has no C body: its only dispatch is as a Promise reaction, and promise_reaction_job routes a
-   step-machine closure onto the tramp as a call-root flow. A C entry would mean an unrouted call site. */
-static JSValue js_iter_close_throw_c_entry(JSContext *ctx, JSValueConst this_val,
-                                          int argc, JSValueConst *argv,
-                                          int magic, JSValueConst *func_data)
-{
-    DFAIL("the async-from-sync closeIterator reaction reached its C entry — it is a step machine, so this call "
-          "site must route through do_step_tramp; a JS_Call here would drive a generator `finally` off-tramp");
-    return JS_ThrowTypeError(ctx, "async-from-sync closeIterator: unrouted call shape (no off-tramp implementation exists)");
-}
-
+   step-machine closure onto the tramp as a call-root flow. */
 static JSValue js_iter_close_throw_create(JSContext *ctx, JSValueConst sync_iter)
 {
-    JSValue f = JS_NewCFunctionData(ctx, js_iter_close_throw_c_entry, 1, 0, 1, &sync_iter);
-    if (JS_IsException(f))
-        return f;
-    promise_closure_set_step(f, &js_iter_close_throw_def);
-    return f;
+    return js_new_step_closure(ctx, &js_iter_close_throw_def, 1, 0, 1, &sync_iter);
 }
 
 /* 27.1.4.4 AsyncFromSyncIteratorContinuation steps 5-15 as a STEP MACHINE. Step 5 is
@@ -98256,24 +98178,13 @@ static const JSTrampStepDef js_afs_cont_def = {
     .algorithm = "27.1.6.4 AsyncFromSyncIteratorContinuation", .steps = js_afs_cont_steps
 };
 
-static JSValue js_afs_cont_c_entry(JSContext *ctx, JSValueConst this_val, int argc,
-                                   JSValueConst *argv, int magic, JSValueConst *func_data)
-{
-    DFAIL("AsyncFromSyncIteratorContinuation reached its C entry — route that call shape onto do_step_tramp");
-    return JS_ThrowTypeError(ctx, "AsyncFromSyncIteratorContinuation reached its C entry");
-}
-
 static JSValue js_new_afs_cont(JSContext *ctx, JSValueConst sync_iter, JSValueConst resolve,
                                JSValueConst reject, int done, int close_on_rejection)
 {
     JSValueConst data[5];
-    JSValue dv = js_int32(done), cv = js_int32(close_on_rejection), f;
+    JSValue dv = js_int32(done), cv = js_int32(close_on_rejection);
     data[0] = sync_iter; data[1] = resolve; data[2] = reject; data[3] = dv; data[4] = cv;
-    f = JS_NewCFunctionData(ctx, js_afs_cont_c_entry, 1, 0, 5, data);
-    if (JS_IsException(f))
-        return f;
-    promise_closure_set_step(f, &js_afs_cont_def);
-    return f;
+    return js_new_step_closure(ctx, &js_afs_cont_def, 1, 0, 5, data);
 }
 
 /* AsyncIteratorPrototype */
@@ -99150,19 +99061,6 @@ static const JSTrampStepDef js_export_getter_def = {
     .algorithm = "3.2.2's ExportGetter (proposal-shadowrealm)", .steps = js_export_getter_steps
 };
 
-/* The C body of the ExportGetter closure. It is NOT a second implementation: a closure's step_def is
-   consulted at the call convergence point, and this entry is what a call that never reaches one would get —
-   so it fails visibly, the way every other unrouted membrane entry does. */
-static JSValue js_export_getter_body(JSContext *ctx, JSValueConst this_val, int argc,
-                                     JSValueConst *argv, int magic, JSValue *func_data)
-{
-    DFAIL("ShadowRealmImportValue's ExportGetter was called off the chain — its GetWrappedValue runs the "
-          "page's code and has no flow base here");
-    (void)this_val; (void)argc; (void)argv; (void)magic; (void)func_data;
-    JS_ThrowInternalError(ctx, "the ShadowRealm export getter only runs on the interpreter's chain");
-    return JS_EXCEPTION;
-}
-
 /* 3.3.2 ShadowRealm.prototype.importValue + 3.2.2 ShadowRealmImportValue. The specifier's ToString is the
    page's code, so it is a request; everything after it is promise plumbing plus the ExportGetter above. */
 /* ONE list expanded twice; not in the published edition, so named rather than numbered - see WCALL_STAGES. */
@@ -99239,13 +99137,12 @@ static int js_shadow_realm_importvalue_step(JSContext *ctx, void *st, JSValue cb
     /* steps 5-7: the ExportGetter, created in the CALLER's realm — which is what decides the realm its
        GetWrappedValue wraps into. */
     gdata[0] = step_arg(&s->hdr, 1);
-    getter = JS_NewCFunctionData(ctx, js_export_getter_body, 1, 0, 1, gdata);
+    getter = js_new_step_closure(ctx, &js_export_getter_def, 1, 0, 1, gdata);
     if (JS_IsException(getter)) {
         JS_FreeValue(ctx, inner);
         JS_FreeValue(ctx, inner_funcs[0]); JS_FreeValue(ctx, inner_funcs[1]);
         return -1;
     }
-    promise_closure_set_step(getter, &js_export_getter_def);
 
     /* steps 8-9: PerformPromiseThen(inner, onFulfilled, %ThrowTypeError%, outer). The rejection handler is
        the intrinsic %ThrowTypeError%, which is 3.2.2's way of saying a load failure does not leak the eval
