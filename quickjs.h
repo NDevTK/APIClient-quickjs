@@ -641,6 +641,38 @@ JS_EXTERN bool JS_IsOutOfMemoryError(JSContext *ctx, JSValueConst v);
 typedef void JSContextTeardownFunc(JSRuntime *rt, JSContext *ctx);
 JS_EXTERN void JS_SetContextTeardownHook(JSRuntime *rt, JSContextTeardownFunc *cb);
 
+/* THE COUNTED REFERENCES A HOST HUNG OFF A REALM, DECLARED TO THE COLLECTOR — the other half of the hook above,
+ * and the half without which that one can never fire.
+ *
+ * A host record reached through JS_GetContextOpaque is not a GC object, so JS_MarkContext walks a realm without
+ * ever naming what the record holds. Every reference in it is then one gc_decref cannot subtract, so each object
+ * it names keeps a refcount nothing in the heap accounts for, reads as EXTERNALLY ROOTED, and gc_scan revives
+ * the whole graph behind it. When one of those references points back INTO the realm — a Window, its
+ * WindowProxy, its `document` — the realm is a cycle with one edge the collector cannot see and is uncollectable
+ * for the life of the runtime: the teardown hook that would release the record fires only when the realm dies,
+ * and the record is exactly what stops it dying. That is not a slow leak, it is a permanent one, and it is
+ * unbounded in a host that mints a realm per navigable.
+ *
+ * MEASURED, WHICH IS WHY THIS EXISTS RATHER THAN A NOTE SAYING IT SHOULD: every child navigable's realm in
+ * web-platform-tests' html/browsers survived to JS_FreeRuntime, whose gc_obj_list walk then reported the entire
+ * page — Window, document, every function object — as a leak with nothing in the report naming an owner. It was
+ * the single largest abort cause in that directory, above every spec failure in it.
+ *
+ * THE HOOK REPORTS EXACTLY WHAT THE RECORD OWNS, ONCE EACH: the same list its teardown releases, which is why a
+ * host writes the two as ONE list with two consumers. Marking a reference twice, or marking one the record does
+ * not own, makes gc_decref over-subtract and frees an object that is still live — the failure mode is a
+ * use-after-free rather than a leak, so the list is not a place to be generous. It is called during a collection
+ * (from gc_decref and again from gc_scan) and must do nothing but report. */
+typedef void JSContextMarkFunc(JSRuntime *rt, JSContext *ctx, JS_MarkFunc *mark_func);
+JS_EXTERN void JS_SetContextMarkHook(JSRuntime *rt, JSContextMarkFunc *cb);
+
+/* THE DECLARED HOOK, so a host can state at the birth of a record that the collector will read it — the same
+ * reason JS_ContextRefCount is exposed, and not a decision input either. It exists because this file CANNOT
+ * make that assertion itself: whether a record holds counted references OF THIS RUNTIME is known only to the
+ * host that shaped it (run-test262's agent record holds the parent runtime's values and correctly declares no
+ * hook), so an assert at JS_SetContextOpaque would fire on a record that is perfectly well formed. */
+JS_EXTERN JSContextMarkFunc *JS_GetContextMarkHook(JSRuntime *rt);
+
 /* A REALM'S REFERENCE COUNT, for stating an ownership invariant where one is being handed over. Not a decision
  * input — a host that branches on this is guessing at a lifetime the collector owns. */
 JS_EXTERN int JS_ContextRefCount(JSContext *ctx);
