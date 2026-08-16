@@ -10552,18 +10552,34 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                            finds, for ANY callable, and calls it on the tramp chain as a 0-arg method call.
                            The JS_CallFree that used to be here was measured over the whole corpus behind a
                            DCHECK and never reached, so it is deleted rather than left as a fallback. */
-                        /* NAME THE PROPERTY. Without it the abort says only that SOME C read somewhere in the
-                           engine hit SOME accessor, and the caller is not in the report — the wasm stack is
-                           function indices — so whoever lands here has a search of every JS_GetProperty* call
-                           site in the browser half. The atom is in hand at the failure, and it is the whole of
-                           what identifies the read. */
+                        /* NAME THE PROPERTY *AND WHOSE*. The atom alone is not enough to identify the read, and
+                           that shortfall cost a real session: `name` is an accessor on FOUR unrelated things in
+                           this engine — Window (§7.1's `window.name`), DOMException, Attr, and any page object
+                           whose config the browser half reads — so four completely different bugs printed the
+                           identical line, and the search the atom was added to prevent happened anyway, one
+                           layer in. The caller is still not in the report (the wasm stack is function indices),
+                           but the RECEIVER'S CLASS plus the HOLDER'S CLASS narrow it to one component: a
+                           `name` on JS_CLASS_DOMEXCEPTION is an error-report path, on the global it is an
+                           attacker-source read, on JS_CLASS_OBJECT it is a page config.
+                           The two classes are separate because the getter is normally found on a PROTOTYPE, so
+                           the holder names the interface and the receiver names the instance the read was
+                           actually made on — and when they differ, that difference is the identification. */
 #if APICLIENT_DEV
                         {
-                            char pbuf[ATOM_GET_STR_BUF_SIZE], why[256];
+                            char pbuf[ATOM_GET_STR_BUF_SIZE], hbuf[ATOM_GET_STR_BUF_SIZE];
+                            char rbuf[ATOM_GET_STR_BUF_SIZE], why[320];
+                            JSRuntime *rt0 = ctx->rt;
+                            const char *rcls = "a primitive";
+                            if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+                                rcls = JS_AtomGetStr(ctx, rbuf, sizeof(rbuf),
+                                                     rt0->class_array[JS_VALUE_GET_OBJ(obj)->class_id].class_name);
                             snprintf(why, sizeof why,
-                                     "JS_GetPropertyInternal reached a getter for `%s` — route this read onto "
-                                     "the tramp chain instead of running the getter from C",
-                                     JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop));
+                                     "JS_GetPropertyInternal reached a getter for `%s` on %s (the accessor is "
+                                     "held by %s) — route this read onto the tramp chain instead of running the "
+                                     "getter from C",
+                                     JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop), rcls,
+                                     JS_AtomGetStr(ctx, hbuf, sizeof(hbuf),
+                                                   rt0->class_array[p->class_id].class_name));
                             DFAIL(why);
                         }
 #endif
@@ -21196,21 +21212,33 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                length, `slice` clamping its indices — user code reached from C before the state existed, with no
                step to route it to. There is no init any more: the driver allocates the state and the prologue is
                step 0, so a coercion in a prologue requests a TOPRIMITIVE step exactly like one in a body. */
-            {   /* NAME the builtin. Without it the abort says only "a step builtin", and finding WHICH one meant
-                   bisecting the corpus a directory at a time — the assert is supposed to name the exact unbuilt
-                   mechanism, not start a search. The STEPDEF id identifies the def uniquely; the `name` property
-                   is what a reader recognises, and reading it here is safe because the very next statement is
-                   abort(). */
-                char why[192];
-                const char *nm = NULL;
-                JSValue nv = JS_GetProperty(ctx, func_obj, JS_ATOM_name);
-                if (!JS_IsException(nv)) nm = JS_ToCString(ctx, nv);
+            /* NAME the builtin — from its DEF, never from a property read. This read the `name` property with
+               JS_GetProperty and justified it as "safe because the very next statement is abort()". That claim
+               is false in three ways and each one is a defect an abort path must not have. (1) A property read
+               runs the property machinery, which has asserts of its own: a receiver whose `name` is an ACCESSOR
+               aborts inside JS_GetPropertyInternal's own getter DFAIL, so the report names the wrong failure
+               entirely and the mechanism this assert exists to name is never printed — an assert that fires
+               about itself. (2) A getter IS page code, which is the one thing this engine forbids reaching from
+               a C activation, so the diagnostic for a missing flow base was itself running without one.
+               (3) DFAIL compiles out in release while the read does not, so a release build ran the getter and
+               leaked both the JSValue and the CString on a path that then returned an exception nobody set.
+               The def is the honest source and a better one: `.algorithm` is a static string naming the SPEC
+               ALGORITHM, which is what a reader needs, where `name` is a page-writable property that any bundle
+               can redefine. The whole block is dev-only, so release neither formats nor reads anything. */
+#if APICLIENT_DEV
+            {
+                const JSTrampStepDef *sdef = tramp_step_def_of(func_obj);
+                char why[256];
+                DCHECK(sdef && sdef->algorithm,
+                       "a JS_CFUNC_step callee carries no step def to name it — the cproto and the def are set "
+                       "together at the declaration, so one without the other is a half-finished registration");
                 snprintf(why, sizeof(why),
-                         "the step builtin `%s` (STEPDEF id %d) was invoked outside the interpreter's dispatch — "
-                         "route that call site onto do_step_tramp; there is no second driver",
-                         nm ? nm : "?", p->u.cfunc.magic);
+                         "the step machine for %s (STEPDEF id %d) was invoked outside the interpreter's "
+                         "dispatch — route that call site onto do_step_tramp; there is no second driver",
+                         sdef->algorithm, p->u.cfunc.magic);
                 DFAIL(why);
             }
+#endif
             ret_val = JS_EXCEPTION;
         }
         break;
