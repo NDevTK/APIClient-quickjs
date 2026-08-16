@@ -11795,8 +11795,12 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
     intptr_t h, h1;
 
     /* forced-exec TIME-TRAVEL: a DELETE of a baseline slot is a shared-state mutation exactly like a write —
-       record the slot's value FIRST (existed=1, base=value) so unapply re-creates it and the flow's own deletion
-       is isolated (apply re-deletes via cur_existed=0). Gated by the hook (flow-local + not-installed skip). */
+       record the slot's value FIRST (existed=1, base=value) so unapply re-creates it, and so the flow's own
+       deletion is REPLAYED AS A DELETION rather than as a write of undefined (the host's entry records whether
+       the flow HAS the slot, not only what value it holds — see cow_capture_hook). Note this runs before the
+       walk below knows whether the slot is there at all, so an absent one is captured too, and the same
+       absent-side record is what keeps apply from inventing a property out of it. Gated by the hook
+       (flow-local + not-installed skip). */
     cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), atom);
 
  redo:
