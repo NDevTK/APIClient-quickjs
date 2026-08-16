@@ -677,6 +677,23 @@ JS_EXTERN JSContextMarkFunc *JS_GetContextMarkHook(JSRuntime *rt);
  * input — a host that branches on this is guessing at a lifetime the collector owns. */
 JS_EXTERN int JS_ContextRefCount(JSContext *ctx);
 
+/* A REF-COUNTED VALUE'S REFERENCE COUNT, for the same purpose and under the same restriction as the realm's
+ * above: STATING an ownership invariant, never deciding on one. A host that branches on this is guessing at a
+ * lifetime the collector owns; a host that ASSERTS on it is saying, at the one moment the answer is decidable,
+ * exactly who is allowed to be holding a value.
+ *
+ * MEASURED, like its sibling. An accessor that hands out an owned reference to internal state — IndexedDB
+ * §5.5's list of database changes — had three callers and one of them dropped its reference without giving it
+ * back. The value was an empty Array, so the entire consequence was invisible in every census except one: an
+ * Array holds Array.prototype, Array.prototype holds the realm's function objects, and each of those holds the
+ * REALM, so one leaked reference to an empty Array made a whole browser immortal (2612 Functions, 408 shapes,
+ * a JSContext at refcount 3108) and the leak walk named nothing but three anonymous Arrays. The assert this
+ * exists for fires at the transaction that dropped it instead.
+ *
+ * The value must be one that HAS a reference count — a number, a boolean and a short string are copied rather
+ * than shared, so an invariant stated over one is a statement about nothing, and asking is asserted against. */
+JS_EXTERN int JS_ValueRefCount(JSValueConst v);
+
 JS_EXTERN void *JS_GetContextOpaque(JSContext *ctx);
 JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
 JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);

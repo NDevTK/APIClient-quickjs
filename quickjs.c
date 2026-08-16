@@ -4021,6 +4021,15 @@ int JS_ContextRefCount(JSContext *ctx)
     return JS_REF_COUNT(ctx);
 }
 
+int JS_ValueRefCount(JSValueConst v)
+{
+    DCHECK(JS_VALUE_HAS_REF_COUNT(v),
+           "the reference count of a value that does not have one was asked for — a number, a boolean and a "
+           "short string are copied rather than shared, so an ownership invariant stated over one is a "
+           "statement about nothing and the answer would be a constant");
+    return JS_REF_COUNT(JS_VALUE_GET_PTR(v));
+}
+
 static void update_stack_limit(JSRuntime *rt)
 {
 #if defined(__wasi__)
