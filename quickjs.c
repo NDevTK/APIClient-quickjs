@@ -321,6 +321,7 @@ struct JSRuntime {
        is out of gc_obj_list by the time it is on this list. */
     struct list_head gc_ctx_sweep_list;   /* JSContext.header.link — realms whose references are released */
     JSContextTeardownFunc *ctx_teardown;  /* see JS_SetContextTeardownHook */
+    JSContextMarkFunc *ctx_mark;          /* see JS_SetContextMarkHook */
     JSGCPhaseEnum gc_phase : 8;
     size_t malloc_gc_threshold;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
@@ -3631,6 +3632,13 @@ void *JS_GetContextOpaque(JSContext *ctx)
 
 void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 {
+    /* NO ASSERT HERE THAT A MARK HOOK IS DECLARED, and the reason is worth writing down because the assert is
+       the obvious thing to reach for and it is WRONG. Whether a record needs one is a fact only the HOST knows:
+       run-test262 attaches its agent record to the agent thread's own realm while every JSValue in that record
+       belongs to the PARENT runtime, so declaring a hook for it would mark another runtime's objects, and
+       api-test attaches a bare JSValue slot. A record that holds nothing of THIS runtime needs no hook, so the
+       invariant is "a record holding counted references of this realm declares them" — which is stated where
+       the record's shape is known (core/dom/document.c asserts it as each record is born). */
     ctx->user_opaque = opaque;
 }
 
@@ -3767,6 +3775,12 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
 
     if (ctx->regexp_result_shape)
         mark_func(rt, &ctx->regexp_result_shape->header);
+
+    /* AND THE HOST'S OWN RECORD ON THIS REALM — see JS_SetContextMarkHook. Everything above is a reference the
+       realm holds in a field this file declared; a host record holds references in fields it did not, and until
+       this line they were the only edges of the heap graph no walk ever crossed. */
+    if (rt->ctx_mark)
+        rt->ctx_mark(rt, ctx, mark_func);
 }
 
 /* A REALM'S TEARDOWN IS SPLIT BY PHASE-SAFETY, exactly as free_object's is, and for the same reason: the last
@@ -3946,6 +3960,20 @@ void JS_SetContextTeardownHook(JSRuntime *rt, JSContextTeardownFunc *cb)
            "a second realm-teardown hook was declared for one runtime — the hook is asked about every realm, "
            "so two of them means one host's realms are being torn down by another host's answer");
     rt->ctx_teardown = cb;
+}
+
+void JS_SetContextMarkHook(JSRuntime *rt, JSContextMarkFunc *cb)
+{
+    DCHECK(rt->ctx_mark == NULL || cb == NULL || rt->ctx_mark == cb,
+           "a second realm-mark hook was declared for one runtime — the hook is asked about every realm, so "
+           "two of them means one host's records are being reported by another host's answer, and the records "
+           "the loser held become invisible to the collector again");
+    rt->ctx_mark = cb;
+}
+
+JSContextMarkFunc *JS_GetContextMarkHook(JSRuntime *rt)
+{
+    return rt->ctx_mark;
 }
 
 int JS_ContextRefCount(JSContext *ctx)
@@ -41673,6 +41701,16 @@ static int flow_settle_await(JSContext *ctx, JSAsyncFunctionState *s) {
    parser that is fine. Returns the module's evaluation PROMISE, which is what evaluating a module yields; the
    caller settles it through the same job pump it uses for an async script. */
 JSValue JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags) {
+    /* A MODULE'S NAME IS NOT A LABEL, it is the record's [[HostDefined]] identity: it keys the module map, it is
+       the base a nested `import` and an `import.meta.url` resolve against, and it is what the loader registers a
+       fetched dependency under. So there is no placeholder to substitute the way JS_FlowNew substitutes
+       "<flow>" — a made-up name silently makes two documents' modules the same module and resolves relative
+       specifiers against nothing. It is also a plain strlen away from the parser's atom table, so a NULL here is
+       a segfault inside js_parse_init rather than anything a reader could trace back to this call. */
+    DCHECK(filename != NULL && filename[0] != '\0',
+           "JS_FlowEvalModule was given no name for the module — a module's name is its resolution base (the "
+           "module map key, the base of a nested import, import.meta.url), so the caller must pass the script's "
+           "base URL rather than leave it to be invented here");
     JSValue bc = JS_Eval(ctx, src, len, filename,
                          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
                          (eval_flags & JS_EVAL_FLAG_STRICT));
