@@ -364,7 +364,11 @@ static void module_serde(void)
     assert(loader_calls == 0);
     JSValue mod = JS_Eval(ctx, code, strlen(code), "a",
                           JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY);
-    assert(loader_calls == 1);
+    /* 16.2.1.7.1 ParseModule LOADS NOTHING. It fills [[RequestedModules]] from the parse and leaves
+       [[LoadedModules]] empty; the host is asked by 16.2.1.6.1.1 LoadRequestedModules, which is a later phase
+       and a promise. This used to assert 1 here, which is what a compile-time resolve looked like from
+       outside. */
+    assert(loader_calls == 0);
     assert(!JS_IsException(mod));
     assert(JS_IsModule(mod));
     size_t len = 0;
@@ -373,14 +377,21 @@ static void module_serde(void)
     assert(buf);
     assert(len > 0);
     JS_FreeValue(ctx, mod);
-    assert(loader_calls == 1);
+    assert(loader_calls == 0);
     mod = JS_ReadObject(ctx, buf, len, JS_READ_OBJ_BYTECODE);
     js_free(ctx, buf);
-    assert(loader_calls == 1); // 'b' is returned from cache
+    /* Deserialising is parsing too: the reader restores [[RequestedModules]] by name and asks nobody. */
+    assert(loader_calls == 0);
     assert(!JS_IsException(mod));
     JSValue ret = JS_EvalFunction(ctx, mod);
     assert(!JS_IsException(ret));
     assert(JS_IsPromise(ret));
+    /* THE LOAD IS A PROMISE EVEN WHEN THE LOADER ANSWERS ON THE SPOT, so Link and Evaluate run on its
+       reaction and the embedder has to pump for them. */
+    JSContext *ctx1;
+    while (JS_ExecutePendingJob(rt, &ctx1) > 0)
+        ;
+    assert(loader_calls == 1);
     JSValue result = JS_PromiseResult(ctx, ret);
     assert(!JS_IsException(result));
     assert(JS_IsUndefined(result));

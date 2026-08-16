@@ -1132,9 +1132,8 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
         if (JS_VALUE_GET_TAG(arg) != JS_TAG_MODULE)
             return JS_ThrowTypeError(ctx, "not a module");
 
-        if (JS_ResolveModule(ctx, arg) < 0)
-            return JS_EXCEPTION;
-
+        /* JS_EvalFunction loads the graph itself now (16.2.1.6.1.1 before Link), so it returns a promise
+           that settles as the module's evaluation promise does. */
         if (js_module_set_import_meta(ctx, arg, false, false) < 0)
             return JS_EXCEPTION;
 
@@ -4943,10 +4942,8 @@ void js_std_eval_binary(JSContext *ctx, const uint8_t *buf, size_t buf_len,
         JS_FreeValue(ctx, obj);
     } else {
         if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
-            if (JS_ResolveModule(ctx, obj) < 0) {
-                JS_FreeValue(ctx, obj);
-                goto exception;
-            }
+            /* JS_EvalFunction loads the graph itself now (16.2.1.6.1.1 before Link); js_std_await below is
+               what pumps the jobs that load runs on. */
             if (js_module_set_import_meta(ctx, obj, false, true) < 0)
                 goto exception;
             val = JS_EvalFunction(ctx, obj);

@@ -1942,12 +1942,14 @@ JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_
 JS_EXTERN JSValue JS_ReadObject3(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                                  int flags, JSSABTab *psab_tab,
                                  const JSTransferReadHook *transfer);
-/* instantiate and evaluate a bytecode function. Only used when
-   reading a script or module with JS_ReadObject() */
+/* Instantiate and evaluate a bytecode function. Only used when reading a script or module with JS_ReadObject().
+   FOR A MODULE THIS IS THE WHOLE OF HTML §8.1.3.3's "run a module script": it LOADS the graph
+   (16.2.1.6.1.1 LoadRequestedModules), and only upon that load's fulfilment LINKS and EVALUATES it — so it
+   returns a PROMISE that settles as the module's own evaluation promise does, and the embedder must pump jobs
+   for it to progress. A JS_ResolveModule stood beside it to load the graph up front; loading cannot be
+   synchronous (a host answers 16.2.1.10 whenever the network does) so there was nothing left for it to do that
+   this call does not, and a caller that "resolved" first was asserting a phase order it could not enforce. */
 JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
-/* load the dependencies of the module 'obj'. Useful when JS_ReadObject()
-   returns a module. */
-JS_EXTERN int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
 
 /* only exported for os.Worker() */
 JS_EXTERN JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);

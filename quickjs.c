@@ -655,6 +655,13 @@ struct JSContext {
        caller that can wait (JS_LoadModuleInternal) immediately after the loader returns. JS_UNDEFINED whenever
        no load is parked, which is every moment except that handoff. */
     JSValue module_load_pending;
+    /* THE RESOLVED SPECIFIER THE PARKED LOAD IS FOR, written by the only function that ever computes it
+       (js_host_resolve_imported_module) and taken together with the promise above. The source text alone cannot
+       finish a load: compiling it needs this name, which is the record's module map key AND the base every
+       specifier inside it resolves against. It used to be dropped and the RAW specifier used in its place, so a
+       parked `import("./chunk.js")` registered a record under "./chunk.js" while every lookup asked for the
+       resolved name — the same file fetched, compiled and evaluated once per import. */
+    JSValue module_load_pending_name;
     /* IfAbruptCloseIterator / IteratorCloseAll deferred to this context's interpreter caller: the JS_CallInternal
        exception label runs 7.4.9 on the tramp for each entry, saving and restoring the in-flight exception across
        it, so the page's `return` (a generator's finally, an accessor, a proxy trap, a plain method containing a
@@ -667,12 +674,6 @@ struct JSContext {
        unwind — the completion the drain restores is always the one the first failure raised. */
     JSValue *pending_close_iters;
     int pending_close_n, pending_close_cap;
-    /* A module-import resolution WALK is in progress on this context. Resolving a module's imports LOADS them, and
-       the embedder's loader compiles each one, which resolves ITS imports — so the walk recursed OUT through the
-       loader and back in, and the module graph's depth became the C stack's. The walk is an explicit frame stack
-       now; this flag is what makes the re-entrant call from the loader a no-op, because the outer walk sees the
-       freshly loaded module through rme->module and descends into it at exactly the point the recursion did. */
-    bool module_resolving;
     /* A KEYED-OPERATION continuation whose unwind only the interpreter can perform, parked by an abandon walk that
        reached it from OUTSIDE the interpreter. The two teardown walks are mutually recursive — getprop_throw and
        do_getprop_abandon hand a CONT_TOPRIM_GET link to js_toprim_abandon, and a coercion requested BY a keyed
@@ -1221,7 +1222,15 @@ struct JSModuleDef {
     JSValue func_obj; /* only used for JS modules */
     JSModuleInitFunc *init_func; /* only used for C modules */
     bool has_tla; /* true if func_obj contains await */
-    bool resolved;
+    /* 16.2.1.5's [[Status]] `new`, INVERTED: false means this record's requested modules have never been
+       loaded. The spec gives `new` its own status because loading and linking are different phases with
+       different failure semantics — a load that FAILS leaves every record it touched still `new`, so a later
+       load walks the graph again, while a load that SUCCEEDS moves them all to `unlinked` together at the very
+       end (16.2.1.6.1.1.1 step 5.b). `status` below starts at UNLINKED and cannot express `new`, so this bool
+       is it, and it is written in exactly one place: the completion of a load. It used to mean "this walk has
+       reached this module", set on the way IN, which conflated `new` with the per-load [[Visited]] set — and a
+       graph whose child load failed was then never walked again, so its unanswered request reached Link. */
+    bool loaded;
     bool func_created;
     JSModuleStatus status : 8;
     /* temp use during js_module_link() & js_module_evaluate() */
@@ -3586,12 +3595,12 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->error_ctor = JS_NULL;
     ctx->oom_error = JS_UNDEFINED;
     ctx->error_back_trace = JS_UNDEFINED;
-    ctx->module_resolving = false;
     ctx->pending_close_iters = NULL;
     ctx->pending_close_n = 0;
     ctx->pending_close_cap = 0;
     ctx->pending_import_cap = NULL;
     ctx->module_load_pending = JS_UNDEFINED;
+    ctx->module_load_pending_name = JS_UNDEFINED;
     ctx->pending_gp_unwind = NULL;
     ctx->pending_gp_unwind_kind = 0;   /* CONT_NONE */
     ctx->error_prepare_stack = JS_UNDEFINED;
@@ -3689,20 +3698,13 @@ JSValue JS_GetFunctionProto(JSContext *ctx)
     return js_dup(ctx->function_proto);
 }
 
-/* THE MODULES A FAILED COMPILE LEFT BEHIND, and now the only reason to walk this list other than the realm's
-   own teardown — which is SPLIT IN TWO (see JS_FreeContext) and therefore walks it itself, once per half. The
-   "free them all" spelling went with that split rather than surviving beside it: a caller reaching it would be
-   freeing a module's memory in whichever phase it happened to be in.
-   XXX: would be more efficient with separate module lists */
-static void js_free_unresolved_modules(JSContext *ctx)
-{
-    struct list_head *el, *el1;
-    list_for_each_safe(el, el1, &ctx->loaded_modules) {
-        JSModuleDef *m = list_entry(el, JSModuleDef, link);
-        if (!m->resolved)
-            js_free_module_def(ctx, m);
-    }
-}
+/* THE MODULES A FAILED LOAD LEFT BEHIND ARE NOT SWEPT, AND THAT IS THE SPEC'S ANSWER, NOT A LEAK. This walk
+   used to free every record whose graph had not been resolved, on the two failure paths of a walk that both
+   loaded and linked. HTML §8.1.3.3's module map is the load's MEMO and it memoizes failure too — a fetch that
+   404s leaves null in the map so the next import of that URL does not refetch — so a record a failed load
+   compiled stays in ctx->loaded_modules by design, and is freed with the realm by the split teardown in
+   JS_FreeContext, which walks the list itself once per half. Freeing them early was also what made a module
+   value held by a promise reaction dangle. */
 
 JSContext *JS_DupContext(JSContext *ctx)
 {
@@ -3838,6 +3840,9 @@ static void js_context_release_refs(JSRuntime *rt, JSContext *ctx)
     DCHECK(JS_IsUndefined(ctx->module_load_pending),
            "a module load parked on a source promise that nothing ever took — the loader called "
            "JS_ModuleLoadPending from a path that cannot wait for it");
+    DCHECK(JS_IsUndefined(ctx->module_load_pending_name),
+           "a parked module load's resolved specifier outlived its context — the promise and the name are "
+           "written together and taken together, so one surviving alone means a caller took only half");
     DCHECK(ctx->pending_gp_unwind == NULL, "a parked keyed-operation unwind outlived its context");
     while (ctx->pending_close_n > 0)   /* normally empty (drained at the exception label); free defensively */
         JS_FreeValue(ctx, ctx->pending_close_iters[--ctx->pending_close_n]);
@@ -54991,8 +54996,6 @@ static bool keyed_by_attributes(JSContext *ctx, JSAtom key, const char *cname)
     return same;
 }
 
-static JSValue js_module_take_pending(JSContext *ctx);
-
 static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
                                                     const char *base_cname,
                                                     const char *cname1,
@@ -55046,6 +55049,18 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     } else {
         m = rt->u.module_loader_func(ctx, cname, rt->module_loader_opaque);
     }
+    /* THE LOADER PARKED, so the RESOLVED specifier goes with the promise. Only this function ever computes it,
+       and whoever finishes the load needs it for both of the things a module's name is: the module map key it
+       will be registered under, and the base every specifier inside it resolves against. Written here, taken by
+       js_module_take_pending — one write, one read, and a DCHECK on each side that the pair is never split. */
+    if (!m && !JS_IsUndefined(ctx->module_load_pending)) {
+        DCHECK(JS_IsUndefined(ctx->module_load_pending_name),
+               "a second module load parked its resolved specifier on a slot the first was never taken from");
+        ctx->module_load_pending_name = JS_NewString(ctx, cname);
+        CHECK(!JS_IsException(ctx->module_load_pending_name),
+              "a parked module load could not keep its resolved specifier — nothing could then finish the load, "
+              "and the flow that imported would stay parked on a source that never arrives");
+    }
     /* The loader registers the record under the raw specifier (it is loading a FILE). When the attributes made
        the key DIFFER from that specifier, re-key the record so the next import with the same type finds it and
        one with a different type does not. A plain import's key IS the specifier, and then nothing is touched —
@@ -55078,13 +55093,6 @@ static JSModuleDef *js_host_resolve_imported_module_atom(JSContext *ctx,
         return NULL;
     }
     m = js_host_resolve_imported_module(ctx, base_cname, cname, attributes);
-    if (!m && !JS_IsUndefined(ctx->module_load_pending)) {
-        JS_FreeValue(ctx, js_module_take_pending(ctx));
-        DFAIL("a STATIC import parked on a source promise, and this walk cannot wait for it: js_resolve_module "
-              "links the graph from C with no point to suspend at. Build the parking resolve — the walk becomes "
-              "a step machine that REQUESTS each not-yet-loaded module and is re-entered with it, the way the "
-              "dynamic import already resumes on its source promise");
-    }
     JS_FreeCString(ctx, base_cname);
     JS_FreeCString(ctx, cname);
     return m;
@@ -55737,78 +55745,13 @@ static void js_module_reexport_imported_bindings(JSContext *ctx, JSModuleDef *m,
     }
 }
 
-/* Resolve a module's imports, and theirs, as an EXPLICIT FRAME STACK. The recursion this replaces went OUT through
-   the embedder — resolve loads a module, the loader compiles it, compiling resolves its imports — so a deep import
-   chain exhausted the C stack and surfaced as the PARSER's "Maximum call stack size exceeded". A module graph is
-   the page's data and its depth is not the C stack's business; nothing caps this walk.
-   The ORDER is the recursion's exactly: a child is descended into immediately after it is loaded, before the
-   parent's next import, which is where the recursive call sat. The re-entrant call the loader makes is a no-op —
-   the outer walk sees the loaded module through rme->module and pushes it itself. */
-typedef struct JSModuleResolveFrame {
-    JSModuleDef *m;
-    int i;              /* cursor over m->req_module_entries */
-} JSModuleResolveFrame;
-
-static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
-{
-    JSModuleResolveFrame *frames = NULL;
-    int depth = 0, cap = 0, ret = -1;
-
-    if (m->resolved)
-        return 0;
-    if (ctx->module_resolving)
-        return 0;   /* re-entered from the loader: the walk below owns this module */
-    ctx->module_resolving = true;
-    m->resolved = true;
-    for (;;) {
-        JSModuleResolveFrame *f;
-        if (depth == cap) {
-            int ncap = cap ? cap * 2 : 8;
-            JSModuleResolveFrame *nf = js_realloc(ctx, frames, sizeof(*nf) * (size_t)ncap);
-            if (unlikely(!nf))
-                goto done;
-            frames = nf;
-            cap = ncap;
-        }
-#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
-        if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
-            char buf1[ATOM_GET_STR_BUF_SIZE];
-            printf("resolving module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
-        }
-#endif
-        frames[depth].m = m;
-        frames[depth].i = 0;
-        depth++;
-        for (;;) {
-            JSModuleDef *m1;
-            JSReqModuleEntry *rme;
-            f = &frames[depth - 1];
-            if (f->i >= f->m->req_module_entries_count) {
-                depth--;
-                if (depth == 0) { ret = 0; goto done; }
-                continue;
-            }
-            rme = &f->m->req_module_entries[f->i];
-            f->i++;
-            m1 = js_host_resolve_imported_module_atom(ctx, f->m->module_name, rme->module_name, rme->attributes);
-            if (!m1)
-                goto done;
-            rme->module = m1;
-            /* js_host_resolve_imported_module() normally resolves as it loads; it cannot while this walk owns the
-               resolution, and a module loaded with JS_EvalBinary() was never resolved there either. Both are the
-               same case now: an unresolved child is descended into here. */
-            if (!m1->resolved) {
-                m1->resolved = true;
-                m = m1;
-                break;   /* push a frame for m1 */
-            }
-        }
-    }
- done:
-    ctx->module_resolving = false;
-    js_free(ctx, frames);
-    return ret;
-}
+/* THE LOAD IS NOT HERE ANY MORE. js_resolve_module stood at this point and did two of the spec's three
+   phases at once: it WALKED the graph and it asked the host for every child it did not have, from inside a
+   synchronous C walk with no point to suspend at — and it ran at COMPILE time as well, which 16.2.1.7.1
+   ParseModule does not do (a parsed record's [[LoadedModules]] is empty and stays empty until a load).
+   16.2.1.6.1.1 LoadRequestedModules is that phase, it is a PROMISE, and it lives beside the other module
+   operations it belongs with (js_module_load_requested). Linking below now reaches every child through
+   rme->module alone, which is 16.2.1.9 GetImportedModule — one step, and that step is an assertion. */
 
 static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical)
 {
@@ -55934,8 +55877,15 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
             stack = ns;
             cap = ncap;
         }
-        for (i = m->req_module_entries_count - 1; i >= 0; i--)
+        for (i = m->req_module_entries_count - 1; i >= 0; i--) {
+            /* 16.2.1.9 GetImportedModule, at the EARLIEST reader of [[LoadedModules]] — this walk runs before
+               Link and would dereference the NULL rather than assert on it. A request with no record here is
+               the load phase not having run (or not having finished) on this graph. */
+            DCHECK(m->req_module_entries[i].module != NULL,
+                   "16.2.1.9: a module request had no loaded record when its graph's functions were created — "
+                   "js_module_load_requested has not completed on this graph");
             stack[depth++] = m->req_module_entries[i].module;
+        }
         do {
             if (depth == 0) { ret = 0; goto done; }
             m = stack[--depth];
@@ -56230,6 +56180,13 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
         while (f->i < f->m->req_module_entries_count) {
             JSModuleDef *m1 = f->m->req_module_entries[f->i].module;
             f->i++;
+            /* 16.2.1.9 GetImportedModule, whose whole body is `Assert: records has exactly one element, since
+               LoadRequestedModules has completed successfully on referrer prior to invoking this abstract
+               operation`. Linking asks the host for NOTHING; a request with no record is a graph that was
+               linked without being loaded, which is the phase order broken and not a module that is missing. */
+            DCHECK(m1 != NULL,
+                   "16.2.1.9: a module request reached LINKING with no loaded record — Link never loads, so "
+                   "this graph was linked before js_module_load_requested finished on it (or at all)");
             nindex = js_module_linking_enter(m1, pstack_top, index);
             if (nindex < 0) {
                 /* already visited: take the minimum the recursive form took on return */
@@ -56414,8 +56371,14 @@ static void js_load_module_reject_pending(JSContext *ctx, JSValueConst *resolvin
     JS_FreeValue(ctx, err);
 }
 
-/* THE TAIL OF A LOAD, shared by the synchronous answer and the asynchronous one: link the graph, evaluate it,
-   and settle the capability with the namespace once evaluation's own promise does. */
+/* THE PHASE THAT COMES FIRST, declared here because both of its consumers are below it: 16.2.1.6.1.1
+   LoadRequestedModules, then `on_loaded` upon its fulfilment. See js_module_load_requested. */
+static void js_load_module_then(JSContext *ctx, JSModuleDef *m,
+                                JSValueConst *resolving_funcs, JSCFunctionData *on_loaded);
+
+/* 13.3.10.2's TAIL, run only once the graph is LOADED (js_load_module_then puts it there): link, evaluate, and
+   settle the import's capability with the module NAMESPACE once evaluation's own promise does — which is what
+   `import()` resolves to, and the one thing that distinguishes it from running a module script. */
 static JSValue js_module_eval_capability(JSContext *ctx, JSModuleDef *m);
 static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m);
 
@@ -56426,10 +56389,6 @@ static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
     JSValue func_obj, evaluate_resolving_funcs[2];
     JSValueConst func_data[3];
 
-    if (js_resolve_module(ctx, m) < 0) {
-        js_free_unresolved_modules(ctx);
-        goto fail;
-    }
     /* LINK, then take the capability, THEN evaluate — spelled as the three steps rather than as JS_EvalFunction
        precisely so the registration below lands between the second and the third. The module body can FORK; a
        sibling forked mid-body inherits the world as it was at the branch, and this continuation has to already
@@ -56467,6 +56426,18 @@ static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
     JS_FreeValue(ctx, ret_val);
 }
 
+/* `import()`'s continuation once its graph is loaded. func_data = [resolve, reject, module] — the shape
+   js_load_module_then builds for every on_loaded. */
+static JSValue js_module_loaded_import(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv, int magic,
+                                       JSValueConst *func_data)
+{
+    DCHECK(JS_VALUE_GET_TAG(func_data[2]) == JS_TAG_MODULE,
+           "a load continuation was handed something that is not the module record it loaded");
+    js_load_module_evaluate(ctx, JS_VALUE_GET_PTR(func_data[2]), func_data);
+    return JS_UNDEFINED;
+}
+
 /* The source arrived. func_data = [resolve, reject, module_name]; argv[0] is the module's SOURCE TEXT. Compiling
    it here registers the record under that name, so a second import of the same specifier finds it loaded and
    never asks the host again. This is the resume of the load the loader parked — the importing flow's
@@ -56492,7 +56463,7 @@ static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
     m = js_find_loaded_module(ctx, name_atom);
     JS_FreeAtom(ctx, name_atom);
     if (m) {
-        js_load_module_evaluate(ctx, m, resolving_funcs);
+        js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import);
         return JS_UNDEFINED;
     }
 
@@ -56513,9 +56484,12 @@ static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
     DCHECK(JS_VALUE_GET_TAG(func_obj) == JS_TAG_MODULE,
            "compiling a module source did not produce a module record");
     m = JS_VALUE_GET_PTR(func_obj);
-    /* js_load_module_evaluate takes its own reference through JS_NewModuleValue. */
+    /* js_load_module_then takes its own reference through JS_NewModuleValue. */
     JS_FreeValue(ctx, func_obj);
-    js_load_module_evaluate(ctx, m, resolving_funcs);
+    /* COMPILING IS NOT LOADING. The record this just parsed has its own `import`s and an EMPTY [[LoadedModules]]
+       (16.2.1.7.1), so what follows the compile is the load of ITS graph — not the link. That is the whole
+       difference between the phase order this file used to have and the one the spec states. */
+    js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import);
     return JS_UNDEFINED;
  fail:
     js_load_module_reject_pending(ctx, resolving_funcs);
@@ -56542,12 +56516,542 @@ void JS_ModuleLoadPending(JSContext *ctx, JSValue source_promise)
 
 /* Did the loader just park? Consumes the handoff slot: JS_UNDEFINED means it answered synchronously (with a
    module, or with a throw). Every caller of js_host_resolve_imported_module asks, because a caller that cannot
-   wait must say so rather than silently drop the load. */
-static JSValue js_module_take_pending(JSContext *ctx)
+   wait must say so rather than silently drop the load.
+   THE NAME COMES WITH IT, always, because half a handoff is the shape a consumer papers over with a default:
+   the source text does not say what the module is CALLED, and the caller that compiles it has only the raw
+   specifier it typed, which is not the resolved one. Both slots are written together by
+   js_host_resolve_imported_module and both are cleared here, and the DCHECK is that they never split. */
+static JSValue js_module_take_pending(JSContext *ctx, JSValue *pname)
 {
     JSValue p = ctx->module_load_pending;
+
+    DCHECK(pname != NULL, "a parked module load was taken without its resolved specifier — the name is not "
+                          "optional, it is the module map key and the base its own imports resolve against");
+    *pname = ctx->module_load_pending_name;
     ctx->module_load_pending = JS_UNDEFINED;
+    ctx->module_load_pending_name = JS_UNDEFINED;
+    DCHECK(JS_IsUndefined(p) == JS_IsUndefined(*pname),
+           "a parked module load has a source promise without a resolved specifier, or a specifier without a "
+           "source promise — the two are written by one line and must arrive together");
     return p;
+}
+
+/* ============ 16.2.1.6.1.1 LoadRequestedModules — THE LOAD IS A PHASE, AND IT IS NOT THE LINK ============
+ *
+ * ECMAScript gives a module graph three operations in this order, and the order is the whole design:
+ *
+ *   LoadRequestedModules  populates every record's [[LoadedModules]] and returns a PROMISE. It is the only one
+ *                         of the three that talks to the host (16.2.1.10 HostLoadImportedModule), and the host
+ *                         may answer whenever it likes — 16.2.1.11 FinishLoadingImportedModule is called
+ *                         "either synchronously or asynchronously".
+ *   Link                  walks the graph that phase filled in. It reaches every child through 16.2.1.9
+ *                         GetImportedModule, whose entire body is an ASSERTION that the record is already
+ *                         there. Link never loads, so link never waits.
+ *   Evaluate              runs it.
+ *
+ * HTML says the same thing in its own words: "fetch a single module script" calls record.LoadRequestedModules(),
+ * and only "upon fulfillment of loadingPromise" does it "Perform record.Link()".
+ *
+ * quickjs conflated the first two into js_resolve_module — a synchronous C walk that both descended the graph
+ * and asked the host for every child it did not have, run at COMPILE time as well as at link time. A host that
+ * cannot answer on the spot had nowhere to park inside it, which is exactly what a browser's module fetch is,
+ * and what SECURITY.md forces this engine's to be (every byte of network goes through safeFetch). A static
+ * `import` therefore hit a DFAIL saying precisely that, and this is that DFAIL built.
+ *
+ * THE WALK IS RE-ENTERED, NOT RESUMED, and that is the spec's shape rather than a simplification of it.
+ * InnerModuleLoading issues a host request and KEEPS GOING through the rest of the referrer's requests; when an
+ * answer arrives later, ContinueModuleLoading starts a fresh InnerModuleLoading rooted at the module that
+ * arrived. So there is no cursor to park and no half-finished traversal to serialise — what carries across the
+ * park is the GraphLoadingState and the [[LoadedModules]] links already written into the records, and both of
+ * those are ordinary heap state the flow's COW delta and its snapshot already cover. A partially loaded graph
+ * is a set of records in the module map plus a pending count; nothing about it is a C stack.
+ *
+ * WHAT IS STILL C RECURSION HERE: nothing. The already-loaded arm of InnerModuleLoading is spec'd as a
+ * recursive call and its depth is the PAGE'S graph depth, so it is an explicit frame stack for the same reason
+ * js_inner_module_linking is one.
+ */
+
+/* The GraphLoadingState Record of 16.2.1.6.1.1, as a JS OBJECT and not a malloc'd C record — because a load
+   PARKS, which makes this data a flow QUEUES. It must fork per flow (two arms of a branch that both import are
+   two loads, and one arm's [[PendingModulesCount]] is not the other's), it must park to the cold tier with the
+   flow and come back, and it must be reachable by the collector while the only thing holding it is a promise
+   reaction's func_data. A malloc'd record named by a raw pointer from a JSCFunctionData does none of the three,
+   and the leak it makes is one the runtime's own gc_obj_list walk cannot see.
+   Its prototype is NULL: a page that writes Object.prototype.pending must not intercept the engine's own
+   bookkeeping, and a setter there would run the page's code inside the load. */
+static JSValue js_gls_new(JSContext *ctx, JSValueConst *resolving_funcs)
+{
+    JSValue st, visited;
+
+    st = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(st))
+        return JS_EXCEPTION;
+    visited = JS_NewArray(ctx);
+    if (JS_IsException(visited)) {
+        JS_FreeValue(ctx, st);
+        return JS_EXCEPTION;
+    }
+    /* [[PendingModulesCount]] starts at 1: the root InnerModuleLoading call is itself one completion to
+       account for, which is what stops an empty graph resolving before it has been walked. */
+    if (JS_DefinePropertyValueStr(ctx, st, "visited", visited, JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueStr(ctx, st, "loading", js_bool(true), JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueStr(ctx, st, "pending", js_int32(1), JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueStr(ctx, st, "resolve", js_dup(resolving_funcs[0]), JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueStr(ctx, st, "reject", js_dup(resolving_funcs[1]), JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(ctx, st);
+        return JS_EXCEPTION;
+    }
+    return st;
+}
+
+/* Every read below DCHECKs the field's TAG rather than defaulting it. A GraphLoadingState field has exactly one
+   writer, so a read that finds undefined is a producer that never wrote — the failure a `|| 0` would turn into
+   a plausible count. */
+static bool js_gls_is_loading(JSContext *ctx, JSValueConst state)
+{
+    JSValue v = JS_GetPropertyStr(ctx, state, "loading");
+    bool b;
+
+    DCHECK(JS_VALUE_GET_TAG(v) == JS_TAG_BOOL,
+           "a module load's [[IsLoading]] is not the boolean its only writer writes");
+    b = (JS_VALUE_GET_BOOL(v) != 0);
+    JS_FreeValue(ctx, v);
+    return b;
+}
+
+static void js_gls_set_loading(JSContext *ctx, JSValueConst state, bool b)
+{
+    CHECK(JS_SetPropertyStr(ctx, state, "loading", js_bool(b)) >= 0,
+          "a module load's [[IsLoading]] could not be written — a load that cannot record its own failure "
+          "goes on issuing requests after it has rejected");
+}
+
+static int js_gls_pending(JSContext *ctx, JSValueConst state)
+{
+    JSValue v = JS_GetPropertyStr(ctx, state, "pending");
+    int n;
+
+    DCHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT,
+           "a module load's [[PendingModulesCount]] is not the integer its only writer writes");
+    n = JS_VALUE_GET_INT(v);
+    JS_FreeValue(ctx, v);
+    return n;
+}
+
+static void js_gls_set_pending(JSContext *ctx, JSValueConst state, int n)
+{
+    CHECK(JS_SetPropertyStr(ctx, state, "pending", js_int32(n)) >= 0,
+          "a module load's [[PendingModulesCount]] could not be written — the load would never finish");
+}
+
+/* 16.2.1.6.1.1.1 step 2.a's `Append module to state.[[Visited]]`, answering step 2's `state.[[Visited]] does
+   not contain module` on the way. Returns true when this call is the one that appended it.
+   [[Visited]] IS NOT m->loaded, and collapsing them is a real defect rather than a tidy-up: `[[Status]] is new`
+   is a fact about the RECORD that survives every load, while [[Visited]] is a fact about THIS load. A load that
+   fails leaves every record it touched still `new` (step 5.b runs only when the count reaches zero), so a later
+   load walks that graph again; a single flag set on the way in would have marked those records loaded and left
+   their unanswered requests to reach Link. */
+static bool js_gls_visit(JSContext *ctx, JSValueConst state, JSModuleDef *m)
+{
+    JSValue arr, el;
+    uint32_t i, len = 0;
+    bool fresh = true;
+
+    arr = JS_GetPropertyStr(ctx, state, "visited");
+    DCHECK(JS_IsArray(arr), "a module load's [[Visited]] is not the array its only writer writes");
+    CHECK(js_get_length32(ctx, &len, arr) == 0, "a module load's [[Visited]] length could not be read");
+    for (i = 0; i < len; i++) {
+        el = JS_GetPropertyUint32(ctx, arr, i);
+        DCHECK(JS_VALUE_GET_TAG(el) == JS_TAG_MODULE,
+               "a module load's [[Visited]] holds something that is not a module record");
+        if (JS_VALUE_GET_PTR(el) == m)
+            fresh = false;
+        JS_FreeValue(ctx, el);
+        if (!fresh)
+            break;
+    }
+    if (fresh)
+        CHECK(JS_SetPropertyUint32(ctx, arr, len, JS_NewModuleValue(ctx, m)) >= 0,
+              "a module could not be appended to a load's [[Visited]] — a dropped visit re-walks a cycle "
+              "forever and double-counts every request in it");
+    JS_FreeValue(ctx, arr);
+    return fresh;
+}
+
+/* 16.2.1.6.1.1.1 step 5.b: `If loaded.[[Status]] is new, set loaded.[[Status]] to unlinked`, for the whole
+   [[Visited]] list AT ONCE and only when the load succeeded. */
+static void js_gls_mark_loaded(JSContext *ctx, JSValueConst state)
+{
+    JSValue arr, el;
+    uint32_t i, len = 0;
+
+    arr = JS_GetPropertyStr(ctx, state, "visited");
+    DCHECK(JS_IsArray(arr), "a module load's [[Visited]] is not the array its only writer writes");
+    CHECK(js_get_length32(ctx, &len, arr) == 0, "a module load's [[Visited]] length could not be read");
+    for (i = 0; i < len; i++) {
+        el = JS_GetPropertyUint32(ctx, arr, i);
+        DCHECK(JS_VALUE_GET_TAG(el) == JS_TAG_MODULE,
+               "a module load's [[Visited]] holds something that is not a module record");
+        ((JSModuleDef *)JS_VALUE_GET_PTR(el))->loaded = true;
+        JS_FreeValue(ctx, el);
+    }
+    JS_FreeValue(ctx, arr);
+}
+
+/* 16.2.1.6.1.1.1 steps 3-5: the TAIL OF EVERY InnerModuleLoading CALL, whether that call walked a module or
+   found nothing to do. The load finishes when the last outstanding call accounts for itself. */
+static void js_module_loading_settle_one(JSContext *ctx, JSValueConst state)
+{
+    int n = js_gls_pending(ctx, state);
+
+    DCHECK(n >= 1, "16.2.1.6.1.1.1 step 4: a module load accounted for more completions than it requested");
+    n--;
+    js_gls_set_pending(ctx, state, n);
+    if (n == 0) {
+        JSValue res, ret, arg = JS_UNDEFINED;
+        js_gls_set_loading(ctx, state, false);
+        js_gls_mark_loaded(ctx, state);
+        res = JS_GetPropertyStr(ctx, state, "resolve");
+        DCHECK(JS_IsFunction(ctx, res), "a module load's capability resolve is not a function");
+        ret = JS_Call(ctx, res, JS_UNDEFINED, 1, vc(&arg));
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, res);
+    }
+}
+
+static void js_inner_module_loading(JSContext *ctx, JSValueConst state, JSModuleDef *m);
+
+/* 16.2.1.6.1.1.2 ContinueModuleLoading — the RE-ENTRY POINT, and the reason the walk needs no parked cursor: a
+   request answered later restarts the loading process AT THE MODULE THAT ARRIVED, not at the position some
+   traversal had reached. `m == NULL` is the throw completion, whose exception is in flight. */
+static void js_continue_module_loading(JSContext *ctx, JSValueConst state, JSModuleDef *m)
+{
+    JSValue rej, err, ret;
+
+    if (!js_gls_is_loading(ctx, state)) {
+        /* step 1: the load already settled, so this completion is DISCARDED — a graph's requests overlap, so a
+           second one failing after the first has already rejected is ordinary. A discarded THROW completion
+           still has its exception in flight, and leaving it there hands somebody else's failure to whatever
+           runs next out of this job. */
+        if (!m && JS_HasException(ctx))
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        return;
+    }
+    if (m) {
+        js_inner_module_loading(ctx, state, m);
+        return;
+    }
+    DCHECK(JS_HasException(ctx),
+           "a module load's throw completion arrived with no exception in flight — the rejection reason is "
+           "whatever failed, and there is nothing here to invent one from");
+    js_gls_set_loading(ctx, state, false);
+    err = JS_GetException(ctx);
+    rej = JS_GetPropertyStr(ctx, state, "reject");
+    DCHECK(JS_IsFunction(ctx, rej), "a module load's capability reject is not a function");
+    ret = JS_Call(ctx, rej, JS_UNDEFINED, 1, vc(&err));
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, err);
+    JS_FreeValue(ctx, rej);
+}
+
+/* THE RE-ENTRY ITSELF. func_data = [state, referrer, request index, resolved specifier]; argv[0] is the module's
+   SOURCE TEXT, which is what the loader parked on. Compiling it registers the record under the resolved name,
+   so a second import of the same specifier finds it in the map and never asks the host again. This is the
+   RESUME of the load: the importing flow's continuation is the reaction chain this runs on, and no scope is
+   ever re-entered (a re-run would be a replay). */
+static JSValue js_module_request_fulfilled(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv, int magic,
+                                           JSValueConst *func_data)
+{
+    JSValueConst state = func_data[0];
+    JSModuleDef *referrer, *m;
+    JSReqModuleEntry *rme;
+    JSAtom name_atom;
+    const char *src, *name;
+    size_t src_len;
+    JSValue func_obj;
+    int idx;
+
+    DCHECK(argc >= 1, "a module source promise fulfilled with no value — what the loader parked on is the "
+                      "module's SOURCE TEXT, and there is nothing to compile without it");
+    DCHECK(JS_VALUE_GET_TAG(func_data[1]) == JS_TAG_MODULE,
+           "a parked module request's referrer is not a module record");
+    DCHECK(JS_VALUE_GET_TAG(func_data[2]) == JS_TAG_INT,
+           "a parked module request's index is not the integer its only writer writes");
+    referrer = JS_VALUE_GET_PTR(func_data[1]);
+    idx = JS_VALUE_GET_INT(func_data[2]);
+    DCHECK(idx >= 0 && idx < referrer->req_module_entries_count,
+           "a parked module request names an index outside its referrer's request table");
+    rme = &referrer->req_module_entries[idx];
+
+    if (!js_gls_is_loading(ctx, state))
+        return JS_UNDEFINED;             /* 16.2.1.6.1.1.2 step 1: a sibling request already rejected this load */
+
+    /* ALREADY LOADED? Two flows exploring the same page park on the same specifier, and both resume with the
+       same body — the loader ran once per flow because neither had finished when the other asked. Compiling it
+       twice would put a second record under one name. The module map is the load's memo (16.2.1.11 finishes a
+       load another already completed by handing back the existing record), so this asks it first. */
+    name_atom = JS_ValueToAtom(ctx, func_data[3]);
+    if (name_atom == JS_ATOM_NULL)
+        goto fail;
+    m = js_find_loaded_module(ctx, name_atom);
+    JS_FreeAtom(ctx, name_atom);
+    if (!m) {
+        src = JS_ToCStringLen(ctx, &src_len, argv[0]);
+        if (!src)
+            goto fail;
+        name = JS_ToCString(ctx, func_data[3]);
+        if (!name) {
+            JS_FreeCString(ctx, src);
+            goto fail;
+        }
+        func_obj = JS_Eval(ctx, src, src_len, name,
+                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        JS_FreeCString(ctx, name);
+        JS_FreeCString(ctx, src);
+        if (JS_IsException(func_obj))
+            goto fail;
+        DCHECK(JS_VALUE_GET_TAG(func_obj) == JS_TAG_MODULE,
+               "compiling a module source did not produce a module record");
+        m = JS_VALUE_GET_PTR(func_obj);
+        JS_FreeValue(ctx, func_obj);     /* the module map owns the record */
+    }
+    /* 16.2.1.11 step 1.a: a request already answered must be answered with the SAME record. 16.2.1.10 requires
+       the host to be idempotent per (referrer, request), and a host that is not would silently give one import
+       statement two module records. */
+    DCHECK(rme->module == NULL || rme->module == m,
+           "16.2.1.10's idempotence broken: one (referrer, request) was answered with two different records");
+    rme->module = m;                     /* step 1.b: append to referrer's [[LoadedModules]] */
+    js_continue_module_loading(ctx, state, m);
+    return JS_UNDEFINED;
+ fail:
+    js_continue_module_loading(ctx, state, NULL);
+    return JS_UNDEFINED;
+}
+
+/* The source fetch itself failed: 16.2.1.11 with a throw completion, which ContinueModuleLoading turns into the
+   load's rejection — what a browser does for a module whose network request did not succeed. */
+static JSValue js_module_request_rejected(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv, int magic,
+                                          JSValueConst *func_data)
+{
+    DCHECK(argc >= 1, "a module source promise rejected with no reason");
+    JS_Throw(ctx, js_dup(argv[0]));
+    js_continue_module_loading(ctx, func_data[0], NULL);
+    return JS_UNDEFINED;
+}
+
+/* 16.2.1.10 HostLoadImportedModule for ONE request of `referrer`, plus 16.2.1.11 FinishLoadingImportedModule
+   when the host answers on the spot. Returns the record to descend into, or NULL — either because the host
+   PARKED (the re-entry is now a reaction on the source promise) or because it threw (which stops the load). */
+static JSModuleDef *js_module_request_host_load(JSContext *ctx, JSValueConst state,
+                                                JSModuleDef *referrer, int idx)
+{
+    JSReqModuleEntry *rme = &referrer->req_module_entries[idx];
+    JSModuleDef *m1;
+    JSValue pending, name, mv, reactions[2];
+    JSValueConst func_data[4];
+
+    m1 = js_host_resolve_imported_module_atom(ctx, referrer->module_name,
+                                              rme->module_name, rme->attributes);
+    if (m1) {
+        rme->module = m1;                /* 16.2.1.11 step 1.b, answered synchronously */
+        return m1;
+    }
+    pending = js_module_take_pending(ctx, &name);
+    if (JS_IsUndefined(pending)) {
+        js_continue_module_loading(ctx, state, NULL);
+        return NULL;
+    }
+    /* WHAT THE RE-ENTRY NEEDS, AND ONLY THAT: the state to continue, the referrer and the INDEX of the request
+       inside it (a request table is fixed once its module is compiled, so the index still names the same entry
+       however long the fetch takes), and the resolved specifier to compile under. Everything else about where
+       the walk had got to is deliberately absent — ContinueModuleLoading does not resume a traversal. */
+    mv = JS_NewModuleValue(ctx, referrer);
+    func_data[0] = state;
+    func_data[1] = mv;
+    func_data[2] = js_int32(idx);
+    func_data[3] = name;
+    reactions[0] = JS_NewCFunctionData(ctx, js_module_request_fulfilled, 1, 0, 4, func_data);
+    reactions[1] = JS_NewCFunctionData(ctx, js_module_request_rejected, 1, 0, 4, func_data);
+    CHECK(!JS_IsException(reactions[0]) && !JS_IsException(reactions[1]),
+          "a parked module request could not build its re-entry — the load would never resume and the flow "
+          "that imported would stay parked on a source that does arrive and reaches nobody");
+    JS_FreeValue(ctx, mv);
+    JS_FreeValue(ctx, name);
+    JS_FreeValue(ctx, js_promise_then_native(ctx, pending, vc(reactions)));
+    JS_FreeValue(ctx, reactions[0]);
+    JS_FreeValue(ctx, reactions[1]);
+    JS_FreeValue(ctx, pending);
+    return NULL;
+}
+
+typedef struct JSModuleLoadFrame {
+    JSModuleDef *m;
+    int i;                               /* cursor over m->req_module_entries */
+} JSModuleLoadFrame;
+
+/* 16.2.1.6.1.1.1 InnerModuleLoading, as an explicit frame stack. The spec's recursion is into a module the
+   referrer ALREADY has a record for, and its depth is the page's graph depth, so recursing in C would make a
+   deep import chain a C-stack limit — the same reason js_inner_module_linking is a frame stack. Nothing here
+   caps the walk.
+   ORDER IS OBSERVABLE: the host is asked for each request in source order, and a child already in
+   [[LoadedModules]] is descended into immediately, before the referrer's next request. That is where the
+   recursive call sits in the spec, and this engine's loader RECORDS every specifier it is asked for, so the
+   order is part of what the tool reports. */
+static void js_inner_module_loading(JSContext *ctx, JSValueConst state, JSModuleDef *m)
+{
+    JSModuleLoadFrame *frames = NULL;
+    int depth = 0, cap = 0;
+
+    DCHECK(js_gls_is_loading(ctx, state),
+           "16.2.1.6.1.1.1 step 1: InnerModuleLoading ran for a load that is no longer loading");
+    for (;;) {
+#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
+        if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
+            char buf1[ATOM_GET_STR_BUF_SIZE];
+            printf("loading module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
+        }
+#endif
+        /* ENTER `m`. A record whose [[Status]] is not `new`, or one this load has already visited, is not
+           walked — but the CALL still ends, and its end is the decrement below. */
+        if (m->loaded || !js_gls_visit(ctx, state, m)) {
+            js_module_loading_settle_one(ctx, state);
+        } else {
+            /* step 2.c: every request will produce exactly one further InnerModuleLoading call, now or when
+               the host answers, and each of those ends in one decrement. */
+            js_gls_set_pending(ctx, state,
+                               js_gls_pending(ctx, state) + m->req_module_entries_count);
+            if (depth == cap) {
+                int ncap = cap ? cap * 2 : 8;
+                JSModuleLoadFrame *nf = js_realloc(ctx, frames, sizeof(*nf) * (size_t)ncap);
+                CHECK(nf != NULL, "a module graph load could not grow its walk — a dropped frame silently "
+                                  "leaves part of the graph unloaded and Link then asserts on it");
+                frames = nf;
+                cap = ncap;
+            }
+            frames[depth].m = m;
+            frames[depth].i = 0;
+            depth++;
+        }
+        for (;;) {
+            JSModuleLoadFrame *f;
+            JSReqModuleEntry *rme;
+            JSModuleDef *m1;
+
+            if (depth == 0 || !js_gls_is_loading(ctx, state))
+                goto done;
+            f = &frames[depth - 1];
+            if (f->i >= f->m->req_module_entries_count) {
+                depth--;                 /* this module's own call ends here */
+                js_module_loading_settle_one(ctx, state);
+                continue;
+            }
+            rme = &f->m->req_module_entries[f->i];
+            f->i++;
+            if (rme->module) {           /* step 2.d.ii: already in [[LoadedModules]] */
+                m = rme->module;
+                break;                   /* descend */
+            }
+            m1 = js_module_request_host_load(ctx, state, f->m, f->i - 1);
+            if (m1) {
+                m = m1;
+                break;                   /* descend into what the host answered with */
+            }
+            /* PARKED, or the request threw. Neither leaves anything to descend into now, and neither stops the
+               referrer's remaining requests from being issued — which is why a graph's fetches overlap. */
+        }
+    }
+ done:
+    js_free(ctx, frames);
+}
+
+/* 16.2.1.6.1.1 LoadRequestedModules. Returns the load's promise. */
+static JSValue js_module_load_requested(JSContext *ctx, JSModuleDef *m)
+{
+    JSValue promise, resolving_funcs[2], state;
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        return JS_EXCEPTION;
+    state = js_gls_new(ctx, vc(resolving_funcs));
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    if (JS_IsException(state)) {
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
+    }
+    js_inner_module_loading(ctx, state, m);
+    JS_FreeValue(ctx, state);
+    return promise;
+}
+
+/* Load the graph, and upon fulfilment run `on_loaded` — the shape both consumers share. `on_loaded` receives
+   func_data = [resolve, reject, module]; a rejected load rejects the caller's capability with the same reason,
+   which is js_load_module_rejected reading the same three slots. */
+static void js_load_module_then(JSContext *ctx, JSModuleDef *m,
+                                JSValueConst *resolving_funcs, JSCFunctionData *on_loaded)
+{
+    JSValue loading, mv, reactions[2];
+    JSValueConst func_data[3];
+
+    loading = js_module_load_requested(ctx, m);
+    if (JS_IsException(loading)) {
+        js_load_module_reject_pending(ctx, resolving_funcs);
+        return;
+    }
+    mv = JS_NewModuleValue(ctx, m);
+    func_data[0] = resolving_funcs[0];
+    func_data[1] = resolving_funcs[1];
+    func_data[2] = mv;
+    reactions[0] = JS_NewCFunctionData(ctx, on_loaded, 0, 0, 3, func_data);
+    reactions[1] = JS_NewCFunctionData(ctx, js_load_module_rejected, 0, 0, 3, func_data);
+    CHECK(!JS_IsException(reactions[0]) && !JS_IsException(reactions[1]),
+          "a module graph load could not build its continuation — the graph would load and reach nobody");
+    JS_FreeValue(ctx, mv);
+    JS_FreeValue(ctx, js_promise_then_native(ctx, loading, vc(reactions)));
+    JS_FreeValue(ctx, reactions[0]);
+    JS_FreeValue(ctx, reactions[1]);
+    JS_FreeValue(ctx, loading);
+}
+
+/* HTML §8.1.3.3 "run a module script", once the graph is loaded: Link it, Evaluate it, and settle this
+   promise exactly as the module's OWN evaluation promise settles — Evaluate() returns a promise for undefined,
+   not for the namespace, which is the whole difference between this tail and `import()`'s. */
+static JSValue js_module_loaded_run(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv, int magic,
+                                    JSValueConst *func_data)
+{
+    JSValueConst *resolving_funcs = func_data;
+    JSModuleDef *m;
+    JSValue cap, ret, ev;
+
+    DCHECK(JS_VALUE_GET_TAG(func_data[2]) == JS_TAG_MODULE,
+           "a load continuation was handed something that is not the module record it loaded");
+    m = JS_VALUE_GET_PTR(func_data[2]);
+    if (js_create_module_function(ctx, m) < 0)
+        goto fail;
+    if (js_link_module(ctx, m) < 0)
+        goto fail;
+    /* The capability BEFORE evaluating, and this promise adopts it BEFORE evaluating too — same ordering and
+       the same reason as js_load_module_evaluate: the body can FORK, and a sibling forked mid-body has to find
+       this continuation already registered in the world it inherits. */
+    cap = js_module_eval_capability(ctx, m);
+    if (JS_IsException(cap)) {
+    fail:
+        js_load_module_reject_pending(ctx, resolving_funcs);
+        return JS_UNDEFINED;
+    }
+    ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, vc(&cap));
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, cap);
+    ev = js_evaluate_module(ctx, m);
+    /* The capability exists, so the only failure js_evaluate_module can still report is the one that creates it;
+       every evaluation error settles that capability instead. */
+    DCHECK(!JS_IsException(ev), "module evaluation threw after its capability existed — an evaluation error "
+                                "settles the capability, it does not throw past it");
+    JS_FreeValue(ctx, ev);
+    return JS_UNDEFINED;
 }
 
 static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
@@ -56561,17 +57065,19 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
 
     m = js_host_resolve_imported_module(ctx, basename, filename, attributes);
     if (m) {
-        js_load_module_evaluate(ctx, m, resolving_funcs);
+        js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import);
         return;
     }
-    pending = js_module_take_pending(ctx);
+    pending = js_module_take_pending(ctx, &name_val);
     if (JS_IsUndefined(pending)) {
         js_load_module_reject_pending(ctx, resolving_funcs);
         return;
     }
-    /* 16.2.1.9: the host finishes the load later. The capability is kept alive by the reactions, so this
-       returns with the import still pending and the flow that issued it still suspended on it. */
-    name_val = JS_NewString(ctx, filename);
+    /* 16.2.1.11: the host finishes the load later. The capability is kept alive by the reactions, so this
+       returns with the import still pending and the flow that issued it still suspended on it.
+       THE NAME IS THE RESOLVED SPECIFIER THE HANDOFF CARRIED, not `filename`. `filename` is what the page
+       WROTE — `./chunk.js` — and registering the record under that would key the module map by a name no
+       lookup ever asks for, so every import of one file compiled and evaluated it again. */
     func_data[0] = resolving_funcs[0];
     func_data[1] = resolving_funcs[1];
     func_data[2] = name_val;
@@ -62734,19 +63240,22 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
         DFAIL("JS_EvalFunctionInternal ran a program body from C — route it onto the tramp chain");
         return JS_ThrowTypeError(ctx, "eval");
     } else if (tag == JS_TAG_MODULE) {
-        JSModuleDef *m;
-        m = JS_VALUE_GET_PTR(fun_obj);
+        /* HTML §8.1.3.3 "run a module script", ALL THREE PHASES IN THE SPEC'S ORDER. This used to link and
+           evaluate directly, which was only ever correct because the compile had already loaded the graph
+           behind the parser's back; with 16.2.1.7.1 doing what it says, the graph arrives here EMPTY and the
+           load is the first thing that has to happen. Loading is asynchronous, so the result is a PROMISE that
+           settles as the module's own evaluation promise settles, and the embedder must pump jobs for it —
+           which is what "upon fulfillment of loadingPromise, Perform record.Link()" means. */
+        JSModuleDef *m = JS_VALUE_GET_PTR(fun_obj);
+        JSValue resolving_funcs[2];
         /* the module refcount should be >= 2 */
         JS_FreeValue(ctx, fun_obj);
-        if (js_create_module_function(ctx, m) < 0)
-            goto fail;
-        if (js_link_module(ctx, m) < 0)
-            goto fail;
-        ret_val = js_evaluate_module(ctx, m);
-        if (JS_IsException(ret_val)) {
-        fail:
+        ret_val = JS_NewPromiseCapability(ctx, resolving_funcs);
+        if (JS_IsException(ret_val))
             return JS_EXCEPTION;
-        }
+        js_load_module_then(ctx, m, vc(resolving_funcs), js_module_loaded_run);
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
     } else {
         JS_FreeValue(ctx, fun_obj);
         ret_val = JS_ThrowTypeError(ctx, "bytecode function expected");
@@ -62873,11 +63382,13 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     fun_obj = js_create_function(ctx, fd);
     if (JS_IsException(fun_obj))
         goto fail1;
-    /* Could add a flag to avoid resolution if necessary */
+    /* 16.2.1.7.1 ParseModule ENDS HERE. It produces a Source Text Module Record with [[RequestedModules]] filled
+       in from the parse and [[LoadedModules]] EMPTY — it loads nothing, because loading is 16.2.1.6.1.1 and it
+       is a later phase that returns a promise. A js_resolve_module call stood here and asked the host for every
+       import at COMPILE time, so a loader that answers asynchronously (a browser's does; SECURITY.md forces
+       this engine's to) had nowhere to park inside a parser. */
     if (m) {
         m->func_obj = fun_obj;
-        if (js_resolve_module(ctx, m) < 0)
-            goto fail1;
         fun_obj = JS_NewModuleValue(ctx, m);
     }
     if (flags & JS_EVAL_FLAG_COMPILE_ONLY) {
@@ -62988,18 +63499,6 @@ JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
 JSValue JS_Eval2(JSContext *ctx, const char *input, size_t input_len, JSEvalOptions *options)
 {
     return JS_EvalThis2(ctx, ctx->global_obj, input, input_len, options);
-}
-
-int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
-{
-    if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
-        JSModuleDef *m = JS_VALUE_GET_PTR(obj);
-        if (js_resolve_module(ctx, m) < 0) {
-            js_free_unresolved_modules(ctx);
-            return -1;
-        }
-    }
-    return 0;
 }
 
 /*******************************************************************/
@@ -65015,22 +65514,15 @@ static JSValue JS_ReadModule(BCReaderState *s)
             goto fail;
         for(i = 0; i < m->req_module_entries_count; i++) {
             JSReqModuleEntry *rme = &m->req_module_entries[i];
-            JSModuleDef **pm = &rme->module;
             if (bc_get_atom(s, &rme->module_name))
                 goto fail;
-            // Resolves a module either from the cache or by requesting
-            // it from the module loader. From cache is not ideal because
-            // the module may not be the one it was a time of serialization
-            // but directly petitioning the module loader is not correct
-            // either because then the same module can get loaded twice.
-            // JS_WriteModule() does not serialize modules transitively
-            // because that doesn't work for C modules and is also prone
-            // to loading the same JS module twice.
-            *pm = js_host_resolve_imported_module_atom(s->ctx, m->module_name,
-                                                       rme->module_name,
-                                                       rme->attributes);
-            if (!*pm)
-                goto fail;
+            /* A DESERIALISED RECORD IS A PARSED ONE: [[RequestedModules]] from the stream, [[LoadedModules]]
+               EMPTY. This asked the module loader for every request right here, which is the same conflation
+               the parser had — a synchronous host call on a path with nowhere to park, made worse by being
+               inside JS_ReadObject, which is not a flow and never could wait. JS_WriteModule does not
+               serialise a graph transitively anyway, so this could only ever ask the loader; the load phase
+               (js_module_load_requested, reached through JS_EvalFunction) asks it for exactly the same
+               specifiers, once, and can park while it does. */
         }
     }
 

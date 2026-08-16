@@ -87,10 +87,8 @@ static JSValue load_standalone_module(JSContext *ctx)
     if (JS_IsException(obj))
         goto exception;
     assert(JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE);
-    if (JS_ResolveModule(ctx, obj) < 0) {
-        JS_FreeValue(ctx, obj);
-        goto exception;
-    }
+    /* JS_EvalFunction loads the graph itself now — 16.2.1.6.1.1 before Link, which is the order the spec
+       states and which a caller cannot perform up front because loading is asynchronous. */
     if (js_module_set_import_meta(ctx, obj, false, true) < 0) {
         JS_FreeValue(ctx, obj);
         goto exception;
