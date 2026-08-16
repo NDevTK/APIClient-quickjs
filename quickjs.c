@@ -21183,6 +21183,22 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->arg_buf = (JSValue *)arg_buf;
 
     func = p->u.cfunc.c_function;
+    /* THE POINTER THIS IS ABOUT TO CALL EXISTS. Four cprotos deliberately carry NO body — step, step_ctor,
+       consume and iterdrive install `.generic = NULL`, because the machine IS the implementation and their arms
+       below DFAIL rather than call. Every other cproto names a C body, and the arms reach it through a union
+       member without ever asking whether it is there.
+       This is asserted rather than assumed because the set of bodyless builtins GROWS: each conversion moves
+       another row from JS_CFUNC_MAGIC_DEF to a declaration, and the seven promise combinators joined it most
+       recently. A row converted while some path still routes it to a body arm calls through NULL, and the
+       failure that produces is a jump to address 0 with no symbol and no return address — a backtrace that
+       names nothing, in a process that was working a moment earlier. It is the C-FUNCTION twin of the XOR
+       js_new_c_function_data now asserts for a closure, and it is asked here for the same reason: at the point
+       the pointer is loaded, so it names the registration that half-happened rather than the instruction that
+       ran. */
+    DCHECK(func.generic != NULL || cproto == JS_CFUNC_step || cproto == JS_CFUNC_step_ctor
+           || cproto == JS_CFUNC_consume || cproto == JS_CFUNC_iterdrive,
+           "a C function whose cproto names a body carries none — its registration declared a machine and left "
+           "the row pointing at a body arm, or a new bodyless cproto was added without joining this list");
     switch(cproto) {
     case JS_CFUNC_constructor:
     case JS_CFUNC_constructor_or_func:
