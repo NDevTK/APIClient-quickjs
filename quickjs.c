@@ -3288,10 +3288,17 @@ static void js_gc_object_census(JSRuntime *rt, const char *tag)
                 continue;
             if (c > 1)   /* c-1 is the class id; 0 is not one, and c == 0 is "not a JSObject" */
                 cn = JS_AtomGetStrRT(rt, cbuf, sizeof(cbuf), rt->class_array[c - 1].class_name);
-            fprintf(stderr, "[%s] %-14s %-28s x%-6d refcount %d..%d\n", tag,
-                    t < (int)countof(TYPE_NAME) ? TYPE_NAME[t] : "?", cn, n[k], rc_min[k], rc_max[k]);
+            /* ONE STREAM FOR THE WHOLE REPORT. This counted on stderr while the root DUMP beside it goes to
+               stdout — which is where every user of quickjs's dump infra writes — so the two halves of one
+               report arrived interleaved in a `2>&1` log and in two different files otherwise, and a reader
+               matching `object Object x3` to the three objects it counts had to do it across a stream
+               boundary with no ordering guarantee. The verdict still goes to stderr, because the verdict is
+               the DCHECK and not the report. */
+            printf("[%s] %-14s %-28s x%-6d refcount %d..%d\n", tag,
+                   t < (int)countof(TYPE_NAME) ? TYPE_NAME[t] : "?", cn, n[k], rc_min[k], rc_max[k]);
         }
     }
+    fflush(stdout);   /* the DCHECK that follows this report aborts, and an unflushed report is no report */
     (free)(n);
 }
 
