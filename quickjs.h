@@ -581,12 +581,21 @@ typedef struct JSMallocFunctions {
 #define JS_DUMP_MODULE_RESOLVE 0x1000  /* dump module resolution steps */
 #define JS_DUMP_PROMISE        0x2000  /* dump promise steps */
 #define JS_DUMP_LEAKS          0x4000  /* dump leaked objects and strings in JS_FreeRuntime */
-#define JS_DUMP_ATOM_LEAKS     0x8000  /* dump leaked atoms in JS_FreeRuntime */
+/* 0x8000 WAS JS_DUMP_ATOM_LEAKS, and it is gone rather than kept as a name. The atom walk it gated is
+   unconditional now, for the reason stated at the gc_obj_list census it stands beside: a leak report that
+   exists only in some builds reports only some leaks, and no host in this tree ever set this bit — so every
+   leaked interned string and private Symbol was invisible in every run. A flag whose only reader has been
+   deleted is a setting a caller can turn on to no effect, which is the same concealment as a default over a
+   field nobody writes. JS_ABORT_ON_LEAKS drops the bit with it. */
 #define JS_DUMP_MEM           0x10000  /* dump memory usage in JS_FreeRuntime */
 #define JS_DUMP_OBJECTS       0x20000  /* dump objects in JS_FreeRuntime */
 #define JS_DUMP_ATOMS         0x40000  /* dump atoms in JS_FreeRuntime */
 #define JS_DUMP_SHAPES        0x80000  /* dump shapes in JS_FreeRuntime */
-#define JS_ABORT_ON_LEAKS    0x10C000  /* abort on atom/object/string leaks; for testing */
+/* Abort on what JS_FreeRuntime's leak reports found. This is the RELEASE-build verdict: in dev the object,
+   realm, step-machine and atom censuses each carry their own DCHECK, which aborts at the report naming what
+   leaked, and those are compiled out at APICLIENT_DEV=0. check_dump_flag tests ALL the bits it is given, so
+   this asks for the abort bit and JS_DUMP_LEAKS together. */
+#define JS_ABORT_ON_LEAKS    0x104000
 
 // Finalizers run in LIFO order at the very end of JS_FreeRuntime.
 // Intended for cleanup of associated resources; the runtime itself

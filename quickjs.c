@@ -3440,64 +3440,94 @@ void JS_FreeRuntime(JSRuntime *rt)
     js_free_rt(rt, rt->host_step_defs);   /* the defs themselves are static data the host owns */
     js_free_rt(rt, rt->class_array);
 
-#ifdef ENABLE_DUMPS // JS_DUMP_ATOM_LEAKS
-    /* only the atoms defined in JS_InitAtoms() should be left */
-    if (check_dump_flag(rt, JS_DUMP_ATOM_LEAKS)) {
-        bool header_done = false;
+    /* THE ATOMS NOBODY RELEASED, ON THE SAME TERMS AS THE OBJECTS ABOVE — AND UNCONDITIONALLY, WHICH IS THE
+       WHOLE OF THIS CHANGE. This walk used to be behind `#ifdef ENABLE_DUMPS` AND `check_dump_flag(rt,
+       JS_DUMP_ATOM_LEAKS)`, and no host in this tree ever set that bit: run-test262 sets JS_DUMP_LEAKS, which
+       does NOT include it, and nothing under engine/host calls JS_SetDumpFlags at all. So a leaked interned
+       string or private Symbol was invisible in EVERY run this engine has ever made — which is exactly how
+       navigation_destination.c's release came to be written, exported from its header and called by nobody
+       while the private Symbol its internal slots hang off leaked every time: an atom is not a GC object, so
+       the census above cannot see one, and the one report that could was switched off. The argument is the
+       gc_obj_list census's own, verbatim — a leak report that exists only in some builds reports only some
+       leaks — so this is the same gate: an unconditional census, `leak` raised for JS_ABORT_ON_LEAKS, and a
+       DCHECK on top. The dump flag went with the arm; a flag whose only reader is deleted is a setting a caller
+       can turn on to no effect.
+       NAMING THE SURVIVOR IS THE POINT, and it is the one thing the `abort()` at the end of this function
+       cannot do: that abort is fed by four arms (this one, the object census, the string walk, malloc_count),
+       fires after js_arena_free_all and after the JSRuntime itself is gone, and prints nothing — four causes,
+       one indistinguishable verdict. The DCHECK stands where the leak was found and says WHICH atom, so the
+       report is a work queue rather than a fact that something is wrong.
+       IT RUNS HERE, AFTER THE CLASSES, AND THAT ORDER IS FORCED BOTH WAYS: every JSClass holds a counted
+       reference to its class_name atom and the loop directly above is what drops them, so running this any
+       earlier reports several hundred healthy class names as leaks; and the object census cannot come down to
+       join it, because it reads class_array to name what it counts. */
+    {
+        char why[512] = "";
+        JSAtom first = JS_ATOM_NULL;
+        const char *first_kind = "";
+        int n_leaked = 0;
 
         for(i = 0; i < rt->atom_size; i++) {
             JSAtomStruct *p = rt->atom_array[i];
-            if (!atom_is_free(p) /* && p->str*/) {
-                if (i >= JS_ATOM_END || JS_REF_COUNT(p) != 1) {
-                    if (!header_done) {
-                        header_done = true;
-                        if (rt->rt_info) {
-                            printf("%s:1: atom leakage:", rt->rt_info);
-                        } else {
-                            printf("Atom leaks:\n"
-                                   "    %6s %6s %s\n",
-                                   "ID", "REFCNT", "NAME");
-                        }
-                    }
-                    if (rt->rt_info) {
-                        printf(" ");
-                    } else {
-                        printf("    %6u %6u ", i, JS_REF_COUNT(p));
-                    }
-                    switch (p->atom_type) {
-                    case JS_ATOM_TYPE_STRING:
-                        JS_DumpString(rt, p);
-                        break;
-                    case JS_ATOM_TYPE_GLOBAL_SYMBOL:
-                        printf("Symbol.for(");
-                        JS_DumpString(rt, p);
-                        printf(")");
-                        break;
-                    case JS_ATOM_TYPE_SYMBOL:
-                        if (p->hash == JS_ATOM_HASH_SYMBOL) {
-                            printf("Symbol(");
-                            JS_DumpString(rt, p);
-                            printf(")");
-                        } else {
-                            printf("Private(");
-                            JS_DumpString(rt, p);
-                            printf(")");
-                        }
-                        break;
-                    }
-                    if (rt->rt_info) {
-                        printf(":%u", JS_REF_COUNT(p));
-                    } else {
-                        printf("\n");
-                    }
-                    leak = true;
-                }
+            const char *kind;
+
+            if (atom_is_free(p))
+                continue;
+            /* only the atoms JS_InitAtoms() defined should be left, each held by the atom table alone */
+            if (i < JS_ATOM_END && JS_REF_COUNT(p) == 1)
+                continue;
+            /* THE KIND IS HALF THE IDENTIFICATION. A private Symbol and an interned string carrying the same
+               description are leaked by different code — one is an interface's internal-slot key and names the
+               component whose release was never called, the other is a property name some record kept — so the
+               description alone sends the reader to the wrong file. */
+            switch (p->atom_type) {
+            case JS_ATOM_TYPE_STRING:
+                kind = "string";
+                break;
+            case JS_ATOM_TYPE_GLOBAL_SYMBOL:
+                kind = "Symbol.for";
+                break;
+            case JS_ATOM_TYPE_SYMBOL:
+                /* JS_ATOM_TYPE_PRIVATE is never STORED in atom_type: a private name is TYPE_SYMBOL carrying
+                   hash 1, which is why the hash and not the type makes this distinction. */
+                kind = p->hash == JS_ATOM_HASH_SYMBOL ? "Symbol" : "Private";
+                break;
+            default:
+                kind = "?";
+                DFAIL("an atom whose atom_type is none of STRING / GLOBAL_SYMBOL / SYMBOL — the type is written "
+                      "once at intern time and PRIVATE is encoded as SYMBOL with hash 1, so there is no fourth "
+                      "value for this field to hold");
+                break;
             }
-        }
-        if (rt->rt_info && header_done)
+            if (n_leaked++ == 0) {
+                first = i;
+                first_kind = kind;
+            }
+            /* EVERY LINE CARRIES THE TAG, like js_gc_object_census's and for its reason: a driver collecting
+               this report out of a mixed stream filters by line, so a header plus indented rows is a report
+               whose rows are invisible to the thing that quotes it. On stdout, where the rest of quickjs's
+               dump infra writes, so the two halves of one report cannot arrive in two files. */
+            printf("[atomleak] id %-6u refcount %-6u %-10s ", i, JS_REF_COUNT(p), kind);
+            JS_DumpString(rt, p);
             printf("\n");
+        }
+        if (n_leaked > 0) {
+            char abuf[ATOM_GET_STR_BUF_SIZE];
+
+            fflush(stdout);   /* the DCHECK below aborts, and an unflushed report is no report */
+            leak = true;
+            snprintf(why, sizeof(why),
+                     "the runtime went down with %d ATOM%s still interned — the first is %s(%s) at id %u, "
+                     "refcount %u. An atom is not a GC object, so the `[gcleak]` walk above cannot report one: "
+                     "a survivor here is a reference some component took and never dropped, and a Private one "
+                     "is an interface's internal-slot key whose release its host never calls. `[atomleak]` "
+                     "above names every one of them",
+                     n_leaked, n_leaked == 1 ? "" : "S", first_kind,
+                     JS_AtomGetStrRT(rt, abuf, sizeof(abuf), first), first,
+                     JS_REF_COUNT(rt->atom_array[first]));
+        }
+        DCHECK(n_leaked == 0, why);
     }
-#endif
 
     /* free the atoms */
     for(i = 0; i < rt->atom_size; i++) {
