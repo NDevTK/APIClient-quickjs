@@ -1654,6 +1654,22 @@ typedef struct JSTimeTravelHooks {
        element a million times costs one entry — the delta stays O(shared state TOUCHED), which an undo log of
        ranges would not. */
     void (*buf_write)(JSContext *ctx, JSValueConst abuf);
+    /* Before a flow changes a shared ARRAY BUFFER's LIFETIME — its `resize`/`grow`, its `transfer`, or a
+       detach. buf_write above is about the buffer's CONTENTS; this is about the storage those contents live
+       in, and they are two facts because a byte entry cannot express either one: an entry holds `a_len` bytes
+       read off the buffer, so a resize makes the entry describe a length the buffer no longer has and a detach
+       makes it name storage that has been freed.
+       WHY THE SITE IS THE MUTATION AND NOT THE SAVE. The save-side CHECKs in cow_state_save (a NULL byte
+       pointer, a length that no longer matches) DO name this, and they can only fire for a buffer this flow
+       had ALREADY captured — which is one of the two orderings. Resize FIRST and write SECOND and the entry is
+       created after the fact, holding the post-resize bytes as if they were the baseline: no length ever
+       disagrees, no CHECK fires, and the sibling silently inherits both the new size and the write. A
+       zero-length resizable buffer is only the extreme of that ordering (there is no byte to write before the
+       resize, so it is ALWAYS the silent one) and not a separate case. Asked here, the ordering stops
+       mattering, because the mutation cannot happen without passing this.
+       The host answers it as it answers every other capture: a buffer the running flow created is private and
+       may be resized freely; a SHARED one aborts naming the entry to build. */
+    void (*buf_lifetime)(JSContext *ctx, JSValueConst abuf);
 } JSTimeTravelHooks;
 /* The evaluation state of a module record, as an opaque owned blob — the module twin of JS_AsyncStateSave. */
 JS_EXTERN void *JS_ModuleEvalStateSave(JSContext *ctx, void *m);

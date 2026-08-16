@@ -7328,6 +7328,19 @@ static void cow_capture_bytes(JSContext *ctx, JSObject *p)
            "the capture would silently record nothing");
     g_time_travel.buf_write(ctx, JS_MKPTR(JS_TAG_OBJECT, p->u.typed_array->buffer));
 }
+/* THE ONE PLACE A BUFFER'S STORAGE IS DECLARED ABOUT TO MOVE — resize/grow, transfer, detach. `abuf` is the
+   ArrayBuffer/SharedArrayBuffer OBJECT, the same name cow_capture_bytes uses, because the byte entry and this
+   one are two facts about one thing.
+   IT IS ASKED AT THE MUTATION, WHICH IS THE WHOLE OF WHY IT EXISTS. cow_state_save already refuses a captured
+   buffer whose bytes have gone or whose length has changed — but only for a buffer this flow had captured
+   BEFORE it mutated it. The other ordering (resize, then write) creates the entry afterwards, over the
+   post-resize bytes, and every later save agrees with itself: one ordering aborts by name and the other
+   corrupts every sibling in silence. A capture point at the mutation has no ordering to get wrong. */
+static void cow_capture_buffer_lifetime(JSContext *ctx, JSValueConst abuf)
+{
+    if (g_time_travel.buf_lifetime)
+        g_time_travel.buf_lifetime(ctx, abuf);
+}
 /* Ask the host to record an object's pre-write state (for per-flow revert). Whether a FLOW_LOCAL object is
    skipped is decided by the HOST hook, NOT here: a snapshot fork SHARES the parent frame's flow_local objects
    with the sibling, so once a flow has forked those objects are shared and their mutations MUST be captured. The
@@ -102590,6 +102603,11 @@ void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
 
     if (!abuf || abuf->detached)
         return;
+    /* forced-exec TIME-TRAVEL: a detach FREES the storage a byte entry names and empties every view over it,
+       which is the same lifetime fact a resize is and is refused at the same place. cow_state_save's NULL-bytes
+       CHECK names it too, and only for a buffer already captured — `buf.transfer()` before this flow ever wrote
+       a byte reaches that CHECK never. */
+    cow_capture_buffer_lifetime(ctx, obj);
     if (abuf->free_func) {
         abuf->free_func(ctx->rt, abuf->opaque, abuf->data);
         /* The backing data has been released. Do not release it again when
@@ -102799,6 +102817,10 @@ static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
                 pmax_len = &max_len;
         }
     }
+    /* forced-exec TIME-TRAVEL: a transfer DETACHES this buffer, and the arm below does it inline rather than
+       through JS_DetachArrayBuffer — so the declaration is made once here, above both arms, after every throw
+       and before either of them touches the storage. */
+    cow_capture_buffer_lifetime(ctx, this_val);
     /* create an empty AB */
     if (new_len == 0) {
         JS_DetachArrayBuffer(ctx, this_val);
@@ -102890,12 +102912,24 @@ static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val,
     bad_length:
         return JS_ThrowRangeError(ctx, "invalid array buffer length");
     }
+    /* A SAB CAN ONLY GROW — 25.2.5.4 step 8's RangeError, hoisted out of the branch below so that the single
+       lifetime capture can stand AFTER every refusal and BEFORE the storage moves. It is the same refusal at
+       the same point (no user code runs between the two) and it is what lets the capture be one line rather
+       than one per arm. */
+    if (abuf->shared && len < abuf->byte_length)
+        goto bad_length;
+    /* forced-exec TIME-TRAVEL: THE STORAGE IS ABOUT TO MOVE, and that is a mutation of the buffer OBJECT that
+       the byte entry cannot express — an entry holds `a_len` bytes, so a resize leaves it describing a length
+       the buffer no longer has. Declared HERE rather than left to the save-side CHECKs, because those can only
+       fire for a buffer this flow had already captured: `rab.resize(n)` BEFORE the first write creates the
+       entry afterwards, over the post-resize bytes, and nothing downstream ever disagrees with itself. The
+       host skips a buffer the running flow created and aborts on a shared one, naming the entry to build. */
+    if (len != abuf->byte_length)
+        cow_capture_buffer_lifetime(ctx, this_val);
     // SABs can only grow and we don't need to realloc because
     // js_array_buffer_constructor3 commits all memory upfront;
     // regular RABs are resizable both ways and realloc
     if (abuf->shared) {
-        if (len < abuf->byte_length)
-            goto bad_length;
         // Note this is off-spec; there's supposed to be a single atomic
         // |byteLength| property that's shared across SABs but we store
         // it per SAB instead. That means when thread A calls sab.grow(2)
