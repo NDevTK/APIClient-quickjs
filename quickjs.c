@@ -24839,7 +24839,7 @@ static JSIterConsume *js_iter_consume_new(JSContext *ctx)
    forbids calling the observable .add), so the consume step needs them before their definitions. */
 static JSValue map_normalize_key(JSContext *ctx, JSValue key);
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s, JSValueConst key);
-static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key);
+static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValue key, int pos);
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr);
 static JSValue js_map_new(JSContext *ctx, int magic);
 static bool setmap_consume_ready(JSContext *ctx, JSValueConst *call_argv, int call_argc, JSValue *out_getiter);
@@ -73417,7 +73417,7 @@ static int setop_copy_this(JSContext *ctx, JSIterConsume *s)
     list_for_each(el, &ss->records) {
         JSMapRecord *mr = list_entry(el, JSMapRecord, link), *nr;
         if (mr->empty) continue;
-        nr = map_add_record(ctx, ts, mr->key);
+        nr = map_add_record(ctx, ts, mr->key, JS_MAP_POS_TAIL);
         if (!nr) { JS_ThrowOutOfMemory(ctx); return -1; }
         nr->value = JS_UNDEFINED;
     }
@@ -73575,7 +73575,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 if (s->setop == SETOP_DIFF) {
                     if (hmr) map_delete_record(ctx->rt, hrs, hmr);
                 } else if (!hmr) {
-                    hmr = map_add_record(ctx, hrs, hel);
+                    hmr = map_add_record(ctx, hrs, hel, JS_MAP_POS_TAIL);
                     if (!hmr) { JS_FreeValue(ctx, hel); JS_ThrowOutOfMemory(ctx); return -1; }
                     hmr->value = JS_UNDEFINED;
                 }
@@ -73689,7 +73689,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             if (!gmr) {
                 JSValue garr = JS_NewArray(ctx);
                 if (JS_IsException(garr)) { JS_FreeValue(ctx, gkey); JS_FreeValue(ctx, gel); return -1; }
-                gmr = map_add_record(ctx, gms, gkey);   /* dups the key */
+                gmr = map_add_record(ctx, gms, gkey, JS_MAP_POS_TAIL);   /* dups the key */
                 if (!gmr) { JS_FreeValue(ctx, gkey); JS_FreeValue(ctx, garr); JS_FreeValue(ctx, gel);
                             JS_ThrowOutOfMemory(ctx); return -1; }
                 gmr->value = garr;
@@ -74084,7 +74084,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 /* 24.2.4.8 step 7.c.ii.2: intersection has no copy, so it DOES read O.[[SetData]] live, and the
                    spec's own NOTE covers the duplicate the other side may yield. */
                 if (map_find_record(ctx, ts, value) && !map_find_record(ctx, rs, value)) {
-                    mr = map_add_record(ctx, rs, value);
+                    mr = map_add_record(ctx, rs, value, JS_MAP_POS_TAIL);
                     if (!mr) { JS_FreeValue(ctx, value); return -1; }
                     mr->value = JS_UNDEFINED;
                 }
@@ -74093,7 +74093,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
             }
             if (s->setop == SETOP_UNION) {
                 if (!map_find_record(ctx, rs, value)) {
-                    mr = map_add_record(ctx, rs, value);
+                    mr = map_add_record(ctx, rs, value, JS_MAP_POS_TAIL);
                     if (!mr) { JS_FreeValue(ctx, value); return -1; }
                     mr->value = JS_UNDEFINED;
                     JS_FreeValue(ctx, value);   /* map_add_record dups the key */
@@ -74110,7 +74110,7 @@ static int js_iter_consume_step(JSContext *ctx, JSIterConsume *s, JSValue res)
                 if (present) {
                     if (mr) map_delete_record(ctx->rt, rs, mr);
                 } else if (!mr) {
-                    mr = map_add_record(ctx, rs, value);
+                    mr = map_add_record(ctx, rs, value, JS_MAP_POS_TAIL);
                     if (!mr) { JS_FreeValue(ctx, value); return -1; }
                     mr->value = JS_UNDEFINED;
                 }
@@ -94590,8 +94590,55 @@ static JSWeakRefRecord **get_first_weak_ref(JSValueConst key)
         return NULL; // pacify compiler
 }
 
+/* WHERE A RECORD SITS IS PART OF ITS STATE, because a Set/Map iterates in INSERTION order and that order is
+   observable. So the two questions below are the read and the write half of one fact, and they exist because a
+   COW unapply that re-added a deleted record at the TAIL rebuilt a different collection: a flow's
+   `m.delete('a')` on ['a','b','c'] came back as ['b','c','a'], and a clear() came back reversed.
+   The unit is the LIVE record: a zombie (mr->empty, kept alive by an iterator that still points at it) is not
+   iterated and so is not a position. A list has no index, so both halves are O(position) — which is O(1) for
+   the two shapes that actually delete in bulk (clear(), and `for (k of m.keys()) m.delete(k)`, both of which
+   remove the head), and paid only on a captured mutation of a SHARED collection. */
+static int map_record_pos(const JSMapState *s, const JSMapRecord *mr)
+{
+    struct list_head *el;
+    int pos = 0;
+
+    list_for_each(el, &s->records) {
+        const JSMapRecord *r = list_entry(el, JSMapRecord, link);
+        if (r == mr)
+            return pos;
+        pos += !r->empty;
+    }
+    DFAIL("a Set/Map record's position was asked of a collection the record is not in");
+    return JS_MAP_POS_TAIL;
+}
+
+/* The node a record must be inserted BEFORE so that exactly `pos` live records precede it. JS_MAP_POS_TAIL — the
+   ordinary add, and the replay of one — is the list head, which list_add_tail reads as "append". A `pos` past
+   the end is the same append, and it is not a silent clamp: it is the only answer a shorter collection has, and
+   the DCHECK in JS_MapAddRecord is what says a delta may not ask for one. */
+static struct list_head *map_pos_before(JSMapState *s, int pos)
+{
+    struct list_head *el;
+    int n = 0;
+
+    if (pos == JS_MAP_POS_TAIL)
+        return &s->records;
+    list_for_each(el, &s->records) {
+        const JSMapRecord *r = list_entry(el, JSMapRecord, link);
+        if (r->empty)
+            continue;
+        if (n == pos)
+            return el;
+        n++;
+    }
+    return &s->records;
+}
+
+/* `pos` is where the record must land — JS_MAP_POS_TAIL for every ordinary add (10.1's append), or the number of
+   live records that must precede it, which only the COW restore of a DELETED record asks for. */
 static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
-                                   JSValueConst key)
+                                   JSValueConst key, int pos)
 {
     uint32_t h;
     JSMapRecord *mr;
@@ -94617,7 +94664,7 @@ static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
     }
     h = map_hash_key(ctx, key) & (s->hash_size - 1);
     list_add_tail(&mr->hash_link, &s->hash_table[h]);
-    list_add_tail(&mr->link, &s->records);
+    list_add_tail(&mr->link, map_pos_before(s, pos));
     s->record_count++;
     if (s->record_count >= s->record_count_threshold) {
         map_hash_resize(ctx, s);
@@ -94699,12 +94746,15 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
     mr = map_find_record(ctx, s, key);
     if (mr) {
         /* OVERWRITE of an existing record (Map.set of a present key): capture the old value so a snapshot-forked
-           sibling restores it on unapply. A Set re-add is a no-op (same value) — nothing to capture. */
+           sibling restores it on unapply. A Set re-add is a no-op (same value) — nothing to capture.
+           NO POSITION: an overwrite does not move the record, so its inverse creates nothing and has nothing to
+           place — which is why this does not pay map_record_pos's walk. */
         if (g_time_travel.map_mutate && !s->is_weak && !is_set)
-            g_time_travel.map_mutate(ctx, this_val, key, mr->value, value, JS_MAP_MUTATE_OVERWRITE);
+            g_time_travel.map_mutate(ctx, this_val, key, mr->value, value, JS_MAP_MUTATE_OVERWRITE,
+                                     JS_MAP_POS_TAIL);
         JS_FreeValue(ctx, mr->value);
     } else {
-        mr = map_add_record(ctx, s, key);
+        mr = map_add_record(ctx, s, key, JS_MAP_POS_TAIL);
         if (!mr)
             return JS_EXCEPTION;
         /* a genuinely NEW record on a shared Set/Map: capture it per-flow so a snapshot-forked sibling stays
@@ -94718,37 +94768,63 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
 
 /* Per-flow Set/Map COW record primitives (JS_MapAddRecord / JS_MapDeleteRecord) — see quickjs.h. Manipulate the
    internal JSMapState record directly so cow apply/unapply bypass any JS-level add/set/delete override. */
-int JS_MapAddRecord(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val)
+/* THERE IS NO STATUS TO DROP, and that is the change rather than a simplification. Both of these answered -1
+   for two different things — "the delta names something that is not a Set/Map", which is a broken invariant of
+   the engine's own logic, and "map_add_record's js_malloc failed", which is an OOM inside a CONTEXT SWITCH —
+   and the two COW callers looked at neither. So a failed re-add left the baseline record silently missing AND a
+   pending InternalError belonging to no flow, which the next thing to check for an exception read as its own.
+   The invariant is asserted where it is decidable and the allocation is a CHECK (a dropped baseline record
+   corrupts the frontier in release too), so there is nothing left for a caller to ignore. */
+static JSMapState *js_map_cow_state(JSValueConst obj)
 {
     JSObject *p;
     JSMapState *s;
+
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+           "a COW delta holds a Set/Map record entry whose collection is not an object");
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id == JS_CLASS_MAP || p->class_id == JS_CLASS_SET,
+           "a COW delta holds a Set/Map record entry on an object that is neither — a WEAK collection is never "
+           "captured (its records are not iterated and its keys do not survive a park), so the entry was read "
+           "off a different object than the one it names");
+    s = p->u.opaque;
+    DCHECK(s != NULL, "a COW delta holds a record entry for a Set/Map with no state — the collection was torn "
+                      "down while a parked flow still named it");
+    return s;
+}
+void JS_MapAddRecord(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val, int pos)
+{
+    JSMapState *s = js_map_cow_state(obj);
     JSMapRecord *mr;
     JSValueConst nkey;
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) return -1;
-    p = JS_VALUE_GET_OBJ(obj);
-    if (p->class_id != JS_CLASS_MAP && p->class_id != JS_CLASS_SET) return -1;
-    s = p->u.opaque;
-    if (!s) return -1;
+
+    DCHECK(pos == JS_MAP_POS_TAIL || pos >= 0, "a Set/Map record restore was given a position that is neither "
+                                               "an append nor a count of the records preceding it");
     nkey = map_normalize_key_const(ctx, key);
     mr = map_find_record(ctx, s, nkey);
-    if (mr) { JS_FreeValue(ctx, mr->value); }
-    else { mr = map_add_record(ctx, s, nkey); if (!mr) return -1; }
+    if (mr) {
+        /* ALREADY IN ITS PLACE — an overwrite writes a value into a record the collection already holds, and a
+           record does not move when its value changes, so `pos` is not consulted. That is why an OVERWRITE
+           entry has no position to carry. */
+        JS_FreeValue(ctx, mr->value);
+    } else {
+        DCHECK(pos == JS_MAP_POS_TAIL || (uint32_t)pos <= s->record_count,
+               "a Set/Map record restore names a position past the end of the collection — the entries invert "
+               "in reverse, so everything that was removed after this record has already been put back and the "
+               "position it was captured at must exist");
+        mr = map_add_record(ctx, s, nkey, pos);
+        CHECK(mr, "OOM re-adding a Set/Map record during a context switch — the baseline record would be gone "
+                  "for every flow with nothing left that could put it back");
+    }
     mr->value = js_dup(val);
-    return 0;
 }
-int JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst key)
+void JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst key)
 {
-    JSObject *p;
-    JSMapState *s;
-    JSMapRecord *mr;
-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) return -1;
-    p = JS_VALUE_GET_OBJ(obj);
-    if (p->class_id != JS_CLASS_MAP && p->class_id != JS_CLASS_SET) return -1;
-    s = p->u.opaque;
-    if (!s) return -1;
-    mr = map_find_record(ctx, s, map_normalize_key_const(ctx, key));
-    if (mr) map_delete_record(ctx->rt, s, mr);
-    return 0;
+    JSMapState *s = js_map_cow_state(obj);
+    JSMapRecord *mr = map_find_record(ctx, s, map_normalize_key_const(ctx, key));
+
+    if (mr)
+        map_delete_record(ctx->rt, s, mr);
 }
 
 static JSValue js_map_get(JSContext *ctx, JSValueConst this_val,
@@ -94851,7 +94927,7 @@ static int js_map_upsert_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             return 0;
         }
     }
-    mr = map_add_record(ctx, ms, key);
+    mr = map_add_record(ctx, ms, key, JS_MAP_POS_TAIL);
     if (!mr) { JS_FreeValue(ctx, value); return -1; }
     mr->value = value;
     s->result = js_dup(value);
@@ -94905,10 +94981,13 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
     mr = map_find_record(ctx, s, key);
     if (!mr)
         return JS_FALSE;
-    /* DELETE of a present record on a shared Set/Map: capture the key+old value so a snapshot-forked sibling
-       re-adds it on unapply (a Set's value is UNDEFINED, harmless). */
+    /* DELETE of a present record on a shared Set/Map: capture the key+old value AND ITS POSITION, so a
+       snapshot-forked sibling re-adds it where it was (a Set's value is UNDEFINED, harmless). Without the
+       position the unapply appended, and `m.delete('a')` on ['a','b','c'] came back as ['b','c','a'] — a
+       different collection, since iteration order is insertion order and observable. */
     if (g_time_travel.map_mutate && !s->is_weak)
-        g_time_travel.map_mutate(ctx, this_val, key, mr->value, JS_UNDEFINED, JS_MAP_MUTATE_DELETE);
+        g_time_travel.map_mutate(ctx, this_val, key, mr->value, JS_UNDEFINED, JS_MAP_MUTATE_DELETE,
+                                 map_record_pos(s, mr));
     map_delete_record(ctx->rt, s, mr);
     return JS_TRUE;
 }
@@ -94922,8 +95001,28 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    /* `clear` is defined on Map and Set only — a weak collection has no such method — so the guard js_map_delete
+       carries for its own weak spellings is here a statement about the engine instead. */
+    DCHECK(!s->is_weak, "Set/Map.prototype.clear ran on a WEAK collection");
     list_for_each_safe(el, el1, &s->records) {
         mr = list_entry(el, JSMapRecord, link);
+        if (mr->empty)
+            continue;   /* a zombie an iterator still points at: already deleted, nothing to capture */
+        /* forced-exec TIME-TRAVEL: A TRUNCATION IS THE ONE MUTATION THAT DESTROYS N RECORDS PER CALL, so it is
+           the one whose absence from the delta costs the most — and this one captured NOTHING at all, three
+           functions below the delete that captures every single record. `sharedMap.clear()` in one flow emptied
+           the collection for every sibling, permanently. Each removal is the same reversible DELETE js_map_delete
+           records, taken in list order, so each is at position 0 by the time it is removed and the reverse-order
+           inversion rebuilds the collection in its original order. */
+        if (g_time_travel.map_mutate) {
+            uint32_t n = s->record_count;
+            g_time_travel.map_mutate(ctx, this_val, mr->key, mr->value, JS_UNDEFINED,
+                                     JS_MAP_MUTATE_DELETE, map_record_pos(s, mr));
+            DCHECK(s->record_count == n && !mr->empty,
+                   "the collection changed while its cleared records were being captured — a capture may grow "
+                   "the host's delta and a growth may release a PARKED flow, which is why it may never revert "
+                   "the running flow's heap; `el1` is a node this walk is holding across that call");
+        }
         map_delete_record(ctx->rt, s, mr);
     }
     return JS_UNDEFINED;

@@ -1609,13 +1609,18 @@ typedef struct JSTimeTravelHooks {
        key). The host records the KNOWN-NEW add on the current flow's delta so a snapshot-forked sibling stays
        isolated: unapply deletes the flow's added record, apply re-adds it (JS_MapAddRecord / JS_MapDeleteRecord).
        O(1), the accumulator hot path for `new Set(gen)` / `[...set]`-building — mirrors arr_append for arrays.
-       Only fires for a genuinely new record; an overwrite/delete of a baseline record is not yet captured. */
+       An add APPENDS, so its replay appends and it carries no position. The overwrite and delete of a baseline
+       record are map_mutate's, below — a sentence here used to say they "are not yet captured", which stopped
+       being true when that hook was added and then read as an instruction to build it again. */
     void (*map_add)(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val);
     /* Before an OVERWRITE (Map.set of an existing key: op=1, old=the current value, val=the new value) or a DELETE
-       (Set.delete / Map.delete of a present record: op=2, old=the current value, val ignored) on a shared Set/Map.
-       The host records a reversible undo-log entry so a snapshot-forked sibling stays isolated: apply replays the
-       op, unapply inverts it (overwrite restores old; delete re-adds old). Completes map_add's add-only capture. */
-    void (*map_mutate)(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst old_val, JSValueConst val, int op);
+       (Set.delete / Map.delete / Set.clear / Map.clear of a present record: op=2, old=the current value, val
+       ignored) on a shared Set/Map. The host records a reversible undo-log entry so a snapshot-forked sibling
+       stays isolated: apply replays the op, unapply inverts it (overwrite restores old; delete re-adds old).
+       Completes map_add's add-only capture.
+       `pos` is WHERE the inverse must put the record back: the number of LIVE records preceding it for a DELETE,
+       and JS_MAP_POS_TAIL for an OVERWRITE, whose inverse creates nothing and therefore places nothing. */
+    void (*map_mutate)(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst old_val, JSValueConst val, int op, int pos);
     /* Before a flow changes the ASYNC STATE of a shared object: a promise leaving PENDING, a REACTION being
        attached to one that is still pending, or a resolving-function pair latching already_resolved. The
        reaction list belongs here for the same reason the settlement does — `if (flag) p.then(h1); else
@@ -1738,9 +1743,17 @@ JS_EXTERN JSValue JS_VarRefGetValue(void *cell);
 JS_EXTERN void    JS_VarRefSetValue(JSContext *ctx, void *cell, JSValue val);
 /* Per-flow Set/Map COW: manipulate a Set/Map's internal record directly (bypassing any JS-level method override),
    so the host's cow apply/unapply can re-add / remove the per-flow record for JSTimeTravelHooks.map_add. `obj`
-   must be a Set or Map. Add sets/overwrites the record for `key` (val ignored for a Set); Delete removes it. */
-JS_EXTERN int JS_MapAddRecord(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val);
-JS_EXTERN int JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst key);
+   must be a Set or Map. Add sets/overwrites the record for `key` (val ignored for a Set); Delete removes it.
+   A RECORD'S POSITION IS PART OF ITS STATE, because a Set/Map iterates in INSERTION order and that order is
+   observable: `pos` is the number of LIVE records that must precede the re-added one, or JS_MAP_POS_TAIL to
+   append — which is what every ordinary add does and what replaying one must do. It is consulted only when the
+   record has to be CREATED; an overwrite writes a value into a record already in its place.
+   NEITHER RETURNS A STATUS, because the two things the old -1 conflated are answered where they arise: the
+   "obj is a Set/Map with live state" invariant is a DCHECK inside, and the re-add's allocation is a CHECK (an
+   OOM here loses a baseline record inside a context switch and leaves an InternalError belonging to no flow). */
+#define JS_MAP_POS_TAIL (-1)
+JS_EXTERN void JS_MapAddRecord(JSContext *ctx, JSValueConst obj, JSValueConst key, JSValueConst val, int pos);
+JS_EXTERN void JS_MapDeleteRecord(JSContext *ctx, JSValueConst obj, JSValueConst key);
 
 /* APIClient forced-execution CONCOLIC-VALUE hooks — how a concolic (symbolic + carried example) value
    PROPAGATES through the two interpreter operators that must carry it. One concern, one owner (the concolic
