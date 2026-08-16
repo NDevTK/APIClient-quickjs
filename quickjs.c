@@ -56503,20 +56503,50 @@ static JSValue js_load_module_fulfilled(JSContext *ctx, JSValueConst this_val,
     return JS_GetModuleNamespace(ctx, JS_VALUE_GET_PTR(func_data[0]));
 }
 
-/* The in-flight exception REJECTS the import's capability. Every failure of a load reaches this, whether the
-   module was answered synchronously or its source arrived later. */
-static void js_load_module_reject_pending(JSContext *ctx, JSValueConst *resolving_funcs)
+/* DELETED: js_load_module_reject_pending. Its whole body was `JS_Call(resolving_funcs[1], JS_GetException())` —
+   the import's capability settled from a C activation, which is the identical dead end js_load_module_rejected
+   was. `resolving_funcs[1]` is PAGE CODE whenever the import's capability came from a promise SUBCLASS, and the
+   native one is a step machine, so a loop, an await or a getter in either had no flow base under that JS_Call to
+   park into and aborted. Its "XXX: what to do if exception ?" is answered by the same move rather than by a
+   policy: the settle's own throw is a COMPLETION now, never a value to drop.
+   ITS FIVE CALL SITES DO NOT SHARE ONE ANSWER, because the question is what is UNDER the C activation and that
+   differs. THREE OF THEM ALREADY RUN INSIDE A FLOW: js_load_module_evaluate (reached only from
+   js_module_loaded_import), js_module_source_fulfilled and js_module_loaded_run are promise REACTION HANDLERS,
+   so each is phase 0 of promise_reaction_job's call-root flow and its completion already has somewhere to go.
+   There the rejection is the handler's OWN THROW — the exception stays in flight, the handler returns
+   JS_EXCEPTION, and phase 1 of that same flow delivers it to the capability on the base the handler ran on.
+   js_settle_as_flow at those three would be a SECOND flow nested inside the first, and BOTH can park: the inner
+   one takes the pump's one park slot and the outer one's phase 1 then trips JS_ParkFlow's "two flows parked at
+   once". A nested flow is not a smaller version of the right answer, it is a different one.
+   THAT ONLY WORKS BECAUSE THE REACTION'S DERIVED CAPABILITY IS NOW THE IMPORT'S REJECT — see js_load_module_then
+   and JS_LoadModuleInternal, which hand perform_promise_then {undefined, resolving_funcs[1]}. js_promise_then_
+   native made a THROWAWAY capability, so a handler's throw rejected a promise nobody held and the import hung.
+   The resolve half stays UNDEFINED on purpose: on_loaded's normal return means "the settle is not mine, it is
+   registered on the evaluation promise", and a real resolve there would settle the import with undefined the
+   instant the graph loaded — resolving `import()` to undefined instead of the namespace.
+   THE OTHER TWO ARE EMBEDDER ENTRIES WITH NO FLOW UNDER THEM AT ALL — JS_LoadModuleInternal (reached from
+   JS_LoadModule and from js_dynamic_import_job, both plain C) and JS_EvalFunctionInternal's module arm — and
+   that is exactly what js_settle_as_flow exists for: it BUILDS the call root the settle runs on. */
+static void js_load_module_reject_at_entry(JSContext *ctx, JSValueConst *resolving_funcs)
 {
-    JSValue err = JS_GetException(ctx);
-    JSValue ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-    JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
+    JSValue err;
+    DCHECK(JS_HasException(ctx),
+           "a module load's failure reached its entry settle with no exception in flight — the rejection reason "
+           "is whatever failed, and there is nothing here to invent one from");
+    err = JS_GetException(ctx);
+    CHECK(js_settle_as_flow(ctx, resolving_funcs[1], err) == 0,
+          "a module load's rejection could not be delivered at an embedder entry — either the flow could not be "
+          "allocated or the reject threw, and there is no job pump under this call to report either to, so the "
+          "import would stay pending forever");
     JS_FreeValue(ctx, err);
 }
 
 /* THE PHASE THAT COMES FIRST, declared here because both of its consumers are below it: 16.2.1.6.1.1
-   LoadRequestedModules, then `on_loaded` upon its fulfilment. See js_module_load_requested. */
-static void js_load_module_then(JSContext *ctx, JSModuleDef *m,
-                                JSValueConst *resolving_funcs, JSCFunctionData *on_loaded);
+   LoadRequestedModules, then `on_loaded` upon its fulfilment. See js_module_load_requested.
+   -1 leaves the failure's exception IN FLIGHT for the caller to deliver, because only the caller knows whether
+   it is standing in a flow (return it) or at an embedder entry (js_load_module_reject_at_entry). */
+static __exception int js_load_module_then(JSContext *ctx, JSModuleDef *m,
+                                           JSValueConst *resolving_funcs, JSCFunctionData *on_loaded);
 
 /* 13.3.10.2's TAIL, run only once the graph is LOADED (js_load_module_then puts it there): link, evaluate, and
    settle the import's capability with the module NAMESPACE once evaluation's own promise does — which is what
@@ -56524,8 +56554,10 @@ static void js_load_module_then(JSContext *ctx, JSModuleDef *m,
 static JSValue js_module_eval_capability(JSContext *ctx, JSModuleDef *m);
 static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m);
 
-static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
-                                    JSValueConst *resolving_funcs)
+/* -1 is a THROW, not a settle: this runs inside js_module_loaded_import, which is a reaction handler, so the
+   failure is that flow's own abrupt completion and phase 1 hands it to the import's reject. */
+static __exception int js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
+                                               JSValueConst *resolving_funcs)
 {
     JSValue cap, ret_val;
     JSValue func_obj, evaluate_resolving_funcs[2];
@@ -56537,15 +56569,12 @@ static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
        the hoisted-definition prologue, which the compiler emits with no back-edge and which therefore cannot
        fork. */
     if (js_create_module_function(ctx, m) < 0)
-        goto fail;
+        return -1;
     if (js_link_module(ctx, m) < 0)
-        goto fail;
+        return -1;
     cap = js_module_eval_capability(ctx, m);
-    if (JS_IsException(cap)) {
-    fail:
-        js_load_module_reject_pending(ctx, resolving_funcs);
-        return;
-    }
+    if (JS_IsException(cap))
+        return -1;
 
     /* 16.2.1.6.1.3.1: the IMPORT'S CAPABILITY IS THE DERIVED CAPABILITY OF THIS PerformPromiseThen, which is
        what stops either reaction from having to CALL it. js_promise_then_native made a throwaway capability
@@ -56573,24 +56602,35 @@ static void js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
     DCHECK(!JS_IsException(ret_val), "module evaluation threw after its capability existed — an evaluation error "
                                      "settles the capability, it does not throw past it");
     JS_FreeValue(ctx, ret_val);
+    return 0;
 }
 
 /* `import()`'s continuation once its graph is loaded. func_data = [resolve, reject, module] — the shape
-   js_load_module_then builds for every on_loaded. */
+   js_load_module_then builds for every on_loaded.
+   A LINK OR CAPABILITY FAILURE IS THIS REACTION'S OWN THROW. It used to be a JS_Call on the import's reject made
+   from inside this C activation; as a completion it becomes phase 1 of the very flow this handler is running on,
+   so a subclass's reject — or the native one's step machine — has a base to park in. The NORMAL return stays
+   JS_UNDEFINED and settles nothing, which is why the derived capability js_load_module_then registers has an
+   UNDEFINED resolve: the import's settlement belongs to the evaluation promise js_load_module_evaluate just
+   attached to, not to the graph having loaded. */
 static JSValue js_module_loaded_import(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv, int magic,
                                        JSValueConst *func_data)
 {
     DCHECK(JS_VALUE_GET_TAG(func_data[2]) == JS_TAG_MODULE,
            "a load continuation was handed something that is not the module record it loaded");
-    js_load_module_evaluate(ctx, JS_VALUE_GET_PTR(func_data[2]), func_data);
+    if (js_load_module_evaluate(ctx, JS_VALUE_GET_PTR(func_data[2]), func_data) < 0)
+        return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
 
 /* The source arrived. func_data = [resolve, reject, module_name]; argv[0] is the module's SOURCE TEXT. Compiling
    it here registers the record under that name, so a second import of the same specifier finds it loaded and
    never asks the host again. This is the resume of the load the loader parked — the importing flow's
-   continuation is the reaction chain this runs on, never a re-run of the importing scope. */
+   continuation is the reaction chain this runs on, never a re-run of the importing scope.
+   EVERY FAILURE HERE IS THIS REACTION'S OWN THROW, delivered to the import's reject as phase 1 of this flow —
+   see the note where js_load_module_reject_pending used to stand. The JS_Call it used to make ran the reject
+   inside this C activation with no base under it. */
 static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv, int magic,
                                           JSValueConst *func_data)
@@ -56608,28 +56648,29 @@ static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
        load that another already completed by handing back the existing record), so this asks it first. */
     name_atom = JS_ValueToAtom(ctx, func_data[2]);
     if (name_atom == JS_ATOM_NULL)
-        goto fail;
+        return JS_EXCEPTION;
     m = js_find_loaded_module(ctx, name_atom);
     JS_FreeAtom(ctx, name_atom);
     if (m) {
-        js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import);
+        if (js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import) < 0)
+            return JS_EXCEPTION;
         return JS_UNDEFINED;
     }
 
     src = JS_ToCStringLen(ctx, &src_len, argv[0]);
     if (!src)
-        goto fail;
+        return JS_EXCEPTION;
     name = JS_ToCString(ctx, func_data[2]);
     if (!name) {
         JS_FreeCString(ctx, src);
-        goto fail;
+        return JS_EXCEPTION;
     }
     func_obj = JS_Eval(ctx, src, src_len, name,
                        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     JS_FreeCString(ctx, name);
     JS_FreeCString(ctx, src);
     if (JS_IsException(func_obj))
-        goto fail;
+        return JS_EXCEPTION;
     DCHECK(JS_VALUE_GET_TAG(func_obj) == JS_TAG_MODULE,
            "compiling a module source did not produce a module record");
     m = JS_VALUE_GET_PTR(func_obj);
@@ -56638,10 +56679,8 @@ static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
     /* COMPILING IS NOT LOADING. The record this just parsed has its own `import`s and an EMPTY [[LoadedModules]]
        (16.2.1.7.1), so what follows the compile is the load of ITS graph — not the link. That is the whole
        difference between the phase order this file used to have and the one the spec states. */
-    js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import);
-    return JS_UNDEFINED;
- fail:
-    js_load_module_reject_pending(ctx, resolving_funcs);
+    if (js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import) < 0)
+        return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
 
@@ -57136,37 +57175,50 @@ static JSValue js_module_load_requested(JSContext *ctx, JSModuleDef *m)
 }
 
 /* Load the graph, and upon fulfilment run `on_loaded` — the shape both consumers share. `on_loaded` receives
-   func_data = [resolve, reject, module]; a rejected load rejects the caller's capability with the same reason,
-   which needs no reaction of its own — that reaction IS resolving_funcs[1]. */
-static void js_load_module_then(JSContext *ctx, JSModuleDef *m,
-                                JSValueConst *resolving_funcs, JSCFunctionData *on_loaded)
+   func_data = [resolve, reject, module].
+   THE DERIVED CAPABILITY IS {UNDEFINED, resolving_funcs[1]}, and each half is a statement.
+     reject   — a rejected load rejects the caller's capability with the SAME reason, and 27.2.5.4.1 says a
+                missing onRejected RETHROWS, so there is no reaction to register: promise_reaction_job's
+                no-handler path forwards the reason through js_settle_as_flow, a call root a subclass's reject
+                can park inside. It also carries `on_loaded`'s OWN throw, which is what lets every failure below
+                a reaction handler be a completion instead of a JS_Call.
+     resolve  — UNDEFINED because on_loaded's normal return settles NOTHING. Both consumers register the real
+                settlement on the module's EVALUATION promise and then return undefined; a resolve here would
+                fire the instant the graph loaded and resolve `import()` with undefined instead of the namespace.
+                27.2.2.1 drops the completion when the half is undefined, which is exactly the old behaviour of
+                the throwaway capability js_promise_then_native used to make — minus the promise nobody held. */
+static __exception int js_load_module_then(JSContext *ctx, JSModuleDef *m,
+                                           JSValueConst *resolving_funcs, JSCFunctionData *on_loaded)
 {
     JSValue loading, mv, reactions[2];
-    JSValueConst func_data[3];
+    JSValueConst func_data[3], cap[2];
 
     loading = js_module_load_requested(ctx, m);
-    if (JS_IsException(loading)) {
-        js_load_module_reject_pending(ctx, resolving_funcs);
-        return;
-    }
+    if (JS_IsException(loading))
+        return -1;
     mv = JS_NewModuleValue(ctx, m);
     func_data[0] = resolving_funcs[0];
     func_data[1] = resolving_funcs[1];
     func_data[2] = mv;
     reactions[0] = JS_NewCFunctionData(ctx, on_loaded, 0, 0, 3, func_data);
-    reactions[1] = js_dup(resolving_funcs[1]);   /* forwarded unchanged: the reject IS the reaction */
+    reactions[1] = JS_UNDEFINED;
     CHECK(!JS_IsException(reactions[0]),
           "a module graph load could not build its continuation — the graph would load and reach nobody");
     JS_FreeValue(ctx, mv);
-    JS_FreeValue(ctx, js_promise_then_native(ctx, loading, vc(reactions)));
+    cap[0] = JS_UNDEFINED;
+    cap[1] = resolving_funcs[1];
+    CHECK(perform_promise_then(ctx, loading, vc(reactions), cap) == 0,
+          "a module graph load's continuation could not be attached — the import would never settle");
     JS_FreeValue(ctx, reactions[0]);
-    JS_FreeValue(ctx, reactions[1]);
     JS_FreeValue(ctx, loading);
+    return 0;
 }
 
 /* HTML §8.1.3.3 "run a module script", once the graph is loaded: Link it, Evaluate it, and settle this
    promise exactly as the module's OWN evaluation promise settles — Evaluate() returns a promise for undefined,
-   not for the namespace, which is the whole difference between this tail and `import()`'s. */
+   not for the namespace, which is the whole difference between this tail and `import()`'s.
+   A LINK OR CAPABILITY FAILURE IS THIS REACTION'S OWN THROW, delivered to resolving_funcs[1] as phase 1 of this
+   flow — see the note where js_load_module_reject_pending used to stand. */
 static JSValue js_module_loaded_run(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv, int magic,
                                     JSValueConst *func_data)
@@ -57179,18 +57231,15 @@ static JSValue js_module_loaded_run(JSContext *ctx, JSValueConst this_val,
            "a load continuation was handed something that is not the module record it loaded");
     m = JS_VALUE_GET_PTR(func_data[2]);
     if (js_create_module_function(ctx, m) < 0)
-        goto fail;
+        return JS_EXCEPTION;
     if (js_link_module(ctx, m) < 0)
-        goto fail;
+        return JS_EXCEPTION;
     /* The capability BEFORE evaluating, and this promise adopts it BEFORE evaluating too — same ordering and
        the same reason as js_load_module_evaluate: the body can FORK, and a sibling forked mid-body has to find
        this continuation already registered in the world it inherits. */
     cap = js_module_eval_capability(ctx, m);
-    if (JS_IsException(cap)) {
-    fail:
-        js_load_module_reject_pending(ctx, resolving_funcs);
-        return JS_UNDEFINED;
-    }
+    if (JS_IsException(cap))
+        return JS_EXCEPTION;
     ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, vc(&cap));
     JS_FreeValue(ctx, ret);
     JS_FreeValue(ctx, cap);
@@ -57210,16 +57259,19 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
 {
     JSModuleDef *m;
     JSValue pending, name_val, reactions[2];
-    JSValueConst func_data[3];
+    JSValueConst func_data[3], cap[2];
 
     m = js_host_resolve_imported_module(ctx, basename, filename, attributes);
     if (m) {
-        js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import);
+        /* AN EMBEDDER ENTRY, so a failure has no flow to be the completion of: both callers are plain C
+           (JS_LoadModule, and js_dynamic_import_job, which is a job the pump runs directly). */
+        if (js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import) < 0)
+            js_load_module_reject_at_entry(ctx, resolving_funcs);
         return;
     }
     pending = js_module_take_pending(ctx, &name_val);
     if (JS_IsUndefined(pending)) {
-        js_load_module_reject_pending(ctx, resolving_funcs);
+        js_load_module_reject_at_entry(ctx, resolving_funcs);
         return;
     }
     /* 16.2.1.11: the host finishes the load later. The capability is kept alive by the reactions, so this
@@ -57232,8 +57284,21 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     func_data[2] = name_val;
     reactions[0] = JS_NewCFunctionData(ctx, js_module_source_fulfilled, 1, 0, 3, func_data);
     reactions[1] = JS_NewCFunctionData(ctx, js_module_source_rejected, 1, 0, 3, func_data);
+    /* CHECKED, because perform_promise_then does not report a handler that is an EXCEPTION — JS_IsFunction says
+       no and it is filed as "no handler", so an OOM here would silently turn the arriving source into a
+       discarded completion. js_promise_then_native hid the same failure one layer further out, in the
+       JS_FreeValue its result was passed straight to. */
+    CHECK(!JS_IsException(reactions[0]) && !JS_IsException(reactions[1]),
+          "a module source load could not build its continuations — the source would arrive and reach nobody");
     JS_FreeValue(ctx, name_val);
-    JS_FreeValue(ctx, js_promise_then_native(ctx, pending, vc(reactions)));
+    /* THE DERIVED CAPABILITY IS THE IMPORT'S REJECT, with an UNDEFINED resolve — the same pair, and the same two
+       reasons, as js_load_module_then's: it carries js_module_source_fulfilled's THROW (which is every failure
+       of the compile, now that the settle is a completion rather than a JS_Call), and it settles nothing when
+       that handler returns normally, because what it returns to is a load it has just registered on. */
+    cap[0] = JS_UNDEFINED;
+    cap[1] = resolving_funcs[1];
+    CHECK(perform_promise_then(ctx, pending, vc(reactions), cap) == 0,
+          "a module source load's continuation could not be attached — the import would never settle");
     JS_FreeValue(ctx, reactions[0]);
     JS_FreeValue(ctx, reactions[1]);
     JS_FreeValue(ctx, pending);
@@ -63402,7 +63467,10 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
         ret_val = JS_NewPromiseCapability(ctx, resolving_funcs);
         if (JS_IsException(ret_val))
             return JS_EXCEPTION;
-        js_load_module_then(ctx, m, vc(resolving_funcs), js_module_loaded_run);
+        /* AN EMBEDDER ENTRY: JS_EvalFunction is called from C with nothing under it, so a failure of the load
+           has no flow whose completion it could be and the settle has to build its own call root. */
+        if (js_load_module_then(ctx, m, vc(resolving_funcs), js_module_loaded_run) < 0)
+            js_load_module_reject_at_entry(ctx, vc(resolving_funcs));
         JS_FreeValue(ctx, resolving_funcs[0]);
         JS_FreeValue(ctx, resolving_funcs[1]);
     } else {
