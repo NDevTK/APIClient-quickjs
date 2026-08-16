@@ -11583,7 +11583,7 @@ int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
    false if the property does not exist, true if it exists. If true is
    returned, the property descriptor 'desc' is filled present. */
 static int JS_GetOwnPropertyInternal2(JSContext *ctx, JSPropertyDescriptor *desc,
-                                      JSObject *p, JSAtom prop, int *pflags)
+                                      JSObject *p, JSAtom prop, int *pflags, bool as_slot)
 {
     JSShapeProperty *prs;
     JSProperty *pr;
@@ -11606,7 +11606,14 @@ retry:
                         desc->setter = js_dup(JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.setter));
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
                     JSValue val = *pr->u.var_ref->pvalue;
-                    if (unlikely(JS_IsUninitialized(val))) {
+                    /* THE TDZ CHECK IS THE OPERATION'S, NOT THE SLOT'S — the same distinction `as_slot` draws
+                       at delete_property and at the length write. 9.4.2's ReferenceError belongs to
+                       [[GetOwnProperty]] on a module namespace whose export has not been initialised; the COW
+                       capture is asking what the STORAGE holds, and uninitialised is a state that storage can
+                       be in and that the slot write puts straight back. Throwing here answered the capture
+                       with -1, which it read as "the slot is absent" while leaving a live ReferenceError
+                       belonging to no flow — reachable by deleting a module-namespace export in TDZ. */
+                    if (unlikely(JS_IsUninitialized(val)) && !as_slot) {
                         JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
                         return -1;
                     }
@@ -11628,7 +11635,7 @@ retry:
             }
             /* for consistency, send the exception even if desc is NULL */
             if (unlikely((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)) {
-                if (unlikely(JS_IsUninitialized(*pr->u.var_ref->pvalue))) {
+                if (unlikely(JS_IsUninitialized(*pr->u.var_ref->pvalue)) && !as_slot) {
                     JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
                     return -1;
                 }
@@ -11686,7 +11693,7 @@ retry:
 static int JS_GetOwnPropertyInternal(JSContext *ctx, JSPropertyDescriptor *desc,
                                      JSObject *p, JSAtom prop)
 {
-    return JS_GetOwnPropertyInternal2(ctx, desc, p, prop, NULL);
+    return JS_GetOwnPropertyInternal2(ctx, desc, p, prop, NULL, /*as_slot*/false);
 }
 
 /* Same as JS_GetOwnPropertyInternal but only returns flags, not
@@ -11695,7 +11702,7 @@ static int JS_GetOwnPropertyInternal(JSContext *ctx, JSPropertyDescriptor *desc,
 static int JS_GetOwnPropertyFlagsInternal(JSContext *ctx, int *pflags,
                                           JSObject *p, JSAtom prop)
 {
-    return JS_GetOwnPropertyInternal2(ctx, NULL, p, prop, pflags);
+    return JS_GetOwnPropertyInternal2(ctx, NULL, p, prop, pflags, /*as_slot*/false);
 }
 
 /* The COW delta's own-property read: a SLOT's whole state, never an operation.
@@ -11733,9 +11740,16 @@ int JS_GetOwnSlotDesc(JSContext *ctx, JSPropertyDescriptor *pd, JSValueConst obj
            "a COW delta is capturing a typed-array element as a property SLOT: its storage is the buffer's "
            "BYTES, which no JSValue round-trips (a NaN payload normalises), so route this capture through "
            "cow_capture_bytes");
-    has = JS_GetOwnPropertyInternal(ctx, pd, p, prop);
-    if (has <= 0)
-        return has;
+    has = JS_GetOwnPropertyInternal2(ctx, pd, p, prop, NULL, /*as_slot*/true);
+    /* WHAT IS LEFT OF -1 IS AN ALLOCATION, and the caller has nowhere to put one. The non-object case returned
+       above; the Proxy and typed-array cases are refused above; and the TDZ ReferenceError is the OPERATION's,
+       which `as_slot` does not ask for. So a failure here is JS_AutoInitProperty's or a string index's, and
+       both are OOM — which the write twin already treats as fatal for the same reason: a capture that does not
+       happen leaks one flow's write into every sibling, and there is no flow here to throw on. */
+    CHECK(has >= 0, "a COW slot read could not answer what a slot holds — the only remaining failure is an "
+                    "allocation, and a lost baseline read leaks one flow's state into every sibling");
+    if (has == 0)
+        return 0;
     DCHECK(!(pd->flags & JS_PROP_GETSET) ||
            ((JS_IsObject(pd->getter) || JS_IsUndefined(pd->getter)) &&
             (JS_IsObject(pd->setter) || JS_IsUndefined(pd->setter))),
