@@ -1590,10 +1590,14 @@ typedef void (*JSTimeTravelGenFork)(JSContext *ctx, JSValueConst genobj, void *b
 typedef struct JSTimeTravelHooks {
     void (*prop_write)(JSContext *ctx, JSValueConst obj, JSAtom atom);  /* before writing a shared obj[atom] */
     void (*cell_write)(JSContext *ctx, void *cell);                     /* before writing a shared closure cell */
-    /* Before a fast-array APPEND creates obj[idx] (idx == current length). The slot is KNOWN-NEW, so the host
-       records it O(1) — no dedup scan and no baseline lookup (existed=0 always). This is the hot path (a shared
-       accumulator built one element at a time); routing it through prop_write's O(n) dedup scan makes building an
-       N-element array O(N^2). */
+    /* Before a fast-array APPEND creates obj[idx] (idx == the dense count). The slot's BASELINE is absent, so
+       the host needs no baseline lookup for it (existed=0 always) — that, and not the absence of a dedup, is
+       what makes this the accumulator's hot path. It still dedups (O(1), on the hash index): a define on the
+       same index captures the slot first, and a push/pop loop would otherwise add an entry per iteration for
+       one slot, which is the O(shared-state-touched) invariant broken over a single element.
+       The array's `length` is captured through prop_write immediately before this fires — an append writes the
+       length too, and only sometimes, so it is a slot with its own entry rather than a number derived from
+       these. See cow_capture_append. */
     void (*arr_append)(JSContext *ctx, JSValueConst obj, JSAtom atom);
     /* A concolic branch inside a synchronously-driven GENERATOR body forked the flow: clone_deep_flow built a
        fresh per-flow gen_data CLONE (cur_gd) of the shared generator object's execution state (base_gd is its
@@ -1708,8 +1712,13 @@ JS_EXTERN int  JS_IsFlowShared(JSValueConst obj);
 JS_EXTERN uint32_t JS_ObjFlowGen(JSValueConst obj);
 JS_EXTERN uint32_t JS_FlowGen(void);
 JS_EXTERN uint32_t JS_FlowBumpGen(void);
-JS_EXTERN int  JS_IsArrayIndexSlot(JSValueConst obj, JSAtom atom, uint32_t *idx);
-JS_EXTERN void JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len);
+/* Is this captured slot's storage a DENSE array element (a fast Array, index inside its dense count)? Only then
+   is removing the slot a shrink of the dense part; every other integer-indexed slot on an Array is an ordinary
+   property JS_DeleteOwnSlot removes. Pairs with the shrink below — the delta's element half. */
+JS_EXTERN int  JS_IsArrayDenseSlot(JSValueConst obj, JSAtom atom, uint32_t *idx);
+/* Remove the dense elements from `count` up — the COUNT and never the `length`, which is a slot with its own
+   entry (arr_append captures it). A length write is a different operation and it removes these elements too. */
+JS_EXTERN void JS_ArrayTruncateDense(JSContext *ctx, JSValueConst obj, uint32_t count);
 JS_EXTERN void JS_SetTimeTravelHooks(const JSTimeTravelHooks *hooks);
 /* Per-flow generator-state COW: swap a shared generator object's execution-state pointer and own clones by
    refcount (see JSTimeTravelHooks.gen_fork). The clone is opaque to the host (JSGeneratorData is engine-internal). */

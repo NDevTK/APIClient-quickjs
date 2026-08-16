@@ -1784,6 +1784,7 @@ static void free_property(JSRuntime *rt, JSProperty *pr, int prop_flags);
 /* the four SLOT halves JS_SetOwnSlotDesc is assembled from — each defined beside the operation it was split out
    of, and declared here because the slot write belongs beside its read twin rather than beside the array. */
 static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len, bool as_slot);
+static void array_dense_truncate(JSContext *ctx, JSObject *p, uint32_t len, bool as_slot);
 static int array_grow_dense_to(JSContext *ctx, JSObject *p, uint32_t idx);
 static void set_fast_array_element(JSContext *ctx, JSObject *p, uint32_t idx, JSValue val);
 static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom, bool as_slot);
@@ -7367,11 +7368,24 @@ static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
         g_time_travel.prop_write(ctx, obj, prop);
 }
 
-/* Record a KNOWN-NEW fast-array append slot (idx == length). O(1): the host skips the dedup scan and baseline
-   lookup (existed=0 always). The hot path for a shared accumulator — see JSTimeTravelHooks.arr_append. */
+/* Record a fast-array APPEND slot: its baseline is ABSENT, so the host needs no baseline lookup for it — see
+   JSTimeTravelHooks.arr_append. The hot path for a shared accumulator.
+   AN APPEND IS TWO WRITES AND ONLY ONE OF THEM IS THE ELEMENT, which is what this used to record. `length` is a
+   real property slot that add_fast_array_element writes straight through prop[0] — and writes ONLY when the
+   append grows it (`new_len > array_len`), so on an array whose length RUNS AHEAD of its dense count
+   (`new Array(10)`, or `a.length = 8` on `[1,2,3]`) the append leaves the length untouched. The unapply then
+   removed the element through a LENGTH WRITE and left behind a length the baseline never had: `buf[0] = 'a'` in
+   one flow made `buf.length === 0` for every sibling, permanently. So the length is captured HERE, as the slot
+   it is, and the element removal is now just the dense shrink (JS_ArrayTruncateDense). The engine's own dense
+   push path already CHECKED this invariant one function over — js_array_push_step refuses its fast path unless
+   `array_len == p->u.array.count` — and add_fast_array_element had no such guard; that asymmetry was the bug.
+   The length capture is hash-deduped by the host after the first append, so an N-element accumulator pays one
+   hash lookup per append and holds one length entry in total. */
 static inline void cow_capture_append(JSContext *ctx, JSValueConst obj, JSAtom idx) {
-    if (g_time_travel.arr_append)
-        g_time_travel.arr_append(ctx, obj, idx);
+    if (!g_time_travel.arr_append)
+        return;
+    cow_capture(ctx, obj, JS_ATOM_length);
+    g_time_travel.arr_append(ctx, obj, idx);
 }
 /* Is this object flow-local (created by the running flow post-baseline)? The host's COW hook uses this to decide
    the skip, since after a fork a flow_local object may be shared with the snapshot sibling. */
@@ -7392,33 +7406,50 @@ int JS_IsFlowShared(JSValueConst obj) {
            JS_VALUE_GET_OBJ(obj)->flow_gen <= g_flow_fork_gen;
 }
 
-/* Host COW helper: is this an ARRAY element slot (obj is an array, atom an integer index)? On a hit *idx is the
-   index. cow_unapply removes a flow-CREATED array append by TRUNCATING the array to *idx (set_array_length frees
-   the tail) instead of JS_DeleteProperty, which would convert the fast array to slow and leave the element. */
-int JS_IsArrayIndexSlot(JSValueConst obj, JSAtom atom, uint32_t *idx) {
-    if (JS_IsArray(obj) && __JS_AtomIsTaggedInt(atom)) { *idx = __JS_AtomToUInt32(atom); return 1; }
-    return 0;
-}
-/* Host COW helper: the array `length` SLOT written (truncating a fast array frees the tail's elements). Used by
-   cow_unapply to remove a flow-created append without a fast-array->slow conversion. It reaches the shrink
-   DIRECTLY rather than through the slot write, because it is not restoring a captured DESCRIPTOR: the length's
-   attributes belong to the length's own entry when a flow touched them, and this call is about the elements
-   above `len`. The host cannot spell JS_ATOM_length, so the length lives here rather than at the caller. */
-void JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len) {
+/* Host COW helper: is this slot's STORAGE a DENSE ARRAY ELEMENT — an Array still in fast mode, with an integer
+   index INSIDE its dense part? Only then is removing the slot a shrink of the dense COUNT; every other
+   integer-indexed slot on an Array (a slow array's property, an index at or past the dense count) is an
+   ordinary property and JS_DeleteOwnSlot removes it.
+   It used to ask only "is this an Array and is the atom an integer", which answered YES for both of those and
+   sent them to a LENGTH write — see JS_ArrayTruncateDense for what that cost. */
+int JS_IsArrayDenseSlot(JSValueConst obj, JSAtom atom, uint32_t *idx) {
     JSObject *p;
-    uint32_t reached;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || !__JS_AtomIsTaggedInt(atom))
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array)
+        return 0;
+    *idx = __JS_AtomToUInt32(atom);
+    return *idx < p->u.array.count;
+}
+/* Host COW helper: REMOVE the dense elements from `count` up — the dense COUNT and nothing else.
+ *
+ * THE LENGTH IS NOT PART OF THIS, and that is the whole change. A flow-created append is removed by shrinking
+ * the dense part, because JS_DeleteOwnSlot would convert the fast array to a slow one; the unapply used to
+ * reach that shrink through a LENGTH WRITE (array_set_length_slot), on the reasoning that an array's length is
+ * derived from the element entries rather than captured as the slot it is. That reasoning holds only while
+ * `length == count`. `new Array(10)` is length 10 and count 0; `a.length = 8` on `[1,2,3]` is length 8 and
+ * count 3 — and add_fast_array_element writes the length ONLY when the append grows it (`new_len > array_len`),
+ * so on either of those arrays the append leaves the length alone and the unapply's truncation then wrote a
+ * length the baseline never had (`buf[0]='a'` in one flow left `buf.length === 0` for its siblings, forever).
+ * The length is a real slot with a real entry now — cow_capture_append captures it beside the element — so this
+ * call is about the ELEMENTS and the entries no longer have to be replayed in any particular order relative to
+ * each other. `array_set_length_slot` still owns the pair (a length write removes the elements above it).
+ */
+void JS_ArrayTruncateDense(JSContext *ctx, JSValueConst obj, uint32_t count) {
+    JSObject *p;
 
-    DCHECK(len <= (uint32_t)INT32_MAX, "an array length slot write above INT32_MAX — the length slot stores a "
-                                       "tagged int and a fast array can hold no more");
     DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
            JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_ARRAY,
-           "an array length slot write on something that is not an Array");
+           "a dense-part shrink on something that is not an Array");
     p = JS_VALUE_GET_OBJ(obj);
-    reached = array_set_length_slot(ctx, p, len, /*as_slot*/true);
-    DCHECK(reached == len,
-           "an array length slot write did not reach the length it was given — the SLOT shrink removes an index "
-           "whatever its attributes, so nothing this flow defined above the baseline length can block it");
-    (void)reached;
+    DCHECK(p->fast_array,
+           "a dense-part shrink on an Array that is no longer fast — it has no dense part, so the slot this "
+           "names is an ordinary property that JS_DeleteOwnSlot removes (see JS_IsArrayDenseSlot)");
+    DCHECK(count <= p->u.array.count,
+           "a dense-part shrink to an index ABOVE the dense count — a shrink cannot create elements, so the "
+           "entry that asked for this was read off a different array than the one it names");
+    array_dense_truncate(ctx, p, count, /*as_slot*/true);
 }
 
 /* Time-travel capture for a CLOSURE CELL: a captured local is a shared JSVarRef, not a property, so a write to
@@ -12422,6 +12453,42 @@ static int call_setter(JSContext *ctx, JSObject *setter,
     }
 }
 
+/* THE DENSE PART, SHRUNK — the ONE place elements at or above an index are removed from a fast array, split out
+   because a LENGTH write is not the only thing that asks for it. The other asker is the COW unapply, which
+   removes a flow-created append by taking the dense count back down and must leave the length ALONE (the length
+   is captured as the slot it is — see JS_ArrayTruncateDense). Keeping the two together made the length ride
+   along with every element removal, which was the whole of that defect.
+   `as_slot` is the same distinction it is everywhere else in this file: the OPERATION captures each removed
+   index for the running flow's delta, the SLOT restore does not (it IS the delta, mid-context-switch). */
+static void array_dense_truncate(JSContext *ctx, JSObject *p, uint32_t len, bool as_slot)
+{
+    uint32_t old_len = p->u.array.count;
+    uint32_t i;
+
+    DCHECK(p->fast_array, "a dense-part shrink on an array with no dense part");
+    if (len >= old_len)
+        return;
+    for (i = len; i < old_len; i++) {
+        /* forced-exec TIME-TRAVEL: A SHRINK REMOVES ELEMENTS, and removing one is a shared-state mutation
+           exactly as writing one is. This free reaches neither JS_SetPropertyInternal2 nor
+           set_fast_array_element, so `arr.length = 0` on a SHARED array captured the length slot at the caller
+           and NOT one of the values it drops: the unapply put the length back and the elements stayed gone, for
+           this flow and for every sibling. The SLOW-array arm of array_set_length_slot has always captured
+           them, because it removes each index through delete_property, whose own capture is right there -- so
+           this is the two arms of one operation agreeing rather than a new rule. Captured per index, since that
+           is what a slot is. */
+        if (!as_slot)
+            cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32(i));
+        JS_FreeValue(ctx, p->u.array.u.values[i]);
+        p->u.array.u.values[i] = JS_UNDEFINED;
+    }
+    DCHECK(p->u.array.count == old_len,
+           "the dense part moved while its removed elements were being captured — a capture may grow the "
+           "host's delta and a growth may release a PARKED flow, which is why it may never revert the running "
+           "flow's heap");
+    p->u.array.count = len;
+}
+
 /* THE LENGTH SLOT, WRITTEN — 10.4.2.4 steps 15-17 with neither its coercion (steps 3-4) nor its read-only test
    (step 12). The elements at or above `len` are removed and prop[0] is set to the length actually REACHED.
    Split out of set_array_length for the write that is NOT the operation. JS_SetOwnSlotDesc restores a captured
@@ -12440,28 +12507,7 @@ static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len,
 
     cur_len = len;
     if (likely(p->fast_array)) {
-        uint32_t old_len = p->u.array.count;
-        if (len < old_len) {
-            for(i = len; i < old_len; i++) {
-                /* forced-exec TIME-TRAVEL: A SHRINK REMOVES ELEMENTS, and removing one is a shared-state
-                   mutation exactly as writing one is. This free reaches neither JS_SetPropertyInternal2 nor
-                   set_fast_array_element, so `arr.length = 0` on a SHARED array captured the length slot at
-                   the caller and NOT one of the values it drops: the unapply put the length back and the
-                   elements stayed gone, for this flow and for every sibling. The SLOW-array arm below has
-                   always captured them, because it removes each index through delete_property, whose own
-                   capture is right there -- so this is the two arms of one operation agreeing rather than a
-                   new rule. Captured per index, since that is what a slot is. */
-                if (!as_slot)
-                    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), __JS_AtomFromUInt32((uint32_t)i));
-                JS_FreeValue(ctx, p->u.array.u.values[i]);
-                p->u.array.u.values[i] = JS_UNDEFINED;
-            }
-            DCHECK(p->u.array.count == old_len,
-                   "the dense part moved while its removed elements were being captured — a capture may grow "
-                   "the host's delta and a growth may release a PARKED flow, which is why it may never revert "
-                   "the running flow's heap");
-            p->u.array.count = len;
-        }
+        array_dense_truncate(ctx, p, len, as_slot);
         p->prop[0].u.value = js_uint32(len);
     } else {
         /* Note: length is always a uint32 because the object is an
@@ -13323,6 +13369,19 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                     /* XXX: should update the length after defining
                        the property */
                     len = idx + 1;
+                    /* forced-exec TIME-TRAVEL: the third length write, and the one furthest from anything that
+                       looks like `length`. 10.4.2.1 step 3.f.i grows the length when an index at or above it is
+                       defined, and on a SLOW array (or a fast one this define just converted) that write lands
+                       here, under an atom that is the INDEX. The unapply used to take the length back down as a
+                       side effect of removing the created index; it removes the index as the ordinary property
+                       it is now, so the length is captured as the slot it is — same as add_fast_array_element's
+                       and js_array_push_step's. */
+                    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), JS_ATOM_length);
+                    /* RE-FOUND ACROSS THE CAPTURE, for the reason JS_SetOwnSlotDesc re-finds `prs` across its
+                       payload write: a capture may grow the host's delta, a growth may release a parked flow,
+                       and a release walks the heap — so a JSProperty pointer taken before it is a pointer into
+                       storage that may have been reallocated under it. */
+                    plen = &p->prop[0];
                     set_value(ctx, &plen->u.value, js_uint32(len));
                 }
             }
