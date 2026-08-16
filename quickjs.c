@@ -4453,6 +4453,29 @@ JSAtom JS_DupAtom(JSContext *ctx, JSAtom v)
     return v;
 }
 
+#if APICLIENT_DEV
+/* THE ATOM'S REFCOUNT, so a component can check its OWN ledger against it. `[atomleak]` in JS_FreeRuntime is
+   the only mechanism this engine has for an unmatched JS_DupAtom, and it reports at teardown — the whole run
+   is over, every frame that could name the site is gone, and the number it prints is a total rather than a
+   first occurrence. A caller that knows how many references an operation is supposed to take can say so where
+   the operation happens instead.
+   A CONST atom (a built-in name or a tagged integer) maintains no refcount at all — JS_DupAtom and JS_FreeAtom
+   above return immediately for one — so a delta over it means nothing and it answers 0 at both ends of any
+   window, which satisfies every ledger trivially and correctly. */
+static int js_atom_refcount(JSRuntime *rt, JSAtom v)
+{
+    JSAtomStruct *p;
+
+    if (__JS_AtomIsConst(v))
+        return 0;
+    DCHECK(v < (JSAtom)rt->atom_size, "an atom id outside the runtime's atom table");
+    p = rt->atom_array[v];
+    DCHECK(!atom_is_free(p), "an atom id on the free list was asked for its refcount — whatever holds this id "
+                             "released the atom and went on using it");
+    return JS_REF_COUNT(p);
+}
+#endif
+
 static JSAtomKindEnum JS_AtomGetKind(JSContext *ctx, JSAtom v)
 {
     JSRuntime *rt;
@@ -13990,6 +14013,44 @@ int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
 {
     int ret;
     ret = JS_DefinePropertyValueConst(ctx, this_obj, prop, val, flags);
+    JS_FreeValue(ctx, val);
+    return ret;
+}
+
+/* A DATA PROPERTY UNDER A KEY THE CALLER ONLY BORROWS — the spelling every snapshot walk needs, and the one
+   JS_DefinePropertyValue's signature does not state.
+ *
+ * ITS TWO ARGUMENTS HAVE TWO DIFFERENT OWNERSHIPS: it frees its VALUE and never its KEY. JS_DefinePropertyValueValue
+ * directly below is the proof — it JS_FreeAtoms the atom it built the moment the define returns, because nothing
+ * else will. So a machine whose own state OWNS the key has nothing to hand over, and the JS_DupAtom that looks
+ * like it balances the call is an increment nobody matches: one leaked atom reference per property, per walk.
+ * Three sites had exactly that — Iterator.zipKeyed's tuple, Object.getOwnPropertyDescriptors, and object SPREAD —
+ * each of them a machine holding an [[OwnPropertyKeys]] snapshot it releases itself.
+ *
+ * THE ASSERT IS THE LEDGER, and it is here rather than at those sites so the next key-holding builtin inherits
+ * it. A define takes AT MOST the one reference the new shape property owns — and none at all when the key is
+ * already in the shape or a hashed shape that already names it is reused — so a rise of more than one came from
+ * the CALLER and is a reference the runtime will never get back. The value is freed AFTER the reading, which is
+ * why this does not simply wrap JS_DefinePropertyValue: releasing it can drop the last object that interned this
+ * same name, and that moves the very number the ledger is about. */
+static int js_define_prop_borrowed_key(JSContext *ctx, JSValueConst this_obj,
+                                       JSAtom prop, JSValue val, int flags)
+{
+    int ret;
+#if APICLIENT_DEV
+    int rc0 = js_atom_refcount(ctx->rt, prop);
+#endif
+    ret = JS_DefinePropertyValueConst(ctx, this_obj, prop, val, flags);
+#if APICLIENT_DEV
+    /* the ledger, spelled as a guarded DFAIL rather than a DCHECK because a DCHECK's condition is still
+       TYPE-CHECKED in a release build (`(void)sizeof(cond)`), and every term of this one is dev-only. */
+    if (ret >= 0 && js_atom_refcount(ctx->rt, prop) > rc0 + 1)
+        DFAIL("a define under a BORROWED key raised its atom's refcount by more than the one reference the new "
+              "property owns, so the caller handed over a reference this call never takes back — a JS_DupAtom "
+              "in the argument list of a define that borrows its key. That reference is leaked for the lifetime "
+              "of the runtime and would otherwise surface only as an `[atomleak]` line at JS_FreeRuntime, with "
+              "the run already over and every frame that could name this site gone");
+#endif
     JS_FreeValue(ctx, val);
     return ret;
 }
@@ -69150,8 +69211,8 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             if (mode == PROPWALK_DESCS) {
                 /* 20.1.2.9 step 4.b-c: the descriptor IS the element, kept for every key regardless of
                    enumerability, and defined on the result. */
-                if (JS_DefinePropertyValue(ctx, s->result, JS_DupAtom(ctx, s->atoms[s->i].atom), desc,
-                                           JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                if (js_define_prop_borrowed_key(ctx, s->result, s->atoms[s->i].atom, desc,
+                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                     return -1;
                 s->i++; s->hdr.stage = PW_KEYHEAD;
                 continue;
@@ -69219,8 +69280,8 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 s->hdr.stage = PW_WRITE;
             } else if (mode == PROPWALK_SPREAD) {
                 /* CreateDataPropertyOrThrow on a FRESH object: no setter, no trap, nothing that can suspend. */
-                if (JS_DefinePropertyValue(ctx, s->result, JS_DupAtom(ctx, s->atoms[s->i].atom), item,
-                                           JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                if (js_define_prop_borrowed_key(ctx, s->result, s->atoms[s->i].atom, item,
+                                                JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                     return -1;
             } else if (mode == PROPWALK_ENTRIES) {
                 JSValue pair = JS_NewArray(ctx), key;
@@ -78877,11 +78938,13 @@ static void js_iter_zip_defer_closes(JSContext *ctx, JSIteratorZipData *it, int3
 
 /* Where a tuple slot goes: a position in an Array for Iterator.zip, a KEY on a null-prototype object for
    Iterator.zipKeyed. One function, because the drive is otherwise identical and a second copy of it is what the
-   two self-hosted builtins were. */
+   two self-hosted builtins were.
+   The key is BORROWED from the RECORD, which holds it for as long as the zipper lives and releases it in
+   js_iter_zip_data_free — so this hands over nothing, and the define that says so is the one that asserts it. */
 static int zip_put_result(JSContext *ctx, JSIteratorZipData *it, JSValueConst results, uint32_t k, JSValue v)
 {
     if (it->keys)
-        return JS_DefinePropertyValue(ctx, results, JS_DupAtom(ctx, it->keys[k]), v, JS_PROP_C_W_E);
+        return js_define_prop_borrowed_key(ctx, results, it->keys[k], v, JS_PROP_C_W_E);
     return JS_DefinePropertyValueUint32(ctx, results, k, v, JS_PROP_C_W_E);
 }
 
