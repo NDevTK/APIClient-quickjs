@@ -4198,8 +4198,16 @@ static __maybe_unused void JS_DumpString(JSRuntime *rt, JSString *p)
         printf("<null>");
         return;
     }
+    /* THE REFCOUNT IS LABELLED, because unlabelled it is indistinguishable from the string. It printed as a
+       bare number butted against the opening quote, so a leak report reading `name: 22""` says "the property
+       `name` holds an empty string that 22 things share" and reads as "a name 22 characters long" — a length,
+       which is the one other number anybody would expect there. It cost a careful reader a sentence of doubt
+       in exactly the report that is supposed to remove doubt. And the ambiguity is not only in the reader:
+       a string whose CONTENT begins with a digit is written with the same bytes as a refcount prefix, so
+       `3"7 items"` and a shared `"37 items"` are the same six characters. `rc=` is two characters and the
+       whole of the fix; the `L` below is already a labelled flag for the same reason. */
     if (JS_REF_COUNT(p) != 1)
-        printf("%d", JS_REF_COUNT(p));
+        printf("rc=%d", JS_REF_COUNT(p));
     if (p->is_wide_char)
         putchar('L');
     sep = '\"';
