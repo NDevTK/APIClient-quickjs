@@ -7215,10 +7215,61 @@ static bool js_toprim_operand(JSValueConst v)
    with the sibling, so once a flow has forked those objects are shared and their mutations MUST be captured. The
    host knows the fork state (its delta has a base segment) and the flow_local status (JS_IsFlowLocal); it skips
    only a truly-private object of a never-forked flow. Defined early — the write sites are earlier. */
+/* THE ONE PLACE A BUFFER'S BYTES ARE DECLARED ABOUT TO CHANGE — the typed-array/DataView twin of cow_capture,
+   and the third layer of the same defect ab7815ae and 7422288f fixed above it.
+ *
+ * A typed array's elements are NOT JSValues and NOT shape slots: they are raw bytes in an ArrayBuffer, so a
+ * write to one reaches neither JS_SetPropertyInternal2 nor add_property nor set_fast_array_element, and
+ * therefore no COW capture at all. `ta[i] = v` — JS_SetPropertyValue's ten typed-array arms — had none, and
+ * neither did fill, copyWithin, set's memmove, sort's writeback, reverse, DataView's setters or Atomics. Each
+ * left one flow's mutation of a SHARED buffer standing in the baseline for every sibling and standing through
+ * the unapply whose whole job is to take it back out.
+ *
+ * `p` is the VIEW (a typed array or a DataView) and what is captured is its BUFFER, because the buffer is the
+ * storage and the view is only a name for part of it — see JSTimeTravelHooks.buf_write for why the unit is the
+ * bytes and not the element. Two views over one buffer therefore dedup to ONE entry rather than aliasing each
+ * other under two keys that the delta could not know were the same storage.
+ *
+ * SPURIOUS CAPTURE IS SOUND AND IS WHY THIS SITS EARLY IN EACH WRITER. The capture must happen before the first
+ * byte changes; it need not happen after the writer's bounds/detach/immutability checks, because a capture whose
+ * write never lands puts back the bytes the buffer never stopped holding — the same tolerance cow_restore_base
+ * already documents for `Math.PI = 1`. Placing it before a coercion that could detach the buffer is likewise
+ * deliberate: the detach is itself an uncaptured shared mutation, and the restore is where that aborts by name. */
+static void cow_capture_bytes(JSContext *ctx, JSObject *p)
+{
+    if (!g_time_travel.buf_write)
+        return;
+    DCHECK(p->u.typed_array != NULL,
+           "a byte write on a view with no JSTypedArray record: the buffer it writes into cannot be named, so "
+           "the capture would silently record nothing");
+    g_time_travel.buf_write(ctx, JS_MKPTR(JS_TAG_OBJECT, p->u.typed_array->buffer));
+}
+/* Ask the host to record an object's pre-write state (for per-flow revert). Whether a FLOW_LOCAL object is
+   skipped is decided by the HOST hook, NOT here: a snapshot fork SHARES the parent frame's flow_local objects
+   with the sibling, so once a flow has forked those objects are shared and their mutations MUST be captured. The
+   host knows the fork state (its delta has a base segment) and the flow_local status (JS_IsFlowLocal); it skips
+   only a truly-private object of a never-forked flow. Defined early — the write sites are earlier.
+   A TYPED ARRAY'S NUMERIC INDEX IS ROUTED TO ITS BUFFER'S BYTES, and the routing is HERE rather than at the
+   eight sites that capture, for the reason set_fast_array_element captures rather than at its seven writers: a
+   record the delta must see cannot be a line each site remembers, and the sites are not the ones a reader would
+   guess. [[DefineOwnProperty]] and its create half are the obvious two; `delete ta[0]` captures before it learns
+   what the slot is, `Reflect.set(ta, 0, v)` walks in through JS_SetPropertyInternal2's head with an atom that is
+   a tagged int, and the interpreter's own put-field fast path is a fourth. Each produced an entry over storage
+   that is not a slot at all, which JS_GetOwnSlot and JS_SetOwnSlot now both refuse — so the router is what makes
+   those two asserts statements about the engine's own logic rather than about ordinary JS. */
 static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
-    if (g_time_travel.prop_write && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (is_typed_array(p->class_id) && __JS_AtomIsTaggedInt(prop)) {
+        cow_capture_bytes(ctx, p);
+        return;
+    }
+    if (g_time_travel.prop_write)
         g_time_travel.prop_write(ctx, obj, prop);
 }
+
 /* Record a KNOWN-NEW fast-array append slot (idx == length). O(1): the host skips the dedup scan and baseline
    lookup (existed=0 always). The hot path for a shared accumulator — see JSTimeTravelHooks.arr_append. */
 static inline void cow_capture_append(JSContext *ctx, JSValueConst obj, JSAtom idx) {
@@ -11414,6 +11465,13 @@ int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop)
     p = JS_VALUE_GET_OBJ(obj);
     DCHECK(p->class_id != JS_CLASS_PROXY,
            "a COW delta holds a Proxy: capturing or swapping it would run the page's traps mid-context-switch");
+    /* The read twin refuses what the write twin refuses, and this one fires at the CAPTURE rather than at the
+       swap — cow_capture_hook reads through here before it appends the entry, so a typed-array index routed to
+       cow_capture instead of cow_capture_bytes aborts where it was written down. See JS_SetOwnSlot. */
+    DCHECK(!(is_typed_array(p->class_id) && __JS_AtomIsTaggedInt(prop)),
+           "a COW delta is capturing a typed-array element as a property SLOT: its storage is the buffer's "
+           "BYTES, which no JSValue round-trips (a NaN payload normalises), so route this capture through "
+           "cow_capture_bytes");
     has = JS_GetOwnPropertyInternal(ctx, &pd, p, prop);
     if (has <= 0)
         return has;
@@ -11520,22 +11578,22 @@ void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val)
             return;
         }
         if (is_typed_array(p->class_id)) {
-            /* the store is per element TYPE and JS_SetPropertyValue's switch IS that store; duplicating it here
-               would be a second copy of the one thing this file already says once. `val` came off the read twin,
-               which answers a typed-array element as the NUMBER it holds, so the coercion inside runs no page
-               code and cannot detach the buffer, and with no throw flag every remaining arm answers without
-               throwing: an IMMUTABLE buffer writes nothing, which is the right restore because an element that
-               cannot be written cannot have changed (the entry is JS_DefineProperty capturing before it learns
-               the define will be refused), and an out-of-range index is unreachable behind the bound below. */
-            DCHECK(idx < p->u.array.count,
-                   "a typed-array element slot outside the array: a detached buffer has count 0, and the read "
-                   "twin answers no slot the array does not hold");
-            DCHECK((p->class_id == JS_CLASS_BIG_INT64_ARRAY || p->class_id == JS_CLASS_BIG_UINT64_ARRAY)
-                   ? JS_IsBigInt(val) : JS_IsNumber(val),
-                   "a typed-array element slot restore was handed something the array does not store: the read "
-                   "twin answers a Number, or a BigInt for a 64-bit array, and anything else is COERCED here — "
-                   "the page's valueOf with no flow under it, and a throw with no flow to receive it");
-            JS_SetPropertyValue(ctx, obj, js_int32(idx), val, 0);
+            /* DELETED: the typed-array element restore. It re-issued JS_SetPropertyValue to put the NUMBER the
+               read twin answered back into the element, and it was the second half of a unit that is wrong: a
+               typed array's elements are BYTES in an ArrayBuffer, not slots, and a JSValue cannot carry them
+               back. Under JS_NAN_BOXING — every 32-bit build, and the wasm one is 32-bit — __JS_NewFloat64
+               NORMALISES a NaN, so a Float64Array element the page stored with a payload came back canonical and
+               the resume was not byte-identical; a DataView's write has no element to name at all; and two views
+               over one buffer named one storage under two keys the delta could not know were the same.
+               The bytes are captured on the BUFFER now (cow_capture_bytes / JSTimeTravelHooks.buf_write), and no
+               element entry is created for a typed array at all: cow_capture ROUTES a typed array's numeric
+               index to the bytes, so every site that captures a slot is covered by that one decision. Reaching
+               here means a capture went around cow_capture and made a slot entry for storage the byte entry
+               owns; the read twin refuses the same thing one step earlier, at the capture. */
+            JS_FreeValue(ctx, val);
+            DFAIL("a COW delta holds a typed-array element as a property SLOT: its storage is the buffer's "
+                  "BYTES and the byte entry owns it, so route the capture that made this entry through "
+                  "cow_capture_bytes");
             return;
         }
         if (idx >= p->u.array.count && array_grow_dense_to(ctx, p, idx))
@@ -12710,6 +12768,14 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         /* fast path for array access */
         p = JS_VALUE_GET_OBJ(this_obj);
         idx = JS_VALUE_GET_INT(prop);
+        /* `ta[i] = v` — the ten typed-array arms below all end in a raw store through u.array.u.<T>_ptr, so not
+           one of them reached a COW capture and a flow's write to a SHARED buffer stood in the baseline for
+           every sibling. ONE capture at the operation and not a line each arm remembers, for the reason
+           set_fast_array_element captures rather than its seven writers; and BEFORE the coercions, because a
+           capture whose store never lands puts back bytes that never changed while a coercion that runs the
+           page's valueOf can reach a store this has not yet seen. */
+        if (is_typed_array(p->class_id))
+            cow_capture_bytes(ctx, p);
         switch(p->class_id) {
         case JS_CLASS_ARRAY:
             if (unlikely(idx >= (uint32_t)p->u.array.count)) {
@@ -13142,7 +13208,12 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
        baseline read this capture makes, and the flow-side read cow_save_cur makes when the flow is switched out
        -- so a define that redefines an accessor or leaves one behind aborts naming the descriptor entry to
        build. A define that only narrows `writable` is caught on the other side, by the assert cow_restore_base
-       makes on the value it puts back. */
+       makes on the value it puts back.
+       A TYPED ARRAY'S NUMERIC INDEX carries itself to the BYTES from inside cow_capture — 10.4.5.3's define
+       delegates to TypedArraySetElement, which is JS_SetPropertyValue's typed-array arm and writes the buffer,
+       so an entry naming (view, index) would be a second and weaker record of storage the byte entry owns. That
+       is the entry `Object.defineProperty(ta, 0, {value:1})` used to produce, and it is routed at the one place
+       rather than here, because this is not the only site that reaches a typed array with an index. */
     cow_capture(ctx, this_obj, prop);
 
  redo_prop_update:
@@ -102307,6 +102378,60 @@ uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj)
     return NULL;
 }
 
+/* THE BUFFER'S BYTES, READ — see quickjs.h. NOT JS_GetArrayBuffer, which is an operation: it THROWS on a
+   detached buffer and on a non-buffer, and the COW swap that calls this has no flow base to run an exception on,
+   exactly as JS_GetOwnSlot is not [[GetOwnProperty]]. A DETACHED buffer answers NULL/0 rather than aborting,
+   because a detached buffer holds no bytes and there is nothing for a flow to have written. */
+const uint8_t *JS_GetBufferBytes(JSValueConst obj, uint32_t *plen)
+{
+    JSObject *p;
+    JSArrayBuffer *abuf;
+
+    *plen = 0;
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+           "a COW delta holds a buffer's bytes on something that is not an object");
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id == JS_CLASS_ARRAY_BUFFER || p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER,
+           "a COW delta holds a buffer's bytes on a class that owns no ArrayBuffer storage — the capture named "
+           "a VIEW where it must name the buffer that owns the bytes");
+    abuf = p->u.array_buffer;
+    if (abuf->detached)
+        return NULL;
+    DCHECK(abuf->byte_length >= 0, "an ArrayBuffer with a negative byte length");
+    *plen = (uint32_t)abuf->byte_length;
+    return abuf->data;
+}
+
+/* ITS WRITE TWIN — see quickjs.h. It CANNOT FAIL for the reason JS_SetOwnSlot cannot, and the two ways it could
+   not land are both mutations of the buffer OBJECT rather than of its contents, which is precisely what this
+   entry cannot express: a DETACH (transfer / structuredClone) frees the storage, and a RESIZE reallocates it to
+   a different length. Both abort here naming the buffer-lifetime entry to build, rather than writing bytes into
+   storage that is no longer the storage the flow read. */
+void JS_SetBufferBytes(JSValueConst obj, const void *bytes, uint32_t len)
+{
+    JSObject *p;
+    JSArrayBuffer *abuf;
+
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+           "a COW delta puts a buffer's bytes back on something that is not an object");
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id == JS_CLASS_ARRAY_BUFFER || p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER,
+           "a COW delta puts a buffer's bytes back on a class that owns no ArrayBuffer storage");
+    abuf = p->u.array_buffer;
+    /* CHECK and not DCHECK, on check.h's own rule: past either of these the memcpy below writes into storage
+       that was freed or is shorter than the copy, and proceeding is memory corruption rather than a wrong
+       answer. The capability they name is the same one either way. */
+    CHECK(!abuf->detached,
+          "a COW delta is putting a buffer's bytes back into a DETACHED buffer: a flow transferred it and the "
+          "storage every entry names is freed, so build the buffer-LIFETIME entry (detach and resize are "
+          "mutations of the buffer object, which an entry over its contents cannot express)");
+    CHECK((uint32_t)abuf->byte_length == len,
+          "a COW delta is putting back a different number of bytes than the buffer now holds: a flow RESIZED "
+          "it, which is a mutation of the buffer object rather than of its contents — build the "
+          "buffer-lifetime entry beside the byte entry");
+    memcpy(abuf->data, bytes, len);
+}
+
 static bool array_buffer_is_resizable(const JSArrayBuffer *abuf)
 {
     return abuf->max_byte_length >= 0;
@@ -102850,6 +102975,9 @@ static int js_typed_array_set_ta(JSContext *ctx,
             goto range_error;
         if (src_p->class_id == p->class_id) {
             /* same type, use memmove */
+            /* the DESTINATION's bytes only: the source is read. The element-by-element tail below needs no
+               capture of its own — it stores through JS_SetPropertyUint32, which is routed. */
+            cow_capture_bytes(ctx, p);
             memmove(dest_abuf->data + dest_ta->offset + (offset << shift),
                     src_abuf->data + src_ta->offset, src_len << shift);
             return 1;
@@ -102992,6 +103120,7 @@ static JSValue js_typed_array_copywithin_build(JSContext *ctx, JSValueConst this
 
     if (typed_array_is_oob(p))
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+    cow_capture_bytes(ctx, p);   /* the memmove below is a raw byte write — see cow_capture_bytes */
 
     // RAB may have been resized by evil .valueOf method
     space = p->u.array.count - max_int(to, from);
@@ -103064,6 +103193,7 @@ static JSValue js_typed_array_fill_build(JSContext *ctx, JSValueConst this_val, 
 
     if (typed_array_is_oob(p))
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+    cow_capture_bytes(ctx, p);   /* the memset/element loop below is a raw byte write — see cow_capture_bytes */
 
     // RAB may have been resized by evil .valueOf method
     final = min_int(final, p->u.array.count);
@@ -103415,6 +103545,7 @@ static JSValue js_typed_array_reverse(JSContext *ctx, JSValueConst this_val,
     p = JS_VALUE_GET_OBJ(this_val);
     if (typed_array_is_immutable(p))
         return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+    cow_capture_bytes(ctx, p);   /* the swap loops below write the storage in place — see cow_capture_bytes */
     if (len > 0) {
         switch (typed_array_size_log2(p->class_id)) {
         case 0:
@@ -104035,6 +104166,7 @@ static int js_ta_sort_put(JSContext *ctx, JSValueConst obj, int64_t j, JSValueCo
         return 0;
     if (js_typed_array_fill_value(ctx, p, v, &v64))
         return -1;
+    cow_capture_bytes(ctx, p);   /* the writeback below stores raw bytes — see cow_capture_bytes */
     switch (typed_array_size_log2(p->class_id)) {
     case 0: p->u.array.u.uint8_ptr[j]  = (uint8_t)v64;  break;
     case 1: p->u.array.u.uint16_ptr[j] = (uint16_t)v64; break;
@@ -105191,6 +105323,11 @@ static JSValue js_dataview_setValue(JSContext *ctx,
     if ((int64_t)ta->offset + ta->length > abuf->byte_length)
         return JS_ThrowTypeError(ctx, "out of bound");
     ptr = abuf->data + ta->offset + pos;
+    /* THE WRITE THAT PROVES THE UNIT. `dv.setFloat64(3, x)` writes bytes 3..10 of the buffer: a DataView
+       exposes no indexed properties, so there is no (object, index) slot an entry could name, and those bytes
+       cross the element boundary of every view over the same storage. Captured on the buffer like every other
+       byte write — see cow_capture_bytes. */
+    cow_capture_bytes(ctx, JS_VALUE_GET_OBJ(this_obj));
 
     switch(class_id) {
     case JS_CLASS_INT8_ARRAY:
@@ -105557,6 +105694,10 @@ static JSValue js_atomics_op(JSContext *ctx,
         return JS_ThrowRangeError(ctx, "out-of-bound access");
 
     ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
+    /* every op but LOAD writes the storage; LOAD reads it, and capturing there would be a spurious entry on
+       every Atomics.load of a shared buffer. See cow_capture_bytes. */
+    if (op != ATOMICS_OP_LOAD)
+        cow_capture_bytes(ctx, p);
 
    switch(op | (size_log2 << 3)) {
 
@@ -105670,6 +105811,7 @@ static JSValue js_atomics_store(JSContext *ctx,
     p = js_atomics_get_buf(ctx, argv[0], argv[1], NULL, &idx, 0);
     if (!p)
         return JS_EXCEPTION;
+    cow_capture_bytes(ctx, p);   /* both branches below atomic_store into the storage — see cow_capture_bytes */
     size_log2 = typed_array_size_log2(p->class_id);
     if (size_log2 == 3) {
         int64_t v64;

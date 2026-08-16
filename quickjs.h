@@ -1244,9 +1244,20 @@ JS_EXTERN int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSA
 /* Its WRITE twin: the SLOT's stored value put back. NOT [[Set]] — no prototype walk, no setter, no `writable`
    and no `extensible`, because a delta is swapped by the scheduler and every one of those refuses by THROWING
    with no flow base to run the exception on. Mirrors every kind the read answers (data, VARREF, AUTOINIT, dense
-   element, the array `length` pair, typed-array element) and CANNOT FAIL — an accessor slot and an allocation
+   element, the array `length` pair) and CANNOT FAIL — an accessor slot and an allocation
    failure both abort at the origin, so there is no status a caller could default. Consumes `val`. */
 JS_EXTERN void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val);
+/* THE BUFFER'S BYTES, READ AND PUT BACK — the byte twin of the slot pair above, and the reason it is a separate
+   pair rather than one more kind of slot is JSTimeTravelHooks.buf_write's: a view's element is not what the page
+   wrote, the storage is. `obj` is the ArrayBuffer/SharedArrayBuffer OBJECT.
+   Neither takes a JSContext and neither can throw, for the same reason JS_SetOwnSlot cannot: they run inside a
+   context switch that has no flow base to receive an exception. The read answers NULL with *plen 0 for a
+   DETACHED buffer — a positive statement, not a failure: a detached buffer holds no bytes, so there is nothing a
+   flow could have changed. The write asserts the length it is handed is still the buffer's; a flow that RESIZED
+   or DETACHED it aborts there naming the buffer-lifetime entry to build, because those are mutations of the
+   buffer OBJECT rather than of its contents and an entry over the contents cannot express them. */
+JS_EXTERN const uint8_t *JS_GetBufferBytes(JSValueConst obj, uint32_t *plen);
+JS_EXTERN void JS_SetBufferBytes(JSValueConst obj, const void *bytes, uint32_t len);
 JS_EXTERN void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                                    uint32_t len);
 
@@ -1595,6 +1606,24 @@ typedef struct JSTimeTravelHooks {
        `closure` for the duration of this flow and records the swap on its delta, exactly as gen_fork does for a
        generator's execution state. The delta OWNS cur_data (JS_AsyncDataRef/Unref). */
     void (*async_fork)(JSContext *ctx, JSValueConst closure, void *base_data, void *cur_data);
+    /* Before a flow writes any of a shared ARRAY BUFFER's BYTES. `abuf` is the ArrayBuffer/SharedArrayBuffer
+       OBJECT — never a view and never a raw pointer — because the buffer is what OWNS the storage and is the
+       only name every writer of it agrees on.
+       THE UNIT IS THE BUFFER'S BYTES AND NOT A VIEW'S ELEMENT, for three reasons the code decides rather than
+       taste. (1) A DataView write has NO element: `dv.setFloat64(3, x)` writes bytes 3..10 of the buffer, a
+       DataView exposes no indexed properties at all, and those bytes cross the element boundary of every view
+       over that buffer — so an (object, index) slot entry cannot even name the write. (2) A Float64Array
+       element cannot round-trip through a JSValue: under JS_NAN_BOXING — which is every 32-bit build, and the
+       wasm one is 32-bit — __JS_NewFloat64 NORMALISES a NaN, so a payload the page stored comes back canonical
+       and §Time-travel's byte-identical resume is not. (3) `fill`/`set`/`copyWithin`/`sort`/`reverse`/Atomics
+       write through memmove/memset over the raw storage, where there is no per-element hook to hang a capture
+       on and one entry per element would cost sizeof(CowEntry) per BYTE.
+       Aliasing follows from the unit rather than being handled by it: a Float64Array and a Uint8Array over one
+       buffer are one entry, because they are one storage. The host captures the buffer's bytes ONCE per flow
+       (JS_GetBufferBytes / JS_SetBufferBytes are the read/write twins the swap uses), so a loop overwriting one
+       element a million times costs one entry — the delta stays O(shared state TOUCHED), which an undo log of
+       ranges would not. */
+    void (*buf_write)(JSContext *ctx, JSValueConst abuf);
 } JSTimeTravelHooks;
 /* The evaluation state of a module record, as an opaque owned blob — the module twin of JS_AsyncStateSave. */
 JS_EXTERN void *JS_ModuleEvalStateSave(JSContext *ctx, void *m);
