@@ -12700,6 +12700,14 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
     JSProperty *pr;
     int ret, prop_flags;
 
+    /* forced-exec TIME-TRAVEL: the CREATE half of [[DefineOwnProperty]] has a SECOND entry -- 10.1.9.2 step
+       3.d.i's CreateDataProperty, which JS_SetPropertyInternal2 performs on the RECEIVER. That function captures
+       at its head, and what it names there is the object it WALKED: `Reflect.set(o, "x", v, receiver)` walks `o`
+       and creates the slot on `receiver`, so the entry described an object the write never touched. Captured on
+       the object the slot lands on. Reached from JS_DefineProperty the slot is already in the delta and this
+       dedups in O(1); it is not folded into that caller because this is the one arm the caller cannot see. */
+    cow_capture(ctx, JS_MKPTR(JS_TAG_OBJECT, p), prop);
+
     /* add a new property or modify an existing exotic one */
     if (p->is_exotic) {
         if (p->class_id == JS_CLASS_ARRAY) {
@@ -12898,6 +12906,25 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
         return -1;
     }
     p = JS_VALUE_GET_OBJ(this_obj);
+
+    /* forced-exec TIME-TRAVEL: [[DefineOwnProperty]] is the OTHER way a shared slot changes, and it is the one
+       that had no capture at all. Every arm below writes the slot IN PLACE -- the data value, the getter/setter
+       pair, the var_ref, the array length, and the attribute bits through js_update_property_flags -- and the
+       tail creates one, so a flow's Object.defineProperty / Reflect.defineProperty / JS_DefinePropertyValue* /
+       JS_DefinePropertyGetSet on a BASELINE object stood in the baseline for every sibling and survived the
+       unapply whose whole job is to take it back out. A top-level `function f(){}` is one of them:
+       JS_DefineGlobalFunction routes here, which is why the var/let DEFINE path below captures and its function
+       twin did not.
+       ONE capture at the OPERATION rather than one per arm, for the reason a dense element is captured inside
+       set_fast_array_element rather than at its seven writers: a record the delta must see cannot be a line each
+       arm remembers.
+       WHAT AN ENTRY CANNOT YET HOLD IS ASSERTED RATHER THAN ASSUMED. An entry records a slot's VALUE and never
+       its ATTRIBUTES, and JS_GetOwnSlot refuses an ACCESSOR slot on BOTH sides of the round trip -- the
+       baseline read this capture makes, and the flow-side read cow_save_cur makes when the flow is switched out
+       -- so a define that redefines an accessor or leaves one behind aborts naming the descriptor entry to
+       build. A define that only narrows `writable` is caught on the other side, by the assert cow_restore_base
+       makes on the value it puts back. */
+    cow_capture(ctx, this_obj, prop);
 
  redo_prop_update:
     prs = find_own_property(&pr, p, prop);
