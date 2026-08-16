@@ -66388,19 +66388,27 @@ static JSValue js_coerce1_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-static JSValue js_microtask_job(JSContext *ctx,
-                                int argc, JSValueConst *argv)
-{
-    return JS_Call(ctx, argv[0], ctx->global_obj, 0, NULL);
-}
-
+/* HTML §8.6's queueMicrotask: "queue a microtask to invoke callback". The callback is PAGE CODE — the case that
+   proves it is `queueMicrotask(() => { for(;;) x++; })` — and it ran inside js_microtask_job's JS_Call, a C
+   activation with no flow base under it, so the loop had nothing to park into and drove to completion. The
+   engine already has the replacement, built for exactly this: JS_EnqueueCallJob queues `func(...args)` as a
+   CALL-ROOT FLOW, so the callback is preemptible, forkable and parkable like every other flow. The C job body
+   is deleted with the conversion; there is nothing left to select between.
+   ORDERING IS UNCHANGED, and that is not an accident of this call: the job goes on the SAME microtask list
+   (js_enqueue's is_task=false arm) at the SAME FIFO position, so it still runs inside the current checkpoint
+   ahead of every task. A preempt inside it does not move it either — reaction_flow_step parks into the pump's
+   slot rather than re-queueing, and JS_ExecutePendingJob DCHECKs that the host resumed the slot before
+   draining the next job.
+   THE `this` IS UNDEFINED, NOT global_obj, and this is the spec answer rather than a consequence: the callback
+   is a Web IDL callback function invoked with an undefined thisArg, so a strict-mode callback observes
+   `this === undefined` (real Chrome agrees). A sloppy-mode one still sees the global, because that coercion is
+   the callee's own and happens at its activation. */
 static JSValue js_global_queueMicrotask(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
     if (check_function(ctx, argv[0]))
         return JS_EXCEPTION;
-    if (JS_EnqueueJob(ctx, js_microtask_job, 1, &argv[0]))
-        return JS_EXCEPTION;
+    JS_EnqueueCallJob(ctx, argv[0], 0, NULL);
     return JS_UNDEFINED;
 }
 
@@ -95334,8 +95342,18 @@ typedef struct JSReactionFlow {
     /* The SETTLE is a second phase of the same flow, not a JS_Call from C. A capability's resolve is page code
        twice over — a subclass may wrap it, and the NATIVE one is a step machine whose `then` read on a thenable
        result is itself a request — so settling from C ran that read with no flow base. Phase 1 re-uses the very
-       same call-root base the handler ran on. */
-    uint8_t phase;             /* 0 = the handler is running, 1 = the settle is */
+       same call-root base the handler ran on.
+       WHAT THE TWO PHASES ARE, stated as the completion rule rather than as two names, because a flow that is
+       ONE call starts at phase 1 and there is then no handler for the name to be about:
+         phase 0 — a HANDLER body: its completion is owed to `resolve`/`reject`, so an abrupt one becomes the
+                   capability's rejection and is consumed HERE. A reaction with no capability at all (the await
+                   extension passes undefined for both) drops it, which is 27.2.2.1's behaviour and upstream's.
+         phase 1 — the LAST call of the flow: its RESULT is not observable and is discarded, and its THROW is
+                   the flow's completion — returned to the job pump, which is the host's report-an-exception
+                   edge. js_settle_as_flow and host_call_job are both whole flows of this shape; a host callback
+                   that throws is reported exactly as HTML §8.6's queueMicrotask and 9.13's cleanup callback
+                   require, rather than being handed to a capability that does not exist. */
+    uint8_t phase;
 } JSReactionFlow;
 
 static void js_reaction_park_resume(JSContext *ctx, void *opaque);
@@ -95527,7 +95545,12 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
             if (st == 0)
                 continue;   /* PHASE 1 on the same flow: settle_start has rebuilt rf->fs for it */
             reaction_flow_free(ctx, rf);
-            return st < 0 && JS_IsException(ctx->rt->current_exception) ? JS_EXCEPTION : JS_UNDEFINED;
+            /* JS_HasException, NOT JS_IsException(current_exception): `current_exception` holds the thrown
+               VALUE and is JS_UNINITIALIZED when there is none — the JS_TAG_EXCEPTION sentinel is never stored
+               in it, so the old test was false for every input and the one completion it exists to carry, an
+               UNCATCHABLE error (settle_start returns -1 without consuming it, precisely so it keeps
+               propagating), was reported to the pump as a success. */
+            return st < 0 && JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
         }
         /* phase 1: the resolving function's own result is discarded; only its throw matters. */
         reaction_flow_free(ctx, rf);
@@ -95573,7 +95596,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
                                     JSValueConst *argv)
 {
     JSValueConst handler, func;
-    JSValue res, res2;
+    JSValue res;
     JSValueConst arg;
     bool is_reject;
 
@@ -95621,13 +95644,21 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
        creating a dummy promise in the 'await' implementation of async
        functions */
     if (!JS_IsUndefined(func)) {
-        res2 = JS_Call(ctx, func, JS_UNDEFINED, 1, vc(&res));
-    } else {
-        res2 = JS_UNDEFINED;
+        /* 27.2.2.1 steps 7-9 WITH NO HANDLER: the completion goes straight to the capability's resolving
+           function, and that function is PAGE CODE whenever the capability came from a subclass — a
+           `class P extends Promise { constructor(ex){ super((res,rej)=>{ for(;;); }) } }` executor's resolve is
+           an ordinary bytecode function, and the NATIVE one is a step machine whose `then` read on a thenable
+           result runs a getter. Both ran here inside a JS_Call, which is a C activation with no flow base under
+           it: the loop had nothing to park into and the getter had no flow to fork. It is the same call the
+           HANDLER path already routes as phase 1 of its flow, so it takes the same primitive — a whole flow
+           that is one call. A park returns 0 and the pump resumes the slot before the next job, so the
+           settlement keeps its position in the microtask order. */
+        int st = js_settle_as_flow(ctx, func, res);
+        JS_FreeValue(ctx, res);
+        return st < 0 ? JS_EXCEPTION : JS_UNDEFINED;
     }
     JS_FreeValue(ctx, res);
-
-    return res2;
+    return JS_UNDEFINED;
 }
 
 /* THE JOB A HOST EDGE ENQUEUES: `func(...args)` as a CALL-ROOT FLOW, later. The platform needs a route from C
@@ -95648,6 +95679,12 @@ static JSValue host_call_job(JSContext *ctx, int argc, JSValueConst *argv)
     }
     rf->resolve = JS_UNDEFINED;   /* nothing settles when this returns */
     rf->reject = JS_UNDEFINED;
+    /* PHASE 1: there is no handler phase here either — the whole flow is this one call, so its result is
+       discarded and its THROW is the job's completion. At phase 0 the completion would have been offered to a
+       capability, found both halves undefined, and DROPPED it: a queueMicrotask callback or a
+       FinalizationRegistry cleanup callback that threw would have reported success to the pump and the host's
+       report-an-exception edge would never have fired. */
+    rf->phase = 1;
     return reaction_flow_step(ctx, rf);
 }
 
@@ -95659,12 +95696,18 @@ static void js_enqueue_call(JSContext *ctx, JSValueConst func, int argc, JSValue
     DCHECK(argc >= 0, "JS_EnqueueCallJob with a negative argument count");
     if (argc + 1 > (int)countof(stack)) {
         args = js_malloc(ctx, sizeof(*args) * (size_t)(argc + 1));
-        if (!args) { JS_ThrowOutOfMemory(ctx); return; }
+        /* CHECK, not a throw: this function is void, so an OOM it "reported" went to a context nobody was
+           going to read — the callback was simply never queued, and a dropped flow is the one allocation
+           failure CLAUDE.md names as always-fatal. It is not hypothetical plumbing either: queueMicrotask,
+           a FinalizationRegistry cleanup, a timer expiry and an event listener all queue through here, and
+           each of them vanishing silently is a run that reports green having lost work. */
+        CHECK(args != NULL, "a page callback could not be queued: out of memory building its argument list");
     }
     args[0] = func;
     for (i = 0; i < argc; i++)
         args[i + 1] = argv[i];
-    js_enqueue(ctx, host_call_job, argc + 1, args, is_task);
+    CHECK(js_enqueue(ctx, host_call_job, argc + 1, args, is_task) == 0,
+          "a page callback could not be queued: out of memory building its job entry");
     if (args != stack)
         js_free(ctx, (void *)args);
 }
@@ -105546,8 +105589,6 @@ static void js_finrec_free(JSRuntime *rt, JSFinRecEntry *fre)
     js_free_rt(rt, fre);
 }
 
-static JSValue js_finrec_job(JSContext *ctx, int argc, JSValueConst *argv);
-
 /* Empty the runtime's parked-cleanup list — see JSRuntime::finrec_pending. With `enqueue`, this is where 9.13's
    HostEnqueueFinalizationRegistryCleanupJob happens: outside any teardown, where allocating is ordinary, driven
    by the two functions that ask what work is pending, so a target that died since the last question is answered
@@ -105560,10 +105601,13 @@ static void js_finrec_drain(JSRuntime *rt, bool enqueue)
         JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
         list_del(&fre->link);
         if (enqueue) {
-            JSValueConst args[2];
-            args[0] = fre->cb;
-            args[1] = fre->held_val;
-            JS_EnqueueJob(fre->ctx, js_finrec_job, 2, args);
+            /* 9.13's cleanup callback is PAGE CODE — `new FinalizationRegistry(h => { while (h) {} })` — and it
+               ran inside js_finrec_job's JS_Call, a C activation with no flow base under it. It queues as a
+               CALL-ROOT FLOW like every other page callback, so it is preemptible and parkable; the C job body
+               is deleted with the conversion. Same list, same FIFO position, so the cleanup job's place among
+               the microtasks queued before it is exactly what it was. */
+            JSValueConst arg = fre->held_val;
+            JS_EnqueueCallJob(fre->ctx, fre->cb, 1, &arg);
         }
         js_finrec_free(rt, fre);
     }
@@ -105712,11 +105756,6 @@ static const JSCFunctionListEntry js_finrec_proto_funcs[] = {
 static const JSClassShortDef js_finrec_class_def[] = {
     { JS_ATOM_FinalizationRegistry, js_finrec_finalizer, js_finrec_mark }, /* JS_CLASS_FINALIZATION_REGISTRY */
 };
-
-static JSValue js_finrec_job(JSContext *ctx, int argc, JSValueConst *argv)
-{
-    return JS_Call(ctx, argv[0], JS_UNDEFINED, 1, &argv[1]);
-}
 
 int JS_AddIntrinsicWeakRef(JSContext *ctx)
 {
