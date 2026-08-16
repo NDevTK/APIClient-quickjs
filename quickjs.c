@@ -3213,9 +3213,82 @@ void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
         rt->rt_info = s;
 }
 
-/* Defined with the census it walks, below the step surface's own types — same reason the GC-object namer's
-   helpers are declared inside JS_FreeRuntime rather than defined there. */
+/* Declared here and defined with the census it walks, below the step surface's own types. */
 static void js_step_census_report(JSRuntime *rt);
+
+/* The class-name buffer the census below needs. The atom table is still alive where the report runs, which is
+   what makes naming a class possible at all. */
+#define ATOM_GET_STR_BUF_SIZE 64
+
+/* NAME THE LEAKED GC OBJECTS, per KIND, where a kind is (GC type, class id). A class NUMBER makes the report a
+ * lookup table away from being actionable, and the atom holding the name is still alive here, so printing it
+ * turns "1552 of class_id=12" into the component that owns them. Per kind rather than one line each: a leak is
+ * usually thousands of one thing, and a scrollback of identical lines hides the two or three OTHER kinds that
+ * name the real owner.
+ *
+ * THE TABLE IS SIZED BY THE RUNTIME'S OWN CLASS COUNT, and that is what changed. It was a fixed 64 kinds with
+ * `if (i == nk && nk < countof(kinds))` under it, so the 65th kind was counted NOWHERE and the report read
+ * exactly as complete as one with room for it — the excluded-test defect living inside the gate that exists to
+ * catch things. This engine registers a class per Web IDL interface, so 64 is a number a real leak crosses, and
+ * a census that can silently omit a row is not a census. There is no row it can now fail to hold: a GC type
+ * this build has not named lands in a spare slot printed as `?`, and a class id outside the table lands with
+ * the non-objects rather than being dropped.
+ *
+ * IT IS CALLED TWICE, OVER TWO DIFFERENT READINGS OF THE SAME LIST — see JS_FreeRuntime — which is the other
+ * reason it is a function: the two walks were two copies of one grouping, and the copy nobody maintains is the
+ * one that goes on printing. */
+static void js_gc_object_census(JSRuntime *rt, const char *tag)
+{
+    static const char *const TYPE_NAME[] = {
+        "object", "bytecode", "shape", "var_ref", "async_function", "context"
+    };
+    const int ntype = (int)countof(TYPE_NAME) + 1;   /* +1: a GC type this build does not name yet */
+    const int ncid  = (int)rt->class_count + 1;      /* +1: cid -1, a GC object that is not a JSObject */
+    const size_t cells = (size_t)ntype * (size_t)ncid;
+    struct list_head *el;
+    int *n, *rc_min, *rc_max, t, c;
+
+    /* THE PLAIN ALLOCATOR, DELIBERATELY. This table is the diagnostic and not runtime memory, and js_malloc_rt
+       answers to the runtime's own memory limit — which is the one thing a run failing on memory has already
+       spent. */
+    n = calloc(cells * 3, sizeof *n);
+    CHECK(n != NULL, "the leak census could not allocate its own counters — the report that names the leak is "
+                     "the one thing a run which is already failing still has to produce");
+    rc_min = n + cells;
+    rc_max = rc_min + cells;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+        int type = JS_GC_TYPE(h);
+        int cid = (type == JS_GC_OBJ_TYPE_JS_OBJECT) ? (int)((JSObject *)h)->class_id : -1;
+        int rc = JS_REF_COUNT(h);
+        size_t k;
+
+        if (type < 0 || type >= (int)countof(TYPE_NAME)) type = (int)countof(TYPE_NAME);
+        if (cid < 0 || cid >= (int)rt->class_count) cid = -1;
+        k = (size_t)type * (size_t)ncid + (size_t)(cid + 1);
+        if (n[k]++ == 0) {
+            rc_min[k] = rc_max[k] = rc;
+        } else {
+            if (rc < rc_min[k]) rc_min[k] = rc;
+            if (rc > rc_max[k]) rc_max[k] = rc;
+        }
+    }
+    for (t = 0; t < ntype; t++) {
+        for (c = 0; c < ncid; c++) {
+            size_t k = (size_t)t * (size_t)ncid + (size_t)c;
+            char cbuf[ATOM_GET_STR_BUF_SIZE];
+            const char *cn = "";
+
+            if (n[k] == 0)
+                continue;
+            if (c > 1)   /* c-1 is the class id; 0 is not one, and c == 0 is "not a JSObject" */
+                cn = JS_AtomGetStrRT(rt, cbuf, sizeof(cbuf), rt->class_array[c - 1].class_name);
+            fprintf(stderr, "[%s] %-14s %-28s x%-6d refcount %d..%d\n", tag,
+                    t < (int)countof(TYPE_NAME) ? TYPE_NAME[t] : "?", cn, n[k], rc_min[k], rc_max[k]);
+        }
+    }
+    free(n);
+}
 
 void JS_FreeRuntime(JSRuntime *rt)
 {
@@ -3269,136 +3342,66 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     JS_RunGC(rt);
 
-#ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-    /* leaking objects */
-    if (check_dump_flag(rt, JS_DUMP_LEAKS)) {
-        bool header_done;
-        JSGCObjectHeader *p;
-        int count;
-
-        /* remove the internal refcounts to display only the object
-           referenced externally */
-        list_for_each(el, &rt->gc_obj_list) {
-            p = list_entry(el, JSGCObjectHeader, link);
-            JS_GC_MARK(p) = 0;
-        }
-        gc_decref(rt);
-
-        header_done = false;
-        list_for_each(el, &rt->gc_obj_list) {
-            p = list_entry(el, JSGCObjectHeader, link);
-            if (JS_REF_COUNT(p) != 0) {
-                if (!header_done) {
-                    printf("Object leaks:\n");
-                    JS_DumpObjectHeader(rt);
-                    header_done = true;
-                }
-                JS_DumpGCObject(rt, p);
-                leak = true;
-            }
-        }
-
-        count = 0;
-        list_for_each(el, &rt->gc_obj_list) {
-            p = list_entry(el, JSGCObjectHeader, link);
-            if (JS_REF_COUNT(p) == 0) {
-                count++;
-            }
-        }
-        if (count != 0)
-            printf("Secondary object leaks: %d\n", count);
-    }
-#endif
-
-    /* Declared here because the leak report runs in JS_FreeRuntime, which is above their definitions — the
-       atom table is still alive at this point, which is what makes naming the class possible at all. */
-    #define ATOM_GET_STR_BUF_SIZE 64
-    /* DIAG: NAME the leaked GC objects before aborting. A class NUMBER makes the report a lookup table away
-       from being actionable, and the atom that holds the name is still alive at this point — so printing it
-       costs nothing and turns "1552 of class_id=12" into the component that owns them. Counted per kind rather
-       than one line each: a leak is usually thousands of one thing, and a scrollback of identical lines hides
-       the two or three OTHER kinds that name the real owner. */
+    /* THE ONE LEAK REPORT, AND IT IS UNCONDITIONAL. It used to be TWO: this census, and quickjs's own
+       JS_DUMP_LEAKS object pass above it — which is DELETED, because the pair had a seam and the seam was the
+       bug. That pass ran a `gc_decref` and never ran the matching `gc_scan`, so with the flag set it left every
+       mark at 1 and every internal reference subtracted, and this census then walked a list the objects with no
+       external root had already been moved OFF; the root pass below would then call `gc_decref` a second time
+       and abort inside it on `JS_GC_MARK(p) == 0` — a `@WHY` about the collector standing where a leak report
+       belongs. run-test262 sets JS_DUMP_LEAKS on every corpus runtime it makes, so that is not a hypothetical
+       configuration: it is the harness §Testing names as the gate for leaks. One reporter, in every build, on
+       the same heap. `leak` is still raised for JS_ABORT_ON_LEAKS, which is the deleted pass's only other
+       output and is fed from here now. */
     if (!list_empty(&rt->gc_obj_list)) {
-        struct list_head *el;
-        struct { int type, cid, n, rc_min, rc_max; } kinds[64];
-        int nk = 0, i;
-
-        list_for_each(el, &rt->gc_obj_list) {
-            JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
-            int type = JS_GC_TYPE(h);
-            int cid = (type == JS_GC_OBJ_TYPE_JS_OBJECT) ? ((JSObject *)h)->class_id : -1;
-            int rc = JS_REF_COUNT(h);
-            for (i = 0; i < nk; i++)
-                if (kinds[i].type == type && kinds[i].cid == cid) {
-                    kinds[i].n++;
-                    if (rc < kinds[i].rc_min) kinds[i].rc_min = rc;
-                    if (rc > kinds[i].rc_max) kinds[i].rc_max = rc;
-                    break;
-                }
-            if (i == nk && nk < (int)countof(kinds)) {
-                kinds[nk].type = type; kinds[nk].cid = cid; kinds[nk].n = 1;
-                kinds[nk].rc_min = kinds[nk].rc_max = rc; nk++;
-            }
-        }
-        for (i = 0; i < nk; i++) {
-            static const char *const TYPE_NAME[] = { "object", "bytecode", "shape", "var_ref", "async_function", "context" };
-            const char *tn = (kinds[i].type >= 0 && kinds[i].type < (int)countof(TYPE_NAME))
-                             ? TYPE_NAME[kinds[i].type] : "?";
-            char cbuf[ATOM_GET_STR_BUF_SIZE];
-            const char *cn = "";
-            if (kinds[i].cid > 0 && kinds[i].cid < (int)rt->class_count)
-                cn = JS_AtomGetStrRT(rt, cbuf, sizeof(cbuf), rt->class_array[kinds[i].cid].class_name);
-            fprintf(stderr, "[gcleak] %-14s %-28s x%-6d refcount %d..%d\n",
-                    tn, cn, kinds[i].n, kinds[i].rc_min, kinds[i].rc_max);
-        }
+        js_gc_object_census(rt, "gcleak");
+        leak = true;
 
         /* WHICH OF THEM IS ROOTED FROM OUTSIDE THE HEAP — the only part of this report that names a CULPRIT.
            A leaked CYCLE has no owner to go looking for: every object in it is held by another object in it,
            so ONE stray reference from outside keeps a whole realm alive and the table above then lists two
-           thousand objects, every one of them innocent. quickjs's own JS_DUMP_LEAKS pass already answers the
-           question — gc_decref subtracts every reference the heap makes OF ITSELF, so whatever still has a
-           refcount afterwards is held by something that is not a GC object at all: a C record, a parked flow's
-           frame, a host handle. That is the thing to go and free.
-           It runs unconditionally rather than behind a dump flag because a non-empty list is ALWAYS a failure
-           of this gate, and it is non-destructive: gc_scan puts every refcount and mark back, exactly as
-           JS_RunGC does between the same two calls (nothing here is garbage — the JS_RunGC above already took
-           it — so gc_scan's first loop returns the entire set to gc_obj_list). */
-        {
-            struct { int type, cid, n, rc_min, rc_max; } roots[64];
-            int nr = 0;
-            gc_decref(rt);
-            list_for_each(el, &rt->gc_obj_list) {
-                JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
-                int type = JS_GC_TYPE(h);
-                int cid = (type == JS_GC_OBJ_TYPE_JS_OBJECT) ? ((JSObject *)h)->class_id : -1;
-                int rc = JS_REF_COUNT(h);
-                for (i = 0; i < nr; i++)
-                    if (roots[i].type == type && roots[i].cid == cid) {
-                        roots[i].n++;
-                        if (rc < roots[i].rc_min) roots[i].rc_min = rc;
-                        if (rc > roots[i].rc_max) roots[i].rc_max = rc;
-                        break;
-                    }
-                if (i == nr && nr < (int)countof(roots)) {
-                    roots[nr].type = type; roots[nr].cid = cid; roots[nr].n = 1;
-                    roots[nr].rc_min = roots[nr].rc_max = rc; nr++;
-                }
-            }
-            gc_scan(rt);
-            for (i = 0; i < nr; i++) {
-                static const char *const TYPE_NAME[] = { "object", "bytecode", "shape", "var_ref", "async_function", "context" };
-                const char *tn = (roots[i].type >= 0 && roots[i].type < (int)countof(TYPE_NAME))
-                                 ? TYPE_NAME[roots[i].type] : "?";
-                char cbuf[ATOM_GET_STR_BUF_SIZE];
-                const char *cn = "";
-                if (roots[i].cid > 0 && roots[i].cid < (int)rt->class_count)
-                    cn = JS_AtomGetStrRT(rt, cbuf, sizeof(cbuf), rt->class_array[roots[i].cid].class_name);
-                fprintf(stderr, "[gcroot] held from OUTSIDE the heap: %-14s %-28s x%-6d refcount %d..%d\n",
-                        tn, cn, roots[i].n, roots[i].rc_min, roots[i].rc_max);
-            }
-        }
+           thousand objects, every one of them innocent. gc_decref subtracts every reference the heap makes OF
+           ITSELF, so whatever still has a refcount afterwards is held by something that is not a GC object at
+           all: a C record, a parked flow's frame, a host handle. That is the thing to go and free.
+           It is non-destructive: gc_scan puts every refcount and mark back, exactly as JS_RunGC does between
+           the same two calls (nothing here is garbage — the JS_RunGC above already took it — so gc_scan's
+           first loop returns the entire set to gc_obj_list).
+           AND EACH ROOT IS DUMPED, not just counted. The count answers "how many" for a question whose whole
+           content is "WHICH": the culprit set is small by construction (it is what is left after every internal
+           reference is subtracted), and `object Object x3` is three objects a reader cannot tell apart from any
+           other three. JS_DumpGCObject is the tool this engine already has for that — its address, its
+           refcount, its prototype and its own property names — so the next reading of this report starts from
+           the objects rather than from their class names. The dump lands on STDOUT because that is where every
+           other user of quickjs's dump infra writes, so it is flushed and labelled rather than redirected. */
+        gc_decref(rt);
+        printf("[gcroot] the GC objects still held from OUTSIDE the heap, one line each:\n");
+        JS_DumpObjectHeader(rt);
+        list_for_each(el, &rt->gc_obj_list)
+            JS_DumpGCObject(rt, list_entry(el, JSGCObjectHeader, link));
+        fflush(stdout);
+        js_gc_object_census(rt, "gcroot");
+        gc_scan(rt);
     }
-    DCHECK(list_empty(&rt->gc_obj_list), "list_empty(&rt->gc_obj_list)");
+    /* THE REALM QUESTION IS ASKED BEFORE THE OBJECT ONE — after both reports have printed, because whichever
+       assert fires takes the process with it and the reader needs the census either way. A leaked realm is ONE
+       fact, and the census reports it as eighty-five anonymous platform objects that a reader then has to
+       RECOGNISE as a Window's worth of state; that is a recognition and not a measurement, and it was made by
+       hand once. Every holder of a realm holds it by refcount, including a flow parked inside it (its heap
+       frames hold that realm's function objects, and each of those holds the realm), so a realm nothing points
+       at any more is a CYCLE and the collection above is what breaks it. One still on this list afterwards is
+       held by a counted reference from OUTSIDE the heap — a host handle never freed, a C record holding one of
+       its function objects, a suspended chain nobody released — and everything that realm can reach is leaked
+       behind it. Asked FIRST of the two because it explains the second: an engine whose realm survived has no
+       separate object leak to go looking for. */
+    DCHECK(list_empty(&rt->context_list),
+           "the runtime went down with a REALM still live — the collection above breaks a realm's own cycle, so "
+           "one that survived it is named by a counted reference from outside the heap, and its global, its "
+           "interface prototypes, its documents' wrappers and its intrinsics are all leaked behind it; the "
+           "`[gcroot]` dump above names the objects that reference is reachable through");
+    DCHECK(list_empty(&rt->gc_obj_list),
+           "the runtime went down with GC OBJECTS still live — every one of them is memory nothing can free "
+           "any more. `[gcleak]` above counts them by class; `[gcroot]` counts, and the dump beside it names, "
+           "the ones still held from OUTSIDE the heap once every reference the heap makes of itself has been "
+           "subtracted — those are the culprits and everything else is what they reach");
 
     /* THE MACHINES NOBODY FINISHED. Declared here and defined with the census itself, for the reason the GC
        object namer above is declared here: this report runs in JS_FreeRuntime, which sits above the step
