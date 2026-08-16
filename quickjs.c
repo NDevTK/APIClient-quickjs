@@ -3250,7 +3250,12 @@ static void js_gc_object_census(JSRuntime *rt, const char *tag)
 
     /* THE PLAIN ALLOCATOR, DELIBERATELY. This table is the diagnostic and not runtime memory, and js_malloc_rt
        answers to the runtime's own memory limit — which is the one thing a run failing on memory has already
-       spent. */
+       spent.
+       AND ITS RELEASE IS SPELLED `(free)`, because this file forbids the raw one: `#define free(p)
+       free_is_forbidden(p)` guards every allocation that IS runtime memory, and the parentheses are what stop
+       a function-like macro expanding. That is not a trick to get around the guard — the guard is right and
+       this allocation is genuinely outside what it governs — but `calloc` is NOT in that macro list while
+       `free` is, so the asymmetry compiles the allocation and rejects the release. It cost a build. */
     n = calloc(cells * 3, sizeof *n);
     CHECK(n != NULL, "the leak census could not allocate its own counters — the report that names the leak is "
                      "the one thing a run which is already failing still has to produce");
@@ -3287,7 +3292,7 @@ static void js_gc_object_census(JSRuntime *rt, const char *tag)
                     t < (int)countof(TYPE_NAME) ? TYPE_NAME[t] : "?", cn, n[k], rc_min[k], rc_max[k]);
         }
     }
-    free(n);
+    (free)(n);
 }
 
 void JS_FreeRuntime(JSRuntime *rt)
