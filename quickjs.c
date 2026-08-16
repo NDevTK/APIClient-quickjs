@@ -29317,7 +29317,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    back-edge PARK and the outcome FORK — put it in a bodyless TrampFrame first, and clone_deep_flow's
    CONT_STEP_YIELD arm clones it through the machine's own `visit` for either. Written once because the two
    differ only in what happens next: the park pushes it and unwinds, the fork stashes it, snapshots, and takes
-   it straight back off. The frame carries nothing but the machine — no bytecode, no locals, sf zeroed. */
+   it straight back off. The frame carries nothing but the machine — no bytecode, no locals, sf zeroed.
+   AND IT IS THE ONE TRAMP PUSH THAT DOES NOT SWITCH `sf`. Every other push has a callee to become; this one
+   wraps the frame that is already running, records it as `caller_sf`, and leaves the interpreter's `sf` alone.
+   So a do_preempt reached through do_step_park writes the resume point of the machine's CALLER — and when that
+   caller is the flow's own base, the parked flow ends up holding a base cur_sp AND a chain at once. That is
+   legal and routinely resumed; free_tramp_chain is where it is asserted, and it is recorded here because this
+   macro is the reason it happens. */
 #define STEP_ANCHOR_NEW(tfv) do {                                                                       \
         (tfv) = tramp_frame_new(rt);                                                                    \
         if (unlikely(!(tfv))) { tramp_step_chain_free(ctx, stt); JS_ThrowOutOfMemory(ctx); goto exception; } \
@@ -41774,7 +41780,10 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
         /* Completion is signalled by the FRAME, not the return value (which could be a small int colliding
            with a FUNC_RET_* code): a NORMAL-func_kind program completes via `done:` leaving BOTH cur_sp NULL
            AND the tramp chain empty. A BASE suspend (done_generator) saves cur_sp (non-null); a DEEP suspend
-           returns directly with cur_sp NULL but stashes the chain in tramp_top. So suspended iff either is set. */
+           stashes the chain in tramp_top. So suspended iff either is set — and EITHER is the operative word,
+           never "exactly one of": a step machine parked at its own back-edge from the base frame sets BOTH,
+           because the anchor do_step_park pushes is the one tramp push that leaves `sf` naming its caller. See
+           free_tramp_chain, which is where the belief that they were exclusive was written down as an assert. */
         /* `r` IS the program's completion value here (`done:` returns ret_val — the value the global program's
            OP_return left on the stack, or JS_EXCEPTION). Freeing it discarded what the script evaluated to, which
            is exactly the value a synchronous host eval API ($262.createRealm().evalScript) must hand back. */
@@ -42456,8 +42465,11 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
 JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     JSStackFrame *sf = &s->frame;
-    /* A flow is SUSPENDED iff a base frame saved cur_sp OR a deep chain is stashed in tramp_top (a deep
-       suspend leaves the BASE cur_sp NULL — its live point is in the chain, not the base). */
+    /* A flow is SUSPENDED iff a base frame saved cur_sp OR a deep chain is stashed in tramp_top. The two are
+       not exclusive (free_tramp_chain says why: a base-anchored step machine sets both), which is why the
+       chain is asked about FIRST — a flow holding one is DEEP however its base reads, and clone_deep_flow is
+       what normalises the clone's base back to a dormant cur_sp. Ordering this the other way would take the
+       shallow arm on a flow whose live point is in the chain and clone a base as if it were the whole flow. */
     DCHECK(sf->cur_sp != NULL || s->tramp_top != NULL, "JS_FlowClone: flow is not SUSPENDED (only a paused frame can be snapshot-forked)");
     if (s->tramp_top != NULL) return clone_deep_flow(ctx, s);   /* deep: base + tramp chain */
     /* A base suspended with an EMPTY chain is suspended in its own bytecode, and a call root has none: its
@@ -42593,11 +42605,30 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
  * names, its async/generator body state, the reference it holds across a coroutine drive, and its C
  * continuation. Anything else read here would be a second owner for something that already has one.
  *
- * THE LIVE END OF A FRAME IS THE NEXT FRAME'S caller_sp, never the frame's own cur_sp — only the DEEPEST frame
- * is running, and do_preempt saves cur_sp for that one alone. A mid-call frame's cur_sp is NULL because it IS
- * mid-call, and its live region ends where it stood when it made that call, which is the record its callee
- * kept. Getting this from the wrong place would free the caller's operands twice (the callee's argument copies
- * sit above caller_sp) or leak everything above it.
+ * THE LIVE END OF A FRAME IS THE NEXT FRAME'S caller_sp, never the frame's own cur_sp. A mid-call frame's
+ * cur_sp is NULL because it IS mid-call, and its live region ends where it stood when it made that call, which
+ * is the record its callee kept. Getting this from the wrong place would free the caller's operands twice (the
+ * callee's argument copies sit above caller_sp) or leak everything above it.
+ *
+ * AND THE BASE MAY HOLD A cur_sp OF ITS OWN WHILE THIS CHAIN EXISTS, which this function asserted was
+ * impossible and is not. The claim used to be "a deep suspend leaves the base's cur_sp NULL because its live
+ * point is in the chain, so one of the two is stale", and it was read off the ordinary call: OP_call pushes a
+ * callee frame and SWITCHES `sf` to it, so do_preempt's `sf->cur_sp = sp` lands on the callee and the base is
+ * left dormant. The STEP ANCHOR is the one push that does not switch `sf` — it is bodyless by design and
+ * records `caller_sf = sf` (see STEP_ANCHOR_NEW) — so a machine parked at its own back-edge through
+ * do_step_park runs do_preempt with `sf` still naming the machine's CALLER. When that caller is the flow's own
+ * base frame (a top-level `arr.map(f)`, `str.replace(re, f)`, `JSON.stringify(o, fn)`, `arr.sort(cmp)` in the
+ * page's script), the park writes the base's cur_sp AND stashes the anchor: both fields set, permanently, in a
+ * perfectly ordinary parked snapshot. Nothing is stale — do_step_park captures the anchor's caller_sp and
+ * do_preempt writes the base's cur_sp from the SAME `sp`, two instructions apart, so the two AGREE by
+ * construction. The deep-resume path has always relied on that (it reads and clears the base's cur_sp before
+ * restoring the machine from the anchor's caller record), and clone_deep_flow normalises it away (the clone
+ * comes out with cur_sp NULL), which is exactly why the false assert survived: forks hid the shape and nothing
+ * FREED one until the pager started selling the frontier's tail.
+ * So the invariant is AGREEMENT, not absence, and it is asserted as such — which is strictly the stronger
+ * check, because a genuinely stale cur_sp is a value the old test could never have distinguished from a legal
+ * anchor. The teardown itself needed no change: it already ends by writing the bottom frame's caller_sp into
+ * the base, which in this case is the value that is already there.
  *
  * AFTERWARDS THE BASE IS A BASE-SUSPENDED FLOW. The bottom frame's caller_sp is the base frame's live end, so
  * writing it into frame.cur_sp turns a DEEP-suspended flow into exactly the shape async_func_free already
@@ -42606,13 +42637,29 @@ static void free_tramp_chain(JSContext *ctx, JSAsyncFunctionState *s)
 {
     JSRuntime *rt = ctx->rt;
     TrampFrame *t = (TrampFrame *)s->tramp_top;
+    TrampFrame *bt;
     JSValue *live_end;
+    JSValue *base_end;
 
     DCHECK(t != NULL, "free_tramp_chain: no chain to tear down — the caller must ask whether the flow is "
                       "DEEP-suspended before claiming it is");
-    DCHECK(s->frame.cur_sp == NULL,
-           "free_tramp_chain: the base frame saved a live stack position AND holds a chain — a deep suspend "
-           "leaves the base's cur_sp NULL because its live point is in the chain, so one of the two is stale");
+    /* THE BASE'S LIVE END, READ BEFORE ANYTHING IS FREED — because it is also the one thing that can prove the
+       base's own cur_sp is not stale, and an assertion that fires after the frees is a report of damage rather
+       than a guard against it. Moved up from the tail of the walk for that reason. */
+    for (bt = t; bt->up; bt = bt->up)
+        ;
+    base_end = bt->caller_sp;
+    DCHECK(base_end != NULL,
+           "free_tramp_chain: the bottom frame recorded no caller stack position — that is the BASE frame's "
+           "live end, and without it the base cannot be torn down at all");
+    /* AGREEMENT, NOT ABSENCE — see the header comment. A base-anchored step machine parks with BOTH the base's
+       cur_sp and this chain set, and the two are the same position written twice by one do_preempt. What must
+       never happen is that they DISAGREE: the base would then be carrying a live end from some earlier suspend,
+       and the walk below would free its operands to the wrong depth — double-freeing above the real end or
+       leaking everything under it. */
+    DCHECK(s->frame.cur_sp == NULL || s->frame.cur_sp == base_end,
+           "free_tramp_chain: the base frame's saved stack position disagrees with the bottom frame's record of "
+           "it — one of the two is stale, so the base's live region is bounded by a position it never had");
     /* The deepest frame is the RUNNING one, so its live end is its own saved position. A step anchor is the one
        frame with no body at all — its sf is zeroed and this is NULL — and nothing below reads it, because a
        frame with nothing to unwind has no live region to bound. */
@@ -42683,9 +42730,13 @@ static void free_tramp_chain(JSContext *ctx, JSAsyncFunctionState *s)
         live_end = caller_end;
     }
 
-    DCHECK(live_end != NULL,
-           "free_tramp_chain: the bottom frame recorded no caller stack position — that is the BASE frame's live "
-           "end, and without it the base cannot be torn down at all");
+    /* THE WALK ENDED WHERE THE PRE-WALK SAID IT WOULD. `live_end` is now the last frame's caller_sp and
+       `base_end` was the bottom's, read before any free — so this is the two-sided half of the check above:
+       it proves the destructive walk visited the whole chain and that nothing relinked `up` underneath it. */
+    DCHECK(live_end == base_end,
+           "free_tramp_chain: the walk finished on a different frame from the one the chain ended at before it "
+           "started — a frame's `up` changed during the teardown, so the base is about to be given a live end "
+           "that belongs to a chain this flow no longer has");
     s->tramp_top = NULL;
     s->frame.cur_sp = live_end;   /* the bottom frame's caller_sp: the base is now BASE-suspended */
 }
