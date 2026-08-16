@@ -1224,6 +1224,12 @@ JS_EXTERN int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
    Proxy nor an accessor is reachable, because a delta is swapped by the scheduler and either would run the page's
    code mid-context-switch. 1 = own property (*pval owned), 0 = absent, -1 = threw. */
 JS_EXTERN int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop);
+/* Its WRITE twin: the SLOT's stored value put back. NOT [[Set]] — no prototype walk, no setter, no `writable`
+   and no `extensible`, because a delta is swapped by the scheduler and every one of those refuses by THROWING
+   with no flow base to run the exception on. Mirrors every kind the read answers (data, VARREF, AUTOINIT, dense
+   element, the array `length` pair, typed-array element) and CANNOT FAIL — an accessor slot and an allocation
+   failure both abort at the origin, so there is no status a caller could default. Consumes `val`. */
+JS_EXTERN void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val);
 JS_EXTERN void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                                    uint32_t len);
 
@@ -1611,7 +1617,7 @@ JS_EXTERN uint32_t JS_ObjFlowGen(JSValueConst obj);
 JS_EXTERN uint32_t JS_FlowGen(void);
 JS_EXTERN uint32_t JS_FlowBumpGen(void);
 JS_EXTERN int  JS_IsArrayIndexSlot(JSValueConst obj, JSAtom atom, uint32_t *idx);
-JS_EXTERN int  JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len);
+JS_EXTERN void JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len);
 JS_EXTERN void JS_SetTimeTravelHooks(const JSTimeTravelHooks *hooks);
 /* Per-flow generator-state COW: swap a shared generator object's execution-state pointer and own clones by
    refcount (see JSTimeTravelHooks.gen_fork). The clone is opaque to the host (JSGeneratorData is engine-internal). */

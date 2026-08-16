@@ -1781,6 +1781,11 @@ static JSValue JS_ToObjectFree(JSContext *ctx, JSValue val);
 static JSProperty *add_property(JSContext *ctx,
                                 JSObject *p, JSAtom prop, int prop_flags);
 static void free_property(JSRuntime *rt, JSProperty *pr, int prop_flags);
+/* the three SLOT halves JS_SetOwnSlot is assembled from — each defined beside the operation it was split out
+   of, and declared here because the slot write belongs beside its read twin rather than beside the array. */
+static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len);
+static int array_grow_dense_to(JSContext *ctx, JSObject *p, uint32_t idx);
+static void set_fast_array_element(JSContext *ctx, JSObject *p, uint32_t idx, JSValue val);
 static int JS_ToBigInt64Free(JSContext *ctx, int64_t *pres, JSValue val);
 static JSValue JS_ThrowStackOverflow(JSContext *ctx);
 static JSValue JS_ThrowTypeErrorRevokedProxy(JSContext *ctx);
@@ -7237,10 +7242,16 @@ int JS_IsArrayIndexSlot(JSValueConst obj, JSAtom atom, uint32_t *idx) {
     if (JS_IsArray(obj) && __JS_AtomIsTaggedInt(atom)) { *idx = __JS_AtomToUInt32(atom); return 1; }
     return 0;
 }
-/* Host COW helper: set an array's length (truncating a fast array frees the freed tail's elements). Used by
-   cow_unapply to remove a flow-created append without a fast-array->slow conversion. */
-int JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len) {
-    return JS_SetProperty(ctx, obj, JS_ATOM_length, js_uint32(len));
+/* Host COW helper: the array `length` SLOT written (truncating a fast array frees the tail's elements). Used by
+   cow_unapply to remove a flow-created append without a fast-array->slow conversion. It is JS_SetOwnSlot and not
+   a [[Set]] for the reason JS_SetOwnSlot exists at all: the flow whose append is being taken back out may also
+   be the flow that froze the array, and `JS_SetProperty` — which is what stood here — then refused by throwing
+   a TypeError inside a context switch with no flow base to run it on. The host cannot spell JS_ATOM_length, so
+   the atom is supplied here rather than the operation. */
+void JS_ArraySetLength(JSContext *ctx, JSValueConst obj, uint32_t len) {
+    DCHECK(len <= (uint32_t)INT32_MAX, "an array length slot write above INT32_MAX — the length slot stores a "
+                                       "tagged int and a fast array can hold no more");
+    JS_SetOwnSlot(ctx, obj, JS_ATOM_length, js_uint32(len));
 }
 
 /* Time-travel capture for a CLOSURE CELL: a captured local is a shared JSVarRef, not a property, so a write to
@@ -11405,6 +11416,144 @@ int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop)
     return 1;
 }
 
+/* THE WRITE TWIN OF JS_GetOwnSlot — a SLOT's stored value PUT BACK, never an operation, and it CANNOT FAIL.
+ *
+ * The read side has drawn this line since it was written and the write side never did: cow_restore_base put a
+ * captured baseline value back with JS_SetProperty, a [[Set]], which walks the prototype chain, calls a setter,
+ * consults `writable` and `extensible`, and REFUSES by THROWING — inside a context switch that has no flow base
+ * to run an exception on. Three shapes reached it and each left a pending TypeError belonging to no flow, which
+ * the next exception check read as its own: a slot the flow narrowed with a define (Object.freeze,
+ * `{writable:false}`); a slot the flow DELETED off a non-extensible object, which a [[Set]] may not re-create;
+ * and a SPURIOUS capture whose write then threw — `Math.PI = 1` inside a flow captures the slot, fails the
+ * write, and comes back here to put back a value the slot never stopped holding. None of the three can arise
+ * now, because none of the three questions is asked: the scheduler is not the page, and a swap writes storage.
+ *
+ * IT MIRRORS EVERY KIND ITS TWIN ANSWERS, which is what makes the round trip closed rather than nearly closed:
+ * a data slot, a VARREF (a mapped-`arguments` element or a module-namespace export, whose storage IS a closure
+ * cell), an AUTOINIT (instantiated on the way, exactly as the read instantiates it), a fast-array element, the
+ * array `length` PAIR (through array_set_length_slot, so the elements above it go with it — a raw prop[0] write
+ * would leave a dense count the length no longer describes), and a typed-array element. An ACCESSOR is refused
+ * on this side too, because an entry records a VALUE and never the getter/setter pair — that is the descriptor
+ * entry, and it is the next thing to build.
+ *
+ * Consumes `val`. There is no status to return: a slot write is refused by nothing, and the only way it can not
+ * happen is an allocation failure, which is a CHECK at the origin rather than a code the caller might default. */
+void JS_SetOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValue val)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSObject *p;
+    uint32_t idx;
+
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+           "a COW delta holds a slot on something that is not an object");
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id != JS_CLASS_PROXY,
+           "a COW delta holds a Proxy: capturing or swapping it would run the page's traps mid-context-switch");
+
+ retry:
+    prs = find_own_property(&pr, p, prop);
+    if (prs) {
+        switch (prs->flags & JS_PROP_TMASK) {
+        case JS_PROP_GETSET:
+            JS_FreeValue(ctx, val);
+            DFAIL("a COW delta is putting a VALUE back over an ACCESSOR slot: an entry records a slot's value "
+                  "and never its getter/setter pair, so build the DESCRIPTOR entry (the C/W/E flags and the "
+                  "accessor pair) beside the value — the read twin refuses the same slot on the other side");
+            return;
+        case JS_PROP_VARREF:
+            /* the slot's storage is the CELL, which is what the read twin read through. A module namespace's
+               export is write-protected to the PAGE and this is not the page: the entry exists because
+               delete_property captures before it learns the slot is non-configurable, and putting the same
+               value back through the cell is the no-op that spurious capture asks for. */
+            set_value(ctx, pr->u.var_ref->pvalue, val);
+            return;
+        case JS_PROP_AUTOINIT:
+            /* instantiate and retry — the read twin does exactly this, so by the time an entry exists the slot
+               is a data slot; a lazy intrinsic that a flow has not yet touched can still be one here. */
+            if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
+                CHECK_FAIL("a COW slot restore could not instantiate an AUTOINIT slot: a dropped baseline "
+                           "write leaks one flow's state into every sibling");
+            goto retry;
+        default:
+            if (prs->flags & JS_PROP_LENGTH) {
+                /* the array `length` is a PAIR — the stored number and the elements it bounds — so it is put
+                   back through the same slot write that removes them; a raw prop[0] store would leave a dense
+                   count the length no longer describes. `val` came off the read twin, which answers this slot
+                   as the number the slot STORES (an int, or a double above INT32_MAX), so the conversion below
+                   runs no page code. */
+                uint32_t len;
+                DCHECK(p->class_id == JS_CLASS_ARRAY,
+                       "a JS_PROP_LENGTH slot on a class that is not Array");
+                DCHECK(JS_IsNumber(val),
+                       "an Array length slot restore was handed something that is not the number the read twin "
+                       "answers with — a coercion here would be the page's valueOf with no flow under it");
+                JS_ToUint32(ctx, &len, val);
+                JS_FreeValue(ctx, val);
+                idx = array_set_length_slot(ctx, p, len);   /* the length actually REACHED */
+                DCHECK(idx == len,
+                       "an Array length slot restore was blocked by a NON-CONFIGURABLE index this flow defined "
+                       "above the baseline length — build the descriptor entry so the define comes back out");
+                return;
+            }
+            set_value(ctx, &pr->u.value, val);
+            return;
+        }
+    }
+
+    if (p->fast_array && __JS_AtomIsTaggedInt(prop)) {
+        idx = __JS_AtomToUInt32(prop);
+        if (p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
+            DCHECK(idx < p->u.array.count,
+                   "a mapped-arguments element slot outside the dense part: the mapped part is fixed at "
+                   "creation and a delete converts the object to a slow array first");
+            set_value(ctx, p->u.array.u.var_refs[idx]->pvalue, val);
+            return;
+        }
+        if (is_typed_array(p->class_id)) {
+            /* the store is per element TYPE and JS_SetPropertyValue's switch IS that store; duplicating it here
+               would be a second copy of the one thing this file already says once. `val` came off the read twin,
+               which answers a typed-array element as the NUMBER it holds, so the coercion inside runs no page
+               code and cannot detach the buffer, and with no throw flag every remaining arm answers without
+               throwing: an IMMUTABLE buffer writes nothing, which is the right restore because an element that
+               cannot be written cannot have changed (the entry is JS_DefineProperty capturing before it learns
+               the define will be refused), and an out-of-range index is unreachable behind the bound below. */
+            DCHECK(idx < p->u.array.count,
+                   "a typed-array element slot outside the array: a detached buffer has count 0, and the read "
+                   "twin answers no slot the array does not hold");
+            DCHECK((p->class_id == JS_CLASS_BIG_INT64_ARRAY || p->class_id == JS_CLASS_BIG_UINT64_ARRAY)
+                   ? JS_IsBigInt(val) : JS_IsNumber(val),
+                   "a typed-array element slot restore was handed something the array does not store: the read "
+                   "twin answers a Number, or a BigInt for a 64-bit array, and anything else is COERCED here — "
+                   "the page's valueOf with no flow under it, and a throw with no flow to receive it");
+            JS_SetPropertyValue(ctx, obj, js_int32(idx), val, 0);
+            return;
+        }
+        if (idx >= p->u.array.count && array_grow_dense_to(ctx, p, idx))
+            CHECK_FAIL("a COW slot restore could not grow an array's dense part back over the tail this flow "
+                       "truncated: a dropped baseline element leaks one flow's state into every sibling");
+        set_fast_array_element(ctx, p, idx, val);
+        return;
+    }
+
+    /* THE SLOT IS ABSENT: this flow DELETED a baseline one and the restore has to put it back. Not
+       JS_CreateProperty, which is [[DefineOwnProperty]]'s create half — it consults `extensible`, runs the
+       exotic define_own_property hook, and refuses a typed array's numeric index, and the first of those is
+       precisely the `Object.preventExtensions(o); delete o.x` that used to throw mid-switch.
+       C_W_E is what the entry can express: it records the slot's VALUE and never its attributes, so a baseline
+       slot that was not C_W_E comes back with the wrong ones. That is the DESCRIPTOR entry, named by the assert
+       cow_apply_entries makes when the same gap blocks a re-delete. */
+    DCHECK(!(p->class_id == JS_CLASS_STRING && __JS_AtomIsTaggedInt(prop) &&
+             JS_VALUE_GET_TAG(p->u.object_data) == JS_TAG_STRING &&
+             __JS_AtomToUInt32(prop) < JS_VALUE_GET_STRING(p->u.object_data)->len),
+           "a COW delta holds a String object's index slot: the read twin answers it out of the string's own "
+           "characters, which are non-writable and non-configurable, so no flow can have written or deleted one");
+    pr = add_property(ctx, p, prop, JS_PROP_C_W_E);
+    CHECK(pr, "a COW slot restore could not re-create a slot this flow deleted: a dropped baseline write leaks "
+              "one flow's state into every sibling");
+    pr->u.value = val;
+}
+
 void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                          uint32_t len)
 {
@@ -11922,30 +12071,20 @@ static int call_setter(JSContext *ctx, JSObject *setter,
     }
 }
 
-/* set the array length and remove the array elements if necessary. */
-static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
-                            int flags)
+/* THE LENGTH SLOT, WRITTEN — 10.4.2.4 steps 15-17 with neither its coercion (steps 3-4) nor its read-only test
+   (step 12). The elements at or above `len` are removed and prop[0] is set to the length actually REACHED, which
+   is `len` for a dense array and can be higher for a slow one whose shrink a non-configurable index blocked; the
+   caller compares and decides what that means.
+   Split out of set_array_length for the write that is NOT the operation. JS_SetOwnSlot restores a captured
+   `length` during a context switch, and it must not consult `writable`, because the flow whose baseline is being
+   put back is very often the flow that froze the array. A restore that consults the flow's own attributes is a
+   restore that refuses, and a refusal here has no flow to throw on — see the read twin. */
+static uint32_t array_set_length_slot(JSContext *ctx, JSObject *p, uint32_t len)
 {
-    uint32_t len, idx, cur_len;
+    uint32_t idx, cur_len;
     int i, ret;
 
-    /* 10.4.2.4 steps 3-4 are ToUint32(V) and ToNumber(V) — BOTH on the original V, which is why
-       JS_ToArrayLengthFree does the conversion twice and compares. For an OBJECT V that is the page's
-       valueOf/@@toPrimitive TWICE, and a C activation has no flow to run it on: the write hands that case to
-       CONT_ARRAY_LEN, which produces the validated uint32 and re-issues the operation with it. Reaching here
-       with an object means a write path was not routed — and the DEFINE path's comment used to claim `val is
-       guaranted to be a Uint32`, which `Object.defineProperty([1], "length", {value:{valueOf(){for(;;){}}}})`
-       disproved. */
-    DCHECK(JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT,
-           "an Array length write reached set_array_length with an OBJECT value — route it through CONT_ARRAY_LEN");
-    /* Note: this call can reallocate the properties of 'p' */
-    ret = JS_ToArrayLengthFree(ctx, &len, val, false);
-    if (ret)
-        return -1;
-    /* JS_ToArrayLengthFree() must be done before the read-only test */
-    if (unlikely(!(get_shape_prop(p->shape)[0].flags & JS_PROP_WRITABLE)))
-        return JS_ThrowTypeErrorReadOnly(ctx, flags, JS_ATOM_length);
-
+    cur_len = len;
     if (likely(p->fast_array)) {
         uint32_t old_len = p->u.array.count;
         if (len < old_len) {
@@ -12029,10 +12168,37 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
             cur_len = len;
         }
         set_value(ctx, &p->prop[0].u.value, js_uint32(cur_len));
-        if (unlikely(cur_len > len)) {
-            return JS_ThrowTypeErrorOrFalse(ctx, flags, "not configurable");
-        }
     }
+    return cur_len;
+}
+
+/* set the array length and remove the array elements if necessary. */
+static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
+                            int flags)
+{
+    uint32_t len, cur_len;
+    int ret;
+
+    /* 10.4.2.4 steps 3-4 are ToUint32(V) and ToNumber(V) — BOTH on the original V, which is why
+       JS_ToArrayLengthFree does the conversion twice and compares. For an OBJECT V that is the page's
+       valueOf/@@toPrimitive TWICE, and a C activation has no flow to run it on: the write hands that case to
+       CONT_ARRAY_LEN, which produces the validated uint32 and re-issues the operation with it. Reaching here
+       with an object means a write path was not routed — and the DEFINE path's comment used to claim `val is
+       guaranted to be a Uint32`, which `Object.defineProperty([1], "length", {value:{valueOf(){for(;;){}}}})`
+       disproved. */
+    DCHECK(JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT,
+           "an Array length write reached set_array_length with an OBJECT value — route it through CONT_ARRAY_LEN");
+    /* Note: this call can reallocate the properties of 'p' */
+    ret = JS_ToArrayLengthFree(ctx, &len, val, false);
+    if (ret)
+        return -1;
+    /* JS_ToArrayLengthFree() must be done before the read-only test */
+    if (unlikely(!(get_shape_prop(p->shape)[0].flags & JS_PROP_WRITABLE)))
+        return JS_ThrowTypeErrorReadOnly(ctx, flags, JS_ATOM_length);
+
+    cur_len = array_set_length_slot(ctx, p, len);
+    if (unlikely(cur_len > len))
+        return JS_ThrowTypeErrorOrFalse(ctx, flags, "not configurable");
     return true;
 }
 
@@ -12061,6 +12227,35 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     new_size += slack / sizeof(*new_array_prop);
     p->u.array.u.values = new_array_prop;
     p->u.array.u1.size = new_size;
+    return 0;
+}
+
+/* THE DENSE PART GROWN BACK OVER A TRUNCATED TAIL — the inverse of array_set_length_slot's shrink, and its only
+   caller is the one that has to undo one: JS_SetOwnSlot putting back a baseline element that the running flow's
+   `arr.length = n` removed. The slots between the current count and `idx` are holes here and are filled by the
+   entries restored AFTER this one (a segment restores highest-index-first, so the run walks back down to the
+   baseline length exactly as the appends walked up from it).
+   NOT JS_CreateProperty's convert_to_array, which is what a [[Set]] of an out-of-range index does: a context
+   switch that de-optimises a SHARED array into a slow one has changed the baseline every sibling resumes on,
+   and §Time-travel's resume is byte-identical or it is a cap. The length is carried up with the count exactly as
+   add_fast_array_element carries it, so the fast array's own invariant (length >= count) holds at every
+   intermediate restore; the captured `length` entry then puts the baseline length back over it.
+   Returns -1 with an exception pending on an allocation failure — the one caller turns that into a CHECK. */
+static int array_grow_dense_to(JSContext *ctx, JSObject *p, uint32_t idx)
+{
+    uint32_t new_len = idx + 1;
+
+    DCHECK(p->class_id == JS_CLASS_ARRAY && p->fast_array,
+           "a dense-part grow on something that is not a fast Array — only an Array's length write shrinks a "
+           "dense part, so only an Array has one to grow back");
+    DCHECK(idx >= p->u.array.count, "a dense-part grow to an index the dense part already holds");
+    if (new_len > p->u.array.u1.size && expand_fast_array(ctx, p, new_len))
+        return -1;
+    while (p->u.array.count < new_len)
+        p->u.array.u.values[p->u.array.count++] = JS_UNDEFINED;
+    if (JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT &&
+        (uint32_t)JS_VALUE_GET_INT(p->prop[0].u.value) < new_len)
+        p->prop[0].u.value = js_uint32(new_len);
     return 0;
 }
 
