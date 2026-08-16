@@ -5106,10 +5106,21 @@ bool JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id)
             rt->class_array[class_id].class_id != 0);
 }
 
+/* THE CLASS'S NAME, WHICH IS `class_name` AND NOT `class_id`. This returned the numeric id in the JSAtom's
+   place, and the two are the same C type, so it compiled and answered something for every class. What it
+   answered was the atom whose INDEX happens to equal the class id: JS_CLASS_OBJECT is 1 and quickjs-atom.h's
+   first entry is `null`, so every ordinary object reported its class as "null" — which read exactly like an
+   object that had been through free_object (class_id 0 => unregistered => JS_ATOM_NULL), and sent a solver
+   investigation hunting a use-after-free for a plain `{}`. A diagnostic that fabricates its answer is worse
+   than one that is missing, because it is indistinguishable from a measurement.
+   IT IS ALSO A MEMORY BUG, not only a wrong string: JS_DupAtomRT indexes rt->atom_array by the value it is
+   given and increments the refcount it finds there, so a class registered through JS_NewClassID — every
+   host-defined class, of which this engine has dozens — dup'd whatever atom sits at that index, or read past
+   the atom table entirely when the id exceeds it. */
 JSAtom JS_GetClassName(JSRuntime *rt, JSClassID class_id)
 {
     if (JS_IsRegisteredClass(rt, class_id)) {
-        return JS_DupAtomRT(rt, rt->class_array[class_id].class_id);
+        return JS_DupAtomRT(rt, rt->class_array[class_id].class_name);
     } else {
         return JS_ATOM_NULL;
     }
