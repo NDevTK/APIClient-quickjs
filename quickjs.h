@@ -1457,12 +1457,21 @@ typedef void JSPromiseHook(JSContext *ctx, JSPromiseHookType type,
                            void *opaque);
 /* Enqueue `func(arg)` as a JOB that runs as a CALL-ROOT FLOW — the platform's route from a host edge to a page
    callback (an event listener, a timer). Not a JS_Call: the callback is the page's code and must be able to
-   loop, await and fork, which a C activation cannot host. */
+   loop, await and fork, which a C activation cannot host.
+   A MICROTASK IS QUEUED BY RUNNING SCRIPT, so this entry always has a flow to own its callback and the
+   scheduler takes it at once. The TASK entry below is the one that can be called before there is a frontier at
+   all — see it. */
 JS_EXTERN void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
 /* THE SAME, ON A TASK SOURCE rather than the microtask queue — HTML 8.1.7's other half. A platform edge that
    the spec words as "queue a task" (8.6's timer task source, a queued event fire, a delivered reply) uses this
    one, and the event loop will not begin it until every microtask outstanding has run. Choosing the wrong one
-   is not a performance detail: it reorders what the page observes. */
+   is not a performance detail: it reorders what the page observes.
+   IT MAY BE CALLED BEFORE THERE IS A FRONTIER, which is the other half of the same distinction: the user agent
+   queues a task whenever it likes, including while it is CREATING a Document — HTML §4.8.5's insertion steps
+   for an `<iframe src>` in a page's initial markup queue §7.4 step 14's navigation, and in this engine that
+   happens at qjs_init, before the scheduler is seeded. Such a task is BASELINE work and waits on the runtime
+   for the FIRST FLOW to adopt it (`baseline_call_list` in quickjs.c). It is never dropped, and no embedder
+   pump ever runs it — the callback belongs to a flow's timeline. */
 JS_EXTERN void JS_EnqueueCallTask(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
 JS_EXTERN void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook,
                                  void *opaque);

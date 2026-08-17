@@ -380,6 +380,28 @@ struct JSRuntime {
        this engine picks — it is what the event loop IS — so it lives in the queue rather than in each pump. */
     struct list_head job_list;  /* the MICROTASK queue; list of JSJobEntry.link */
     struct list_head task_list; /* the TASK queues, in the one order a task source's tasks are picked */
+    /* THE WORK THE BASELINE QUEUED, WAITING FOR THE FIRST FLOW TO OWN IT — the two queues above answer "what
+       does the event loop run next", and this one answers a question that exists before there is an event loop
+       at all.
+       A DOCUMENT IS CREATED BEFORE ITS AGENT HAS A FRONTIER. HTML §4.8.5's insertion steps run for every
+       <iframe> in a document's INITIAL MARKUP, so installing the document queues §7.4 step 14's navigation —
+       and in this engine the document is installed by qjs_init while the frontier is seeded by qjs_begin, so
+       at that instant there is no flow to own the callback and no scheduler to hand it to. It went on
+       `job_list`, which this engine never drains (the scheduler IS the job pump — CLAUDE.md §scheduler), so
+       every <iframe src> in a page's own markup was a work item nobody would ever run. The scheduler asserted
+       exactly that at the top of its session (engine/host/solver/engine.c), which is why an iframe-bearing page
+       ABORTED rather than merely losing its frames.
+       SO IT IS HELD HERE AND ADOPTED, which is §Boot's own sentence: the baseline is pre-boot state and boot is
+       the forking FIRST FLOW, so work the baseline queued is that flow's. js_adopt_baseline_calls hands the
+       whole list to the enqueue hook at the one point a flow is EXECUTING, in arrival order, and the entries
+       become ordinary members of the ONE frontier's per-flow queues. Nothing runs from this list: it is a
+       handover, not a second pump.
+       IT IS NOT `JS_IsJobPending`, DELIBERATELY. That predicate answers "does the runtime hold a job for an
+       embedder's JS_ExecutePendingJob to run", and these are not that — no embedder may run them, because the
+       callback belongs to a flow's timeline and there is no flow yet. An entry still here when the runtime is
+       freed IS a dropped work item, and that is where it crashes.
+       ONLY TASKS REACH IT — js_enqueue_platform_call says why a microtask cannot be ownerless. */
+    struct list_head baseline_call_list; /* list of JSJobEntry.link, task-source entries in arrival order */
     /* FINALIZATION-REGISTRY ENTRIES WHOSE TARGET HAS DIED, waiting to become cleanup jobs. 9.13's
        HostEnqueueFinalizationRegistryCleanupJob is the HOST's, "at some future time" — V8 posts it from the GC
        epilogue — and this list is that seam. Enqueueing it where the target is freed instead put allocation
@@ -1273,6 +1295,11 @@ typedef struct JSJobEntry {
     JSContext *ctx;
     JSJobFunc *job_func;
     int argc;
+    /* WHICH OF HTML 8.1.7'S TWO QUEUES THIS ENTRY BELONGS TO. On `job_list`/`task_list` the list it is on is
+       already the answer; on `baseline_call_list` there is no such list to read it off, and the adoption has to
+       hand the scheduler the same flag js_enqueue would have — so a task the user agent queued before the
+       frontier existed does not arrive as a microtask and run inside the first checkpoint it meets. */
+    bool is_task;
     JSValue argv[];
 } JSJobEntry;
 
@@ -2790,6 +2817,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 #endif
     init_list_head(&rt->job_list);
     init_list_head(&rt->task_list);
+    init_list_head(&rt->baseline_call_list);
     init_list_head(&rt->finrec_pending);
 
     if (JS_InitAtoms(rt))
@@ -2976,11 +3004,43 @@ typedef struct { int depth; const char *what; int max; } JSCycleGuard;
 #define CYCLE_GUARD_LEAVE(g)           do { } while (0)
 #endif
 
+/* ONE QUEUE ENTRY, BUILT ONCE — three call sites hold this shape (the two runtime queues, the baseline list)
+   and a fourth reads it back, so the field list lives in one place. Adding a field to JSJobEntry is then one
+   edit here and one in js_job_entry_free, which are read together. Answers NULL on OOM; the caller decides
+   what an unqueued callback means, because the two callers differ (a promise reaction can report it, a
+   platform callback cannot). */
+static JSJobEntry *js_job_entry_new(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv,
+                                    bool is_task)
+{
+    JSJobEntry *e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+    int i;
+
+    if (!e)
+        return NULL;
+    e->ctx = ctx;
+    e->job_func = job_func;
+    e->argc = argc;
+    e->is_task = is_task;
+    for (i = 0; i < argc; i++)
+        e->argv[i] = js_dup(argv[i]);
+    return e;
+}
+
+/* …AND RELEASED ONCE. The entry OWNS a reference to every argument (js_job_entry_new dup'd them), so this is
+   the same list the constructor filled, read the other way round. */
+static void js_job_entry_free(JSRuntime *rt, JSJobEntry *e)
+{
+    int i;
+
+    for (i = 0; i < e->argc; i++)
+        JS_FreeValueRT(rt, e->argv[i]);
+    js_free_rt(rt, e);
+}
+
 static int js_enqueue(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv, bool is_task)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
-    int i;
 
     DCHECK(!rt->in_free, "!rt->in_free");
 
@@ -2991,17 +3051,86 @@ static int js_enqueue(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueCons
     if (g_job_enqueue_hook && g_job_enqueue_hook(ctx, job_func, argc, argv, is_task))
         return 0;
 
-    e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+    e = js_job_entry_new(ctx, job_func, argc, argv, is_task);
     if (!e)
         return -1;
-    e->ctx = ctx;
-    e->job_func = job_func;
-    e->argc = argc;
-    for(i = 0; i < argc; i++) {
-        e->argv[i] = js_dup(argv[i]);
-    }
     list_add_tail(&e->link, is_task ? &rt->task_list : &rt->job_list);
     return 0;
+}
+
+/* THE PLATFORM'S OWN ENQUEUE — a callback the USER AGENT queues, as opposed to one a running program queued.
+ *
+ * A TASK IS THE ONE KIND THAT CAN ARRIVE WITH NO OWNER, and that is HTML's distinction rather than a
+ * convenience here. A MICROTASK is queued by script that is RUNNING (a reaction, queueMicrotask, 9.13's
+ * cleanup job), so a flow always exists to own it; the user agent queues a TASK whenever it likes, including
+ * while it is CREATING a Document — which in this engine happens at qjs_init, before the frontier is seeded.
+ * §4.8.5's insertion steps for an `<iframe src>` in a page's initial markup queue §7.4 step 14's navigation
+ * exactly there.
+ *
+ * SO AN UNOWNED TASK IS BASELINE WORK, not a global-list drop. It waits on baseline_call_list (see the field)
+ * until the first flow executes and adopts it. Everything else keeps js_enqueue's default, and that is
+ * load-bearing rather than conservative: an embedder that pumps with JS_ExecutePendingJob — the upstream
+ * contract, which run-test262 and quickjs-libc are — has no frontier to adopt anything into, and 9.13's
+ * cleanup job reaches this function through exactly that embedder.
+ *
+ * Returns 0 when the callback is queued somewhere it will run, -1 on allocation failure. */
+static int js_enqueue_platform_call(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv,
+                                    bool is_task)
+{
+    JSRuntime *rt = ctx->rt;
+    JSJobEntry *e;
+
+    DCHECK(!rt->in_free, "a platform callback was queued while the runtime was being freed");
+    if (g_job_enqueue_hook || !is_task)
+        return js_enqueue(ctx, job_func, argc, argv, is_task);
+    e = js_job_entry_new(ctx, job_func, argc, argv, is_task);
+    if (!e)
+        return -1;
+    list_add_tail(&e->link, &rt->baseline_call_list);
+    return 0;
+}
+
+/* HAND THE BASELINE'S QUEUED WORK TO THE SCHEDULER — the other half of baseline_call_list, run at the one
+ * point in this engine where a flow is EXECUTING and therefore the one point where there is a member of the
+ * frontier to own a callback. §Boot: the baseline is pre-boot state and boot is the forking FIRST FLOW, so the
+ * work the baseline queued is that flow's work.
+ *
+ * IN ARRIVAL ORDER, and each entry says which queue it belongs to, so a navigation task the parser queued does
+ * not arrive as a microtask. An entry the hook DECLINES stays on the list — declining is not dropping, and the
+ * next flow to execute asks again — but it is a should-never-happen at this call site, because the hook is
+ * being asked from inside a running flow and that is the one thing it needs. */
+static void js_adopt_baseline_calls(JSRuntime *rt)
+{
+    struct list_head *el, *el1;
+
+    if (likely(list_empty(&rt->baseline_call_list)))
+        return;
+    DCHECK(g_job_enqueue_hook != NULL,
+           "a flow is executing over a runtime that holds BASELINE callbacks and no scheduler owns the queues "
+           "— the flow machinery and the job-enqueue hook are one host's, so a host driving flows without "
+           "installing the hook has no frontier for these to become members of, and they would be dropped");
+    /* RELEASE PATH UNDER THE ASSERT: leave them where they are rather than hand them to nothing. They are not
+       lost — the next flow to execute asks again — and there is no other owner to offer them to. */
+    if (!g_job_enqueue_hook)
+        return;
+    list_for_each_safe(el, el1, &rt->baseline_call_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        int taken;
+
+        DCHECK(e->is_task,
+               "a MICROTASK was waiting on the baseline list — js_enqueue_platform_call routes only tasks "
+               "there, because a microtask is queued by RUNNING script and therefore always has a flow to own "
+               "it; one here means a second writer to this list that did not read that rule");
+        taken = g_job_enqueue_hook(e->ctx, e->job_func, e->argc, vc(e->argv), e->is_task);
+        DCHECK(taken,
+               "the scheduler DECLINED a callback the baseline queued while a flow was executing — the only "
+               "reason it declines is that no flow is running, and one is, so the adoption is being made from "
+               "somewhere that is not inside a flow");
+        if (!taken)
+            return;
+        list_del(&e->link);
+        js_job_entry_free(rt, e);
+    }
 }
 
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
@@ -3029,14 +3158,11 @@ static int js_drop_jobs_from(JSRuntime *rt, struct list_head *q, JSContext *ctx)
 
     list_for_each_safe(el, el1, q) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
-        int i;
 
         if (e->ctx != ctx)
             continue;
         list_del(&e->link);
-        for (i = 0; i < e->argc; i++)
-            JS_FreeValueRT(rt, e->argv[i]);
-        js_free_rt(rt, e);
+        js_job_entry_free(rt, e);
         n++;
     }
     return n;
@@ -3049,11 +3175,24 @@ int JS_DropJobsForContext(JSContext *ctx)
 
     n  = js_drop_jobs_from(rt, &rt->job_list, ctx);
     n += js_drop_jobs_from(rt, &rt->task_list, ctx);
+    /* AND THE BASELINE'S, which is a THIRD place a destroyed document's work can be standing. §7.5.10 step 7
+       removes every queued task of the Document being destroyed "without running those tasks", and a document
+       destroyed before the first flow ever executed — a boot flow that removes the `<iframe>` its own markup
+       carried — still has its §7.4 step 14 navigation waiting for adoption. Left here it would be adopted
+       afterwards and would load a document into a navigable that no longer exists. */
+    n += js_drop_jobs_from(rt, &rt->baseline_call_list, ctx);
     if (g_job_drop_hook)
         n += g_job_drop_hook(ctx);
     return n;
 }
 
+/* THE TWO EVENT-LOOP QUEUES ONLY, AND `baseline_call_list` IS EXCLUDED ON PURPOSE. This predicate answers one
+   question — "does the runtime hold a job for JS_ExecutePendingJob to run" — and a baseline callback is not
+   one: it belongs to a flow's timeline and there is no flow yet, so no embedder pump may run it and no host may
+   be told it has work it cannot do. Adding it here would make every document with an initial-markup
+   `<iframe src>` report pending work between qjs_init and qjs_begin, which is the state the adoption exists to
+   make ordinary; the invariant that the callback is not LOST is asserted where it is decidable, at
+   JS_FreeRuntime. */
 bool JS_IsJobPending(JSRuntime *rt)
 {
     js_finrec_drain(rt, true);
@@ -3339,18 +3478,31 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
-        for(i = 0; i < e->argc; i++)
-            JS_FreeValueRT(rt, e->argv[i]);
-        js_free_rt(rt, e);
+        js_job_entry_free(rt, e);
     }
     init_list_head(&rt->job_list);
     list_for_each_safe(el, el1, &rt->task_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
-        for(i = 0; i < e->argc; i++)
-            JS_FreeValueRT(rt, e->argv[i]);
-        js_free_rt(rt, e);
+        js_job_entry_free(rt, e);
     }
     init_list_head(&rt->task_list);
+    /* A BASELINE CALLBACK STILL HERE IS A WORK ITEM NOBODY EVER RAN, and this is the only place that can say
+       so: the list is not JS_IsJobPending's, so no host asks about it, and it is adopted at the first flow
+       that EXECUTES — so what survives to here is a document whose frontier never ran a program at all. The
+       page that produces it is an `<iframe src>` in the initial markup of a document carrying no `<script>`:
+       its boot flow reaches the document-done stages without ever calling JS_FlowResume, so the frame's §7.4
+       step 14 navigation is never adopted and the child document is never fetched, parsed or run. What to
+       build is a second adoption point that does not depend on a PROGRAM — the scheduler reaches every flow
+       once per step whether or not that flow has bytecode to run, and that step boundary is the seam. */
+    DCHECK(list_empty(&rt->baseline_call_list),
+           "the runtime was freed still holding callbacks the BASELINE queued — nothing adopted them, so the "
+           "work they name (an initial-markup <iframe src>'s navigation, a platform task queued while the "
+           "Document was being created) was never run and never reported");
+    list_for_each_safe(el, el1, &rt->baseline_call_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        js_job_entry_free(rt, e);
+    }
+    init_list_head(&rt->baseline_call_list);
 
     /* A parked cleanup entry that never became a job still owns its callback, held value and context, so it is
        released here rather than reported as a leak by the walk below. */
@@ -42873,6 +43025,13 @@ static void free_tramp_chain(JSContext *ctx, JSAsyncFunctionState *s);
 int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     DCHECK(pres != NULL, "JS_FlowResume: the completion value is part of the completion — the caller must take it");
+    /* THE BASELINE'S QUEUED WORK BECOMES THIS FLOW'S — see baseline_call_list. This is the ONE line in the
+       engine at which a flow is executing and the scheduler owns the queues, which are the two things a
+       platform callback queued before the frontier existed has been waiting for. It is here rather than at the
+       session's start because the scheduler has no flow SWITCHED IN there: it seeds one and returns, and the
+       hook it installs answers "no flow is running" until the first step. Ordinarily a no-op — one
+       list_empty on a list that is empty for the whole of every session after the first program starts. */
+    js_adopt_baseline_calls(ctx->rt);
     /* NESTED resume: a host API that evaluates a program synchronously while a flow is already running
        ($262.evalScript, and any embedder JS_Eval from a C builtin) starts a SECOND flow from inside the outer
        flow's C stack. Without this restore the inner flow's base would stay installed after it finishes, and
@@ -97447,7 +97606,10 @@ static void js_enqueue_call(JSContext *ctx, JSValueConst func, int argc, JSValue
     args[0] = func;
     for (i = 0; i < argc; i++)
         args[i + 1] = argv[i];
-    CHECK(js_enqueue(ctx, host_call_job, argc + 1, args, is_task) == 0,
+    /* THE PLATFORM'S ENQUEUE, not js_enqueue's — this entry is the USER AGENT queueing a callback, and the
+       user agent queues one whenever it likes, including while it is CREATING a Document and therefore before
+       any flow exists to own it. js_enqueue_platform_call is what says where such a callback waits. */
+    CHECK(js_enqueue_platform_call(ctx, host_call_job, argc + 1, args, is_task) == 0,
           "a page callback could not be queued: out of memory building its job entry");
     if (args != stack)
         js_free(ctx, (void *)args);
