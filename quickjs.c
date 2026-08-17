@@ -21530,8 +21530,10 @@ int step_todouble_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, 
    because the buffer must be declared in the machine's `visit` for a fork to copy it. `cb` is 2 + argc slots:
    [this, func, args...], the shape the dispatch reads. The machine OWNS what it puts there; this dups on the
    way in and releases on the way out, so a machine never has to remember either half.
-     0 = *pout is the result, 3 = the caller must return that step code, and a throw ABANDONS the machine — a
-   listener's uncaught exception is the page's, and the engine does not swallow it. */
+     0 = *pout is the result, 3 = the caller must return that step code, and a throw ABANDONS the machine unless
+   its definition declares catches_abrupt — a listener's uncaught exception is the page's, and the engine does not
+   swallow it; an algorithm the standard wraps in "while catching any exceptions" is told about it here, as
+   *pout == JS_EXCEPTION with the completion still live. */
 int step_call_run(JSContext *ctx, uint8_t *phase, JSValue *cb, int cb_cap, JSValueConst func,
                   JSValueConst this_val, int argc, JSValueConst *argv, JSValue in, JSValue *pout,
                   JSValue **out_cb, int *out_argc)
@@ -29817,13 +29819,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_iter_consume_step;
                         }
                         DCHECK(ckind == CONT_STEP, "do_construct_dispatch: unknown outer sequence kind");
-                        /* the in-place CONSTRUCT's abrupt, named for the same reason the in-place CALL's is —
-                           see the DCHECK at do_cont_dispatch's CONT_STEP delivery. */
-                        DCHECK(!(JS_IsException(ret_val) && ((JSStepHdr *)cont_st)->def->catches_abrupt),
-                               "a C constructor threw IN PLACE under a machine that declares catches_abrupt, and "
-                               "this arm abandons it instead of delivering — route it to do_step_step with "
-                               "JS_EXCEPTION, the way the frame unwind's CONT_STEP arm does");
-                        if (unlikely(JS_IsException(ret_val))) goto step_abandon;
+                        /* the in-place CONSTRUCT's abrupt, decided where the in-place CALL's is — one request kind
+                           may not answer differently from the other. See step_request_abrupt. */
+                        if (unlikely(JS_IsException(ret_val))) goto step_request_abrupt;
                         goto do_step_step;
                     }
                     if (unlikely(JS_IsException(ret_val))) goto exception;
@@ -30588,15 +30586,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             if (unlikely(JS_IsException(ret_val))) { js_toprim_abandon(ctx, cont_st); goto exception; }
                             goto do_toprim_step;
                         }
-                        /* THE IN-PLACE HALF OF THE ABRUPT DELIVERY, named here for the reason the inner-machine
-                           one below is: the callee was a C builtin, so nothing suspended and the throw arrives
-                           HERE rather than at the frame unwind — and this arm abandons the machine even when its
-                           definition declares that an abrupt call result is its algorithm's value. */
-                        DCHECK(!(JS_IsException(ret_val) && ((JSStepHdr *)cont_st)->def->catches_abrupt),
-                               "a C callee threw IN PLACE under a machine that declares catches_abrupt, and this "
-                               "arm abandons it instead of delivering — route it to do_step_step with "
-                               "JS_EXCEPTION, the way the frame unwind's CONT_STEP arm does");
-                        if (unlikely(JS_IsException(ret_val))) goto step_abandon;
+                        /* THE IN-PLACE HALF OF THE ABRUPT DELIVERY: the callee was a C builtin, so nothing
+                           suspended and the throw arrives HERE rather than at the frame unwind. Whether it is a
+                           delivery or a demolition is one declaration, asked at step_request_abrupt. */
+                        if (unlikely(JS_IsException(ret_val))) goto step_request_abrupt;
                         goto do_step_step;
                     }
                     if (dck == CONT_ITER_CLOSE_CALL) {
@@ -31447,10 +31440,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_preempt;
                 }
 
+            step_request_abrupt:
+                /* AN IN-PLACE REQUEST COMPLETED ABRUPTLY — and whether that is a DELIVERY or a demolition is the
+                 * machine's own declaration, asked HERE and not at the arms, because the CALL arm and the CONSTRUCT
+                 * arm are two spellings of one question and each of them answered it alone (by abandoning).
+                 *
+                 * A definition that declares catches_abrupt states that an abrupt request result is its
+                 * ALGORITHM'S VALUE — DOM §4.9 Interface Element, "create an element" step 5.1.4 is "Run these
+                 * steps while catching any exceptions", so createElement REPORTS a throwing custom-element
+                 * constructor and answers with a failed HTMLUnknownElement. So the machine is re-entered with
+                 * JS_EXCEPTION and the throw still live, exactly as the frame unwind's CONT_STEP arms re-enter it,
+                 * and step_call_run / step_construct_run END the request at the call site that parked on it and
+                 * hand the abrupt back as *pout. Abandoning instead made one algorithm answer differently
+                 * depending on whether its callee happened to have a BYTECODE body — the same divergence the
+                 * frame-unwind arm was written to close, on the other side of the seam.
+                 *
+                 * There is nothing to drop: a sequence's call and a machine's construct keep their operands in the
+                 * machine's own buffer, which both arms assert before they arrive. */
+                DCHECK(JS_IsException(ret_val),
+                       "the in-place abrupt delivery was entered with a value rather than a throw — a machine that "
+                       "catches abrupt completions would read this one as its request's answer");
+                if (((JSStepHdr *)cont_st)->def->catches_abrupt)
+                    goto do_step_step;
+                /* fall through */
             step_abandon:
-                /* an INLINE call/construct threw (a C callee, so nothing suspended): the machine that asked can
+                /* an INLINE call/construct threw and the machine does NOT catch it: the machine that asked can
                    never be reached again, and neither can the machines waiting on IT. The machine is `cont_st`,
-                   which is the ONE variable both arms that jump here agree on — reading it from a local that only
+                   which is the ONE variable every arm that jumps here agrees on — reading it from a local that only
                    the CALL arm set left the CONSTRUCT arm freeing a machine that was already gone. */
                 tramp_step_chain_free(ctx, cont_st);
                 goto exception;
@@ -42508,6 +42524,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     js_free_rt(rt, cs->outer);
                 } else {
                     DCHECK(cs->outer_kind == CONT_STEP, "construct outer continuation: unknown machine kind");
+                    if (((JSStepHdr *)cs->outer)->def->catches_abrupt) {
+                        /* THE CONSTRUCT'S HALF OF THE CALL ARM BELOW. The page's constructor had a BODY, so its
+                           throw arrives here rather than at do_construct_dispatch's in-place arm — and DOM §4.9
+                           Interface Element, "create an element" step 5.1.4 is "Run these steps while catching any
+                           exceptions", so createElement REPORTS it and answers with a failed HTMLUnknownElement.
+                           Freeing the machine here made that depend on whether the page wrote its custom element
+                           in JS or the engine supplied a C constructor. A machine's Construct puts no operands on
+                           the caller stack (the request holds them), so there are none to drop. */
+                        DCHECK(xcg == xcf, "a step machine's Construct never puts operands on the caller stack");
+                        cont_st = cs->outer;
+                        js_free_rt(rt, cs);
+                        ret_val = JS_EXCEPTION;
+                        goto do_step_step;
+                    }
                     tramp_step_state_free(ctx, cs->outer, false);   /* fini OWNS the allocation */
                 }
             }
