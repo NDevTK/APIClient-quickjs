@@ -21151,7 +21151,7 @@ static int step_species_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSVa
     }
 }
 
-/* TypedArraySpeciesCreate (23.2.4.1) as a RESUMABLE sub-sequence — the same shape and the same phases as
+/* TypedArraySpeciesCreate (23.2.4.3) as a RESUMABLE sub-sequence — the same shape and the same phases as
    ArraySpeciesCreate above. Three of its steps run the page's code: Get(O,"constructor"), Get(C,@@species) and
    the Construct. js_typed_array___speciesCreate performed all three from C, so `%TypedArray%[@@species]` set to
    a constructor with a loop in it had no flow base — and once a builtin constructor is a STEP MACHINE that C
@@ -23810,30 +23810,36 @@ static void *js_from_ctor_abandon_upto(JSContext *ctx, void *st, uint8_t *out_ki
     return o;
 }
 
-static void js_from_ctor_abandon(JSContext *ctx, void *st)
-{
-    uint8_t k;
-    void *o = js_from_ctor_abandon_upto(ctx, st, &k);
-    if (o) tramp_step_chain_free(ctx, o);
-}
-
 /* THE ONE teardown of a construct's REQUESTER — the machine waiting for the object. It is reached from every
    abrupt exit of the dispatch, and it has to ASK WHAT KIND the requester is: con_outer_kind is CONT_STEP for a
    step machine, but CONT_FROM_CTOR and CONT_ITER_CONSUME are also requesters, and neither of those states begins
    with a JSStepHdr. Freeing them through the step chain reads their first JSValue field as a JSTrampStepDef * and
    calls through it — the same crash the consume-abandon comment records, and what a blanket
-   tramp_step_chain_free here produced: the suite died without printing a line. */
+   tramp_step_chain_free here produced: the suite died without printing a line.
+   A LOOP over the reports, for the reason js_iter_consume_end_upto REPORTS rather than walks: a requester's own
+   requester is another construct requester whenever §23.2.4.1 TypedArrayCreateFromConstructor is requested from
+   inside a consume that was itself requested by one, and the page picks that depth. Written as calls, one C frame
+   per level; written here, none — each arm either ENDS the chain or hands back the next link. */
 struct JSPromiseCap;
 static void js_promise_cap_requester_abandon(JSContext *ctx, void *st);   /* declared with its record */
 static void js_construct_requester_abandon(JSContext *ctx, void *outer, uint8_t kind)
 {
-    if (!outer)
+    while (outer) {
+        if (kind == CONT_PROMISE_CAP) { js_promise_cap_requester_abandon(ctx, outer); return; }
+        if (kind == CONT_FROM_CTOR) { outer = js_from_ctor_abandon_upto(ctx, outer, &kind); continue; }
+        /* declared later; the alias is asserted equal */
+        if (kind == CONT_ITER_CONSUME_FWD) { outer = js_iter_consume_abandon_upto(ctx, outer, &kind); continue; }
+        DCHECK(kind == CONT_STEP, "construct requester: unknown machine kind");
+        tramp_step_chain_free(ctx, outer);
         return;
-    if (kind == CONT_PROMISE_CAP) { js_promise_cap_requester_abandon(ctx, outer); return; }
-    if (kind == CONT_FROM_CTOR) { js_from_ctor_abandon(ctx, outer); return; }
-    if (kind == CONT_ITER_CONSUME_FWD) { js_iter_consume_abandon(ctx, outer); return; }   /* declared later; the alias is asserted equal */
-    DCHECK(kind == CONT_STEP, "construct requester: unknown machine kind");
-    tramp_step_chain_free(ctx, outer);
+    }
+}
+
+/* The two fixed-kind entries into that loop. They exist because the abandon HOOKS take a bare state — they are
+   named from a call site that already knows the kind — and not because either is a second teardown. */
+static void js_from_ctor_abandon(JSContext *ctx, void *st)
+{
+    js_construct_requester_abandon(ctx, st, CONT_FROM_CTOR);
 }
 typedef struct JSAcquireGet {
     JSValueConst iterable;   /* BORROWED: it is the consumer's own call operand, which lives on the caller's stack
@@ -29441,9 +29447,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 tramp_cap_ctor = JS_UNDEFINED;
                 JS_FreeValue(ctx, tramp_cap_parent); tramp_cap_parent = JS_UNDEFINED;
                 if (cq) {
-                    if (ck9 == CONT_PROMISE_ALL) {
+                    if (ck9 == CONT_PROMISE_ALL || ck9 == CONT_PROMISE_ALL_RECAP) {
                         /* the AGGREGATE's own capability could not be built, so there is no promise to reject with
-                           — IfAbruptRejectPromise has nothing to act on and the throw propagates. */
+                           — IfAbruptRejectPromise has nothing to act on and the throw propagates. A forked
+                           sibling asking again (RECAP) is the same aggregate with the same nothing to reject, and
+                           js_promise_cap_requester_abandon already answered both; only this copy of the list was
+                           missing the second, which the construct unwind's convergence would have DCHECKed. */
                         js_promise_all_end(ctx, (JSPromiseAll *)cq); js_free_rt(rt, cq);
                         goto exception;
                     }
@@ -29849,7 +29858,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            to suspend, so it ran in place and the machine is still parked and resumable. Which
                            machine, and what an abrupt one means to it, is the shared delivery's question — a
                            CONSUME machine asking for §23.2.2.1 %TypedArray%.from step 5.c's
-                           §23.2.4.2 TypedArrayCreateFromConstructor is answered here exactly as the bytecode
+                           §23.2.4.1 TypedArrayCreateFromConstructor is answered here exactly as the bytecode
                            settle answers it. */
                         cont_st = con_outer; con_deliver_kind = con_outer_kind;
                         con_outer = NULL; con_outer_kind = CONT_NONE;
@@ -42542,38 +42551,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                new C() the operands on the caller stack are freed by the caller's own catch-search; for super()
                there are no caller-stack operands (args are the derived frame's argv). */
             struct JSConstruct *cs = xcs;
+            void *creq = cs->outer; uint8_t creq_kind = cs->outer_kind;
             JS_FreeValue(ctx, cs->created_obj);
             JS_FreeValue(ctx, cs->super_ref);
-            if (cs->outer) {
-                /* the machine that requested this construct is abandoned with it — otherwise its collected array,
-                   iterator and callback state leak on every throwing constructor. */
-                if (cs->outer_kind == CONT_PROMISE_CAP) {
-                    js_promise_cap_requester_abandon(ctx, cs->outer);
-                } else if (cs->outer_kind == CONT_FROM_CTOR) {
-                    js_from_ctor_abandon(ctx, cs->outer);
-                } else if (cs->outer_kind == CONT_ITER_CONSUME) {
-                    js_iter_consume_end(ctx, (struct JSIterConsume *)cs->outer);
-                    js_free_rt(rt, cs->outer);
-                } else {
-                    DCHECK(cs->outer_kind == CONT_STEP, "construct outer continuation: unknown machine kind");
-                    if (((JSStepHdr *)cs->outer)->def->catches_abrupt) {
-                        /* THE CONSTRUCT'S HALF OF THE CALL ARM BELOW. The page's constructor had a BODY, so its
-                           throw arrives here rather than at do_construct_dispatch's in-place arm — and DOM §4.9
-                           Interface Element, "create an element" step 5.1.4 is "Run these steps while catching any
-                           exceptions", so createElement REPORTS it and answers with a failed HTMLUnknownElement.
-                           Freeing the machine here made that depend on whether the page wrote its custom element
-                           in JS or the engine supplied a C constructor. A machine's Construct puts no operands on
-                           the caller stack (the request holds them), so there are none to drop. */
-                        DCHECK(xcg == xcf, "a step machine's Construct never puts operands on the caller stack");
-                        cont_st = cs->outer;
-                        js_free_rt(rt, cs);
-                        ret_val = JS_EXCEPTION;
-                        goto do_step_step;
-                    }
-                    tramp_step_state_free(ctx, cs->outer, false);   /* fini OWNS the allocation */
-                }
-            }
             js_free_rt(rt, cs);
+            if (creq) {
+                /* THE CONSTRUCT COMPLETED ABRUPTLY, with the constructor's BODY under it instead of a C
+                   constructor — the same event, so the same delivery. This carried its own copy of the four arms
+                   and the copy had gone stale three separate ways: a consume machine was ended without the
+                   IfAbruptCloseIterator its abandon owes, a non-catching step machine was freed ALONE so every
+                   machine waiting on it leaked (tramp_step_state_free where the walk belongs), and the capability
+                   took a different teardown from the one the dispatch hands it. The step arm's own declaration —
+                   DOM §4.9 Interface Element, "create an element" step 5.1.4 runs the constructor "while catching
+                   any exceptions", so createElement REPORTS a throwing custom element — is asked at
+                   step_request_abrupt, which is where the CALL side already asks it.
+                   A requested Construct puts no operands on the caller stack (the request holds them), which is
+                   what lets this jump leave sp alone. */
+                DCHECK(xcg == xcf, "a requested Construct never puts operands on the caller stack");
+                cont_st = creq; con_deliver_kind = creq_kind;
+                ret_val = JS_EXCEPTION;
+                goto do_construct_requester_abrupt;
+            }
         } else if (xck == CONT_SETTER || xck == CONT_INSTANCEOF
                    || xck == CONT_ITER_NEXT_OP || xck == CONT_ITER_CALL
                    || xck == CONT_FOROF_ACQUIRE
@@ -74737,8 +74735,11 @@ static void *js_iter_consume_end_upto(JSContext *ctx, JSIterConsume *s, uint8_t 
            abrupt path already calls, rather than in a list of the eight sites that tear a consume down — a list
            is what the next site added forgets, and `Reflect.construct(Int8Array, [{}], throwingProto)` leaked a
            whole machine through exactly one of them. The FINISH clears s->outer before calling this, because
-           there the requester is being RESUMED, not abandoned. */
-        DCHECK(s->outer_kind == CONT_STEP, "consume outer continuation: unknown machine kind");
+           there the requester is being RESUMED, not abandoned.
+           The KIND is reported, never asserted here: a consume machine's outer is whatever con_outer was at the
+           Map/Set and TypedArray consume arms, so it is any of the four construct-requester kinds — and a copy of
+           that list at this site is the copy that goes stale. js_construct_requester_abandon owns the list, and
+           this report names no ownership. */
         o = s->outer; *out_kind = s->outer_kind;
         s->outer = NULL; s->outer_kind = CONT_NONE;
     }
@@ -74749,7 +74750,7 @@ static void js_iter_consume_end(JSContext *ctx, JSIterConsume *s)
 {
     uint8_t k;
     void *o = js_iter_consume_end_upto(ctx, s, &k);
-    if (o) tramp_step_chain_free(ctx, o);
+    js_construct_requester_abandon(ctx, o, k);
 }
 
 /* A phase this machine asked the interpreter to run (the entry key's ToPrimitive) THREW where there is no way
@@ -74770,9 +74771,7 @@ static void *js_iter_consume_abandon_upto(JSContext *ctx, void *st, uint8_t *out
 
 static void js_iter_consume_abandon(JSContext *ctx, void *st)
 {
-    uint8_t k;
-    void *o = js_iter_consume_abandon_upto(ctx, st, &k);
-    if (o) tramp_step_chain_free(ctx, o);
+    js_construct_requester_abandon(ctx, st, CONT_ITER_CONSUME);
 }
 
 /* Route Array.from ONLY for the direct-generator, single-arg (no mapfn) shape — the case whose C loop drives the
