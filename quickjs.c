@@ -45334,10 +45334,30 @@ static void js_async_gen_park_resume(JSContext *ctx, void *opaque)
     JS_FreeValue(ctx, gobj);   /* release the ref taken at park */
 }
 
-/* …and the same release for a park that will never run — see js_async_resume_park_free. */
+/* …AND THE SAME RELEASE FOR A PARK THAT WILL NEVER RUN, with the same hazard the async continuation has and
+   for the same reason. This hands the GENERATOR OBJECT back to its refcount, so a surviving reference means
+   its finalizer is somebody else's to run and the chain is theirs to unwind. If the park held the LAST one,
+   js_async_generator_free reaches async_func_free — which frees the base frame's buffer and never `tramp_top`
+   — and every heap frame under it leaks exactly as the reaction's did before js_reaction_park_free took
+   JS_FlowFree's two steps. Asserted rather than unwound, because unwinding a chain whose state another
+   reference is still using is a use-after-free; the reaction disposer unwinds because it IS the owner, and
+   these two are not. This assert is the one that was missing when the pair went in: it was named as a gap
+   rather than written, on the grounds that this finalizer's ownership had not been read. It has now been read
+   — js_async_generator_free, whose async_func_free is reached for every state that is neither COMPLETED nor
+   AWAITING_RETURN — and this is what it says. */
 static void js_async_gen_park_free(JSContext *ctx, void *opaque)
 {
-    JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, (JSObject *)opaque));
+    JSValue gobj = JS_MKPTR(JS_TAG_OBJECT, (JSObject *)opaque);
+#if APICLIENT_DEV
+    {
+        JSAsyncGeneratorData *gs = JS_GetOpaque(gobj, JS_CLASS_ASYNC_GENERATOR);
+        DCHECK(JS_REF_COUNT((JSObject *)opaque) > 1 || gs == NULL || gs->func_state.tramp_top == NULL,
+               "a park held the LAST reference to an async generator whose body still has a heap-frame chain — "
+               "its finalizer reaches async_func_free, which frees the base frame and never the chain, so this "
+               "release leaks every frame under it. Unwind it here as js_reaction_park_free does");
+    }
+#endif
+    JS_FreeValue(ctx, gobj);
 }
 
 /* THE ASYNC-GENERATOR STATE MACHINE, split at the ONE seam that has two entries: the BODY RUN.
