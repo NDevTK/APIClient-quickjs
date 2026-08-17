@@ -27935,6 +27935,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValueConst con_func = JS_UNDEFINED, con_ntgt = JS_UNDEFINED;
     void *con_outer = NULL;                             /* non-NULL = this construct was requested by a state machine; its step receives the object (read+reset in do_construct_tramp) */
     uint8_t con_outer_kind = CONT_NONE;                 /* CONT_* of con_outer */
+    /* CONT_* of the requester in cont_st at do_construct_requester_deliver / _abrupt. It names no ownership —
+       the two labels read and reset it in the same breath — which is why it is not con_outer_kind: that one
+       carries a teardown obligation the `exception` label discharges, and a requester already handed to a
+       delivery must not be abandoned a second time. */
+    uint8_t con_deliver_kind = CONT_NONE;
     JSValueConst *con_args = NULL; int con_argc = 0;
     /* An ARGUMENT-VECTOR construct: con_args is a malloc'd block this label owns rather than a window onto a
        frame that outlives the callee. A flattened bound chain is the case that needs it — its arguments come
@@ -29244,6 +29249,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, ps->resolving_funcs[0]); JS_FreeValue(ctx, ps->resolving_funcs[1]);
                         JS_FreeValue(ctx, ps->super_ref); JS_FreeValue(ctx, ps->executor_own);
                         JS_FreeValue(ctx, r); js_free_rt(rt, ps);
+                        if (pe_fin_outer) {
+                            /* The construct threw, so the machine that asked for it takes the throw by its own
+                               rule. `exception` cannot do it: pe_outer moved onto the state at the arm and is
+                               NULL there, so this requester was the one construct requester nothing released. */
+                            cont_st = pe_fin_outer; con_deliver_kind = pe_fin_outer_kind;
+                            ret_val = JS_EXCEPTION;
+                            goto do_construct_requester_abrupt;
+                        }
                         goto exception;
                     }
                     JS_FreeValue(ctx, rr);
@@ -29256,11 +29269,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, ps->executor_own);   /* Reflect.construct entry: the argsList element */
                 js_free_rt(rt, ps);
                 if (pe_fin_outer) {
-                    DCHECK(pe_fin_outer_kind == CONT_STEP,
-                           "promise-executor outer continuation: unknown machine kind");
-                    cont_st = pe_fin_outer;
+                    /* §27.2.3.1 Promise ( executor ) step 11's promise IS this construct's result, so it goes to
+                       the requester through the one delivery every other construct completion uses. */
+                    cont_st = pe_fin_outer; con_deliver_kind = pe_fin_outer_kind;
                     ret_val = r;
-                    goto do_step_step;
+                    goto do_construct_requester_deliver;
                 }
                 for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += cfirst - cargc;
@@ -29268,6 +29281,58 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 *sp++ = r;
             }
             BREAK;
+
+        do_construct_requester_deliver:
+            /* A CONSTRUCT'S RESULT, HANDED TO THE MACHINE THAT ASKED FOR IT — one place, because a construct
+               COMPLETES in three: a C constructor that ran in place, a bytecode body that returned on the chain,
+               and §27.2.3.1 Promise ( executor )'s finish. Each carried its own copy of this list, and the third
+               had one arm, so `new Promise(executor)` requested by anything but a step machine aborted.
+               §27.2.1.5 NewPromiseCapability ( C ) step 3 is what requests one, and C reaches the native Promise
+               constructor whenever it is not `ctx->promise_ctor` by IDENTITY but is by DECLARATION — a
+               CROSS-REALM Promise (an <iframe>'s), a bound one, a trapless proxy over one. The shortcut at
+               do_promise_cap_tramp is per-realm; tramp_native_machine_of is not.
+               Inputs: cont_st = the requester, con_deliver_kind = its CONT_*, ret_val = the object. */
+            {
+                uint8_t rk = con_deliver_kind;
+                con_deliver_kind = CONT_NONE;
+                DCHECK(cont_st != NULL, "a construct result was delivered to no requester at all");
+                if (rk == CONT_PROMISE_CAP) goto do_promise_cap_ctor_deliver;
+                if (rk == CONT_FROM_CTOR) goto do_from_ctor_deliver;
+                if (rk == CONT_ITER_CONSUME) goto do_iter_consume_step;
+                DCHECK(rk == CONT_STEP, "construct outer continuation: unknown machine kind");
+                goto do_step_step;
+            }
+
+        do_construct_requester_abrupt:
+            /* THE SAME LIST FOR A CONSTRUCT THAT THREW, and it is one list for the reason step_request_abrupt is:
+               a requester may not answer differently depending on which completion arrived. A step machine's
+               declaration decides delivery-or-demolition there; the other three can never run again, so each goes
+               through its own teardown and the throw propagates. */
+            {
+                uint8_t rk = con_deliver_kind;
+                con_deliver_kind = CONT_NONE;
+                DCHECK(cont_st != NULL, "a construct's abrupt completion was delivered to no requester at all");
+                DCHECK(JS_IsException(ret_val),
+                       "the construct abrupt delivery was entered with a value rather than a throw");
+                if (rk == CONT_PROMISE_CAP) {
+                    /* the capability's OWN requester takes the throw — js_promise_cap_abandon is the teardown
+                       (it unwinds the promise hook's parent link and frees `parent`, which a hand-copied
+                       executor+ctor pair here did not). */
+                    JSPromiseCap *pc9 = cont_st;
+                    tramp_cap_outer = pc9->outer; tramp_cap_kind = pc9->outer_kind;
+                    js_promise_cap_abandon(ctx, pc9);
+                    cont_st = NULL;
+                    goto do_promise_cap_abrupt;
+                }
+                if (rk == CONT_FROM_CTOR) {
+                    js_from_ctor_abandon(ctx, cont_st); cont_st = NULL; goto exception;
+                }
+                if (rk == CONT_ITER_CONSUME) {
+                    js_iter_consume_abandon(ctx, cont_st); cont_st = NULL; goto exception;
+                }
+                DCHECK(rk == CONT_STEP, "construct outer continuation: unknown machine kind");
+                goto step_request_abrupt;
+            }
 
         do_promise_cap_tramp:
             /* NewPromiseCapability(C). For the native Promise there is no user code in it at all — a different
@@ -29781,48 +29846,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, con_super_ref); con_super_ref = JS_UNDEFINED;
                     if (con_outer) {
                         /* the machine that ASKED for this construct takes the object; a C constructor has no body
-                           to suspend, so it ran in place and the machine is still parked and resumable. */
-                        uint8_t ckind = con_outer_kind;
-                        cont_st = con_outer;
+                           to suspend, so it ran in place and the machine is still parked and resumable. Which
+                           machine, and what an abrupt one means to it, is the shared delivery's question — a
+                           CONSUME machine asking for §23.2.2.1 %TypedArray%.from step 5.c's
+                           §23.2.4.2 TypedArrayCreateFromConstructor is answered here exactly as the bytecode
+                           settle answers it. */
+                        cont_st = con_outer; con_deliver_kind = con_outer_kind;
                         con_outer = NULL; con_outer_kind = CONT_NONE;
-                        if (ckind == CONT_PROMISE_CAP) {
-                            /* a C constructor (or a subclass whose body had nothing to suspend) ran in place. */
-                            if (unlikely(JS_IsException(ret_val))) {
-                                JSPromiseCap *pc9 = cont_st;
-                                tramp_cap_outer = pc9->outer; tramp_cap_kind = pc9->outer_kind;
-                                JS_FreeValue(ctx, pc9->executor); JS_FreeValue(ctx, pc9->ctor);
-                                js_free_rt(rt, pc9);
-                                cont_st = NULL;
-                                goto do_promise_cap_abrupt;
-                            }
-                            goto do_promise_cap_ctor_deliver;
-                        }
-                        if (ckind == CONT_FROM_CTOR) {
-                            if (unlikely(JS_IsException(ret_val))) {
-                                js_from_ctor_abandon(ctx, cont_st);
-                                cont_st = NULL;
-                                goto exception;
-                            }
-                            goto do_from_ctor_deliver;
-                        }
-                        if (ckind == CONT_ITER_CONSUME) {
-                            /* a CONSUME machine asked for this construct — 23.2.2.1 step 5.c's
-                               TypedArrayCreateFromConstructor is the case. The bytecode settle has always
-                               delivered to it; this arm is what lets the in-place path do the same, and without
-                               it the consume machine could only ask for a construct whose target had a bytecode
-                               body. */
-                            if (unlikely(JS_IsException(ret_val))) {
-                                js_iter_consume_abandon(ctx, cont_st);
-                                cont_st = NULL;
-                                goto exception;
-                            }
-                            goto do_iter_consume_step;
-                        }
-                        DCHECK(ckind == CONT_STEP, "do_construct_dispatch: unknown outer sequence kind");
-                        /* the in-place CONSTRUCT's abrupt, decided where the in-place CALL's is — one request kind
-                           may not answer differently from the other. See step_request_abrupt. */
-                        if (unlikely(JS_IsException(ret_val))) goto step_request_abrupt;
-                        goto do_step_step;
+                        if (unlikely(JS_IsException(ret_val))) goto do_construct_requester_abrupt;
+                        goto do_construct_requester_deliver;
                     }
                     if (unlikely(JS_IsException(ret_val))) goto exception;
                 }
@@ -34638,11 +34670,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     (void)n;
                     if (fin_outer) {
                         /* requested BY a machine: hand it the result, exactly as a step-constructor's does.
-                           Nothing was pushed and nothing is popped — the shape recorded at the creation says so. */
-                        DCHECK(fin_outer_kind == CONT_STEP, "consume outer continuation: unknown machine kind");
-                        cont_st = fin_outer;
+                           Nothing was pushed and nothing is popped — the shape recorded at the creation says so.
+                           A consume machine's outer is ALWAYS a CONSTRUCT requester — §24.1.1.1 Map ( [ iterable ] )
+                           step 6 and §23.2.5.1 TypedArray ( ...args ) step 6.a are the only creations that set it,
+                           from con_outer_kind — so it goes through the one delivery rather than restating a
+                           one-arm copy of its list, which is all that made this CONT_STEP-only, and only because
+                           no requester today constructs with an ITERABLE argument. */
+                        cont_st = fin_outer; con_deliver_kind = fin_outer_kind;
                         ret_val = r;
-                        goto do_step_step;
+                        goto do_construct_requester_deliver;
                     }
                     JSValue *cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
@@ -37621,12 +37657,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         for (i = dlv_cfirst; i < dlv_cargc; i++) JS_FreeValue(ctx, cargv2[i]);
                         sp += dlv_cfirst - dlv_cargc;
                         JS_FreeValue(ctx, super_ref);
-                        cont_st = couter;
-                        if (couter_kind == CONT_ITER_CONSUME) goto do_iter_consume_step;
-                        if (couter_kind == CONT_PROMISE_CAP) goto do_promise_cap_ctor_deliver;
-                        if (couter_kind == CONT_FROM_CTOR) goto do_from_ctor_deliver;
-                        DCHECK(couter_kind == CONT_STEP, "construct outer continuation: unknown machine kind");
-                        goto do_step_step;
+                        cont_st = couter; con_deliver_kind = couter_kind;
+                        goto do_construct_requester_deliver;
                     }
                     if (from_super) {
                         /* super(): no operands on the caller stack — free the super ctor ref and push the bound
