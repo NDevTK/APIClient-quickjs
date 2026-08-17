@@ -450,7 +450,7 @@ struct JSRuntime {
        the ONE gate nondeterministic — a DFAIL that fires 3 runs in 4 names nothing, and a green run proves
        nothing either. Per-runtime (not merely per-thread) is the honest scope: two runtimes on one thread are
        just as separate. */
-    struct { JSFlowParkFn *fn; void *opaque; JSContext *ctx; } parked_flow;
+    struct { JSFlowParkFn *fn; JSFlowParkFreeFn *free_fn; void *opaque; JSContext *ctx; } parked_flow;
 };
 
 struct JSClass {
@@ -27662,22 +27662,34 @@ void JS_RequestFlowYield(void) { FLOW_YIELD_REQUEST(JS_PREEMPT_HOST); }
    preempts inside job-driven code parks HERE, and the host pump (JS_ResumeParkedFlow, called before draining a
    job) resumes it. One slot is what a single-flow engine needs today; the solver's ranked frontier replaces the
    slot, not the contract — "resume the top-ranked parked flow before starting new work" holds at both sizes. */
-void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, void *opaque) {
+void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque) {
     JSRuntime *rt = ctx->rt;
     DCHECK(rt->parked_flow.fn == NULL, "two flows parked at once: the slot resumes before any other work runs");
-    rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn; rt->parked_flow.opaque = opaque;
+    /* THE PARK TAKES A REFERENCE AND THIS IS HOW IT IS GIVEN BACK — see JSFlowParkFreeFn. Required, not
+       optional: a site that parks without saying how its reference is released is a site whose continuation an
+       embedder can only dispose of by RUNNING it, which is the state this parameter exists to end. */
+    DCHECK(free_fn != NULL, "a flow parked without a disposer — the slot owns the reference this site just "
+                            "took, so a teardown or a page-out could only give it back by resuming the body");
+    rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn;
+    rt->parked_flow.free_fn = free_fn; rt->parked_flow.opaque = opaque;
 }
 bool JS_HasParkedFlow(JSRuntime *rt) { return rt->parked_flow.fn != NULL; }
-bool JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn, void **popaque) {
+bool JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn,
+                       JSFlowParkFreeFn **pfree, void **popaque) {
     if (!rt->parked_flow.fn) return false;
-    *pctx = rt->parked_flow.ctx; *pfn = rt->parked_flow.fn; *popaque = rt->parked_flow.opaque;
-    rt->parked_flow.fn = NULL; rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
+    *pctx = rt->parked_flow.ctx; *pfn = rt->parked_flow.fn;
+    *pfree = rt->parked_flow.free_fn; *popaque = rt->parked_flow.opaque;
+    rt->parked_flow.fn = NULL; rt->parked_flow.free_fn = NULL;
+    rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
     return true;
 }
-void JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, void *opaque) {
+void JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque) {
     if (!fn) return;
     DCHECK(rt->parked_flow.fn == NULL, "a flow was switched in while another one's park is still in the slot");
-    rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn; rt->parked_flow.opaque = opaque;
+    DCHECK(free_fn != NULL, "a park was put back into the slot without its disposer — the pair is taken and "
+                            "restored together, so half of one is a continuation nothing can release");
+    rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn;
+    rt->parked_flow.free_fn = free_fn; rt->parked_flow.opaque = opaque;
 }
 /* THE STEP-BOUNDARY ADOPTION POINT — the second half of baseline_call_list, and the half that does not need
    the flow to have a PROGRAM. JS_FlowResume was the only adoption point, and it is reached only by a flow with
@@ -27699,7 +27711,11 @@ bool JS_ResumeParkedFlow(JSRuntime *rt) {
     ctx = rt->parked_flow.ctx;
     op = rt->parked_flow.opaque;
     if (!fn) return false;
-    rt->parked_flow.fn = NULL; rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
+    /* THE DISPOSER IS CLEARED AND NEVER CALLED HERE: running the body IS how this park's reference is
+       discharged (each resume ends in the release its own park took), so calling it too would be the second
+       free of the same reference. The disposer is for the path that does NOT run — teardown, page-out. */
+    rt->parked_flow.fn = NULL; rt->parked_flow.free_fn = NULL;
+    rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
     fn(ctx, op);   /* may park again at the next back-edge — the pump loops */
     return true;
 }
@@ -44767,6 +44783,7 @@ static JSValue js_new_async_await(JSContext *ctx, JSAsyncFunctionData *s)
    pump, never self-resumed to completion. There is no drive-to-completion resume to fall back to. */
 
 static void js_async_resume_park(JSContext *ctx, void *opaque);
+static void js_async_resume_park_free(JSContext *ctx, void *opaque);
 
 /* Resume a SUSPENDED async continuation AS A FLOW (the post-await body). Such a continuation is not a nested
    activation of anything — it IS the running flow — so it becomes its own base while it runs; its loops then
@@ -44790,7 +44807,7 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
            globalThis` read a value the sibling had already changed. The host pump drains this slot before
            starting any job, so the resume is transparent. */
         JS_REF_COUNT(s)++;   /* the slot holds a reference until the resume releases it */
-        JS_ParkFlow(ctx, js_async_resume_park, s);
+        JS_ParkFlow(ctx, js_async_resume_park, js_async_resume_park_free, s);
         return true;
     }
     {
@@ -44835,6 +44852,14 @@ static void js_async_resume_park(JSContext *ctx, void *opaque)
     s->func_state.throw_flag = false;
     js_async_function_resume_as_flow(ctx, s);
     js_async_function_free(ctx->rt, s);   /* release the ref taken at park */
+}
+
+/* …AND THE SAME RELEASE FOR A PARK THAT WILL NEVER RUN — the embedder tore this flow down or paged it out, so
+   the body is not resumed and the line above never executes. It is the mirror of that line and nothing else;
+   the two together are why the park's reference has exactly one owner on both paths. */
+static void js_async_resume_park_free(JSContext *ctx, void *opaque)
+{
+    js_async_function_free(ctx->rt, (JSAsyncFunctionData *)opaque);
 }
 
 static JSValue js_async_function_resolve_call(JSContext *ctx,
@@ -45296,6 +45321,12 @@ static void js_async_gen_park_resume(JSContext *ctx, void *opaque)
     JS_FreeValue(ctx, gobj);   /* release the ref taken at park */
 }
 
+/* …and the same release for a park that will never run — see js_async_resume_park_free. */
+static void js_async_gen_park_free(JSContext *ctx, void *opaque)
+{
+    JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, (JSObject *)opaque));
+}
+
 /* THE ASYNC-GENERATOR STATE MACHINE, split at the ONE seam that has two entries: the BODY RUN.
    `pre` decides what the head of the queue needs and delivers the resume input, settling every case that needs
    no body run; `post` consumes one body run's outcome and says whether the queue has more to drive. Between them
@@ -45453,7 +45484,7 @@ static void js_async_generator_resume_next(JSContext *ctx,
             /* PARKED mid-body: park into THE PUMP, never the job FIFO (that reorders microtasks). The state
                stays EXECUTING, so the pump's resume re-enters here at the saved point. */
             js_dup(JS_MKPTR(JS_TAG_OBJECT, s->generator));   /* the park keeps the suspended body alive */
-            JS_ParkFlow(ctx, js_async_gen_park_resume, s->generator);
+            JS_ParkFlow(ctx, js_async_gen_park_resume, js_async_gen_park_free, s->generator);
             return;
         }
         {
@@ -97431,6 +97462,7 @@ typedef struct JSReactionFlow {
 } JSReactionFlow;
 
 static void js_reaction_park_resume(JSContext *ctx, void *opaque);
+static void js_reaction_park_free(JSContext *ctx, void *opaque);
 
 /* Populate `fs` as a CALL-ROOT flow base (FLOW_BASE_STEP_ROOT): a flow whose entire body is one call,
    handler(arg), for a handler of ANY kind. cur_func is the handler (not necessarily bytecode);
@@ -97640,7 +97672,7 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
                It was invisible while a reaction could only preempt at a loop back-edge, which a `.then` handler
                rarely has; it is not a new bug, it is one that had nothing to reach it. The host pump drains this
                slot before starting any job, so the resume is transparent. */
-            JS_ParkFlow(ctx, js_reaction_park_resume, rf);
+            JS_ParkFlow(ctx, js_reaction_park_resume, js_reaction_park_free, rf);
             return JS_UNDEFINED;   /* PARKED: the pump resumes it; the promise settles when it completes */
         }
         /* COMPLETED via `done:` — that path frees the stack/vars inline but not the frame buffer + cur_func/this */
@@ -97672,6 +97704,14 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
 static void js_reaction_park_resume(JSContext *ctx, void *opaque)
 {
     reaction_flow_step(ctx, (JSReactionFlow *)opaque);
+}
+
+/* …AND THE SAME RELEASE FOR A PARK THAT WILL NEVER RUN. reaction_flow_free is already written for exactly this
+   caller — its own comment names "a forked arm the scheduler dropped, or teardown" as the flow that reaches it
+   with an OPEN bracket, and it fires no AFTER because the invocation it would report never finished. */
+static void js_reaction_park_free(JSContext *ctx, void *opaque)
+{
+    reaction_flow_free(ctx, (JSReactionFlow *)opaque);
 }
 
 /* `func(value)` as a call-root FLOW. JSReactionFlow is exactly the vehicle — a flow plus the capability it

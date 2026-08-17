@@ -1960,7 +1960,15 @@ JS_EXTERN uint64_t  JS_SyncDriveToCompletionCount(void);
    interleaving. The host must resume parked flows BEFORE draining a job, so a forced preempt stays transparent
    to ordering:  while (JS_ResumeParkedFlow(rt)) ;  then run one job. */
 typedef void JSFlowParkFn(JSContext *ctx, void *opaque);
-JS_EXTERN void     JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, void *opaque);
+/* …AND HOW TO RELEASE THE SAME REFERENCE WITHOUT RUNNING THE BODY. The slot OWNS its continuation: every park
+   site takes a reference and only the resume discharges it, so an embedder that tears a flow down — or pages it
+   out to a cold tier, where a recipe replays the WORK and frees none of the MEMORY — had no way to give it back
+   and dropped the last pointer to an activation and its whole heap call chain. Recorded BESIDE the resume so
+   each site states how its own reference is released next to where it takes it; the alternative is one disposer
+   that compares `fn` against the known park functions, which is a table that must be edited every time a fourth
+   site parks and is silently wrong until someone notices. */
+typedef void JSFlowParkFreeFn(JSContext *ctx, void *opaque);
+JS_EXTERN void     JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque);
 JS_EXTERN bool     JS_HasParkedFlow(JSRuntime *rt);
 JS_EXTERN bool     JS_ResumeParkedFlow(JSRuntime *rt);
 /* A PARKED FLOW IS A PIECE OF ONE FLOW'S TIMELINE, so a host that INTERLEAVES flows must carry it with the flow
@@ -1970,8 +1978,10 @@ JS_EXTERN bool     JS_ResumeParkedFlow(JSRuntime *rt);
    So the switch takes it out and the switch back puts it in, exactly as the delta and the decision cursor swap.
    Take returns false and writes nothing when no flow is parked; Put with a NULL fn restores nothing. A host
    that runs ONE flow (run-test262) never needs either: its slot is emptied before anything else runs. */
-JS_EXTERN bool     JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn, void **popaque);
-JS_EXTERN void     JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, void *opaque);
+JS_EXTERN bool     JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn,
+                                        JSFlowParkFreeFn **pfree, void **popaque);
+JS_EXTERN void     JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn,
+                                    void *opaque);
 /* Frame-snapshot fork: deep-copy a SUSPENDED flow into an INDEPENDENT clone that resumes from the same point.
    No fallback — an un-built frame shape (deep tramp chain / live closures) crashes loud. */
 JS_EXTERN JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow);
