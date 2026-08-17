@@ -764,7 +764,7 @@ typedef enum {
 } JSWellKnownSymbol;
 JS_EXTERN JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which);
 
-/* WEB IDL §3.2.11's `USVString`: a DOMString whose UNPAIRED SURROGATES have each been replaced by U+FFFD.
+/* WEB IDL §3.2.12 USVString's `USVString`: a DOMString whose UNPAIRED SURROGATES have each been replaced by U+FFFD.
    That replacement is the whole of what makes the type different from a DOMString, and it cannot be done from
    outside the engine — a host sees only the UTF-8 the C-string conversion produces, where an unpaired
    surrogate has already been written out in whatever form that conversion chose. Every URL member takes
