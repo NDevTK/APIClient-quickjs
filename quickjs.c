@@ -7539,8 +7539,35 @@ static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
         cow_capture_bytes(ctx, p);
         return;
     }
-    if (g_time_travel.prop_write)
+    /* A STAND-IN IS NOT WHERE THE WRITE LANDS, and the delta has to name the storage rather than the address
+       the write was sent to — see JSClassExoticMethods.forwarded_object. HTML §7.2.3's same-origin WindowProxy
+       is the one class that answers: `frame.contentWindow.x = 1` walks its [[GetOwnProperty]] and defines on
+       the other document's Window, so an entry naming the PROXY would restore that baseline onto the proxy as
+       a real own property and shadow the Window from then on, for every flow. Asked HERE because this is the
+       one place every capture converges on — JS_SetPropertyInternal2's head, JS_CreateProperty's head and
+       JS_DefineProperty's each reach it, and a redirect written at one of them is a redirect the other two
+       do not make. INSIDE the delta's own guard, because that is the whole of what it is for: with no delta
+       recording there is no entry to misname, and asking a class where a write is going while the runtime is
+       being torn down is a question with no reason to be asked. */
+    if (g_time_travel.prop_write) {
+        if (unlikely(p->is_exotic) && !p->fast_array) {
+            const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
+            if (em && em->forwarded_object) {
+                JSValueConst fwd = em->forwarded_object(ctx, obj, prop);
+                if (!JS_IsUninitialized(fwd)) {
+                    DCHECK(JS_VALUE_GET_TAG(fwd) == JS_TAG_OBJECT,
+                           "a class answered the capture with a forwarded target that is not an object — the "
+                           "delta names storage, and a primitive has none to record");
+                    DCHECK(!is_typed_array(JS_VALUE_GET_OBJ(fwd)->class_id) || !__JS_AtomIsTaggedInt(prop),
+                           "a class forwarded a keyed capture onto a TYPED ARRAY's index — that storage is the "
+                           "buffer's BYTES and the byte entry owns it, so route the forward through "
+                           "cow_capture_bytes rather than naming a slot that does not exist");
+                    obj = fwd;
+                }
+            }
+        }
         g_time_travel.prop_write(ctx, obj, prop);
+    }
 }
 
 /* Record a fast-array APPEND slot: its baseline is ABSENT, so the host needs no baseline lookup for it — see
@@ -11269,10 +11296,12 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                             if (desc.flags & JS_PROP_GETSET) {
                                 JS_FreeValue(ctx, desc.setter);
                                 JS_FreeValue(ctx, desc.getter);
-                                /* Measured unreachable over the whole corpus behind a DCHECK: the read opcodes
-                                   route every callable getter, and tramp_walk_continues asserts that the only
-                                   class defining this hook past the Proxy is the String index lookup, which
-                                   has no accessors at all. */
+                                /* THE READ OPCODES ROUTE THIS ONE — tramp_accessor_getter asks the class for
+                                   its descriptor and hands the getter to the tramp chain, exactly as it hands
+                                   over a shape slot's. So an accessor arriving HERE is a read performed from
+                                   C, with no flow base to run the getter on, and it is that CALLER that has an
+                                   unbuilt route rather than the class: HTML §7.2.3.5's same-origin WindowProxy
+                                   answers with the other document's Window's accessors on purpose. */
                                 DFAIL("an exotic [[GetOwnProperty]] accessor reached the C read — route it "
                                       "onto the tramp chain");
                                 return JS_ThrowTypeError(ctx, "getter");
@@ -11878,6 +11907,33 @@ static int JS_GetOwnPropertyFlagsInternal(JSContext *ctx, int *pflags,
                                           JSObject *p, JSAtom prop)
 {
     return JS_GetOwnPropertyInternal2(ctx, NULL, p, prop, pflags, /*as_slot*/false);
+}
+
+/* The internal method itself, for a class that STANDS IN for another object — see quickjs.h. The assertion is
+   the whole of what it adds over the internal entry: a class that stands in performs the operation on a target
+   it did not choose, so "does this run the page's code" is a question about the TARGET and has to be asked
+   where the target arrives, not where the stand-in was written. */
+int JS_GetOwnPropertyNoUserCode(JSContext *ctx, JSPropertyDescriptor *desc,
+                                JSValueConst obj, JSAtom prop)
+{
+    JSObject *p;
+    const JSClassExoticMethods *em;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+        JS_ThrowTypeErrorNotAnObject(ctx);
+        return -1;
+    }
+    p = JS_VALUE_GET_OBJ(obj);
+    em = p->is_exotic ? ctx->rt->class_array[p->class_id].exotic : NULL;
+    DCHECK(p->class_id != JS_CLASS_PROXY,
+           "a C-side [[GetOwnProperty]] was forwarded onto a Proxy — its own-property query IS the page's "
+           "`getOwnPropertyDescriptor` trap, and there is no flow base here to run one on; route that caller "
+           "onto the keyed entry's GP_GETOWNPROP");
+    DCHECK(!em || !em->get_own_property || em->get_own_property_no_user_code,
+           "a C-side [[GetOwnProperty]] was forwarded onto a class that has not declared its hook free of the "
+           "page's code — declare get_own_property_no_user_code where that hook is defined, or route the "
+           "caller onto the keyed entry's GP_GETOWNPROP");
+    return JS_GetOwnPropertyInternal(ctx, desc, p, prop);
 }
 
 /* The COW delta's own-property read: a SLOT's whole state, never an operation.
@@ -24645,8 +24701,16 @@ static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom 
    algorithm, not a fallback — which is what the old bail claimed about every exotic object.
    A PROXY stops it: its [[Get]] is the trap, not an ordinary walk, and whichever caller cares about that
    (tramp_proto_proxy) has already answered it — the two ACCESSOR walkers must stop there rather than look past
-   it, which is also what keeps this from consulting a class lookup that could run user code. */
-static bool tramp_walk_continues(JSContext *ctx, JSObject *p, JSAtom atom)
+   it, which is also what keeps this from consulting a class lookup that could run user code.
+   WHAT THE CLASS ANSWERED IS THE OTHER HALF OF THE ANSWER, and the two accessor walkers ask for it. A class
+   whose [[GetOwnProperty]] hands back an ACCESSOR — HTML §7.2.3.5 step 3's same-origin WindowProxy hands back
+   the other document's Window's, which is how `frame.contentWindow.onunload` is reached at all — used to stop
+   the walk with nothing to show for it, and the read then fell to JS_GetPropertyInternal, whose exotic arm
+   DFAILs on exactly that descriptor. So the descriptor comes back and the getter or setter in it is routed
+   like any other, on the tramp chain, with the base as its receiver. `desc` NULL asks only whether the walk
+   continues, which is what the two non-accessor walkers want. */
+static bool tramp_walk_continues_desc(JSContext *ctx, JSObject *p, JSAtom atom,
+                                      JSPropertyDescriptor *desc, bool *pfound)
 {
     const JSClassExoticMethods *em;
     if (!p->is_exotic) return true;
@@ -24659,6 +24723,7 @@ static bool tramp_walk_continues(JSContext *ctx, JSObject *p, JSAtom atom)
         return !(__JS_AtomIsTaggedInt(atom) && __JS_AtomToUInt32(atom) < p->u.array.count);
     em = ctx->rt->class_array[p->class_id].exotic;
     if (em && em->get_own_property) {
+        int r;
         /* The String exotic's index lookup is pure C; so is any class that DECLARES its hook to be. Anything
            else reaching here would start running the page's code from C with no flow base, and says so at
            that point instead of being discovered by a hang. The declaration is the class's own, made where
@@ -24667,9 +24732,41 @@ static bool tramp_walk_continues(JSContext *ctx, JSObject *p, JSAtom atom)
                "an exotic [[GetOwnProperty]] that has not declared itself free of the page's code reached the "
                "accessor walk — declare get_own_property_no_user_code where the hook is defined, or route the "
                "class onto the keyed entry's GP_GETOWNPROP");
-        return JS_GetOwnPropertyInternal(ctx, NULL, p, atom) == 0;
+        if (!desc)
+            return JS_GetOwnPropertyInternal(ctx, NULL, p, atom) == 0;
+        r = JS_GetOwnPropertyInternal(ctx, desc, p, atom);
+        if (r > 0) *pfound = true;   /* the hook fills `desc` on 1 and touches it on neither 0 nor -1 */
+        return r == 0;
     }
     return true;
+}
+static bool tramp_walk_continues(JSContext *ctx, JSObject *p, JSAtom atom)
+{
+    return tramp_walk_continues_desc(ctx, p, atom, NULL, NULL);
+}
+/* The function object an exotic-answered ACCESSOR descriptor names, or NULL for a data property or an absent
+   half. CONSUMES nothing: the caller frees the descriptor, and what comes back is BORROWED past that free —
+   which is the same contract the two shape walkers already have (they return a getter the object's own slot
+   holds) and is what the assert states. A class that SYNTHESISED an accessor per query would answer with a
+   function nobody holds; the WindowProxy's forward hands back the active document's Window's own, which that
+   Window holds, and the walk's caller dups it onto the operand stack before anything can drop it. */
+static JSObject *tramp_exotic_accessor(JSContext *ctx, const JSPropertyDescriptor *d, bool want_setter)
+{
+    JSValueConst fn = want_setter ? d->setter : d->getter;
+    JSObject *f;
+
+    if (!(d->flags & JS_PROP_GETSET) || JS_VALUE_GET_TAG(fn) != JS_TAG_OBJECT)
+        return NULL;
+    f = JS_VALUE_GET_OBJ(fn);
+    if (!(f->class_id == JS_CLASS_BYTECODE_FUNCTION
+          || (f->class_id == JS_CLASS_PROXY ? f->u.proxy_data->is_func
+                                            : ctx->rt->class_array[f->class_id].call != NULL)))
+        return NULL;   /* not callable — 10.1.8.1 step 5 answers undefined, which the C read does */
+    DCHECK(JS_REF_COUNT(f) > 1,
+           "an exotic [[GetOwnProperty]] answered the accessor walk with a function the DESCRIPTOR is the only "
+           "holder of — the walk hands its caller a bare pointer to dup onto the operand stack, so a class "
+           "that mints an accessor per query has to hand over a reference of its own instead");
+    return f;
 }
 /* DIRECT eval, compiled to a CLOSURE for the tramp and never run here. Both spellings of a direct eval — `eval(x)`
    and `eval(...arr)` — reach it, which is the point: the eval'd program's body must run on THIS tramp chain so a
@@ -24739,7 +24836,19 @@ static inline JSObject *tramp_accessor_getter(JSContext *ctx, JSValueConst obj, 
             }
             return NULL;
         }
-        if (!tramp_walk_continues(ctx, p, atom)) return NULL;
+        {   /* the class's own [[GetOwnProperty]] answers for this key, and when its answer is an ACCESSOR that
+               accessor is what the read invokes — same as a shape slot's, one object further out. */
+            JSPropertyDescriptor xd;
+            bool xfound = false;
+            if (!tramp_walk_continues_desc(ctx, p, atom, &xd, &xfound)) {
+                JSObject *xa = NULL;
+                if (xfound) {
+                    xa = tramp_exotic_accessor(ctx, &xd, /*want_setter*/false);
+                    js_free_desc(ctx, &xd);
+                }
+                return xa;
+            }
+        }
         p = p->shape->proto;
         if (!p) return NULL;
     }
@@ -24856,7 +24965,19 @@ static inline JSObject *tramp_accessor_setter(JSContext *ctx, JSValueConst obj, 
             }
             return NULL;   /* own data slot shadows inherited setters -> slow path */
         }
-        if (!tramp_walk_continues(ctx, p, atom)) return NULL;
+        {   /* the setter twin of the read's exotic answer: a class that answers this key with an ACCESSOR owns
+               the write too, and JS_SetPropertyInternal2's own exotic arm ends in call_setter, which DFAILs. */
+            JSPropertyDescriptor xd;
+            bool xfound = false;
+            if (!tramp_walk_continues_desc(ctx, p, atom, &xd, &xfound)) {
+                JSObject *xa = NULL;
+                if (xfound) {
+                    xa = tramp_exotic_accessor(ctx, &xd, /*want_setter*/true);
+                    js_free_desc(ctx, &xd);
+                }
+                return xa;
+            }
+        }
         p = p->shape->proto;
         if (!p) return NULL;
     }

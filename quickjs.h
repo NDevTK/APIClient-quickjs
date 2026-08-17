@@ -867,6 +867,25 @@ typedef struct JSClassExoticMethods {
        the safe direction — it asserts rather than runs. Web IDL's indexed property getter is the first kind
        by construction: an index lookup has no accessors in it. */
     bool get_own_property_no_user_code;
+    /* THE OBJECT THIS ONE'S KEYED OPERATIONS ARE PERFORMED ON — a class that STANDS IN for another object,
+       which is what HTML §7.2.3's same-origin branch makes a WindowProxy: every one of its internal methods
+       is `W.[[X]](…)`, so `frame.contentWindow.onunload = f` writes the OTHER document's Window and not the
+       stand-in.
+       IT EXISTS FOR THE COW DELTA AND FOR NOTHING ELSE, which is why it is one question and not a second
+       property protocol beside the four hooks above. Those hooks forward the OPERATION and the delta cannot
+       see that they did: cow_capture runs at the head of the write, names the object the write was ADDRESSED
+       to, and would record a baseline for the stand-in while the write lands on the object behind it — an
+       entry whose unapply then puts that baseline back as a REAL own property of the stand-in, which from
+       then on shadows the object it was standing in for, for every flow. So the capture asks the class where
+       the write is going, once, at the one place every capture converges on.
+       BORROWED (the stand-in holds it, and the delta's entry holds only the object it names). JS_UNINITIALIZED
+       = this object stands for itself, which is every class that does not declare this.
+       IT IS ASKED PER KEY, because a stand-in need not forward every one: HTML §7.2.5.1's own surface is
+       answered by the WindowProxy itself and only the rest is the Window's, and a capture that forwarded the
+       first group would name the wrong object as surely as one that forwarded none. It runs NO PAGE CODE —
+       every caller is a capture at the head of a write, so a class that reached the page here would run it
+       with no flow base and in the middle of recording a baseline. */
+    JSValueConst (*forwarded_object)(JSContext *ctx, JSValueConst obj, JSAtom prop);
 } JSClassExoticMethods;
 
 typedef void JSClassFinalizer(JSRuntime *rt, JSValueConst val);
@@ -1261,6 +1280,20 @@ JS_EXTERN int JS_GetOwnSlotDesc(JSContext *ctx, JSPropertyDescriptor *pd, JSValu
    can define, so an accessor there says the read landed on an object that is not the one it named.
    1 = own data property (*pval owned), 0 = absent, -1 = threw. */
 JS_EXTERN int JS_GetOwnSlot(JSContext *ctx, JSValue *pval, JSValueConst obj, JSAtom prop);
+/* [[GetOwnProperty]] — the INTERNAL METHOD, performed from C by a class that stands in for another object.
+   HTML §7.2.3.5 step 3's `OrdinaryGetOwnProperty(W, P)` is the caller it exists for: a WindowProxy answering
+   its own [[GetOwnProperty]] hook has to perform the Window's, and the Window is a legacy platform object
+   whose own hook answers `window[0]`.
+   IT IS NOT JS_GetOwnSlotDesc, and the difference is not a nicety: that one reads STORAGE, so a `let` binding
+   in TDZ answers with an uninitialised value where the internal method throws its ReferenceError — right for
+   a delta putting a slot back, wrong for a forward that owes the operation.
+   IT ASSERTS THAT IT RUNS NONE OF THE PAGE'S CODE, at the CLASS rather than at the caller: an object with no
+   exotic hook answers out of its own shape, one whose class declares get_own_property_no_user_code answers out
+   of its own state, and a Proxy — whose every own-property query is the `getOwnPropertyDescriptor` trap —
+   aborts here rather than running a trap in a C activation with no flow base to park it on.
+   1 = own property (*desc filled and OWNED when desc != NULL), 0 = absent, -1 = threw. */
+JS_EXTERN int JS_GetOwnPropertyNoUserCode(JSContext *ctx, JSPropertyDescriptor *desc,
+                                          JSValueConst obj, JSAtom prop);
 /* Its WRITE twin: the SLOT's whole state put back, attributes included. NOT [[Set]] — no prototype walk, no
    setter, no `writable` and no `extensible`; and NOT [[DefineOwnProperty]] either, which is the trap this
    signature exists to avoid: 10.1.6.3 step 4 refuses every change to a NON-CONFIGURABLE slot, and a slot the
