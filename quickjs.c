@@ -44859,7 +44859,20 @@ static void js_async_resume_park(JSContext *ctx, void *opaque)
    the two together are why the park's reference has exactly one owner on both paths. */
 static void js_async_resume_park_free(JSContext *ctx, void *opaque)
 {
-    js_async_function_free(ctx->rt, (JSAsyncFunctionData *)opaque);
+    JSAsyncFunctionData *s = (JSAsyncFunctionData *)opaque;
+
+    /* THE CHAIN IS THE HAZARD HERE TOO, AND WHO OWNS IT DEPENDS ON WHETHER THIS IS THE LAST REFERENCE. The
+       reaction disposer above unwinds its own chain because it IS the owner; this one hands the state back to
+       a refcount, so a surviving reference means somebody else's teardown will do it. If the park held the
+       last one, the terminate below reaches async_func_free — which frees the base frame's buffer and NOT the
+       chain — and every frame under it leaks exactly as the reaction's did. Asserted rather than unwound,
+       because unwinding a chain whose state another reference is still using is a use-after-free, and this
+       path has never been observed holding one. */
+    DCHECK(JS_REF_COUNT(s) > 1 || s->func_state.tramp_top == NULL,
+           "a park held the LAST reference to an async continuation that still has a heap-frame chain — "
+           "async_func_free frees the base frame and never the chain (JS_FlowFree unwinds it first), so this "
+           "release leaks every frame under it. Unwind it here as js_reaction_park_free does");
+    js_async_function_free(ctx->rt, s);
 }
 
 static JSValue js_async_function_resolve_call(JSContext *ctx,
@@ -97628,10 +97641,11 @@ static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s)
            "a flow state that is not a STEP_ROOT was cast to JSReactionFlow — its resolve/reject live past the "
            "end of what was allocated for it");
     rf = (JSReactionFlow *)s;
-    /* A DEEP chain is already gone: JS_FlowFree — the ONLY caller of this — unwinds it before it asks what kind
-       of base it has, precisely so each base kind is written for a flow whose live point is its own. This says
-       so rather than testing for it, because a chain reaching here would mean a second entry into the base
-       teardowns that nothing tore the chain down for. */
+    /* A DEEP chain is already gone: BOTH callers unwind it first — JS_FlowFree, which does it once for every
+       base kind, and js_reaction_park_free, which disposes of a park that will never be resumed and therefore
+       reaches this without going through JS_FlowFree at all. Each base kind is written for a flow whose live
+       point is its own. This says so rather than testing for it, because a chain reaching here would mean a
+       second entry into the base teardowns that nothing tore the chain down for. */
     DCHECK(rf->fs.tramp_top == NULL,
            "a reaction flow reached its base teardown still holding a heap-frame chain — free_tramp_chain runs "
            "at the top of JS_FlowFree, so a chain here came from a path that is not JS_FlowFree");
@@ -97706,12 +97720,24 @@ static void js_reaction_park_resume(JSContext *ctx, void *opaque)
     reaction_flow_step(ctx, (JSReactionFlow *)opaque);
 }
 
-/* …AND THE SAME RELEASE FOR A PARK THAT WILL NEVER RUN. reaction_flow_free is already written for exactly this
-   caller — its own comment names "a forked arm the scheduler dropped, or teardown" as the flow that reaches it
-   with an OPEN bracket, and it fires no AFTER because the invocation it would report never finished. */
+/* …AND THE SAME RELEASE FOR A PARK THAT WILL NEVER RUN — WHICH IS JS_FlowFree'S TWO STEPS, NOT reaction_flow_free
+   ALONE. This called only the latter, and reaction_flow_free frees the JSReactionFlow's own JSValues and its
+   struct: it does not touch the embedded state's frame, and NOTHING touches the heap-frame CHAIN except
+   free_tramp_chain. A parked reaction is suspended precisely because `fs.frame.cur_sp != NULL || fs.tramp_top
+   != NULL` — that is the condition that put it here — so it holds both, and calling the innermost of the three
+   disposals released the reference while leaking every frame under it. The census counted exactly that: the
+   park disposer landed, `f->park_fn == NULL` went quiet, and JS_TrampFrameCount came back byte-identical.
+   The chain FIRST, which is the order JS_FlowFree keeps and the order flow_reaction_free asserts it was kept
+   in — its base teardown is written for a flow whose live point is its own, and a chain reaching it would mean
+   a second entry into a teardown nothing unwound. Guarded, because free_tramp_chain refuses a NULL chain
+   rather than treating it as nothing to do: a flow parked at a base back-edge has no chain at all. */
 static void js_reaction_park_free(JSContext *ctx, void *opaque)
 {
-    reaction_flow_free(ctx, (JSReactionFlow *)opaque);
+    JSReactionFlow *rf = (JSReactionFlow *)opaque;
+
+    if (rf->fs.tramp_top != NULL)
+        free_tramp_chain(ctx, &rf->fs);
+    flow_reaction_free(ctx, &rf->fs);
 }
 
 /* `func(value)` as a call-root FLOW. JSReactionFlow is exactly the vehicle — a flow plus the capability it
