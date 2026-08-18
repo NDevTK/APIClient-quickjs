@@ -744,10 +744,18 @@ struct JSContext {
     /* if NULL, RegExp compilation is not supported */
     JSValue (*compile_regexp)(JSContext *ctx, JSValueConst pattern,
                               JSValueConst flags);
+    /* `caller_sf` IS THE OTHER HALF OF `scope_idx`, and both are meaningful only for a DIRECT eval: 13.3.6.1
+       evaluates the program in the CALLER's variable environment, so the algorithm needs the caller's frame —
+       its bytecode for the strictness, its var_refs for the closure. It is a PARAMETER rather than a read of
+       rt->current_stack_frame because on this engine the caller is a HEAP frame: a direct eval is a work item
+       on the trampoline's own stack, and §scheduler's rule is that an operation which becomes a work item
+       takes its inputs WITH it rather than reading them back off a global that means "the current C
+       activation". NULL for every non-direct eval, which is every other caller. */
     /* if NULL, eval is not supported */
     JSValue (*eval_internal)(JSContext *ctx, JSValueConst this_obj,
                              const char *input, size_t input_len,
-                             const char *filename, int line, int flags, int scope_idx);
+                             const char *filename, int line, int flags, int scope_idx,
+                             JSStackFrame *caller_sf);
     void *user_opaque;
 };
 
@@ -1873,7 +1881,8 @@ static void js_async_function_resolve_mark(JSRuntime *rt, JSValueConst val,
                                            JS_MarkFunc *mark_func);
 static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                const char *input, size_t input_len,
-                               const char *filename, int line, int flags, int scope_idx);
+                               const char *filename, int line, int flags, int scope_idx,
+                               JSStackFrame *caller_sf);
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
 static void js_module_release_refs(JSContext *ctx, JSModuleDef *m);
 static void js_module_free_tables(JSContext *ctx, JSModuleDef *m);
@@ -21424,8 +21433,10 @@ static int step_program_run(JSContext *ctx, JSStepHdr *h, JSContext *realm, JSVa
         str = JS_ToCStringLen(ctx, &len, src);
         if (!str)
             return -1;
+        /* NO CALLER FRAME, and that is what INDIRECT means: 19.2.1.1 evaluates in the GLOBAL environment, so
+           there is no caller scope to take — the `-1` scope_idx beside it says the same thing. */
         clo = JS_EvalInternal(realm, realm->global_obj, str, len, "<input>", 1,
-                              JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE | origin_flags, -1);
+                              JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE | origin_flags, -1, NULL);
         JS_FreeCString(ctx, str);
         if (JS_IsException(clo))
             return -1;
@@ -24829,12 +24840,22 @@ static JSObject *tramp_exotic_accessor(JSContext *ctx, const JSPropertyDescripto
    site, so there is one body-entry question and not one per spelling.
    JS_UNINITIALIZED = step 2 took the non-string arm, so the OPERAND is the completion, unevaluated. What is
    left to each opcode is only its own operand shape and the cleanup that follows from it. */
-static JSValue eval_direct_closure(JSContext *ctx, JSValueConst src, int scope_idx)
+/* `caller_sf` IS THE CALLER'S OWN FRAME, handed over by the opcode that is executing it, and it is the pair of
+   `scope_idx`: the compiler records WHICH scope and the frame is the one that HAS it. It is a parameter and not
+   a read of rt->current_stack_frame for the reason §C-stack gives — every call on this engine trampolines onto
+   the HEAP stack, so "the current C activation" is not the caller and agreeing with it is a coincidence, not a
+   contract. Asserted here at the ORIGIN, where the answer is known, rather than three frames down in
+   19.2.1.1 where a NULL can only be reported. */
+static JSValue eval_direct_closure(JSContext *ctx, JSStackFrame *caller_sf, JSValueConst src, int scope_idx)
 {
     JSValue clo;
     const char *str;
     size_t len;
 
+    DCHECK(caller_sf != NULL,
+           "a direct eval was compiled without the frame of the body that is running it — this function is "
+           "reached only from OP_eval and OP_apply_eval, both of which are executing a bytecode body and hold "
+           "that frame in a register, so there is no shape of this call that legitimately has none");
     js_eval_sink_announce(ctx, src);
     if (!JS_IsString(src))
         return JS_UNINITIALIZED;
@@ -24842,7 +24863,7 @@ static JSValue eval_direct_closure(JSContext *ctx, JSValueConst src, int scope_i
     if (unlikely(!str))
         return JS_EXCEPTION;
     clo = JS_EvalInternal(ctx, JS_UNDEFINED, str, len, "<input>", 1,
-                          JS_EVAL_TYPE_DIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, scope_idx);
+                          JS_EVAL_TYPE_DIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, scope_idx, caller_sf);
     JS_FreeCString(ctx, str);
     if (unlikely(JS_IsException(clo)))
         return clo;
@@ -37978,7 +37999,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         obj = JS_UNDEFINED;
                     /* 19.2.1.1 is eval_direct_closure's, INCLUDING step 2 — this opcode no longer asks whether
                        the source is a String, it declares its operand shape and cleans up after it. */
-                    JSValue eclo = eval_direct_closure(ctx, obj, scope_idx);
+                    JSValue eclo = eval_direct_closure(ctx, sf, obj, scope_idx);
                     if (unlikely(JS_IsException(eclo))) goto exception;
                     if (!JS_IsUninitialized(eclo)) {
                         /* reshape [eval, args..] -> the plain-call shape [closure] with 0 args */
@@ -38057,7 +38078,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        CLOSURE and ran it on the tramp: one operation answering differently by how it was
                        written, which is exactly what this file forbids. Same ROUTE, same CALL, and now the same
                        decision — what is left here is this opcode's own operand shape and its cleanup. */
-                    JSValue eclo = eval_direct_closure(ctx, obj, scope_idx);
+                    JSValue eclo = eval_direct_closure(ctx, sf, obj, scope_idx);
                     if (unlikely(JS_IsException(eclo))) { free_arg_list(ctx, tab, len); goto exception; }
                     /* `obj` points INTO tab, so the completion is taken before the list is freed. */
                     ret_val = JS_IsUninitialized(eclo) ? js_dup(obj) : eclo;
@@ -64901,7 +64922,8 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 /* `export_name` and `input` may be pure ASCII or UTF-8 encoded */
 static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                  const char *input, size_t input_len,
-                                 const char *filename, int line, int flags, int scope_idx)
+                                 const char *filename, int line, int flags, int scope_idx,
+                                 JSStackFrame *caller_sf)
 {
     JSParseState s1, *s = &s1;
     int err, eval_type;
@@ -64920,8 +64942,20 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     m = NULL;
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         JSObject *p;
-        sf = ctx->rt->current_stack_frame;
-        DCHECK(sf != NULL, "sf != NULL");
+        /* 13.3.6.1's CALLER, TAKEN FROM THE CALLER — never re-derived from rt->current_stack_frame. That field
+           is the current C ACTIVATION, and on this engine a call is not one: OP_eval pushes a heap TrampFrame
+           and `goto restart`s, so the frame whose variable environment this eval must see is the interpreter's
+           own `sf` and the runtime global is at best a coincidence that happens to agree. Reading it here was
+           §scheduler's worked defect exactly — an operation that became a work item reading its input back off
+           a global instead of carrying it — and it read NULL on the first run in which a real direct eval ever
+           reached this arm. */
+        sf = caller_sf;
+        DCHECK(sf != NULL,
+               "a DIRECT eval reached 19.2.1.1 with no caller frame — 13.3.6.1 evaluates the program in the "
+               "CALLER's variable environment, so the frame is not optional and no other value can stand in "
+               "for it. Every direct eval comes from OP_eval or OP_apply_eval, both of which are executing a "
+               "bytecode body and hold that frame in a register; a NULL here means a THIRD site now compiles "
+               "with JS_EVAL_TYPE_DIRECT and passed nothing");
         DCHECK(JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT, "JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT");
         p = JS_VALUE_GET_OBJ(sf->cur_func);
         DCHECK(js_class_has_bytecode(p->class_id), "js_class_has_bytecode(p->class_id)");
@@ -65041,7 +65075,8 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
 /* the indirection is needed to make 'eval' optional */
 static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                const char *input, size_t input_len,
-                               const char *filename, int line, int flags, int scope_idx)
+                               const char *filename, int line, int flags, int scope_idx,
+                               JSStackFrame *caller_sf)
 {
     JSRuntime *rt = ctx->rt;
     /* THE @S SEAM'S COVERAGE, TAKEN HERE AND CONSUMED — see g_eval_sink_announced. Every compile passes this
@@ -65065,8 +65100,12 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         JS_FreeValueRT(rt, ctx->error_back_trace);
         ctx->error_back_trace = JS_UNDEFINED;
     }
+    DCHECK((flags & JS_EVAL_TYPE_MASK) != JS_EVAL_TYPE_DIRECT || caller_sf != NULL,
+           "a DIRECT eval was routed through this indirection with no caller frame — 13.3.6.1 needs the "
+           "caller's variable environment and only the site that HAS the frame can supply it, so a NULL here "
+           "is a call site that has not been told to pass one rather than a state the eval can recover from");
     return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
-                              flags, scope_idx);
+                              flags, scope_idx, caller_sf);
 }
 
 JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
@@ -65101,8 +65140,9 @@ JSValue JS_EvalThis2(JSContext *ctx, JSValueConst this_obj,
     JSValue ret;
 
     DCHECK((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL || (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE, "(eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL || (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE");
+    /* GLOBAL or MODULE only (asserted above), so there is no caller scope: NULL, like every non-direct eval. */
     ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename, line,
-                          eval_flags, -1);
+                          eval_flags, -1, NULL);
     return ret;
 }
 
@@ -71168,7 +71208,7 @@ static int js_dynfunc_check_halves(JSContext *ctx, JSFunctionKindEnum func_kind,
             return -1;
         fn = JS_EvalInternal(ctx, ctx->global_obj, cstr, len, "<input>", 1,
                              JS_EVAL_TYPE_INDIRECT | JS_EVAL_FLAG_COMPILE_ONLY |
-                             JS_EVAL_FLAG_FUNCTION_CTOR, -1);
+                             JS_EVAL_FLAG_FUNCTION_CTOR, -1, NULL);
         JS_FreeCString(ctx, cstr);
         if (JS_IsException(fn))
             return -1;
@@ -109805,7 +109845,7 @@ bool JS_DetectModule(const char *input, size_t input_len)
     }
     JS_AddIntrinsicRegExpCompiler(ctx); // otherwise regexp literals don't parse
     val = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, "<unnamed>", 1,
-                            JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY, -1);
+                            JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY, -1, NULL);
     if (JS_IsException(val)) {
         const char *msg = JS_ToCString(ctx, rt->current_exception);
         // gruesome hack to recognize exceptions from import statements;
