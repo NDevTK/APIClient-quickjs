@@ -1906,6 +1906,38 @@ typedef struct JSConcolicHooks {
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
+/* APIClient @S — THE JS-CONTEXT CODE-EXECUTION SINK, ANNOUNCED BY THE ENGINE THAT OWNS IT.
+ *
+ * The other two sink classes belong to the HOST: a markup sink is `element.innerHTML` and a URL sink is a
+ * navigation, and both are members of browser components, so the detector is called from the component that
+ * performs the operation. `eval` is not: 19.2.1 "eval ( source )" and 20.2.1.1.1 CreateDynamicFunction are
+ * ECMAScript intrinsics and live in this file, so this file is the only place that can say a value was offered
+ * to a program evaluation. Without this seam the whole JS-context derivation was reachable only from a
+ * fixture, and a real page's `eval(prefix + attackerInput)` was detected by nothing at all.
+ *
+ * IT IS A HOOK AND NOT A SELECTOR, and the test is structural rather than a claim: it has NO return value, so
+ * there is nothing for the algorithm to route on, and 19.2.1.1 proceeds byte-identically whether a host
+ * registered one or not. A host that registers none (the qjs shell, a conformance host) is told nothing and
+ * behaves exactly as upstream does.
+ *
+ * `src` is the value 19.2.1.1 step 1 was handed, announced BEFORE step 2 ("If source is not a String, return
+ * source") tests it, and BOTH arms are announced because those two arms are the sink's two halves:
+ *   - the NON-STRING arm is where the sink is DETECTED. Unknown external input is an object of the solver's
+ *     value class, so `eval(location.hash)` takes step 2 and returns unevaluated — this engine can compile no
+ *     program because the unknown names none, exactly as HTML 8.6's string-handler arm cannot.
+ *   - the STRING arm is where an @S CANDIDATE is read. A candidate re-run substitutes a concrete payload at
+ *     the source, so the page's own concatenations and filters build a real string, and the detector must see
+ *     the very bytes that are about to be compiled — to scan them per ECMAScript 12 for the lexical state the
+ *     attacker's bytes sit in, and to observe a breakout arriving at its own sink.
+ * The bytes are then COMPILED AND RUN by this engine, and that is what proves a PoC: the sink's own evaluation
+ * IS the fire oracle, so no host may model a second one beside it.
+ *
+ * BORROWED: the hook must not free `src` and must not retain it past the call. */
+typedef void JSEvalSinkFunc(JSContext *ctx, JSValueConst src);
+/* NULL is a legitimate argument and means "no host is listening" — which is what a conformance host is, and
+   what a solver host becomes once it has torn down the store the detector writes into. */
+JS_EXTERN void JS_SetEvalSinkHook(JSEvalSinkFunc *cb);
+
 /* Forced-execution FLOW API — the host CALLS these to create / drive / snapshot / free flows. (The preempt
    CALLBACK that parks a running flow lives in JSFlowControlHooks above; these are the host-driven counterpart.)
    A flow runs as a preemptible heap-resident async-function frame, so it interleaves under the WFQ. */

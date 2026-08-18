@@ -1553,8 +1553,6 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           int argc, JSValueConst *argv, int flags);
 static __exception int JS_ToArrayLengthFree(JSContext *ctx, uint32_t *plen,
                                             JSValue val, bool is_array_ctor);
-static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
-                             JSValueConst val, int flags, int scope_idx);
 static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
                                        JSValueConst suppressed, int backtrace_flags);
 static __maybe_unused void JS_DumpString(JSRuntime *rt, JSString *p);
@@ -7471,6 +7469,29 @@ static _Thread_local JSTimeTravelHooks g_time_travel = { NULL, NULL, NULL };
    `+` (js_add_slow), .cmp through == / === , .is names the solver's value class. One struct, installed by
    JS_SetConcolicHooks. */
 static _Thread_local JSConcolicHooks g_concolic;
+/* forced-exec @S JS-CONTEXT SINK (see JSEvalSinkFunc in quickjs.h) — the host's detector, told that a value was
+   offered to a program evaluation. Installed by JS_SetEvalSinkHook; NULL = no host is listening. */
+static _Thread_local JSEvalSinkFunc *g_eval_sink;
+/* THE SEAM'S COVERAGE, CONSUMED ONCE PER COMPILE, and it is an assertion rather than a piece of the mechanism.
+   JS_EVAL_FLAG_TRAMP_CLOSURE marks a program the PAGE is evaluating — 19.2.1's eval and 20.2.1.1.1's
+   CreateDynamicFunction, the two algorithms this file performs on a page-supplied source — and the two sites
+   that set that flag are exactly the two that announce first. A THIRD one added later without announcing would
+   fail SILENTLY and in the one direction that cannot be noticed: nothing breaks, the program runs, and a real
+   code-execution sink simply reports nothing for ever. So the flag and the announcement are asserted to arrive
+   together, at the one place every compile passes through. */
+static _Thread_local bool g_eval_sink_announced;
+
+/* 19.2.1.1 step 1's source, ANNOUNCED before step 2 tests it for a String — the whole of what this file says
+   about an @S sink, and it says it unconditionally: the non-string arm is where an unknown external input is
+   DETECTED and the string arm is where a candidate run's concrete payload is READ, so a seam that announced
+   only one of them would have exactly half a search.
+   The latch is raised only for a String, because only a String goes on to be compiled. */
+static void js_eval_sink_announce(JSContext *ctx, JSValueConst src)
+{
+    if (g_eval_sink)
+        g_eval_sink(ctx, src);
+    g_eval_sink_announced = JS_IsString(src);
+}
 
 /* 7.1.1 ToPrimitive is defined over ORDINARY objects. A CONCOLIC operand is not one: it is the solver's value
    class standing for unknown external input, and its coercion belongs to the concolic hooks — opacity SURVIVES
@@ -21390,6 +21411,12 @@ static int step_program_run(JSContext *ctx, JSStepHdr *h, JSContext *realm, JSVa
         const char *str;
         size_t len;
         JS_FreeValue(ctx, in);
+        /* THE @S JS-CONTEXT SINK, for every algorithm that reaches this sub-sequence: the INDIRECT eval
+           (19.2.1), CreateDynamicFunction (20.2.1.1.1) and ShadowRealm.prototype.evaluate. Announced before
+           step 2 because step 2's non-string arm is exactly where an unknown external input lands — see
+           JSEvalSinkFunc. The direct-eval spellings announce at eval_direct_closure, which is their own
+           convergence point; those are two algorithms, not one with a fallback. */
+        js_eval_sink_announce(ctx, src);
         if (!JS_IsString(src)) {
             *pout = js_dup(src);   /* 19.2.1.1 step 2: a non-string source is the result, unevaluated */
             return 0;
@@ -24789,15 +24816,34 @@ static JSObject *tramp_exotic_accessor(JSContext *ctx, const JSPropertyDescripto
            "that mints an accessor per query has to hand over a reference of its own instead");
     return f;
 }
-/* DIRECT eval, compiled to a CLOSURE for the tramp and never run here. Both spellings of a direct eval — `eval(x)`
-   and `eval(...arr)` — reach it, which is the point: the eval'd program's body must run on THIS tramp chain so a
-   loop inside it parks for the scheduler exactly like one in any other function, and JS_EvalObject's own JS_CallFree
-   would give it an activation off the chain with no base to park into. The plainness ASSERT lives here rather than
-   at each site, so there is one body-entry question and not one per spelling. */
+/* DIRECT eval — 19.2.1.1 PerformEval for the two spellings the compiler emits, `eval(x)` and `eval(...arr)`.
+   BOTH hand their source here, String or not, and that is now the whole point of the function: step 2 ("If
+   source is not a String, return source") was written out at EACH opcode and a THIRD time inside JS_EvalObject,
+   so one operation decided one spec step in three places. It is decided once, here — beside the @S
+   announcement, which has to see the non-string arm because that arm is precisely where unknown external input
+   lands and where the JS-context sink is DETECTED (see JSEvalSinkFunc). JS_EvalObject was that third copy and
+   its only caller was this line, so it is gone rather than left as a second way to spell the same step.
+   The program is compiled to a CLOSURE and never run here: the eval'd body must run on THIS tramp chain so a
+   loop inside it parks for the scheduler exactly like one in any other function, where a JS_CallFree would give
+   it an activation off the chain with no base to park into. The plainness ASSERT lives here rather than at each
+   site, so there is one body-entry question and not one per spelling.
+   JS_UNINITIALIZED = step 2 took the non-string arm, so the OPERAND is the completion, unevaluated. What is
+   left to each opcode is only its own operand shape and the cleanup that follows from it. */
 static JSValue eval_direct_closure(JSContext *ctx, JSValueConst src, int scope_idx)
 {
-    JSValue clo = JS_EvalObject(ctx, JS_UNDEFINED, src,
-                                JS_EVAL_TYPE_DIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, scope_idx);
+    JSValue clo;
+    const char *str;
+    size_t len;
+
+    js_eval_sink_announce(ctx, src);
+    if (!JS_IsString(src))
+        return JS_UNINITIALIZED;
+    str = JS_ToCStringLen(ctx, &len, src);
+    if (unlikely(!str))
+        return JS_EXCEPTION;
+    clo = JS_EvalInternal(ctx, JS_UNDEFINED, str, len, "<input>", 1,
+                          JS_EVAL_TYPE_DIRECT | JS_EVAL_FLAG_TRAMP_CLOSURE, scope_idx);
+    JS_FreeCString(ctx, str);
     if (unlikely(JS_IsException(clo)))
         return clo;
     DCHECK(tramp_body_is_plain(clo), "direct eval closure is not a trampolinable bytecode function");
@@ -27880,6 +27926,7 @@ void JS_SetFlowGen(uint32_t gen) { g_flow_gen = gen; }
 void JS_SetFlowControlHooks(const JSFlowControlHooks *h) { g_flow_control = *h; }
 void JS_SetTimeTravelHooks(const JSTimeTravelHooks *h) { g_time_travel = *h; }
 void JS_SetConcolicHooks(const JSConcolicHooks *h) { g_concolic = *h; }
+void JS_SetEvalSinkHook(JSEvalSinkFunc *cb) { g_eval_sink = cb; }
 
 /* `typeof x === "undefined"` and `=== "function"` are FUSED by the peephole into ONE opcode that never reaches
    OP_typeof or OP_strict_eq — so without this the concolic decision depended on WHICH STRING the program
@@ -37929,9 +37976,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         obj = call_argv[0];
                     else
                         obj = JS_UNDEFINED;
-                    if (JS_IsString(obj)) {
-                        JSValue eclo = eval_direct_closure(ctx, obj, scope_idx);
-                        if (unlikely(JS_IsException(eclo))) goto exception;
+                    /* 19.2.1.1 is eval_direct_closure's, INCLUDING step 2 — this opcode no longer asks whether
+                       the source is a String, it declares its operand shape and cleans up after it. */
+                    JSValue eclo = eval_direct_closure(ctx, obj, scope_idx);
+                    if (unlikely(JS_IsException(eclo))) goto exception;
+                    if (!JS_IsUninitialized(eclo)) {
                         /* reshape [eval, args..] -> the plain-call shape [closure] with 0 args */
                         for (i = -1; i < call_argc; i++) JS_FreeValue(ctx, call_argv[i]);
                         sp = (JSValue *)call_argv;
@@ -37939,7 +37988,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         call_argc = 0; tramp_first = -1; tramp_is_tail = 0;
                         goto do_tramp_call;
                     }
-                    ret_val = js_dup(obj);   /* non-string direct eval yields its argument unchanged */
+                    ret_val = js_dup(obj);   /* step 2: a non-string source is the completion, unevaluated */
                 } else {
                     /* The identifier `eval` resolved to something ELSE (`eval = f`, a local `var eval`, a `with`
                        object's property). 13.3.6.1 step 6 only special-cases the value %eval%; anything else is an
@@ -38001,29 +38050,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     len = elen;
                 }
                 obj = (len >= 1) ? tab[0] : JS_UNDEFINED;
-                if (JS_IsString(obj)) {
-                    /* DIRECT eval, the SPREAD spelling — and it ran the eval'd program with JS_EvalObject's own
-                       JS_CallFree, i.e. by C recursion, while `eval(x)` a few opcodes up compiled to a CLOSURE and
-                       ran it on the tramp. One operation answering differently by how it was written is exactly what
-                       this file forbids, and the difference was invisible because the eval'd program only aborts if
-                       it happens to contain a loop. Same ROUTE and now the same CALL. */
+                {
+                    /* DIRECT eval, the SPREAD spelling — 19.2.1.1 in full, including step 2, is
+                       eval_direct_closure's. Both spellings used to decide step 2 for themselves and this one
+                       also ran the eval'd program by C recursion while `eval(x)` a few opcodes up compiled to a
+                       CLOSURE and ran it on the tramp: one operation answering differently by how it was
+                       written, which is exactly what this file forbids. Same ROUTE, same CALL, and now the same
+                       decision — what is left here is this opcode's own operand shape and its cleanup. */
                     JSValue eclo = eval_direct_closure(ctx, obj, scope_idx);
+                    if (unlikely(JS_IsException(eclo))) { free_arg_list(ctx, tab, len); goto exception; }
+                    /* `obj` points INTO tab, so the completion is taken before the list is freed. */
+                    ret_val = JS_IsUninitialized(eclo) ? js_dup(obj) : eclo;
                     free_arg_list(ctx, tab, len);
-                    if (unlikely(JS_IsException(eclo))) goto exception;
-                    /* reshape [callee, array] -> the plain-call shape [closure] with 0 args */
                     JS_FreeValue(ctx, sp[-2]);
                     JS_FreeValue(ctx, sp[-1]);
-                    sp[-2] = eclo;
-                    sp--;
-                    call_argv = sp; call_argc = 0; tramp_first = -1; tramp_is_tail = 0;
-                    goto do_tramp_call;
+                    sp -= 2;
+                    *sp++ = ret_val;
+                    if (!JS_IsUninitialized(eclo)) {
+                        /* the closure now stands in the plain-call shape [closure] with 0 args */
+                        call_argv = sp; call_argc = 0; tramp_first = -1; tramp_is_tail = 0;
+                        goto do_tramp_call;
+                    }
+                    /* step 2: a non-string source is the completion, unevaluated — already placed */
                 }
-                ret_val = js_dup(obj);   /* a non-string direct eval yields its argument unchanged */
-                free_arg_list(ctx, tab, len);
-                JS_FreeValue(ctx, sp[-2]);
-                JS_FreeValue(ctx, sp[-1]);
-                sp -= 2;
-                *sp++ = ret_val;
             }
             BREAK;
 
@@ -64995,34 +65044,29 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                const char *filename, int line, int flags, int scope_idx)
 {
     JSRuntime *rt = ctx->rt;
+    /* THE @S SEAM'S COVERAGE, TAKEN HERE AND CONSUMED — see g_eval_sink_announced. Every compile passes this
+       one line, so the question is asked once rather than at each of the sites that could forget to ask it. */
+    bool announced = g_eval_sink_announced;
 
+    g_eval_sink_announced = false;
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
+    DCHECK(!(flags & JS_EVAL_FLAG_TRAMP_CLOSURE) || announced,
+           "a PAGE program reached compilation without passing the @S eval-sink seam — "
+           "JS_EVAL_FLAG_TRAMP_CLOSURE names a program 19.2.1 eval or 20.2.1.1.1 CreateDynamicFunction is "
+           "evaluating, and every one of them announces its source first (js_eval_sink_announce) so the "
+           "JS-context sink can be detected and a candidate's own bytes read at the sink they are about to "
+           "fire in. A site that compiles page source without announcing fails SILENTLY: the program runs, "
+           "nothing breaks, and a real code-execution sink reports nothing for ever. Announce at the new "
+           "site — never relax this");
+    (void)announced;
     if (!rt->current_stack_frame) {
         JS_FreeValueRT(rt, ctx->error_back_trace);
         ctx->error_back_trace = JS_UNDEFINED;
     }
     return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
                               flags, scope_idx);
-}
-
-static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
-                             JSValueConst val, int flags, int scope_idx)
-{
-    JSValue ret;
-    const char *str;
-    size_t len;
-
-    if (!JS_IsString(val))
-        return js_dup(val);
-    str = JS_ToCStringLen(ctx, &len, val);
-    if (!str)
-        return JS_EXCEPTION;
-    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", 1, flags, scope_idx);
-    JS_FreeCString(ctx, str);
-    return ret;
-
 }
 
 JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
