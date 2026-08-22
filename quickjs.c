@@ -17328,21 +17328,54 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
             JSValue val1;
             /* The ToNumber boundary's twin — see the contract stated there. A concolic must not arrive: the
                operator owed it a concolic result, and this function owes C a real JSString.
-               THE OPERATOR THAT OWES IT NOW EXISTS, AND THIS ABORT NAMES THE SITES THAT DO NOT GO THROUGH IT.
-               §7.1.19 ToString ( arg ) over unknown external input answers with a DERIVED CONCOLIC, built at
-               step_tostring_run — the one sub-sequence every builtin whose coercion can run the page's own
-               `toString` performs it through, engine and host alike. What is left here is the handful of C
-               sites that call JS_ToString DIRECTLY on a value the page supplied, each of which is its own
-               unbuilt operator rather than a case for this boundary to absorb: the dynamic-import specifier,
-               `new String(x)`'s wrapper arm, JS_ToUTF32String, Date.parse, the DOMException constructor's two
-               arguments, and JS_ConcatString reached other than through the `+` hook. So this message is a
-               WORK QUEUE and not a wall — answer it at the site named in the frame below this one. */
+               THE OPERATOR THAT OWES IT NOW EXISTS, SO THIS ABORT IS A WORK QUEUE RATHER THAN A WALL, AND THE
+               MESSAGE IS THE WHOLE DIAGNOSTIC. §7.1.19 ToString ( arg ) over unknown external input answers
+               with a DERIVED CONCOLIC at step_tostring_run — the one sub-sequence every builtin and every Web
+               IDL argument coerces through, engine and host alike — so a value arriving HERE came from a C site
+               that called JS_ToString directly. The reader of this `@WHY` has a file:line naming THIS function
+               and no stack (a real page reports the message and nothing else), so the message carries the two
+               things that localise it instead: WHICH unknown value died, by its display shape, and the CLOSED
+               list of callers that can still reach this line. That list was read off the tree, not recalled —
+               every JS_ToString/JS_ToStringFree in this file was attributed to its enclosing function and the
+               guarded ones (decodeURI/encodeURI/escape/unescape, btoa/atob, String.prototype.concat, JSON's
+               property list, JS_ToObject's string arm) removed. Each survivor is its own unbuilt operator, not
+               a case for this boundary to absorb. */
             if (unlikely(g_concolic.is && g_concolic.is(val))) {
-                DCHECK(0, "ToString over a CONCOLIC operand, from a site that is NOT a step machine's coercion "
-                          "— step_tostring_run answers §7.1.19 ToString over unknown external input with a "
-                          "derived concolic, and this caller reached the conversion boundary instead. Build "
-                          "the answer in THAT operator (js_concolic_derive over the operand, named by the "
-                          "operation), never by converting here: this boundary owes C a real string.");
+#if APICLIENT_DEV
+                {
+                    /* The SHAPE, asked for explicitly — the same projection every other C consumer of an
+                       unknown makes (concolic_shape_c, fetch_park's URL, Headers' value). `key_name` answers it
+                       as a real String, so the JS_ToCString below cannot re-enter this function; it is asked
+                       for anyway rather than assumed, because a value that is not a String here would. */
+                    char why[1600];
+                    const char *shape = NULL;
+                    JSValue sv = JS_UNINITIALIZED;
+
+                    if (g_concolic.key_name) {
+                        sv = g_concolic.key_name(ctx, val);
+                        if (JS_IsString(sv))
+                            shape = JS_ToCString(ctx, sv);
+                    }
+                    snprintf(why, sizeof why,
+                             "ToString over UNKNOWN EXTERNAL INPUT `%.240s`, from a C site that is NOT a step "
+                             "machine's coercion. step_tostring_run already answers §7.1.19 ToString ( arg ) "
+                             "over unknown input with a derived concolic (JS_STEP_UNKNOWN), so every builtin "
+                             "and every Web IDL argument is covered and this caller reached the conversion "
+                             "boundary directly. THE CLOSED LIST OF CALLERS THAT CAN: js_import_opts_step "
+                             "(`import(x)`'s specifier), js_str_ctor_step's WRAPPER arm (`new String(x)`; the "
+                             "plain call is answered by the .to_str hook), js_symbol_constructor (`Symbol(x)`), "
+                             "js_Date_parse (`Date.parse(x)`), js_domexception_ctor_body (message and name), "
+                             "JS_ToUTF32String (localeCompare/normalize), JS_ConcatString and JS_ConcatString3 "
+                             "reached other than through the `+` hook, and js_force_tostring (any JS_ToCString "
+                             "on a non-String). Find which by the shape above and build the answer in THAT "
+                             "operator — js_concolic_derive over the operand, named by the operation it is "
+                             "performing — never by converting here: this boundary owes C a real string.",
+                             shape ? shape : "(a shape this engine could not spell)");
+                    if (shape) JS_FreeCString(ctx, shape);
+                    JS_FreeValue(ctx, sv);
+                    DFAIL(why);
+                }
+#endif
                 ret = JS_ThrowTypeError(ctx, "stringifying unknown external input is not modelled yet");
                 goto done;
             }
@@ -21349,6 +21382,11 @@ int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *o
     return 0;
 }
 
+/* THE ToString SUB-SEQUENCE'S OWN CURSOR, declared first because more than one function in it reads the
+   cursor: the coercion itself, its unknown-input arm below, ToPropertyKey's and the receiver form's. It was
+   declared beside step_tostring_run alone, which was true only while that was the whole sub-sequence. */
+enum { STR_PH_START = 0, STR_PH_PRIM };
+
 /* §7.1.19 ToString ( arg ) OVER UNKNOWN EXTERNAL INPUT, PARKED FOR THE DRIVER — see JS_STEP_UNKNOWN for the
    spec argument and for what the driver then does with it. `v` is BORROWED; the header takes its own
    reference, because the caller's may be a value the caller is about to release. */
@@ -21367,7 +21405,6 @@ static int step_tostring_unknown(JSStepHdr *h, JSValueConst v)
    primitive, so the ToString that finishes it runs nothing. 0 = *pout is the string, 5 = the caller must return
    that step code and will be re-entered here, JS_STEP_UNKNOWN = the value is unknown external input and there
    is no String to produce (nothing is written to *pout), -1 = threw. */
-enum { STR_PH_START = 0, STR_PH_PRIM };
 
 int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, JSValue *pout,
                              JSValue **out_cb, int *out_argc)
