@@ -2986,6 +2986,13 @@ void JS_SetJobEnqueueHook(JSJobEnqueueHook h) { g_job_enqueue_hook = h; }
 static _Thread_local JSJobDropHook g_job_drop_hook = NULL;
 void JS_SetJobDropHook(JSJobDropHook h) { g_job_drop_hook = h; }
 
+/* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
+   `+` (js_add_slow), .cmp through == / === , .is names the solver's value class. One struct, installed by
+   JS_SetConcolicHooks. Declared HERE, with the other engine-wide hook sets, because the string helpers a
+   thousand lines below assert against unknown external input reaching them and a declaration that sits after
+   its first assertion is a rule nobody can state. */
+static _Thread_local JSConcolicHooks g_concolic;
+
 /* A C CALL CYCLE'S DEPTH, ASSERTED WHERE IT IS RELIED ON.
  *
  * engine/check_recursion.mjs reports four self-contained cycles over the whole program, and every one of them
@@ -6089,6 +6096,13 @@ JSValue JS_NewStringUTF16(JSContext *ctx, const uint16_t *buf, size_t len)
     return JS_MKPTR(JS_TAG_STRING, str);
 }
 
+/* `str1` and `str3` are the ENGINE's own literals; `str2` is the only operand a page value can be, and it must
+   already be one this helper can convert. UNKNOWN EXTERNAL INPUT IS NOT, and this asserts it rather than
+   letting the ToString below carry it to a boundary that owes C a real JSString: every caller either holds an
+   atom's string (js_get_function_name, js_method_set_properties, js_function_toString, js_symbol_toString,
+   js_str_ctor_step's Symbol arm, js_func_bind_step, JS_ToObjectString and js_object_tostring_step's builtin
+   tag) or took its operand through step_tostring_run, which answers unknown input with JS_STEP_UNKNOWN and
+   collapses the whole machine (js_error_tostring_step, js_re_split_step, sj_open_container). */
 static JSValue JS_ConcatString3(JSContext *ctx, const char *str1,
                                 JSValue str2, const char *str3)
 {
@@ -6096,6 +6110,10 @@ static JSValue JS_ConcatString3(JSContext *ctx, const char *str1,
     int len1, len3;
     JSString *p;
 
+    DCHECK(!(g_concolic.is && g_concolic.is(str2)),
+           "JS_ConcatString3 was handed unknown external input — this helper concatenates engine literals onto "
+           "a value that is already convertible, so an unknown one means a caller skipped the ToString "
+           "sub-sequence that answers §7.1.19 for it");
     if (unlikely(JS_VALUE_GET_TAG(str2) != JS_TAG_STRING)) {
         str2 = JS_ToStringFree(ctx, str2);
         if (JS_IsException(str2))
@@ -6809,10 +6827,22 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
 
 /* op1 and op2 are converted to strings. For convenience, op1 or op2 =
    JS_EXCEPTION are accepted and return JS_EXCEPTION.  */
+/* NEITHER OPERAND IS EVER UNKNOWN EXTERNAL INPUT, and that is an invariant of the ONE operator that reaches
+   here with page values: 13.15.3's `+` answers a concolic operand at js_add_slow's .add hook, which returns 1
+   whenever EITHER side is one, so the concatenation below runs only after both were ruled out. (An ordinary
+   object whose ToPrimitive ANSWERS with unknown input arrives the same way: js_toprim_operand excludes a
+   concolic, so the coerced result re-enters js_add_slow and meets the same hook.) String.prototype.concat
+   folds an unknown piece through that same hook at js_str_concat_join; every other caller holds engine
+   strings. Asserted here rather than at the ToString below because THIS is the operand's origin — the
+   conversion boundary can only say that something unknown arrived, not which operator let it. */
 static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
 {
     JSString *p1, *p2;
 
+    DCHECK(!(g_concolic.is && (g_concolic.is(op1) || g_concolic.is(op2))),
+           "JS_ConcatString was handed unknown external input — 13.15.3's `+` answers one at the concolic .add "
+           "hook and every other caller holds engine strings, so this operand reached string concatenation "
+           "through a path that has no answer for it");
     if (unlikely(!tag_is_string(JS_VALUE_GET_TAG(op1)))) {
         op1 = JS_ToStringFree(ctx, op1);
         if (JS_IsException(op1)) {
@@ -7474,10 +7504,6 @@ uint32_t JS_ObjFlowGen(JSValueConst obj) {
    via the host's absent-slot recording, a creation); .cell_write covers a closure-cell (JSVarRef) write, which
    bypasses the property path. Installed once by JS_SetTimeTravelHooks. */
 static _Thread_local JSTimeTravelHooks g_time_travel = { NULL, NULL, NULL };
-/* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
-   `+` (js_add_slow), .cmp through == / === , .is names the solver's value class. One struct, installed by
-   JS_SetConcolicHooks. */
-static _Thread_local JSConcolicHooks g_concolic;
 /* forced-exec @S JS-CONTEXT SINK (see JSEvalSinkFunc in quickjs.h) — the host's detector, told that a value was
    offered to a program evaluation. Installed by JS_SetEvalSinkHook; NULL = no host is listening. */
 static _Thread_local JSEvalSinkFunc *g_eval_sink;
@@ -17328,18 +17354,28 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
             JSValue val1;
             /* The ToNumber boundary's twin — see the contract stated there. A concolic must not arrive: the
                operator owed it a concolic result, and this function owes C a real JSString.
-               THE OPERATOR THAT OWES IT NOW EXISTS, SO THIS ABORT IS A WORK QUEUE RATHER THAN A WALL, AND THE
-               MESSAGE IS THE WHOLE DIAGNOSTIC. §7.1.19 ToString ( arg ) over unknown external input answers
-               with a DERIVED CONCOLIC at step_tostring_run — the one sub-sequence every builtin and every Web
-               IDL argument coerces through, engine and host alike — so a value arriving HERE came from a C site
-               that called JS_ToString directly. The reader of this `@WHY` has a file:line naming THIS function
-               and no stack (a real page reports the message and nothing else), so the message carries the two
-               things that localise it instead: WHICH unknown value died, by its display shape, and the CLOSED
-               list of callers that can still reach this line. That list was read off the tree, not recalled —
-               every JS_ToString/JS_ToStringFree in this file was attributed to its enclosing function and the
-               guarded ones (decodeURI/encodeURI/escape/unescape, btoa/atob, String.prototype.concat, JSON's
-               property list, JS_ToObject's string arm) removed. Each survivor is its own unbuilt operator, not
-               a case for this boundary to absorb. */
+               EVERY OPERATOR ON THIS PATH IS NOW BUILT, so what remains is ONE SHAPE and the message says
+               which. §7.1.19 ToString ( arg ) over unknown external input answers with a DERIVED CONCOLIC at
+               step_tostring_run — the one sub-sequence every builtin and every Web IDL argument coerces
+               through — and the C sites that reached JS_ToString around it each answer at their own operator
+               now: §13.3.10.2 EvaluateImportCall settles `import(x)`'s capability with a derived namespace,
+               §22.1.1.1 String ( value ) answers both arms at js_str_ctor_unknown, §20.4.1.1
+               Symbol ( [ description ] ) and §21.4.3.2 Date.parse ( string ) derive their results (Date.parse
+               by RUNNING the real parse on the operand's example), and WEB IDL §4.4 DOMException builds the
+               exception out of derived `message` and `name` and derives `code` from the name. Three more that
+               this list used to name were REACHABILITY CLAIMS THAT WERE ALREADY FALSE — JS_ConcatString,
+               JS_ConcatString3 and JS_ToUTF32String cannot be handed unknown input at all — and each now
+               asserts that at its own site instead of being described here, because a list is only worth what
+               its last check was worth.
+               WHAT IS LEFT IS js_force_tostring, and it is NOT an unbuilt operator — it is JS_ToCStringLen2 /
+               JS_ToCStringLenUTF16, a C consumer that wants BYTES. A `const char *` cannot carry a concolic,
+               so there is nothing here to derive INTO and no coercion this boundary could perform: the
+               consumer must ask for the unknown's own display SHAPE at ITS site, which is what fetch's §5.4
+               URL, Headers' value, and the Attr / Element / Node text edges already do through
+               concolic_shape_c. A `@WHY` here therefore names a byte consumer that has not asked yet, and the
+               file:line to fix is the JS_ToCString call, not this one. The reader has no stack (a real page
+               reports the message and nothing else), so the message carries WHICH unknown value died, by its
+               display shape, to identify the edge that took it. */
             if (unlikely(g_concolic.is && g_concolic.is(val))) {
 #if APICLIENT_DEV
                 {
@@ -17358,18 +17394,19 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                     }
                     snprintf(why, sizeof why,
                              "ToString over UNKNOWN EXTERNAL INPUT `%.240s`, from a C site that is NOT a step "
-                             "machine's coercion. step_tostring_run already answers §7.1.19 ToString ( arg ) "
-                             "over unknown input with a derived concolic (JS_STEP_UNKNOWN), so every builtin "
-                             "and every Web IDL argument is covered and this caller reached the conversion "
-                             "boundary directly. THE CLOSED LIST OF CALLERS THAT CAN: js_import_opts_step "
-                             "(`import(x)`'s specifier), js_str_ctor_step's WRAPPER arm (`new String(x)`; the "
-                             "plain call is answered by the .to_str hook), js_symbol_constructor (`Symbol(x)`), "
-                             "js_Date_parse (`Date.parse(x)`), js_domexception_ctor_body (message and name), "
-                             "JS_ToUTF32String (localeCompare/normalize), JS_ConcatString and JS_ConcatString3 "
-                             "reached other than through the `+` hook, and js_force_tostring (any JS_ToCString "
-                             "on a non-String). Find which by the shape above and build the answer in THAT "
-                             "operator — js_concolic_derive over the operand, named by the operation it is "
-                             "performing — never by converting here: this boundary owes C a real string.",
+                             "machine's coercion. step_tostring_run answers §7.1.19 ToString ( arg ) over "
+                             "unknown input with a derived concolic (JS_STEP_UNKNOWN), and every OPERATOR that "
+                             "used to reach this line answers at its own site now (EvaluateImportCall, "
+                             "String(value) and its wrapper, Symbol(description), Date.parse, the DOMException "
+                             "constructor), so ONE shape is left: js_force_tostring, i.e. a JS_ToCString / "
+                             "JS_ToCStringLen / JS_ToCStringLenUTF16 on this value. THAT IS A BYTE CONSUMER, "
+                             "NOT AN UNBUILT OPERATOR — a `const char *` cannot carry a concolic, so there is "
+                             "nothing for this boundary to derive into. FIX IT AT THE JS_ToCString CALL: ask "
+                             "for the unknown's own display shape there (concolic_shape_c), the way fetch's "
+                             "§5.4 URL, Headers' value and the Attr/Element/Node text edges already do. Use "
+                             "the shape above to find which edge took it. If the arrival is NOT a byte "
+                             "consumer, it is a new operator: build the answer in IT — js_concolic_derive over "
+                             "the operand, named by the operation it performs — never by converting here.",
                              shape ? shape : "(a shape this engine could not spell)");
                     if (shape) JS_FreeCString(ctx, shape);
                     JS_FreeValue(ctx, sv);
@@ -59074,6 +59111,23 @@ static int js_import_opts_reject(JSContext *ctx, JSImportOpts *s, JSValue err)
     return 0;
 }
 
+/* §13.3.10.2 EvaluateImportCall's ToString(specifier) OVER UNKNOWN EXTERNAL INPUT. `import(x)` where x is
+   unknown names no module, and the step after the coercion is HostLoadImportedModule — so there is nothing to
+   fetch, nothing to link and nothing to evaluate, and the module NAMESPACE the capability settles with is
+   itself unknown. That is the operator's answer and it is a value, not a rejection: rejecting would hand the
+   page a completion its own `catch` swallows and end the exploration of everything the chunk's exports reach,
+   while a derived concolic keeps `import(x).then(m => m.render())` running with the source still attached —
+   §solver's "code-loading async ALWAYS executes", as close as it can be honoured when the address is unknown.
+   The specifier's SHAPE is what the @H surface then reports for the chunk that could not be named.
+   Always returns 0: the opcode completes normally with the promise, exactly as the reject path does. */
+static int js_import_opts_resolve_unknown(JSContext *ctx, JSImportOpts *s, JSValue ns)
+{
+    JSValue rr = JS_Call(ctx, s->funcs[0], JS_UNDEFINED, 1, vc(&ns));
+    JS_FreeValue(ctx, ns);
+    JS_FreeValue(ctx, rr);
+    return 0;
+}
+
 /* step 12: hand the resolved specifier and attribute record to the host. The load cannot run synchronously —
    it would recurse into js_evaluate_module — so it is a job, and nothing here runs the page's code. */
 static int js_import_opts_enqueue(JSContext *ctx, JSImportOpts *s)
@@ -59127,7 +59181,15 @@ static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
 
         /* step 8: the specifier is a PRIMITIVE by now — an object one was coerced by OP_import's ToPrimitive
            request before the opcode resumed — so this runs nothing. It still throws for a Symbol, and that
-           throw rejects like every other. */
+           throw rejects like every other.
+           UNKNOWN EXTERNAL INPUT REACHES HERE UNCOERCED, because js_toprim_operand excludes a concolic (§7.1.1
+           over one is the identity) — so the operator answers before the coercion, which owes C a real
+           JSString and can only abort. */
+        {
+            JSValue ns = js_concolic_derive(ctx, step_arg(&s->hdr, 0), "import", JS_UNDEFINED);
+            if (!JS_IsUninitialized(ns))
+                return js_import_opts_resolve_unknown(ctx, s, ns);
+        }
         s->spec_str = JS_ToString(ctx, step_arg(&s->hdr, 0));
         if (JS_IsException(s->spec_str)) {
             s->spec_str = JS_UNDEFINED;
@@ -85911,6 +85973,36 @@ static const JSClassExoticMethods js_string_exotic_methods = {
 enum { STRCTOR_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_str_ctor_steps[] = { STRCTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
+/* §22.1.1.1 String ( value ) OVER UNKNOWN EXTERNAL INPUT — the answer for BOTH of its arms, at whichever of
+   the two values step 3 is about to coerce: the argument itself, or what step 1's ToPrimitive request
+   delivered (`new String({toString(){return location.hash}})` arrives the second way, and §7.1.19 step 11's
+   assertion holds about the PAGE's value while the carrier is still an Object).
+   Step 3's ToString of an unknown IS the plain call's whole result, which is why that arm has a dedicated hook
+   whose shape is `String(x)` and not `x.<op>()`. Step 4's StringCreate over an unknown is a different
+   operation and is named as one: there is no real JSString to give StringCreate — made_value below reads the
+   wrapper's length straight off it — and the conversion boundary underneath owes C one. The wrapper's example
+   is ABSENT rather than the operand's: `new String(v)` is an OBJECT, and handing back the string would claim a
+   concrete this engine never built. JS_UNINITIALIZED = an ordinary operand, carry on. */
+static JSValue js_str_ctor_unknown(JSContext *ctx, JSValueConst nt, JSValueConst v)
+{
+    JSValue c;
+
+    if (!(g_concolic.is && g_concolic.is(v)))
+        return JS_UNINITIALIZED;
+    if (JS_IsUndefined(nt)) {
+        DCHECK(g_concolic.to_str != NULL,
+               "22.1.1.1's own coercion hook is absent while unknown-input value semantics are installed — the "
+               "hook set is one struct and a plain String(x) has no other answer");
+        c = g_concolic.to_str(ctx, v);
+    } else {
+        c = js_concolic_derive(ctx, v, "new String", JS_UNDEFINED);
+    }
+    DCHECK(!JS_IsUninitialized(c),
+           "String(unknown external input) declined an operand this engine had already recognised as unknown — "
+           "the value semantics were installed without their derivation hook");
+    return c;
+}
+
 static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSStrCtor *s = st;
@@ -85922,14 +86014,12 @@ static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     /* the wrapper stage = the string is computed and parked on the state; only its prototype read is left */
     if (s->hdr.stage == STRCTOR_WRAPPER)
         goto made_value;
-    /* 22.1.1.1 over UNKNOWN INPUT: String(x) of unknown external input is unknown, with the source kept — the
-       operator answers, because the ToString boundary below owes C a real string. `new String(x)` is a wrapper
-       object and is not this case. */
-    if (!s->coerced && JS_IsUndefined(nt) && g_concolic.to_str && g_concolic.is && g_concolic.is(arg)) {
-        JSValue c = g_concolic.to_str(ctx, arg);
+    /* 22.1.1.1 over UNKNOWN INPUT, asked BEFORE the coercion request below — see js_str_ctor_unknown. The
+       RESULT is the derived concolic itself on both arms: there is no wrapper left to build, and made_value
+       below reads a real string's length off s->val. */
+    if (!s->coerced) {
+        JSValue c = js_str_ctor_unknown(ctx, nt, arg);
         if (!JS_IsUninitialized(c)) {
-            /* the RESULT is the derived concolic itself — a plain call returns the string, and there is no
-               wrapper to build (made_value below reads a real string's length off s->val). */
             JS_FreeValue(ctx, cb_result);
             s->result = c;
             return 0;
@@ -85943,7 +86033,14 @@ static int js_str_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         return 5;
     }
     if (s->coerced) {
-        /* the coercion settled: a primitive, so ToString finishes without user code. */
+        /* the coercion settled: a primitive, so ToString finishes without user code — unless the page's own
+           toString ANSWERED with unknown external input, which is the same operator question one hop later. */
+        JSValue c = js_str_ctor_unknown(ctx, nt, cb_result);
+        if (!JS_IsUninitialized(c)) {
+            JS_FreeValue(ctx, cb_result);
+            s->result = c;
+            return 0;
+        }
         val = JS_ToString(ctx, cb_result);
         JS_FreeValue(ctx, cb_result);
     } else {
@@ -88375,11 +88472,20 @@ static JSValue js_string_case_body(JSContext *ctx, JSValueConst strv, int to_low
 }
 
 /* return (-1, NULL) if exception, otherwise (len, buf) */
+/* THE OPERAND IS ALREADY A COERCED STRING. Its one caller is js_str_recv_step's normalize arm, whose receiver
+   came from step_thisstring_run — §7.1.19 over unknown external input answers there with JS_STEP_UNKNOWN and
+   the driver completes the WHOLE machine with a derived concolic, so the body never runs for one. 22.1.3.12
+   localeCompare reads its two operands the same way and does not reach here at all. Asserted rather than left
+   as a reachability argument, because the argument is about the caller and the crash would be here. */
 static int JS_ToUTF32String(JSContext *ctx, uint32_t **pbuf, JSValue val1)
 {
     JSValue val;
     int len;
 
+    DCHECK(!(g_concolic.is && g_concolic.is(val1)),
+           "JS_ToUTF32String over unknown external input — 22.1.3.15 String.prototype.normalize takes its "
+           "receiver through step_thisstring_run, which collapses the machine to a derived concolic before any "
+           "of this runs, so an unknown here means a caller coerced outside that sub-sequence");
     val = JS_ToString(ctx, val1);
     if (JS_IsException(val))
         return -1;
@@ -95183,6 +95289,16 @@ static JSValue js_symbol_constructor(JSContext *ctx, JSValueConst new_target,
     if (argc == 0 || JS_IsUndefined(argv[0])) {
         p = NULL;
     } else {
+        /* §20.4.1.1 Symbol ( [ description ] ) step 3 OVER UNKNOWN EXTERNAL INPUT. The declaration's coercion
+           is a ToPrimitive, which over a concolic is the identity, so unknown input arrives here uncoerced —
+           and step 4 wants a new Symbol whose [[Description]] IS that unknown String, which
+           JS_NewSymbolInternal cannot build (it takes a JSString) and the conversion boundary below cannot
+           produce. The operator answers with the derived unknown instead: what a page does with a Symbol is
+           use it as a property key, and an unknown key already denotes its own shape through the key_name
+           hook, so the write and the later read still land in the same slot. */
+        JSValue c = js_concolic_derive(ctx, argv[0], "Symbol", JS_UNDEFINED);
+        if (!JS_IsUninitialized(c))
+            return c;
         str = JS_ToString(ctx, argv[0]);
         if (JS_IsException(str))
             return JS_EXCEPTION;
@@ -102533,6 +102649,23 @@ static JSValue js_Date_parse(JSContext *ctx, JSValueConst this_val,
 
     rv = JS_NAN;
 
+    {   /* §21.4.3.2 Date.parse ( string ) OVER UNKNOWN EXTERNAL INPUT. "This function applies the ToString
+           operator to its argument … it returns a Number, the UTC time value" — so the operator's result is a
+           NUMBER derived from the unknown, never a coercion this function's ToString below could perform (that
+           boundary owes C a real JSString). THE PARSE ITSELF RUNS, on the operand's own example: §solver
+           propagates an example only by performing the real operation on the concrete, so this re-enters with
+           the example in place of the argument — the same path a page with a known date takes — and the
+           derived unknown carries the time value this function REALLY computed. `Date.parse(x)` on a cookie or
+           a query parameter is a real bundle shape (an expiry check gating a refresh call), and the branch on
+           its result still forks because the result is still unknown. */
+        JSValue ex = js_concolic_operand(ctx, argv[0]);
+        if (!JS_IsUninitialized(ex)) {
+            JSValue real = JS_UNDEFINED;
+            if (JS_IsString(ex)) { JSValueConst a2[1]; a2[0] = ex; real = js_Date_parse(ctx, this_val, 1, a2); }
+            JS_FreeValue(ctx, ex);
+            return js_concolic_derive(ctx, argv[0], "Date.parse", real);
+        }
+    }
     s = JS_ToString(ctx, argv[0]);
     if (JS_IsException(s))
         return JS_EXCEPTION;
@@ -108873,15 +109006,27 @@ static JSValue js_domexception_ctor_body(JSContext *ctx, JSValueConst obj_,
     JSDOMExceptionData *s;
     JSValue obj = (JSValue)obj_, message, name;
 
-    if (!JS_IsUndefined(argv[0]))
-        message = JS_ToString(ctx, argv[0]);
-    else
+    /* WEB IDL §4.4 DOMException's constructor takes `optional DOMString message` and `optional DOMString
+       name`, and §3.2.10 DOMString IS the ToString of each. OVER UNKNOWN EXTERNAL INPUT that conversion has
+       no real JSString to produce, and the boundary underneath owes C one — so each argument answers as its
+       own derived unknown and the exception is BUILT with it, which is the shape 20.5.1.1's `message` already
+       takes one screen up (js_error_ctor_step). It is not decoration: a bundle that wraps a failed parse of a
+       query parameter in a DOMException and then renders `e.message` has put unknown input in a sink, and
+       keeping the source attached is what lets that be solved. The example is the OPERAND's own — ToString of
+       a String is the identity, so the operation really did produce it. */
+    if (!JS_IsUndefined(argv[0])) {
+        message = js_concolic_derive(ctx, argv[0], "DOMException.message", js_concolic_operand_str(ctx, argv[0]));
+        if (JS_IsUninitialized(message))
+            message = JS_ToString(ctx, argv[0]);
+    } else
         message = js_empty_string(ctx->rt);
     if (JS_IsException(message))
         goto fail1;
-    if (!JS_IsUndefined(argv[1]))
-        name = JS_ToString(ctx, argv[1]);
-    else
+    if (!JS_IsUndefined(argv[1])) {
+        name = js_concolic_derive(ctx, argv[1], "DOMException.name", js_concolic_operand_str(ctx, argv[1]));
+        if (JS_IsUninitialized(name))
+            name = JS_ToString(ctx, argv[1]);
+    } else
         name = JS_AtomToString(ctx, JS_ATOM_Error);
     if (JS_IsException(name))
         goto fail2;
@@ -108952,6 +109097,16 @@ static JSValue js_domexception_get_code(JSContext *ctx, JSValueConst this_val)
     s = JS_GetOpaque2(ctx, this_val, JS_CLASS_DOM_EXCEPTION);
     if (!s)
         return JS_EXCEPTION;
+    /* WEB IDL §4.4 DOMException's `code` is the legacy number the NAME maps to, so an unknown name is an
+       unknown code — derived from the name rather than looked up, because the table below would otherwise read
+       an unknown through JS_ToCStringLen and abort at a boundary that owes C bytes. Nothing is cached: the
+       answer belongs to the value, not to this object's `-1` sentinel, and a cached 0 would say "no legacy
+       code" about a name that may well have one. */
+    {
+        JSValue c = js_concolic_derive(ctx, s->name, "DOMException.code", JS_UNDEFINED);
+        if (!JS_IsUninitialized(c))
+            return c;
+    }
     if (s->code == -1) {
         name = JS_ToCStringLen(ctx, &len, s->name);
         if (!name)
