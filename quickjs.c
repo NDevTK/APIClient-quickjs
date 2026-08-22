@@ -22752,6 +22752,42 @@ static void tramp_frame_free(JSRuntime *rt, TrampFrame *tf)
 
 int JS_TrampFrameCount(JSRuntime *rt) { (void)rt; return g_tramp_frames_live; }
 
+/* EVERY TRAMP PUSH WRITES "WHO CALLED THIS FRAME" TWICE, AND NOTHING ASSERTED THAT THE TWO STAY EQUAL.
+ *
+ * A push records the caller in the TrampFrame (`t->caller_sf = sf`) AND in the callee's JSStackFrame
+ * (`nsf->prev_frame = rt->current_stack_frame`), one statement apart, from the same `sf` — so they are equal by
+ * construction at birth. EIGHT pushes do it — do_tramp_call, do_construct_have_proto, do_apply_tramp,
+ * do_async_tramp_call, do_generator_tramp, do_generator_create_tramp, do_agen_create_tramp, do_agen_drive_enter
+ * — and the ninth, STEP_ANCHOR_NEW, is bodyless: it pushes no JSStackFrame at all, which is why it is exempt
+ * everywhere this invariant appears. (JS_CallInternal's own C entry writes prev_frame with no TrampFrame beside
+ * it, so it is not one of the pair and is not counted.)
+ *
+ * THEY ARE THEN READ APART. The pops split into two families two lines from each other: do_return and the
+ * exception unwind restore rt->current_stack_frame from `sf->prev_frame`, while do_async_settle and the four
+ * coroutine settles restore it from `t->caller_sf` — and js_async_function_post's pop says so in prose, that the
+ * async frame's prev_frame IS atf->caller_sf. Two records, six readers, no assert: an engine in which they had
+ * diverged would run, and would only answer questions wrong.
+ *
+ * WHICH IS EXACTLY WHAT IT DID. clone_deep_flow rebuilt caller_sf for every frame of a forked chain and left
+ * prev_frame NULL, so a resumed deep-forked sibling ran with rt->current_stack_frame naming a frame whose
+ * prev_frame was NULL — and the first return off that chain published the NULL as the runtime's idea of the
+ * running frame while live bytecode kept executing. It is a BOUNDED window (the base's own return restores it
+ * from a prev_frame the resume did relink), which is why every deep-fork fixture passed. Inside the window
+ * is_strict_mode() reads `sf && sf->is_strict_mode` and answers SLOPPY for strict code, which is
+ * ECMAScript 6.2.5.6 PutValue ( refRecord, value ) step 2.a — "If refRecord.[[Strict]] is true, throw a
+ * ReferenceError exception" — silently becoming a write to the global object, plus the four
+ * JS_PROP_THROW_STRICT sites silently not throwing; Function.prototype.caller/.arguments answer null; and every
+ * backtrace stops at the frame that happens to be current.
+ *
+ * So the invariant is asserted at the two sites that read the half the clone got wrong, BEFORE they free
+ * anything — an assert that fires after the frees reports damage instead of preventing it. */
+#define DCHECK_CALLER_RECORDS_AGREE(sf_, tf_)                                                            \
+    DCHECK((sf_)->prev_frame == (tf_)->caller_sf,                                                        \
+           "the running frame's prev_frame is not its heap frame's caller_sf — the two records of this "  \
+           "frame's caller were written together by the push and one of them has been rebuilt without "   \
+           "the other, so rt->current_stack_frame is about to be restored to a frame that is not the "    \
+           "caller this pop is returning to")
+
 /* THE HEAP FRAME CHAIN THE RUNNING STEP CALL SITS ON. The driver sets it around its one invocation of a step
    function and restores it after, so a machine that has to know what ENCLOSES it can look. The Error stack
    accessor is the case that needed it: V8 answers "is a prepareStackTrace call already in flight?" with an
@@ -36916,6 +36952,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int cfirst, cargc; uint8_t itail;
                 void *rcs = rtf->cont_state; uint8_t rck = rtf->cont_kind;
                 int rfof = rtf->forof_off;   /* CONT_FOROF_NEXT: the enum_rec offset, relative to the restored caller sp */
+                /* The two lines below restore the SAME caller from the two records, so this is where a
+                   divergence between them becomes an engine running under a runtime that names the wrong frame.
+                   A STEP ANCHOR is the one frame for which this would be false on a correct chain (it wraps its
+                   caller instead of becoming one, so its zeroed sf holds no prev_frame) — and it cannot be here:
+                   it is tf_top only across the two statements between do_step_park and do_preempt, and
+                   do_preempt returns. An anchor arriving here would already be fatal for a second reason, since
+                   the free below would release the CALLER's local_buf. */
+                DCHECK_CALLER_RECORDS_AGREE(sf, rtf);
                 if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
                 for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
                 js_free_rt(rt, local_buf);
@@ -42230,6 +42274,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         void *xcs = rtf->cont_state; uint8_t xck = rtf->cont_kind;
         int xcf = rtf->call_first, xcg = rtf->call_argc;   /* the throwing call's own operand shape on the caller stack */
         int xfof = rtf->forof_off;   /* CONT_FOROF_NEXT: the enum_rec offset, relative to the restored caller sp */
+        /* the unwind's half of the same pair — see DCHECK_CALLER_RECORDS_AGREE. Asserted before the frees for
+           the same reason, and exempt from nothing: the step anchor cannot reach this label either. */
+        DCHECK_CALLER_RECORDS_AGREE(sf, rtf);
         if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
         for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
         js_free_rt(rt, local_buf);
