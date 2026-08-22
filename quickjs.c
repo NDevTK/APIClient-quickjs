@@ -22779,6 +22779,11 @@ int JS_TrampFrameCount(JSRuntime *rt) { (void)rt; return g_tramp_frames_live; }
  * JS_PROP_THROW_STRICT sites silently not throwing; Function.prototype.caller/.arguments answer null; and every
  * backtrace stops at the frame that happens to be current.
  *
+ * THAT IS FIXED — clone_deep_flow writes both records from one expression now, and the paragraph above is
+ * history rather than a description of this tree; read it as why the assert exists, not as work to do. What
+ * stands here is the assert, because the defect ran green for as long as it existed and nothing but a check at
+ * the read could have said otherwise.
+ *
  * So the invariant is asserted at the two sites that read the half the clone got wrong, BEFORE they free
  * anything — an assert that fires after the frees reports damage instead of preventing it. */
 #define DCHECK_CALLER_RECORDS_AGREE(sf_, tf_)                                                            \
@@ -43777,13 +43782,28 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
            REFERENCE too or both frames release the same one. */
         if (ct->owns_func)
             ct->sf.cur_func = js_dup(ct->sf.cur_func);
-        DCHECK(otf->cont_kind != CONT_AGEN_DRIVE,
-               "clone_deep_flow: a concolic fork inside an ASYNC GENERATOR body on the tramp — the sibling needs "
-               "its OWN JSAsyncGeneratorData (cloned body frame, fresh queue and settlement capability), like the "
-               "async_data and gen_data arms below; the struct copy would share the parent's machine and settle "
-               "both arms' requests off one queue");
+        /* BOTH async-generator kinds, because BOTH keep their live frame in the JSAsyncGeneratorData rather than
+           in async_data/gen_data — so tramp_live_sf() answers &t->sf for them, and &t->sf is the block
+           tramp_frame_new did not zero. The DRIVE was named here and the CREATE (an `ag()` whose PARAMETERS are
+           still binding on the chain) was not, so a fork inside a default-parameter expression fell through to
+           the bytecode arm below and read a function_bytecode out of uninitialised malloc. free_tramp_chain
+           already refuses the pair for the same reason and points at this DCHECK for the other half of it. */
+        DCHECK(otf->cont_kind != CONT_AGEN_DRIVE && otf->cont_kind != CONT_AGEN_CREATE,
+               "clone_deep_flow: a concolic fork inside an ASYNC GENERATOR frame on the tramp (a running body, or "
+               "params still binding) — the sibling needs its OWN JSAsyncGeneratorData (cloned body frame, fresh "
+               "queue and settlement capability), like the async_data and gen_data arms below; the struct copy "
+               "would share the parent's machine and settle both arms' requests off one queue. That arm is also "
+               "what makes tramp_live_sf answer for these frames, which the caller relink below depends on");
 
         if (otf->cont_kind == CONT_STEP_YIELD) {
+            /* AND AN ANCHOR IS ONLY EVER THE TOP. It contributes no JSStackFrame, so a frame BELOW it would take
+               the anchor's zeroed sf as its caller — through caller_clone here and through prev_frame with it.
+               do_step_park pushes it and parks immediately, so nothing is ever pushed above one; asserted rather
+               than assumed, because the existing caller_local_buf check below would report the same violation as
+               a buffer mismatch and send the reader looking at relocation. */
+            DCHECK(i == 0,
+                   "clone_deep_flow: a step ANCHOR below the top of a parked chain — it is bodyless, so the frame "
+                   "under it would inherit a zeroed frame as its caller");
             /* A step machine PARKED AT ITS OWN BACK-EDGE. The anchor frame is bodyless — no bytecode, no
                local_buf, its sf memset to zero — so it carries nothing but the machine, and the sibling needs
                its own for the same reason a CONT_STEP callback frame does. It comes FIRST because the branches
@@ -43996,7 +44016,6 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                    "the bytecode's count, so a larger frame count writes and reads past the allocation");
             ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
             for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
-            ct->sf.prev_frame = NULL;
             if (otf->cont_kind == CONT_PROMISE_EXEC) {
                 /* the Promise EXECUTOR body forked: each arm must settle its own timeline, so the sibling gets its
                    own state. The promise object and its resolving functions are SHARED (created pre-fork, js_dup)
@@ -44082,7 +44101,21 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
+        /* BOTH RECORDS OF THE CALLER, BECAUSE THE PUSH WRITES BOTH — see DCHECK_CALLER_RECORDS_AGREE. This loop
+           rebuilt caller_sf and set the frame's own prev_frame to NULL instead (the assignment that stood in the
+           bytecode arm above, now deleted), on the theory that a clone starts detached. It does not: the deep
+           resume relinks the BASE frame's prev_frame and nothing else, so every frame of a resumed sibling's
+           chain kept that NULL, and the first return off the chain published it as rt->current_stack_frame while
+           the interpreter carried on in the caller this line names. The two are one fact and are now written
+           from one expression.
+           The STEP ANCHOR is exempt for the reason it is exempt at the pops: it wraps its caller rather than
+           becoming one, its sf is zeroed by design, and the resume reads it back through caller_sf alone — so
+           linking its dead frame in would put a bodyless frame on the prev_frame chain that every walker would
+           then have to know to skip. The DCHECK above is what makes "it is always the top" a checked fact
+           rather than the reason this exemption is safe. */
         ct->caller_sf        = caller_clone;
+        if (otf->cont_kind != CONT_STEP_YIELD)
+            tramp_live_sf(ct)->prev_frame = caller_clone;
         /* the caller's record IS the caller's frame — assert that on the ORIGINAL side, then take the clone's. */
         DCHECK(otf->caller_local_buf == cob,
                "clone_deep_flow: the frame's caller_local_buf is not the caller's own buffer base");
