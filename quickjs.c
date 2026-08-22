@@ -17327,11 +17327,22 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
         } else {
             JSValue val1;
             /* The ToNumber boundary's twin — see the contract stated there. A concolic must not arrive: the
-               operator owed it a concolic result, and this function owes C a real string. */
+               operator owed it a concolic result, and this function owes C a real JSString.
+               THE OPERATOR THAT OWES IT NOW EXISTS, AND THIS ABORT NAMES THE SITES THAT DO NOT GO THROUGH IT.
+               §7.1.19 ToString ( arg ) over unknown external input answers with a DERIVED CONCOLIC, built at
+               step_tostring_run — the one sub-sequence every builtin whose coercion can run the page's own
+               `toString` performs it through, engine and host alike. What is left here is the handful of C
+               sites that call JS_ToString DIRECTLY on a value the page supplied, each of which is its own
+               unbuilt operator rather than a case for this boundary to absorb: the dynamic-import specifier,
+               `new String(x)`'s wrapper arm, JS_ToUTF32String, Date.parse, the DOMException constructor's two
+               arguments, and JS_ConcatString reached other than through the `+` hook. So this message is a
+               WORK QUEUE and not a wall — answer it at the site named in the frame below this one. */
             if (unlikely(g_concolic.is && g_concolic.is(val))) {
-                DCHECK(0, "ToString over a CONCOLIC operand — stringifying unknown external input has no "
-                          "concolic semantics yet. Build it in the operator (a derived concolic), never by "
-                          "converting here: this boundary owes C a real string.");
+                DCHECK(0, "ToString over a CONCOLIC operand, from a site that is NOT a step machine's coercion "
+                          "— step_tostring_run answers §7.1.19 ToString over unknown external input with a "
+                          "derived concolic, and this caller reached the conversion boundary instead. Build "
+                          "the answer in THAT operator (js_concolic_derive over the operand, named by the "
+                          "operation), never by converting here: this boundary owes C a real string.");
                 ret = JS_ThrowTypeError(ctx, "stringifying unknown external input is not modelled yet");
                 goto done;
             }
@@ -17398,7 +17409,7 @@ static JSValue JS_ToStringFree(JSContext *ctx, JSValue val)
 static JSValue JS_ToPropertyKeyInternal(JSContext *ctx, JSValueConst val,
                                         int flags)
 {
-    /* 7.1.19 ToPropertyKey OVER AN UNKNOWN KEY. A key must become an ATOM, and a concolic cannot be one — but
+    /* §7.1.21 ToPropertyKey ( arg ) OVER AN UNKNOWN KEY. A key must become an ATOM, and a concolic cannot be one — but
        its SHAPE is a real string and it is stable per source, so an unknown key denotes an unknown-but-
        CONSISTENT slot: `o[x] = 1` then `o[x]` finds it, two different unknown sources are different slots, and
        `delete o[x]`, `x in o`, `o.hasOwnProperty(x)` and every other key-taking builtin all agree with each
@@ -20425,6 +20436,10 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
     h->arg = sd->arg;
     h->stage = 0;
     h->ctor_ntgt = JS_UNINITIALIZED;   /* a CONSTRUCT request's new target: absent means the constructor itself */
+    /* NOT LEFT TO js_mallocz: a zeroed JSValue is the INTEGER 0, and "this machine is not standing on an
+       unknown operand" has to be a value no operand can be. UNINITIALIZED is the same answer ctor_ntgt gives
+       for the same question one line up. */
+    h->unknown_operand = JS_UNINITIALIZED;
     h->cap_promise = JS_UNDEFINED;     /* a CAPABILITY request's [promise, resolve, reject], filled by its delivery */
     h->cap_funcs[0] = JS_UNDEFINED; h->cap_funcs[1] = JS_UNDEFINED;
     h->desc_get = JS_UNDEFINED; h->desc_set = JS_UNDEFINED; h->desc_flags = 0;
@@ -21334,9 +21349,24 @@ int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *o
     return 0;
 }
 
+/* §7.1.19 ToString ( arg ) OVER UNKNOWN EXTERNAL INPUT, PARKED FOR THE DRIVER — see JS_STEP_UNKNOWN for the
+   spec argument and for what the driver then does with it. `v` is BORROWED; the header takes its own
+   reference, because the caller's may be a value the caller is about to release. */
+static int step_tostring_unknown(JSStepHdr *h, JSValueConst v)
+{
+    DCHECK(JS_IsUninitialized(h->unknown_operand),
+           "a second ToString over unknown input on a machine that is already standing on one — the operand "
+           "is taken by the driver before anything else runs, so two of them means a step returned "
+           "JS_STEP_UNKNOWN to something that did not place its completion");
+    h->unknown_operand = js_dup(v);
+    h->str_phase = STR_PH_START;   /* the coercion is over; the machine is about to be torn down either way */
+    return JS_STEP_UNKNOWN;
+}
+
 /* ToString on a value that may run user code. The object case is a TOPRIMITIVE step; whatever comes back is a
    primitive, so the ToString that finishes it runs nothing. 0 = *pout is the string, 5 = the caller must return
-   that step code and will be re-entered here, -1 = threw. */
+   that step code and will be re-entered here, JS_STEP_UNKNOWN = the value is unknown external input and there
+   is no String to produce (nothing is written to *pout), -1 = threw. */
 enum { STR_PH_START = 0, STR_PH_PRIM };
 
 int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, JSValue *pout,
@@ -21344,6 +21374,15 @@ int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, 
 {
     if (h->str_phase == STR_PH_START) {
         JS_FreeValue(ctx, in);
+        /* §7.1.19 steps 9-12 OVER UNKNOWN EXTERNAL INPUT, ANSWERED BEFORE THE COERCION IS EVEN ASKED FOR —
+           the same shape step_length_value already gives LengthOfArrayLike one screen up, and for the same
+           reason: a concolic IS an Object, so the arm below would send it to ToPrimitive, get it straight back
+           (§7.1.1 over a concolic is the identity — the value is primitive in the page and wears an Object
+           only as a carrier), and hand it to a conversion boundary that owes C a real JSString. THIS is the
+           "build it in the operator" that boundary's abort names, and it is built at the ONE sub-sequence every
+           builtin's ToString goes through rather than at the sixty call sites that reach it. */
+        if (unlikely(g_concolic.is && g_concolic.is(v)))
+            return step_tostring_unknown(h, v);
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                    "a coercion is already in flight on this machine's header");
@@ -21359,11 +21398,76 @@ int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, 
     JS_FreeValue(ctx, h->coerce);
     h->coerce = JS_UNDEFINED;
     h->str_phase = STR_PH_START;
+    /* AND THE OTHER WAY IN, which the arm above does not cover: an ORDINARY object whose own coercion method
+       ANSWERED with unknown external input — `{ valueOf() { return location.hash } }`. §7.1.19 step 11 asserts
+       the primitive is not an Object, and a concolic satisfies that assertion about the PAGE's value while
+       failing it about the carrier, so this is the same case arriving one hop later. */
+    if (unlikely(g_concolic.is && g_concolic.is(in))) {
+        int r = step_tostring_unknown(h, in);
+        JS_FreeValue(ctx, in);
+        return r;
+    }
     *pout = JS_ToStringFree(ctx, in);
     return JS_IsException(*pout) ? -1 : 0;
 }
 
-/* ToPropertyKey (7.1.19): ToPrimitive with hint STRING — the page's code when the key is an object — after
+/* THE COMPLETION A MACHINE THAT REPORTED JS_STEP_UNKNOWN GETS, derived from the operand it parked and named by
+ * the ALGORITHM and the SPEC STEP it was coercing at — read out and cleared here, so the teardown that runs
+ * next finds nothing left to give back.
+ *
+ * THE NAME IS BOTH HALVES BECAUSE THE IDENTITY IS WHAT THE PATH CONSTRAINT IS KEYED BY. `def->algorithm` alone
+ * would give `x.replace(x, x)`'s search coercion and its replacement coercion ONE identity, and decide.c would
+ * then let a branch over the first decide a branch over the second — the silent arm-pruning §Solver-half calls
+ * out, in the one direction no gate can see. A stage NAMES ONE SPEC STEP (JSTrampStepDef.steps), which is
+ * exactly "which of this algorithm's coercions this is", and it is the label rather than the index because the
+ * label is what survives a build whose stages moved. */
+static JSValue js_step_unknown_result(JSContext *ctx, JSStepHdr *h)
+{
+    JSValue v = h->unknown_operand, r;
+    const char *label;
+    char *op;
+    size_t n;
+    int nstages = 0;
+
+    h->unknown_operand = JS_UNINITIALIZED;
+    DCHECK(g_concolic.is && g_concolic.is(v),
+           "a step machine's completion was derived from something that is not unknown external input — the "
+           "operand JS_STEP_UNKNOWN names is not on the header the DRIVER is stepping, which is what happens "
+           "when a machine FORWARDS its step to another machine's own header and does not move it across");
+    /* ALWAYS FATAL, not a DCHECK: the pair IS this value's identity, and a derivation that cannot spell one is
+       one decide.c keys under whatever it shares a name with — an arm pruned by a predicate that is not the
+       predicate it was recorded for. That is data integrity rather than a dev-only invariant, and the walk
+       below would dereference the missing list anyway. */
+    CHECK(h->def->algorithm != NULL && h->def->steps != NULL,
+          "a step machine whose ToString was over unknown input declares no algorithm or no steps — the pair "
+          "IS the derived value's identity, and a value that cannot be spelled cannot be told apart from "
+          "this algorithm's other coercions");
+    /* WALKED TO THE TERMINATOR rather than indexed: a stage past the declared list is step_stage_check's own
+       diagnosis, and reading past the array to say so would be a worse fault than the one being reported. */
+    while (h->def->steps[nstages]) nstages++;
+    DCHECK((int)h->stage < nstages,
+           "a step machine coerced unknown input at a stage its algorithm does not declare — the stage label "
+           "is half the derived value's identity, so there is no name to give this coercion");
+    label = (int)h->stage < nstages ? h->def->steps[h->stage] : "(an undeclared stage)";
+    /* SIZED FROM THE TWO STRINGS, never a fixed buffer. A stage label is PROSE — the longest declared in this
+       tree is 470 bytes — and a truncated name is two coercions sharing one identity, which prunes an arm
+       nothing contradicts. There is no correct shorter answer, so the composition is allocated to fit and the
+       only failure left is the allocator's. */
+    n = strlen(h->def->algorithm) + 3 + strlen(label) + 1;
+    op = js_malloc(ctx, n);
+    CHECK(op != NULL, "out of memory naming a derived unknown — a dropped concolic collapses a branch to a "
+                      "concrete arm and deletes everything behind the other");
+    snprintf(op, n, "%s @ %s", h->def->algorithm, label);
+    r = js_concolic_derive(ctx, v, op, JS_UNDEFINED);
+    js_free(ctx, op);   /* the derivation COPIES what it keeps (its shape and its identity are its own) */
+    DCHECK(!JS_IsUninitialized(r),
+           "the concolic derivation declined an operand this engine had already recognised as unknown input — "
+           "the value semantics were installed without the builtin-derivation hook");
+    JS_FreeValue(ctx, v);
+    return r;
+}
+
+/* §7.1.21 ToPropertyKey ( arg ): ToPrimitive with hint STRING — the page's code when the key is an object — after
    which a Symbol is used as-is and anything else is ToString'd. The atom conversion runs nothing. Every C site
    that takes a property key coerces it exactly this way, which is why this is a shared sub-sequence and not part
    of one builtin. */
@@ -21808,6 +21912,13 @@ static JSValue tramp_step_state_free_1(JSContext *ctx, void *st, bool take_resul
     DCHECK(h->delegate == NULL,
            "a machine reached the one-machine teardown still owning a delegate — the chain is taken by "
            "tramp_step_state_free, and an inner machine freed from here would leak its own");
+    /* THE UNKNOWN OPERAND IS TAKEN BEFORE THE TEARDOWN, ALWAYS — the driver derives the machine's completion
+       from it and clears it, and only then frees the state. One reaching here would be a reference nothing
+       gave back, and it would mean a machine returned JS_STEP_UNKNOWN to something that is not the driver. */
+    DCHECK(JS_IsUninitialized(h->unknown_operand),
+           "a step machine was torn down still holding the operand its ToString reported as unknown — the "
+           "driver takes that operand at the one place a machine's completion is placed, so a machine still "
+           "holding one returned JS_STEP_UNKNOWN through a path that is not the step driver");
     if (!take_result && h->coercing && h->def->onerror)
         h->def->onerror(ctx, h->this_val, h->def->body_magic);   /* BEFORE the receiver is released */
 
@@ -22216,6 +22327,14 @@ static void *tramp_step_state_clone(JSContext *ctx, const void *src)
     DCHECK(o->outer == NULL && o->delegate == NULL,
            "deep-fork of a step machine that is nested (an outer machine waiting on it, or an inner it has not "
            "handed over) — the clone must walk the whole chain so the sibling's links point at its OWN copies");
+    /* AND NOT WHILE IT IS STANDING ON AN UNKNOWN OPERAND. `unknown_operand` is deliberately absent from every
+       machine's `visit` (see JSStepHdr) because it is set only across the return that names it, with nothing
+       between it and the driver that could fork; the memcpy below would hand the sibling a reference nobody
+       took, so the claim is asserted here rather than paid for with a dup in every clone. */
+    DCHECK(JS_IsUninitialized(o->unknown_operand),
+           "deep-fork of a step machine standing on the operand its ToString reported as unknown — that "
+           "operand is live only between the machine's return and the driver's placement of its completion, "
+           "so a fork reaching it means something suspended in between");
     /* AND WHETHER THIS STATE MAY BE FORKED AT ALL — see JSTrampStepDef.unforkable. Asked HERE, at the one
        consumer the answer is about, rather than inside the machine's `visit`, which three consumers now drive.
        The machine's own sentence is what aborts, so the report names the object with no halves. */
@@ -31186,15 +31305,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     DCHECK(JS_HasException(ctx), "a step machine reported ABRUPT and left no completion value behind");
                     goto exception;
                 }
-                if (st == 0) {
+                /* DONE, and the SAME PLACEMENT for a completion this engine was never given the inputs to
+                   compute (JS_STEP_UNKNOWN). Which VALUE the machine completes with differs; where that value
+                   goes does not, and the fifteen continuation kinds below are exactly what "where it goes"
+                   means — a second arm restating them would be the delivery written twice. The machine's own
+                   result is DISCARDED on the unknown path: it is whatever partial thing the algorithm had
+                   built out of a string nobody has, and an unknown that carries a prefix the page never
+                   computed is the value Array.prototype.join's own site already refuses to keep. */
+                if (st == 0 || st == JS_STEP_UNKNOWN) {
                     /* EVERY field must be read BEFORE the free: fini owns the allocation, and `h` IS `stt`, so
                        reading orig_cfirst/orig_cargc/orig_is_tail afterwards was a use-after-free — the operand
-                       cleanup below ran off whatever the freed block then held. */
+                       cleanup below ran off whatever the freed block then held. The derivation is the same
+                       obligation one step further: it reads the operand OFF the header, so it runs first. */
                     void *souter = h->outer; uint8_t souter_kind = h->outer_kind;
                     int cfirst = h->orig_cfirst, cargc = h->orig_cargc, foff = h->outer_forof;
                     uint8_t itail = h->orig_is_tail, idiscard = h->discard_result;
+                    JSValue unk = (st == JS_STEP_UNKNOWN) ? js_step_unknown_result(ctx, h) : JS_UNINITIALIZED;
                     JSValue r = tramp_step_state_free(ctx, stt, true);
                     JSValue *cargv;
+                    /* take_result is TRUE above because this is a NORMAL completion, not an abrupt one: nothing
+                       threw, so the definition's `onerror` (IfAbruptCloseIterator and its kin) must not run. */
+                    if (st == JS_STEP_UNKNOWN) { JS_FreeValue(ctx, r); r = unk; }
                     if (souter_kind == CONT_FOROF_NEXT) {
                         /* the machine WAS a for-of .next(). Its operands are dropped and its result enters the
                            loop's protocol exactly where a returned heap frame's does. */
@@ -40045,7 +40176,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         key_toprim:
-            /* ToPropertyKey (7.1.19) on an OBJECT key runs the page's @@toPrimitive/valueOf/toString, and every
+            /* §7.1.21 ToPropertyKey ( arg ) on an OBJECT key runs the page's @@toPrimitive/valueOf/toString, and every
                interpreter site that needs a key reached it through JS_ValueToAtom — from C, so a loop in that
                method preempted in an activation with no flow base, and an ARRAY key reaches
                Array.prototype.toString, a step machine no C body can drive at all. Coerce the key on the tramp
@@ -87869,8 +88000,24 @@ static int js_str_replace_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
         /* step 2.b.i (2.d.i). A DELEGATED built-in @@replace is a machine on the chain, and the outer rests at
            this one step for as long as it runs; a user-defined one is an ordinary call whose result IS the
            answer. */
-        if (s->mode == 3)
-            return ((JSStepHdr *)s->inner)->def->step(ctx, s->inner, cb_result, out_cb, out_argc);
+        if (s->mode == 3) {
+            /* FORWARDING PUTS THE DRIVER'S HEADER AND THE STEPPED MACHINE'S HEADER OUT OF STEP, which is the
+               limitation quickjs-step.h already states about this one call: the inner's requests are answered
+               through cb_result and survive it, but anything the inner records ON ITS OWN HEADER lands where
+               the driver — which is stepping the OUTER — will not look. JS_STEP_UNKNOWN's operand is exactly
+               that, so it is MOVED here, at the one site that forwards. The identity the derivation then
+               composes is the OUTER's algorithm and the OUTER's stage, which is the honest name for it:
+               22.1.3.19 is the algorithm the page called and 22.2.6.11 is a sub-operation of it. */
+            JSStepHdr *ih = s->inner;
+            int r = ih->def->step(ctx, ih, cb_result, out_cb, out_argc);
+            if (r == JS_STEP_UNKNOWN) {
+                DCHECK(JS_IsUninitialized(s->hdr.unknown_operand),
+                       "str.replace forwarded to its delegate while already standing on an unknown operand");
+                s->hdr.unknown_operand = ih->unknown_operand;
+                ih->unknown_operand = JS_UNINITIALIZED;
+            }
+            return r;
+        }
         DCHECK(s->mode == 1, "str.replace rested at the @@replace dispatch with no replacer to run");
         s->result = cb_result;
         return 0;

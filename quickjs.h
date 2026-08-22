@@ -1867,8 +1867,13 @@ typedef struct JSConcolicHooks {
        is what makes this the concolic triple rather than a taint label. Operands are at sp[-nops..sp[-1]] and
        the result is written to sp[-nops], the shape .add and .cmp already use. Returns 1 when it answered. */
     int (*arith)(JSContext *ctx, JSValue *sp, int op, int nops);
-    /* 7.1.17 ToString over unknown input, same rule: `String(x)` is unknown, with the source kept. Returns
-       JS_UNINITIALIZED when the operand is not concolic. */
+    /* §7.1.19 ToString ( arg ) over unknown input, same rule: `String(x)` is unknown, with the source kept.
+       Returns JS_UNINITIALIZED when the operand is not concolic.
+       IT IS THE ANSWER FOR THE ONE ALGORITHM WHOSE RESULT *IS* THE COERCION — 22.1.1.1 String ( value ) — and
+       not for ToString wherever else it appears: a builtin that merely CONSUMES a string derives its own
+       result from the operand, named by its own operation, which is what step_tostring_run's JS_STEP_UNKNOWN
+       does at the one sub-sequence all of them share. Two hooks would be two names for one derivation; these
+       are two derivations, and their shapes say so (`String(x)` versus `x.<operation>()`). */
     JSValue (*to_str)(JSContext *ctx, JSValueConst v);
     /* `obj[x]` with an UNKNOWN key. Not a coercion of the operand — a lookup that names no particular slot, so
        the read yields a concolic derived from the base and the key's source. JS_UNINITIALIZED = not concolic. */

@@ -463,6 +463,13 @@ typedef struct JSStepHdr {
        one per suspension point. Every coercing prologue needs exactly this, so it lives in the header rather
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
+    /* THE OPERAND WHOSE ToString IS UNKNOWN EXTERNAL INPUT — see JS_STEP_UNKNOWN. OWNED, and it lives for
+       exactly as long as the return that names it: the machine parks the operand here, returns
+       JS_STEP_UNKNOWN, and the driver takes it at the one place a machine's completion is placed, with no
+       opcode, no request and no suspension in between. So it is NOT in any machine's `visit` and must not be —
+       nothing can fork or park while it is set, which tramp_step_state_clone and tramp_step_state_free_1 both
+       ASSERT rather than trust. JS_UNINITIALIZED = this machine is not standing on one. */
+    JSValue unknown_operand;
     /* THE UNKNOWN-LENGTH CHAIN's cursor and its operation string — see step_length_unknown. A length read that
        produced unknown external input is answered by a chain of per-position outcome forks, and the machine
        SUSPENDS at every one of them (the sibling's snapshot is taken at the ask), so neither the position nor
@@ -611,6 +618,32 @@ JS_EXTERN JSValueConst JS_StepClosureData(const JSStepHdr *h, int i);
 /* "MY COMPLETION IS ONE OF N FEASIBLE OUTCOMES — FORK HERE." Returned by step_fork_run; the driver decides the
    arm and snapshots the flow for the others. Never returned by a machine directly — see step_fork_run. */
 #define JS_STEP_FORK    23
+/* "MY COMPLETION IS A VALUE THIS ENGINE WAS NEVER GIVEN." Returned by step_tostring_run, never by a machine
+ * directly, and it is the answer to ECMAScript §7.1.19 ToString ( arg ) over UNKNOWN EXTERNAL INPUT.
+ *
+ * §7.1.19 step 9 asserts the remaining case is an Object and step 10 is `ToPrimitive(arg, string)`. §7.1.1
+ * ToPrimitive ( input [ , preferredType ] ) over a concolic returns it unchanged — a concolic stands for a
+ * value that IS primitive in the page and wears an Object only because the solver needs a carrier with an
+ * exotic [[Get]] — so step 12's recursive ToString is a ToString over an unknown String, whose result is an
+ * unknown String. The conversion BOUNDARY cannot answer that (JS_ToStringInternal owes C a real JSString and
+ * says so), so the answer is given where the spec performs the coercion, which for every builtin that can run
+ * the page's `toString` is this one shared sub-sequence.
+ *
+ * WHAT THE DRIVER DOES WITH IT: the machine's whole completion becomes a concolic DERIVED from the operand,
+ * named by the algorithm and the spec step it was coercing at. That is the generalisation of a rule this file
+ * already wrote by hand at Array.prototype.join — "an unknown element makes the whole join unknown", the
+ * concrete prefix subsumed rather than kept, because a partial string is a value the page never computes and
+ * the source identity is what a later sink solves for. Every value-producing algorithm has that shape: a
+ * result computed out of a string nobody has is a result nobody has, and it keeps `src` and `root` so a branch
+ * over it still forks and an @S candidate still injects at the source that fed it.
+ *
+ * A MACHINE WITH A MORE PRECISE ANSWER STATES IT AT ITS OWN SITE, BEFORE THE COERCION, and several already do
+ * — String.prototype.concat folds an unknown piece through the `+` hook so the known literals survive, the
+ * Error constructor defines the derived unknown as `message` and CARRIES ON building the error object,
+ * parseInt/parseFloat and RegExp name their own operation. Those are not a fallback this selects against:
+ * they are the algorithm's own semantics, and they run first because they are IN the algorithm. This is what
+ * an algorithm with nothing better to say completes as, and there is nothing left for it to fall back TO. */
+#define JS_STEP_UNKNOWN 24
 
 /* The machine's own arguments, borrowed. Out-of-range reads undefined, which is what the IDL's optional
    arguments mean at this level. */
@@ -869,7 +902,11 @@ JS_EXTERN int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, con
    `el.addEventListener({toString(){ for(;;){} }}, f)` is the page's loop. Without this a component's only
    honest move was JS_ToCString from C, which in this engine does not quietly misbehave — it reaches
    JS_ToPrimitiveFree's DFAIL and aborts, naming the site — but aborting is where a capability is missing, not
-   where it is built. Returns JS_STEP_REQUEST (the caller returns it), 0 once *pout is set, or -1. */
+   where it is built. Returns JS_STEP_REQUEST (the caller returns it), 0 once *pout is set, or -1.
+   …OR JS_STEP_UNKNOWN, when the value being coerced is UNKNOWN EXTERNAL INPUT and §7.1.19 ToString ( arg )
+   therefore has no String to produce. Nothing is written to *pout on that path; the caller returns the code
+   like any other positive one — which every call site already does, because that is what parking on a request
+   has always meant — and the driver completes the machine with the derived unknown. See JS_STEP_UNKNOWN. */
 JS_EXTERN int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, JSValue *pout,
                                 JSValue **out_cb, int *out_argc);
 
