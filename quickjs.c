@@ -22762,11 +22762,14 @@ int JS_TrampFrameCount(JSRuntime *rt) { (void)rt; return g_tramp_frames_live; }
  * everywhere this invariant appears. (JS_CallInternal's own C entry writes prev_frame with no TrampFrame beside
  * it, so it is not one of the pair and is not counted.)
  *
- * THEY ARE THEN READ APART. The pops split into two families two lines from each other: do_return and the
- * exception unwind restore rt->current_stack_frame from `sf->prev_frame`, while do_async_settle and the four
- * coroutine settles restore it from `t->caller_sf` — and js_async_function_post's pop says so in prose, that the
- * async frame's prev_frame IS atf->caller_sf. Two records, six readers, no assert: an engine in which they had
- * diverged would run, and would only answer questions wrong.
+ * THEY ARE THEN READ APART, AT TEN SITES, AND WHICH RECORD IS READ IS DECIDED BY WHICH POP YOU LANDED IN.
+ * TWO read `sf->prev_frame`: do_return and the exception unwind. EIGHT read `t->caller_sf`: do_async_settle,
+ * do_generator_settle, do_generator_create_settle, do_agen_create_settle, do_agen_drive_settle, the two
+ * async-generator arms of the exception unwind, and the CONT_STEP_YIELD deep resume. do_async_settle states the
+ * equality as a fact in prose — "the async frame's prev_frame IS atf->caller_sf, set when it was pushed" — and
+ * that was the whole of the enforcement: a grep for DCHECK|CHECK|DFAIL intersected with
+ * prev_frame|current_stack_frame returned nothing. Two records, ten readers, no assert: an engine in which they
+ * had diverged would run, and would only answer questions wrong.
  *
  * WHICH IS EXACTLY WHAT IT DID. clone_deep_flow rebuilt caller_sf for every frame of a forked chain and left
  * prev_frame NULL, so a resumed deep-forked sibling ran with rt->current_stack_frame naming a frame whose
@@ -36961,9 +36964,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    divergence between them becomes an engine running under a runtime that names the wrong frame.
                    A STEP ANCHOR is the one frame for which this would be false on a correct chain (it wraps its
                    caller instead of becoming one, so its zeroed sf holds no prev_frame) — and it cannot be here:
-                   it is tf_top only across the two statements between do_step_park and do_preempt, and
-                   do_preempt returns. An anchor arriving here would already be fatal for a second reason, since
-                   the free below would release the CALLER's local_buf. */
+                   the only statement that ever makes one tf_top is do_step_park's, whose very next statement is
+                   `goto do_preempt`, and do_preempt returns. An anchor arriving here would already be fatal for
+                   a second reason, since the free below would release the CALLER's local_buf. */
                 DCHECK_CALLER_RECORDS_AGREE(sf, rtf);
                 if (unlikely(sf->var_ref_count != 0)) close_var_refs(rt, sf);
                 for (pval = local_buf; pval < sp; pval++) JS_FreeValue(ctx, *pval);
