@@ -404,6 +404,10 @@ struct JSRuntime {
        ownerlessness is a property of WHEN the user agent queued the callback and not of which queue it named —
        js_enqueue_platform_call carries the counterexample that made the task-only version wrong. */
     struct list_head baseline_call_list; /* list of JSJobEntry.link, both queues' entries in arrival order */
+    /* THE NEXT NAME TO ISSUE — see JSTaskHandle in quickjs.h. ONE counter for the whole runtime, so a handle is
+       unique across both queues, the baseline list AND whatever the enqueue hook's owner is holding; that
+       uniqueness is exactly what JS_RemoveQueuedTask asserts when it refuses to find one handle twice. */
+    uint64_t next_task_handle;
     /* FINALIZATION-REGISTRY ENTRIES WHOSE TARGET HAS DIED, waiting to become cleanup jobs. 9.13's
        HostEnqueueFinalizationRegistryCleanupJob is the HOST's, "at some future time" — V8 posts it from the GC
        epilogue — and this list is that seam. Enqueueing it where the target is freed instead put allocation
@@ -1310,6 +1314,10 @@ typedef struct JSJobEntry {
        hand the scheduler the same flag js_enqueue would have — so a task the user agent queued before the
        frontier existed does not arrive as a microtask and run inside the first checkpoint it meets. */
     bool is_task;
+    /* THIS ENTRY'S NAME — the same one the enqueue answered its caller and the same one the enqueue hook was
+       offered, so an entry that starts on the baseline list and is later adopted by a flow keeps it. Without
+       that, a tracker holding a handle across the handover would name nothing the instant the frontier began. */
+    JSTaskHandle handle;
     JSValue argv[];
 } JSJobEntry;
 
@@ -2985,6 +2993,8 @@ static _Thread_local JSJobEnqueueHook g_job_enqueue_hook = NULL;
 void JS_SetJobEnqueueHook(JSJobEnqueueHook h) { g_job_enqueue_hook = h; }
 static _Thread_local JSJobDropHook g_job_drop_hook = NULL;
 void JS_SetJobDropHook(JSJobDropHook h) { g_job_drop_hook = h; }
+static _Thread_local JSJobRemoveHook g_job_remove_hook = NULL;
+void JS_SetJobRemoveHook(JSJobRemoveHook h) { g_job_remove_hook = h; }
 
 /* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
    `+` (js_add_slow), .cmp through == / === , .is names the solver's value class. One struct, installed by
@@ -3026,7 +3036,7 @@ typedef struct { int depth; const char *what; int max; } JSCycleGuard;
    what an unqueued callback means, because the two callers differ (a promise reaction can report it, a
    platform callback cannot). */
 static JSJobEntry *js_job_entry_new(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv,
-                                    bool is_task)
+                                    bool is_task, JSTaskHandle handle)
 {
     JSJobEntry *e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
     int i;
@@ -3037,9 +3047,25 @@ static JSJobEntry *js_job_entry_new(JSContext *ctx, JSJobFunc *job_func, int arg
     e->job_func = job_func;
     e->argc = argc;
     e->is_task = is_task;
+    e->handle = handle;
     for (i = 0; i < argc; i++)
         e->argv[i] = js_dup(argv[i]);
     return e;
+}
+
+/* ISSUE ONE NAME — the whole of the identity, and the reason a queued callback can be spoken about after it is
+   queued. Monotone and never reused, so the only thing a stale handle can do is find nothing.
+   THE CEILING IS ASSERTED BECAUSE THE CONSUMER IS A JS SLOT. A task tracker is per-element state under a private
+   Symbol, which makes it a JS value and therefore a double; past 2^53 a handle stops round-tripping exactly and
+   a removal would name the WRONG queued task rather than none — a silent wrong answer, which is the one outcome
+   worse than a crash. */
+static JSTaskHandle js_task_handle_new(JSRuntime *rt)
+{
+    DCHECK(rt->next_task_handle < ((uint64_t)1 << 53),
+           "this runtime has issued 2^53 task handles — a handle is stored in an element's own slot as a JS "
+           "number, so beyond this it no longer round-trips exactly and a tracker's removal would name a "
+           "different queued task instead of naming none");
+    return (JSTaskHandle)(++rt->next_task_handle);
 }
 
 /* …AND RELEASED ONCE. The entry OWNS a reference to every argument (js_job_entry_new dup'd them), so this is
@@ -3053,21 +3079,30 @@ static void js_job_entry_free(JSRuntime *rt, JSJobEntry *e)
     js_free_rt(rt, e);
 }
 
-static int js_enqueue(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv, bool is_task)
+/* `handle` IS ISSUED BY THE CALLER, before this is entered, because it must be the SAME name whichever of the
+   three destinations below the callback lands in — the host's per-flow queue, a runtime queue, or (through
+   js_enqueue_platform_call) the baseline list it is later adopted off. A name minted per destination would be a
+   name the tracker that stored it could not use once the callback moved. */
+static int js_enqueue(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv, bool is_task,
+                      JSTaskHandle handle)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
 
     DCHECK(!rt->in_free, "!rt->in_free");
+    DCHECK(handle != JS_TASK_HANDLE_NONE, "a callback was queued under the never-issued handle, so nothing "
+                                          "could ever name it — every enqueue path allocates one");
 
     /* ASYNC-AS-FLOW: if the host routes this job to a scheduler flow (returns 1), it OWNS it now — do not add it
        to the global job list (there is no global drain in forced-execution; each reaction is a first-class flow).
        The host is told WHICH queue it is taking over, because the checkpoint rule is the queue's and a host that
-       cannot tell a task from a microtask reimplements the ordering bug this split exists to remove. */
-    if (g_job_enqueue_hook && g_job_enqueue_hook(ctx, job_func, argc, argv, is_task))
+       cannot tell a task from a microtask reimplements the ordering bug this split exists to remove. It is told
+       the callback's HANDLE for the same reason: the host that took it is then the only thing that can find it
+       again, and JS_RemoveQueuedTask asks it by that name and no other. */
+    if (g_job_enqueue_hook && g_job_enqueue_hook(ctx, job_func, argc, argv, is_task, handle))
         return 0;
 
-    e = js_job_entry_new(ctx, job_func, argc, argv, is_task);
+    e = js_job_entry_new(ctx, job_func, argc, argv, is_task, handle);
     if (!e)
         return -1;
     list_add_tail(&e->link, is_task ? &rt->task_list : &rt->job_list);
@@ -3104,15 +3139,15 @@ static int js_enqueue(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueCons
  *
  * Returns 0 when the callback is queued somewhere it will run, -1 on allocation failure. */
 static int js_enqueue_platform_call(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv,
-                                    bool is_task)
+                                    bool is_task, JSTaskHandle handle)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
 
     DCHECK(!rt->in_free, "a platform callback was queued while the runtime was being freed");
     if (g_job_enqueue_hook)
-        return js_enqueue(ctx, job_func, argc, argv, is_task);
-    e = js_job_entry_new(ctx, job_func, argc, argv, is_task);
+        return js_enqueue(ctx, job_func, argc, argv, is_task, handle);
+    e = js_job_entry_new(ctx, job_func, argc, argv, is_task, handle);
     if (!e)
         return -1;
     list_add_tail(&e->link, &rt->baseline_call_list);
@@ -3149,7 +3184,10 @@ static void js_adopt_baseline_calls(JSRuntime *rt)
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
         int taken;
 
-        taken = g_job_enqueue_hook(e->ctx, e->job_func, e->argc, vc(e->argv), e->is_task);
+        /* THE ENTRY'S OWN HANDLE CROSSES THE HANDOVER, not a fresh one: whatever queued this callback may
+           already have stored the name in a tracker, and re-naming it here would silently break the one thing
+           the name is for. */
+        taken = g_job_enqueue_hook(e->ctx, e->job_func, e->argc, vc(e->argv), e->is_task, e->handle);
         DCHECK(taken,
                "the scheduler DECLINED a callback the baseline queued while a flow was executing — the only "
                "reason it declines is that no flow is running, and one is, so the adoption is being made from "
@@ -3164,13 +3202,13 @@ static void js_adopt_baseline_calls(JSRuntime *rt)
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                   int argc, JSValueConst *argv)
 {
-    return js_enqueue(ctx, job_func, argc, argv, false);
+    return js_enqueue(ctx, job_func, argc, argv, false, js_task_handle_new(ctx->rt));
 }
 
 int JS_EnqueueTaskJob(JSContext *ctx, JSJobFunc *job_func,
                       int argc, JSValueConst *argv)
 {
-    return js_enqueue(ctx, job_func, argc, argv, true);
+    return js_enqueue(ctx, job_func, argc, argv, true, js_task_handle_new(ctx->rt));
 }
 
 /* HTML §7.5.10 step 7 — see quickjs.h. BOTH runtime queues are walked because a document queues into both: a
@@ -3211,6 +3249,50 @@ int JS_DropJobsForContext(JSContext *ctx)
     n += js_drop_jobs_from(rt, &rt->baseline_call_list, ctx);
     if (g_job_drop_hook)
         n += g_job_drop_hook(ctx);
+    return n;
+}
+
+/* REMOVE BY NAME — the same walk as js_drop_jobs_from with the other predicate, deliberately NOT folded into it
+   with a mode flag: the two questions have different answers about how many entries may match ("every job of
+   this document" versus "the one job called this"), and that difference is the assert at the caller below. */
+static int js_remove_job_from(JSRuntime *rt, struct list_head *q, JSTaskHandle handle)
+{
+    struct list_head *el, *el1;
+    int n = 0;
+
+    list_for_each_safe(el, el1, q) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+
+        if (e->handle != handle)
+            continue;
+        list_del(&e->link);
+        js_job_entry_free(rt, e);
+        n++;
+    }
+    return n;
+}
+
+/* HTML's "remove <task> from its task queue" — see quickjs.h. All three of the runtime's lists AND the enqueue
+   hook's owner, because a callback's destination is decided by when it was queued and a tracker holding its
+   handle knows nothing about that. Finding NOTHING is an ordinary answer (the task already ran, is running, or
+   went with its document); finding it TWICE is not, and that is what the monotone allocation buys. */
+int JS_RemoveQueuedTask(JSRuntime *rt, JSTaskHandle handle)
+{
+    int n;
+
+    DCHECK(handle != JS_TASK_HANDLE_NONE,
+           "a queued task was asked to be removed under the never-issued handle — a tracker slot holding this "
+           "was written by something that did not keep the enqueue's answer");
+    DCHECK(!rt->in_free, "a queued task was removed while the runtime was being freed");
+    n  = js_remove_job_from(rt, &rt->job_list, handle);
+    n += js_remove_job_from(rt, &rt->task_list, handle);
+    n += js_remove_job_from(rt, &rt->baseline_call_list, handle);
+    if (g_job_remove_hook)
+        n += g_job_remove_hook(handle);
+    DCHECK(n <= 1,
+           "one task handle named more than one queued callback — handles are issued by a single monotone "
+           "runtime counter and never reused, so this is two entries carrying one name and a tracker's removal "
+           "just took a task belonging to something else off its queue");
     return n;
 }
 
@@ -98360,10 +98442,14 @@ static JSValue host_call_job(JSContext *ctx, int argc, JSValueConst *argv)
    flow that may never exist would strand it — JS_IsJobPending does not report the baseline list, by design.
    The argv shape is the same either way and lives only here: argv[0] is the callee, the rest is the callback's
    own argument list, which is the contract host_call_job reads back. */
-static void js_enqueue_call(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv, bool is_task,
-                            bool is_platform)
+/* Answers the queued callback's HANDLE, which is the caller's only way to speak about it afterwards — see
+   JSTaskHandle. It is allocated here, before the routing below, so that the name does not depend on which of the
+   three destinations the callback lands in. */
+static JSTaskHandle js_enqueue_call(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv, bool is_task,
+                                    bool is_platform)
 {
     JSValueConst stack[9], *args = stack;
+    JSTaskHandle handle = js_task_handle_new(ctx->rt);
     int i, r;
 
     DCHECK(argc >= 0, "JS_EnqueueCallJob with a negative argument count");
@@ -98379,11 +98465,12 @@ static void js_enqueue_call(JSContext *ctx, JSValueConst func, int argc, JSValue
     args[0] = func;
     for (i = 0; i < argc; i++)
         args[i + 1] = argv[i];
-    r = is_platform ? js_enqueue_platform_call(ctx, host_call_job, argc + 1, args, is_task)
-                    : js_enqueue(ctx, host_call_job, argc + 1, args, is_task);
+    r = is_platform ? js_enqueue_platform_call(ctx, host_call_job, argc + 1, args, is_task, handle)
+                    : js_enqueue(ctx, host_call_job, argc + 1, args, is_task, handle);
     CHECK(r == 0, "a page callback could not be queued: out of memory building its job entry");
     if (args != stack)
         js_free(ctx, (void *)args);
+    return handle;
 }
 
 /* §9.13's CLEANUP CALLBACK AS A CALL-ROOT FLOW — the same job shape the two platform entries below queue, and
@@ -98393,14 +98480,14 @@ static void js_enqueue_cleanup_call(JSContext *ctx, JSValueConst func, JSValueCo
     js_enqueue_call(ctx, func, 1, &held, false, false);
 }
 
-void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv)
+JSTaskHandle JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv)
 {
-    js_enqueue_call(ctx, func, argc, argv, false, true);
+    return js_enqueue_call(ctx, func, argc, argv, false, true);
 }
 
-void JS_EnqueueCallTask(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv)
+JSTaskHandle JS_EnqueueCallTask(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv)
 {
-    js_enqueue_call(ctx, func, argc, argv, true, true);
+    return js_enqueue_call(ctx, func, argc, argv, true, true);
 }
 
 void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook, void *opaque)

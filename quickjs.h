@@ -1488,9 +1488,22 @@ typedef enum JSPromiseHookType {
 typedef void JSPromiseHook(JSContext *ctx, JSPromiseHookType type,
                            JSValueConst promise, JSValueConst parent_promise,
                            void *opaque);
+/* THE NAME OF ONE QUEUED CALLBACK, and the whole reason the two entries below answer rather than return void.
+   HTML has TASK TRACKERS — §4.11.1's details, §4.11.4's dialog and §6.12's popover each hold one, and each
+   says "remove element's <x> toggle task tracker's task from its task queue" so that N transitions in one turn
+   COALESCE into ONE event carrying the ORIGINAL old state. A queue whose entries have no identity cannot obey
+   that sentence, and this is the identity: MONOTONE, allocated at the enqueue, never reused within a runtime.
+   MONOTONE RATHER THAN A POINTER because a handle OUTLIVES what it names — the tracker slot holds it across
+   scheduler steps and the task may have run, been dropped with its document, or gone with a paged-out flow in
+   between. A pointer would then be a use-after-free with no way to tell; an integer nobody re-issues names
+   nothing at all, which is exactly what "remove an already-run task" must mean. JS_TASK_HANDLE_NONE is the
+   never-issued value, so a zeroed field is honestly "no task". */
+typedef uint64_t JSTaskHandle;
+#define JS_TASK_HANDLE_NONE ((JSTaskHandle)0)
+
 /* Enqueue `func(arg)` as a JOB that runs as a CALL-ROOT FLOW — the platform's route from a host edge to a page
    callback (an event listener, a timer). Not a JS_Call: the callback is the page's code and must be able to
-   loop, await and fork, which a C activation cannot host.
+   loop, await and fork, which a C activation cannot host. Answers the queued callback's HANDLE.
    IT MAY BE CALLED BEFORE THERE IS A FRONTIER, exactly as the TASK entry below may. An earlier version of this
    comment said otherwise — that a microtask is always queued by RUNNING script and so always has a flow to own
    its callback — and HTML §8.1.7.3 is the counterexample in one sentence: "when an algorithm running in
@@ -1498,7 +1511,7 @@ typedef void JSPromiseHook(JSContext *ctx, JSPromiseHookType type,
    await and §4.8.11.2 invokes it IMMEDIATELY for a `<video src>` in a document's initial markup, so the user
    agent queues that microtask while it is still creating the Document. Such a callback is BASELINE work and
    waits on the runtime for the first flow to adopt it, like the task below. */
-JS_EXTERN void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
+JS_EXTERN JSTaskHandle JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
 /* THE SAME, ON A TASK SOURCE rather than the microtask queue — HTML 8.1.7's other half. A platform edge that
    the spec words as "queue a task" (8.6's timer task source, a queued event fire, a delivered reply) uses this
    one, and the event loop will not begin it until every microtask outstanding has run. Choosing the wrong one
@@ -1508,8 +1521,10 @@ JS_EXTERN void JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JS
    markup queue §7.4 step 14's navigation, and in this engine that happens at qjs_init, before the scheduler is
    seeded. Such a task is BASELINE work and waits on the runtime for the FIRST FLOW to adopt it
    (`baseline_call_list` in quickjs.c). It is never dropped, and no embedder pump ever runs it — the callback
-   belongs to a flow's timeline. */
-JS_EXTERN void JS_EnqueueCallTask(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
+   belongs to a flow's timeline.
+   ANSWERS THE TASK'S HANDLE, which is what a §4.11.4-shaped task tracker stores: the caller keeps it, and hands
+   it to JS_RemoveQueuedTask when the next transition must take this task back off the queue. */
+JS_EXTERN JSTaskHandle JS_EnqueueCallTask(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
 JS_EXTERN void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook,
                                  void *opaque);
 
@@ -2105,9 +2120,15 @@ JS_EXTERN int JS_EnqueueTaskJob(JSContext *ctx, JSJobFunc *job_func,
    `is_task` says WHICH of HTML 8.1.7's two queues this belongs to — false for a microtask, true for a task
    source. A host that takes ownership takes the ordering rule with it: it may not begin a task while any
    microtask it holds is still outstanding. It is a parameter rather than a second hook because a host that
-   registers one and forgets the other silently loses every job of the kind it forgot. */
+   registers one and forgets the other silently loses every job of the kind it forgot.
+   `handle` IS THE JOB'S IDENTITY and the host must record it beside the job, because the host is then the only
+   thing that can find it again: the removal hook below names a job by this and by nothing else. It is allocated
+   HERE rather than by the host so that one runtime issues every handle — a host-side counter would collide with
+   the runtime's own queues the moment a callback is queued with no flow to own it. It is carried across the
+   baseline handover too, so a task the user agent queued before the frontier existed keeps the name its tracker
+   already holds. */
 typedef int (*JSJobEnqueueHook)(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv,
-                                bool is_task);
+                                bool is_task, JSTaskHandle handle);
 JS_EXTERN void JS_SetJobEnqueueHook(JSJobEnqueueHook h);
 
 /* THE OTHER HALF OF OWNERSHIP. A host that TOOK a job is the only thing that can give it back, so the drop
@@ -2124,6 +2145,27 @@ JS_EXTERN void JS_SetJobDropHook(JSJobDropHook h);
    two queues and from whatever the enqueue hook's owner is holding. Answers the number removed, so a caller
    can assert that a second call finds none. */
 JS_EXTERN int JS_DropJobsForContext(JSContext *ctx);
+
+/* THE SAME OWNERSHIP SEAM, BY NAME INSTEAD OF BY REALM — the hook a host that TOOK a job answers when ONE job
+   is to be taken back off its queue. It never fights JS_DropJobsForContext: that one removes by document and
+   this one by identity, so a job the destroy already removed is simply not found here (and the reverse).
+   IT IS ASKED OF THE HOST'S RUNNING FLOW ALONE, and that is a statement about the design rather than a
+   convenience. A fork COPIES the parent's queued jobs, so after a branch two flows hold two jobs bearing one
+   handle — two timelines' copies of the same queued task — and each arm's tracker names its OWN. A hook that
+   swept every flow would delete the sibling's task from the sibling's timeline, which is the shared-state bug
+   this engine's per-flow queues exist to make impossible. Answers the number removed: 0 or 1. */
+typedef int (*JSJobRemoveHook)(JSTaskHandle handle);
+JS_EXTERN void JS_SetJobRemoveHook(JSJobRemoveHook h);
+
+/* REMOVE ONE QUEUED CALLBACK BY ITS HANDLE, WITHOUT RUNNING IT — HTML's "remove <task> from its task queue",
+   the step every toggle task tracker rests on (§4.11.1 details, §4.11.4 dialog, §6.12 popover).
+   ANSWERS 0 OR 1, AND 0 IS ORDINARY. A handle outlives the task it names: the task may already have run, may
+   be running RIGHT NOW (a `toggle` listener that closes the dialog again asks for the removal of the very task
+   dispatching it — the spec's own no-op, because a running task has already left its queue), or may have gone
+   with a destroyed document or a paged-out flow. So this is a lookup that answers honestly, never a use-after-
+   free and never an assert. What it DOES assert is that a handle names at most one queued callback anywhere,
+   which is the property the monotone allocation is for. */
+JS_EXTERN int JS_RemoveQueuedTask(JSRuntime *rt, JSTaskHandle handle);
 
 JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
 JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
