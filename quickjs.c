@@ -6264,13 +6264,72 @@ JSValue JS_NewAtomString(JSContext *ctx, const char *str)
     return val;
 }
 
-static JSValue js_force_tostring(JSContext *ctx, JSValueConst val1)
+/* THE ONE CONVERGENCE POINT OF EVERY BYTE CONSUMER IN THE ENGINE AND THE HOST — JS_ToCStringLen2At and
+   JS_ToCStringLenUTF16At are the only two callers, and every spelling a call site can write (JS_ToCString,
+   JS_ToCStringLen, JS_ToCStringLen2, JS_ToCStringUTF16, JS_ToCStringLenUTF16) is a macro over one of them.
+   That is why the UNKNOWN-EXTERNAL-INPUT assertion belongs HERE rather than at the call sites: it is asked
+   once, no per-site `if` exists to be forgotten by the next edge that needs bytes, and a new byte consumer
+   cannot be written that skips it.
+   `file`/`line` are the CONSUMER's, captured by the macro — see the contract above the declarations in
+   quickjs.h for why the operand cannot supply them. */
+static JSValue js_force_tostring(JSContext *ctx, JSValueConst val1, const char *file, int line)
 {
     JSObject *p;
     JSValue val;
 
+    /* Read only by the assertion below, which a release build compiles out — the parameters stay in the
+       signature there so ONE argument list serves both builds (see quickjs.h). */
+    (void)file; (void)line;
+    DCHECK(file != NULL,
+           "a byte consumer reached js_force_tostring with no call site — every public spelling is a macro "
+           "that captures __FILE__/__LINE__, so a NULL means a caller was written against the raw entry and "
+           "the assertion below would name nothing");
     if (JS_VALUE_GET_TAG(val1) == JS_TAG_STRING)
         return js_dup(val1);
+#if APICLIENT_DEV
+    /* THE ARRIVAL THIS BOUNDARY CANNOT ANSWER, ASSERTED WHERE IT IS BORN. §7.1.19 ToString ( arg ) step 9
+       asserts the remaining case is an Object and step 10 hands it to §7.1.1 ToPrimitive ( input [ ,
+       preferredType ] ), which over a concolic returns it unchanged — so the ToString below would carry an
+       unknown to an encoder that owes C real bytes. There is nothing to derive INTO: the result of this
+       function is a `const char *`, and a concolic cannot ride one. So the fix is never here, and the message
+       carries the two facts that identify it — WHICH unknown died (its display shape) and WHICH edge took it
+       (the consumer's own file:line).
+       The shape is asked for through key_name, which answers as a real String, so the JS_ToCString below
+       re-enters this function on a JS_TAG_STRING and returns at the fast path above. It is asked for rather
+       than assumed, because a value that came back as anything else would recurse. */
+    if (unlikely(g_concolic.is && g_concolic.is(val1))) {
+        /* SIZED FOR THE WHOLE MESSAGE — the prose is 992 bytes, the shape is capped at 240, and the rest is
+           the CONSUMER'S PATH, the one field whose length this file does not control. It is also why the
+           file:line is placed in the FIRST sentence rather than at the end: a truncation may cost the reader
+           the advice, and must never cost them the address. */
+        char why[1600];
+        const char *shape = NULL;
+        JSValue sv = JS_UNINITIALIZED;
+
+        if (g_concolic.key_name) {
+            sv = g_concolic.key_name(ctx, val1);
+            if (JS_IsString(sv))
+                shape = JS_ToCString(ctx, sv);
+        }
+        snprintf(why, sizeof why,
+                 "ToString over UNKNOWN EXTERNAL INPUT `%.240s`, asked for by the BYTE CONSUMER at %s:%d. "
+                 "That call wants BYTES, and a `const char *` cannot carry a concolic — ECMAScript §7.1.19 "
+                 "ToString ( arg ) steps 9-12 send an Object to §7.1.1 ToPrimitive ( input [ , preferredType "
+                 "] ), which over an unknown is the identity, so there is nothing for this boundary to derive "
+                 "into and no coercion it can perform. FIX IT AT THAT FILE:LINE, not here. If the site wants "
+                 "a NAME (a selector, an attribute, a header, a key), an unknown denotes its own display "
+                 "SHAPE as a real string, stable per source — ask for it there (concolic_shape_c / "
+                 "concolic_name_cstr). If the site is an OPERATOR whose RESULT the page observes, build the "
+                 "answer in the operator: js_concolic_derive over the operand, named by the operation it "
+                 "performs, with the example obtained by RUNNING the real operation on the operand's own "
+                 "example. If the site has to reach the network or park, it parks. What it must never do is "
+                 "convert here.",
+                 shape ? shape : "(a shape this engine could not spell)", file ? file : "(no call site)", line);
+        if (shape) JS_FreeCString(ctx, shape);
+        JS_FreeValue(ctx, sv);
+        DFAIL(why);
+    }
+#endif
     val = JS_ToString(ctx, val1);
     if (!JS_IsException(val))
         return val;
@@ -6309,12 +6368,12 @@ static const char *js_cstring_from_string(JSContext *ctx, size_t *plen, JSValueC
     return js_cstring_encode(ctx, plen, js_dup(val1), cesu8);
 }
 
-const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
-                             bool cesu8)
+const char *JS_ToCStringLen2At(JSContext *ctx, size_t *plen, JSValueConst val1,
+                               bool cesu8, const char *file, int line)
 {
     JSValue val;
 
-    val = js_force_tostring(ctx, val1);
+    val = js_force_tostring(ctx, val1, file, line);
     if (JS_IsException(val)) {
         if (plen)
             *plen = 0;
@@ -6413,14 +6472,14 @@ fail:
     return NULL;
 }
 
-const uint16_t *JS_ToCStringLenUTF16(JSContext *ctx, size_t *plen,
-                                     JSValueConst val1)
+const uint16_t *JS_ToCStringLenUTF16At(JSContext *ctx, size_t *plen,
+                                       JSValueConst val1, const char *file, int line)
 {
     JSString *p, *q;
     uint32_t i;
     JSValue v;
 
-    v = js_force_tostring(ctx, val1);
+    v = js_force_tostring(ctx, val1, file, line);
     if (JS_IsException(v))
         goto fail;
     p = JS_VALUE_GET_STRING(v);
@@ -17658,15 +17717,17 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                JS_ConcatString3 and JS_ToUTF32String cannot be handed unknown input at all — and each now
                asserts that at its own site instead of being described here, because a list is only worth what
                its last check was worth.
-               WHAT IS LEFT IS js_force_tostring, and it is NOT an unbuilt operator — it is JS_ToCStringLen2 /
-               JS_ToCStringLenUTF16, a C consumer that wants BYTES. A `const char *` cannot carry a concolic,
-               so there is nothing here to derive INTO and no coercion this boundary could perform: the
-               consumer must ask for the unknown's own display SHAPE at ITS site, which is what fetch's §5.4
-               URL, Headers' value, and the Attr / Element / Node text edges already do through
-               concolic_shape_c. A `@WHY` here therefore names a byte consumer that has not asked yet, and the
-               file:line to fix is the JS_ToCString call, not this one. The reader has no stack (a real page
-               reports the message and nothing else), so the message carries WHICH unknown value died, by its
-               display shape, to identify the edge that took it. */
+               A BYTE CONSUMER CANNOT REACH THIS LINE ANY MORE, which is why this comment no longer explains
+               how to hunt for one. js_force_tostring — the single point JS_ToCStringLen2At and
+               JS_ToCStringLenUTF16At both converge on, and therefore the point every JS_ToCString spelling in
+               the engine and the host converges on — asserts the same arrival one frame EARLIER and names the
+               consumer's own file:line, which it can do because the macro captured it and this function
+               cannot. The reader has no stack (a real page reports the message and nothing else), so a
+               boundary that can only name the VALUE sends the reader to search every edge that could have
+               taken it; an orphan drive's argument reads the same bytes at all of them.
+               So what still arrives HERE is the other half: a JS_ToString or JS_ToPropertyKey called straight
+               from C by an OPERATOR that did not answer over unknown input. The fix for that is never a
+               conversion, it is the operator's own derived result. */
             if (unlikely(g_concolic.is && g_concolic.is(val))) {
 #if APICLIENT_DEV
                 {
@@ -17685,19 +17746,16 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                     }
                     snprintf(why, sizeof why,
                              "ToString over UNKNOWN EXTERNAL INPUT `%.240s`, from a C site that is NOT a step "
-                             "machine's coercion. step_tostring_run answers §7.1.19 ToString ( arg ) over "
-                             "unknown input with a derived concolic (JS_STEP_UNKNOWN), and every OPERATOR that "
-                             "used to reach this line answers at its own site now (EvaluateImportCall, "
-                             "String(value) and its wrapper, Symbol(description), Date.parse, the DOMException "
-                             "constructor), so ONE shape is left: js_force_tostring, i.e. a JS_ToCString / "
-                             "JS_ToCStringLen / JS_ToCStringLenUTF16 on this value. THAT IS A BYTE CONSUMER, "
-                             "NOT AN UNBUILT OPERATOR — a `const char *` cannot carry a concolic, so there is "
-                             "nothing for this boundary to derive into. FIX IT AT THE JS_ToCString CALL: ask "
-                             "for the unknown's own display shape there (concolic_shape_c), the way fetch's "
-                             "§5.4 URL, Headers' value and the Attr/Element/Node text edges already do. Use "
-                             "the shape above to find which edge took it. If the arrival is NOT a byte "
-                             "consumer, it is a new operator: build the answer in IT — js_concolic_derive over "
-                             "the operand, named by the operation it performs — never by converting here.",
+                             "machine's coercion AND NOT A BYTE CONSUMER. step_tostring_run answers §7.1.19 "
+                             "ToString ( arg ) over unknown input with a derived concolic (JS_STEP_UNKNOWN), "
+                             "and a JS_ToCString / JS_ToCStringLen / JS_ToCStringLenUTF16 on this value dies "
+                             "one frame earlier in js_force_tostring, which names the consuming file:line. "
+                             "What is left is a JS_ToString or JS_ToPropertyKey called straight from C by an "
+                             "OPERATOR that has no answer over unknown input yet. BUILD THE ANSWER IN THAT "
+                             "OPERATOR — js_concolic_derive over the operand, named by the operation it "
+                             "performs, with the example obtained by RUNNING the real operation on the "
+                             "operand's own example — never by converting here: this function owes C a real "
+                             "JSString and the page's value is not one.",
                              shape ? shape : "(a shape this engine could not spell)");
                     if (shape) JS_FreeCString(ctx, shape);
                     JS_FreeValue(ctx, sv);

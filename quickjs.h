@@ -1147,26 +1147,41 @@ JS_EXTERN JSValue JS_NewStringUTF16(JSContext *ctx, const uint16_t *buf,
 JS_EXTERN JSValue JS_NewAtomString(JSContext *ctx, const char *str);
 JS_EXTERN JSValue JS_ToString(JSContext *ctx, JSValueConst val);
 JS_EXTERN JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val);
-JS_EXTERN const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, bool cesu8);
-static inline const char *JS_ToCStringLen(JSContext *ctx, size_t *plen, JSValueConst val1)
-{
-    return JS_ToCStringLen2(ctx, plen, val1, 0);
-}
-static inline const char *JS_ToCString(JSContext *ctx, JSValueConst val1)
-{
-    return JS_ToCStringLen2(ctx, NULL, val1, 0);
-}
+/* THE BYTE CONSUMER'S OWN CALL SITE TRAVELS WITH THE REQUEST, because the assertion that fires underneath it
+   is about the CALLER and the caller is the one thing the operand cannot name. These entries are ToString
+   (ECMAScript §7.1.19 ToString ( arg )) followed by an encoder, and §7.1.19 step 9 asserts the remaining case
+   is an Object, step 10 sends it to §7.1.1 ToPrimitive ( input [ , preferredType ] ), and §7.1.1 over UNKNOWN
+   EXTERNAL INPUT is the identity — the value is primitive in the page and wears an Object only as a carrier.
+   A `const char *` cannot carry a concolic, so there is nothing for this boundary to derive into and no
+   coercion it can perform; the consumer has to ask for the unknown's own display shape at ITS site. The abort
+   that says so used to name only WHICH value died, and that instruction is unfollowable on its own: an orphan
+   drive's argument reads `{orphan<locator>.arg<n>}` at every edge that could have taken it, so the reader was
+   sent to search every byte consumer in the tree by hand. The site is known at the one place that knows it, so
+   it is passed from there and the abort names the file:line to fix.
+   ONE ABI IN BOTH BUILDS: the site is carried whether or not APICLIENT_DEV is set. A translation unit built
+   with a different value of it can then never disagree with this one about the argument list — the skew that
+   makes two objects read one struct at two sizes and fault in a place neither names. A release build simply
+   never reads the two words.
+   MACROS, NOT INLINE WRAPPERS: __FILE__/__LINE__ inside a static inline expand at the HEADER, which is the one
+   site that is never the answer. */
+JS_EXTERN const char *JS_ToCStringLen2At(JSContext *ctx, size_t *plen, JSValueConst val1, bool cesu8,
+                                         const char *file, int line);
+#define JS_ToCStringLen2(ctx, plen, val1, cesu8) \
+    JS_ToCStringLen2At((ctx), (plen), (val1), (cesu8), __FILE__, __LINE__)
+#define JS_ToCStringLen(ctx, plen, val1) \
+    JS_ToCStringLen2At((ctx), (plen), (val1), 0, __FILE__, __LINE__)
+#define JS_ToCString(ctx, val1) \
+    JS_ToCStringLen2At((ctx), NULL, (val1), 0, __FILE__, __LINE__)
 // returns a utf-16 version of the string in native endianness; the
 // string is not nul terminated and can contain unmatched surrogates
 // |*plen| is in uint16s, not code points; a surrogate pair such as
 // U+D834 U+DF06 has len=2; an unmatched surrogate has len=1
-JS_EXTERN const uint16_t *JS_ToCStringLenUTF16(JSContext *ctx, size_t *plen,
-                                               JSValueConst val1);
-static inline const uint16_t *JS_ToCStringUTF16(JSContext *ctx,
-                                                JSValueConst val1)
-{
-    return JS_ToCStringLenUTF16(ctx, NULL, val1);
-}
+JS_EXTERN const uint16_t *JS_ToCStringLenUTF16At(JSContext *ctx, size_t *plen, JSValueConst val1,
+                                                 const char *file, int line);
+#define JS_ToCStringLenUTF16(ctx, plen, val1) \
+    JS_ToCStringLenUTF16At((ctx), (plen), (val1), __FILE__, __LINE__)
+#define JS_ToCStringUTF16(ctx, val1) \
+    JS_ToCStringLenUTF16At((ctx), NULL, (val1), __FILE__, __LINE__)
 JS_EXTERN void JS_FreeCString(JSContext *ctx, const char *ptr);
 JS_EXTERN void JS_FreeCStringRT(JSRuntime *rt, const char *ptr);
 JS_EXTERN void JS_FreeCStringUTF16(JSContext *ctx, const uint16_t *ptr);
