@@ -23914,11 +23914,24 @@ typedef struct JSOpClass {
                                   write through a TRAPLESS proxy, whose forward keeps the proxy as the Receiver.
                                   Same nesting as CONT_GOPD_DESC: a keyed OPERATION parked across the requests
                                   that finish it. */
+/* A KEYED OPERATION PARKED AT ITS OWN RE-ENTRY — the same record, before any trap read has happened. See
+   CONT_GETPROP_YIELD. The field list is not nearly the same as a trap read's, it IS a trap read's: both are
+   "the whole operation, held on the heap while something else runs", and the trap read only additionally
+   carries the method it went to fetch. Written as one record because a second one would be the same operand
+   list stated twice — and the operand list is exactly what `dflags` and `desc_out` above record having been
+   missed once each. */
 typedef struct JSTrapGet {
     JSValue obj;         /* the proxy the operation is on (owned) */
     JSValue val;         /* GP_SET / GP_DEFINE's operand (owned) */
-    JSValue recv;        /* the operation's receiver (owned) */
-    JSValue method;      /* the trap, once the read has produced it (owned); UNDEFINED until then */
+    JSValue recv;        /* the operation's receiver (owned), already resolved past "the object itself" */
+    /* THE TRAP, ONCE THE READ HAS PRODUCED IT (owned) — and JS_UNINITIALIZED, the engine's own empty slot,
+       until then. It used to be JS_UNDEFINED, which is a real trap answer (GetMethod maps null onto undefined
+       and 10.5.x reads that as "no trap"), so "has the read happened?" was a question this record could not
+       answer about itself. Nothing asked while the record existed only between a read's issue and its
+       delivery; a record that is also what a PARK holds is entered at do_getprop_tramp with the question
+       live, and answering it from the object's class instead would be reading a fact about the operand to
+       decide a fact about the request. */
+    JSValue method;
     JSAtom atom;         /* the operation's key (owned); JS_ATOM_NULL for GP_OWNKEYS, which has none */
     void *outer;         /* what is waiting on the OPERATION, not on this read */
     JSValue getter, setter;  /* GP_DEFINE's remaining descriptor fields (owned) */
@@ -23945,6 +23958,70 @@ static void js_trapget_free(JSContext *ctx, JSTrapGet *tg)
     JS_FreeAtom(ctx, tg->atom);
     js_free_rt(ctx->rt, tg);
 }
+
+/* THE OTHER DIRECTION OF THE SAME OWNERSHIP LIST — the fork's copy, read against the release above. A record
+   that can ride a PARKED chain must be answerable by both walks (free_tramp_chain releases one reference,
+   clone_deep_flow takes a second), and a field present in only one of them is the drift that pairing exists
+   to stop: `dflags` and `desc_out` were each missed once on the way IN to this record, and a missed dup here
+   is the same mistake with two flows sharing one operand instead of one flow losing it.
+   `desc_out` IS THE ONE FIELD THIS CANNOT COPY, and it says so instead of copying it wrong. It points INTO
+   the requester's own state (a machine's `&s->facts`), and the walk that relinks `outer` gives the sibling a
+   DIFFERENT requester at a different address — so carrying the pointer over would aim the sibling's answer at
+   the parent's record, and allocating a new one would aim it at a record nobody reads. Neither is expressible
+   from here, because the offset of a field inside a requester is the requester's fact and not this record's.
+   What closes it is a relink the answer-shape travels on, the way `outer` does; until then the fork aborts
+   here rather than answering with something that is not the answer. */
+static JSTrapGet *js_trapget_clone(JSContext *ctx, const JSTrapGet *tg)
+{
+    JSTrapGet *n;
+
+    if (tg->desc_out != NULL)
+        DFAIL("a parked keyed operation carrying a DESCRIPTOR-RECORD answer shape was forked — desc_out points "
+              "inside the requester's own state, and the sibling's requester is a different allocation, so the "
+              "copy would write this arm's answer into the other arm's record. Give the answer shape a relink "
+              "of its own (cont_outer_set's pair, one field further in) before this fork is allowed");
+    n = js_mallocz(ctx, sizeof(*n));
+    if (unlikely(!n))
+        return NULL;
+    n->obj = js_dup(tg->obj);
+    n->val = js_dup(tg->val);
+    n->recv = js_dup(tg->recv);
+    n->method = js_dup(tg->method);
+    n->getter = js_dup(tg->getter);
+    n->setter = js_dup(tg->setter);
+    n->atom = JS_DupAtom(ctx, tg->atom);
+    n->dflags = tg->dflags;
+    n->outer = tg->outer; n->outer_kind = tg->outer_kind;
+    n->op = tg->op; n->no_throw = tg->no_throw;
+    n->desc_out = tg->desc_out;
+    return n;
+}
+
+/* A KEYED PROPERTY OPERATION PARKED AT ITS OWN RE-ENTRY — cont_state = JSTrapGet, in an ANCHOR frame, exactly
+   as CONT_STEP_YIELD is a step machine parked at its own.
+ *
+ * do_getprop_tramp is where every keyed operation is performed AND where four of its own continuations come
+ * back to it: a trapless proxy forwards to its target (§10.5.8 [[Get]] ( propertyKey, receiver ) step 6, and
+ * §10.5.9 [[Set]] ( propertyKey, value, receiver ) step 6), a proxy standing in an ordinary object's
+ * prototype chain takes the operation over (§10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 2),
+ * §10.1.7.1 OrdinaryHasProperty ( obj, propertyKey ) step 4 walks ONE prototype level per re-entry, and a
+ * handler that is itself a Proxy re-enters for its own trap read. None of
+ * those runs a line of the page's code, so none of them reached do_step_step, do_yield_poll or any other
+ * offer — and each is as long as the page's object graph. A chain of N trapless proxies and an N-deep
+ * prototype chain were therefore N iterations the scheduler was never once consulted inside, which is the
+ * same defect do_step_step's offer removed one layer up and the same answer: the offer is made at the LABEL,
+ * once, and not at the sites that jump to it.
+ *
+ * WHAT THE PARK PUTS ON THE HEAP IS THE OPERATION'S OPERANDS, because they are interpreter locals and a
+ * snapshot cannot reach one — the same sentence JSStepHdr::park_in is written under. They go into the record
+ * a trap read already uses for them, and the resume restores the registers from it and re-enters PAST the
+ * offer, so nothing is replayed and nothing is recomputed.
+ *
+ * THE RECORD SURVIVES THE RESUME AS gp_trapst, and that is not a convenience: the restored registers BORROW
+ * from it (JSValueConst, as they borrow from a requester's state today), so the operation's existing
+ * discipline — every exit of do_getprop_tramp frees gp_trapst — is exactly the lifetime the park needs, and
+ * there is no second release site to forget. */
+#define CONT_GETPROP_YIELD 77
 
 static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
 {
@@ -25392,6 +25469,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_AFS_CONT:
     case CONT_ASYNC_AWAIT:
     case CONT_STEP_YIELD:
+    case CONT_GETPROP_YIELD:
     case CONT_ASYNC_SETTLE:
     case CONT_PROMISE_TRY_SETTLE:
     case CONT_PROMISE_ALL_SETTLE:
@@ -29218,13 +29296,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    bottom prev_frame still points at &s->frame, so the whole chain deepest->...->base is intact.
                    Re-enter the DEEPEST frame at its saved pc/sp. */
                 TrampFrame *dtf = s->tramp_top;
-                if (dtf->cont_kind == CONT_STEP_YIELD) {
-                    /* A STEP MACHINE parked at its own back-edge. It has no body to restart, so this cannot take
-                       the `goto restart` below: the frame is popped, the interpreter registers are restored from
-                       the frame's caller record (the same reconstruction do_return performs), and the MACHINE is
-                       re-entered where it left off. Nothing is replayed — the machine's own state is where the
-                       parse position lives. */
+                if (dtf->cont_kind == CONT_STEP_YIELD || dtf->cont_kind == CONT_GETPROP_YIELD) {
+                    /* AN ANCHOR: a STEP MACHINE parked at its own back-edge, or a KEYED PROPERTY OPERATION
+                       parked at its own re-entry. Neither has a body to restart, so this cannot take the `goto
+                       restart` below: the frame is popped, the interpreter registers are restored from the
+                       frame's caller record (the same reconstruction do_return performs), and the continuation
+                       is re-entered where it left off. Nothing is replayed — where each one is, is its own
+                       state and never a position this walk has to guess at.
+                       ONE RESTORE FOR BOTH, because ANCHOR_NEW writes ONE caller record: the two anchors differ
+                       only in what they hand back afterwards, and a second copy of these fifteen lines is
+                       exactly where the pair would stop agreeing. */
                     void *ystt = dtf->cont_state;
+                    uint8_t ykind = dtf->cont_kind;
                     s->tramp_top = NULL;
                     tf_top = dtf->up;
                     sf = dtf->caller_sf; b = dtf->caller_b; ctx = dtf->caller_ctx;
@@ -29239,6 +29322,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sf->cur_sp = NULL;   /* running again */
                     rt->current_stack_frame = sf;
                     tramp_frame_free(rt, dtf);
+                    if (ykind == CONT_GETPROP_YIELD) {
+                        /* A KEYED PROPERTY OPERATION, HANDED BACK ITS OPERANDS. They were interpreter locals
+                           when it parked and they are interpreter locals again now; in between they were the
+                           one thing a snapshot can reach, which is the whole of why the record exists.
+                           THE RECORD STAYS AS gp_trapst, and that is the operation's lifetime rule rather than
+                           an extra one: the registers below BORROW from it, and every exit of the entry already
+                           frees gp_trapst — so there is no second release site for a later reader to miss.
+                           AND IT RESUMES PAST THE OFFER, at do_getprop_run, for do_step_run's reason: a flow
+                           the scheduler has just chosen to run being asked, before it does anything, whether to
+                           yield again is not a suspension point, and taking it would park a flow that has made
+                           no progress. */
+                        JSTrapGet *pk = ystt;
+                        DCHECK(!JS_HasException(ctx),
+                               "a flow resumed into a parked keyed property operation with a completion already "
+                               "live in the runtime — the exception slot is shared, so this one belongs to "
+                               "another flow");
+                        gp_obj = pk->obj; gp_atom = pk->atom; gp_op = pk->op; gp_val = pk->val;
+                        gp_recv = pk->recv; gp_no_throw = pk->no_throw; gp_desc_out = pk->desc_out;
+                        gp_getter = pk->getter; gp_setter = pk->setter; gp_dflags = pk->dflags;
+                        gp_outer = pk->outer; gp_outer_kind = pk->outer_kind;
+                        gp_trapst = pk;
+                        goto do_getprop_run;
+                    }
                     cont_st = ystt;
                     /* WHAT THE DRIVER OWED IT, TAKEN BACK — the delivery it parked holding and the completion
                        that was live in the context then. This is what makes the resume byte-identical: the
@@ -31779,9 +31885,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    caller is the flow's own base, the parked flow ends up holding a base cur_sp AND a chain at once. That is
    legal and routinely resumed; free_tramp_chain is where it is asserted, and it is recorded here because this
    macro is the reason it happens. */
-#define STEP_ANCHOR_NEW(tfv) do {                                                                       \
+/* …AND IT IS NOT A STEP MACHINE'S ALONE. A keyed property OPERATION parks in exactly this frame (see
+   CONT_GETPROP_YIELD) and for exactly this reason — its operands are interpreter locals too — so the
+   construction is the parameterised macro and the two spellings differ ONLY in how each unwinds an OOM: a
+   machine's whole chain through the generic `exception`, a keyed operation through its own teardown. Written
+   as a parameter rather than as a second copy of twenty field assignments, because a copy is where the
+   caller-record pair below silently stops agreeing.
+   `oom_action` MUST leave this block — every anchor is pushed by code that has nothing to do with a NULL
+   frame, so falling through with one is not a state any caller can express. */
+#define ANCHOR_NEW(tfv, oom_action) do {                                                                \
         (tfv) = tramp_frame_new(rt);                                                                    \
-        if (unlikely(!(tfv))) { tramp_step_chain_free(ctx, stt); JS_ThrowOutOfMemory(ctx); goto exception; } \
+        if (unlikely(!(tfv))) { oom_action; }                                                            \
         memset(&(tfv)->sf, 0, sizeof((tfv)->sf));                                                       \
         (tfv)->b = NULL; (tfv)->local_buf = NULL; (tfv)->ctx = ctx; (tfv)->local_slots = 0;              \
         (tfv)->seq_req = NULL; (tfv)->seq_req_kind = CONT_NONE;                                          \
@@ -31801,6 +31915,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         (tfv)->async_promise = JS_UNDEFINED;                                                             \
         (tfv)->close_saved_exc = JS_UNINITIALIZED;                                                       \
     } while (0)
+#define STEP_ANCHOR_NEW(tfv) \
+    ANCHOR_NEW(tfv, tramp_step_chain_free(ctx, stt); JS_ThrowOutOfMemory(ctx); goto exception)
 
         do_step_tramp:
             /* ONE generic entry for every builtin DEFINED as a step machine. Nothing here names a builtin: the
@@ -33956,7 +34072,113 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_getprop_complete;
             }
 
+        do_getprop_park:
+            /* PARK THE KEYED OPERATION. Everything that makes this possible is do_step_park's, one layer down:
+               do_preempt stashes tf_top into the base, so an operation held in an ANCHOR is parked by the
+               ordinary path with nothing special about it.
+               IT SITS OUTSIDE THE OPERATION'S BODY because the offer that reaches it is made BEFORE the body,
+               at the label, where none of the body's read+reset locals exist yet — the operation is the gp_*
+               registers, which is the one thing every way in already agrees on. */
+            {
+                TrampFrame *ktf;
+                JSTrapGet *pk;
+
+                /* THE FRAME FIRST, while the registers still describe the operation: an OOM here unwinds the
+                   operation through its own teardown, which is what getprop_throw is, rather than through the
+                   frame's generic one with the requester chain already dropped. */
+                ANCHOR_NEW(ktf, JS_ThrowOutOfMemory(ctx); goto getprop_throw);
+                /* A PARKED OPERATION ALREADY IN A RECORD IS NOT COPIED INTO A SECOND ONE — an operation whose
+                   trap read has just been delivered (gp_trapst set, method in hand) is re-entering this label
+                   with its operands ALREADY on the heap, so the park keeps the record it is standing on. That
+                   is not an optimisation: two records would both be freed by the operation's one exit. */
+                pk = gp_trapst;
+                if (!pk) {
+                    pk = js_mallocz(ctx, sizeof(*pk));
+                    if (unlikely(!pk)) {
+                        tramp_frame_free(rt, ktf);
+                        JS_ThrowOutOfMemory(ctx);
+                        goto getprop_throw;
+                    }
+                    pk->obj = js_dup(gp_obj);
+                    pk->val = js_dup(gp_val);
+                    /* RESOLVED, exactly as the trap read resolves it: "the object itself" is a spelling of the
+                       receiver and not a third state, and every consumer past this label reads gp_recv_r. */
+                    pk->recv = js_dup(JS_IsUninitialized(gp_recv) ? gp_obj : gp_recv);
+                    pk->method = JS_UNINITIALIZED;   /* no trap read has happened: this record is the operands */
+                    pk->getter = js_dup(gp_getter); pk->setter = js_dup(gp_setter);
+                    pk->dflags = gp_dflags;
+                    pk->atom = JS_DupAtom(ctx, gp_atom);
+                    pk->outer = gp_outer; pk->outer_kind = gp_outer_kind;
+                    pk->op = gp_op; pk->no_throw = (uint8_t)gp_no_throw;
+                    pk->desc_out = gp_desc_out;
+                }
+                /* WHAT do_step_park CARRIES AND THIS DOES NOT. A step machine parks holding a DELIVERY and the
+                   completion that was live when it parked; a keyed operation is being ISSUED, so it holds
+                   neither — there is no answer yet and no throw may be standing. This is the same invariant
+                   JS_FlowResume asserts at the host boundary, at a third granularity: rt->current_exception is
+                   per-RUNTIME and a completion is per-EVALUATION (ECMA-262 §6.2.4 The Completion Record
+                   Specification Type), so one left standing across a park is delivered to whichever flow runs
+                   next. Asserted rather than assumed, and what to build if it ever fires is the pair
+                   JSStepHdr::park_in/park_exc already are. */
+                DCHECK(!JS_HasException(ctx),
+                       "a keyed property operation was parked with a completion live in the runtime — the "
+                       "exception slot is per-RUNTIME and a completion is per-EVALUATION, so this throw would "
+                       "be delivered to whichever flow the scheduler runs next. Carry it across the park the "
+                       "way a step machine's park_exc is carried, or take it where it was produced");
+                /* read + reset every register the record now carries, for the reason every other request input
+                   is read and reset: an operand left standing applies to whatever this frame requests next, and
+                   the next thing this frame does is RETURN to the scheduler. */
+                gp_trapst = NULL;
+                gp_obj = JS_UNDEFINED; gp_atom = JS_ATOM_NULL; gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                gp_recv = JS_UNINITIALIZED; gp_no_throw = 0; gp_desc_out = NULL;
+                gp_getter = gp_setter = JS_UNDEFINED;
+                gp_dflags = JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE
+                          | JS_PROP_HAS_CONFIGURABLE | JS_PROP_C_W_E;
+                gp_outer = NULL; gp_outer_kind = CONT_NONE;
+                ktf->cont_state = pk; ktf->cont_kind = CONT_GETPROP_YIELD;
+                tf_top = ktf;
+                goto do_preempt;
+            }
+
         do_getprop_tramp:
+            /* THE ONE PLACE THE SCHEDULER IS OFFERED A KEYED OPERATION'S NEXT HOP — do_step_step's sentence,
+             * one layer down, and for a defect of exactly the same shape.
+             *
+             * Every performance of every keyed operation reaches this label, and so do FOUR of its own
+             * continuations: a trapless proxy's forward (§10.5.8 [[Get]] ( propertyKey, receiver ) step 6,
+             * "If trap is undefined, then Return ? target.[[Get]](propertyKey, receiver)"), a proxy found
+             * standing in an ordinary object's prototype chain (§10.1.8.1 OrdinaryGet ( obj, propertyKey,
+             * receiver ) step 2, "Return ? parent.[[Get]](propertyKey, receiver)"), §10.1.7.1
+             * OrdinaryHasProperty ( obj, propertyKey )'s ONE-PROTOTYPE-LEVEL-AT-A-TIME walk (step 4, "Return ?
+             * parent.[[HasProperty]](propertyKey)"), and a handler that is itself a Proxy re-entering for its
+             * own trap read.
+             * NONE of those runs a line of the page's code — which is precisely why none of them reached an
+             * offer. do_step_step answers a machine's keyed REQUEST and the sites below answer a plain data
+             * slot in place, so a chain of N trapless proxies and an N-deep prototype chain each ran N hops
+             * with the preempt hook never once consulted. Running no user code is not what makes a C span safe
+             * to leave un-parkable; being O(1) is, and a walk over the page's object graph is not.
+             *
+             * SO THE OFFER IS MADE HERE, ONCE, and not at the four sites that loop back nor at the hundred that
+             * jump in: a consultation at a jump site is per-spelling plumbing, and every spelling it is not
+             * written at is a walk the scheduler is silently never asked inside.
+             *
+             * AND IT IS LOSSLESS FOR THE REASON do_step_step's IS. Every site that reaches this label has
+             * ALREADY had to leave the interpreter in a state this operation can suspend from — the object may
+             * be a Proxy whose trap loops, and that call parks — so the park adds nothing to what each site
+             * already guarantees. What it does add is the operands, and those are interpreter locals, which is
+             * exactly what the record carries (see CONT_GETPROP_YIELD).
+             *
+             * NO FLOW, NO PARK — the same statement do_yield_poll and do_step_step make. */
+            if (unlikely(g_flow_base_gen != NULL) && g_flow_control.preempt != NULL
+                && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
+                FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                if (gen_state != g_flow_base_gen)
+                    DFAIL("a keyed property operation was preempted in an activation that is not the flow base "
+                          "— give that driver a resume-as-flow path, never drive it to completion");
+                FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                goto do_getprop_park;
+            }
+        do_getprop_run:
             /* A keyed property OPERATION requested by a step machine — a READ or a HasProperty. Three shapes, ONE
                entry: a Proxy trap and a bytecode accessor are user code and run ON THIS CHAIN, so a loop in either
                parks; everything else (a data slot, a C getter, a bound accessor, a revoked-proxy throw) is done
@@ -33980,8 +34202,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gp_getter = gp_setter = JS_UNDEFINED;
                 gp_dflags = JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE
                           | JS_PROP_HAS_CONFIGURABLE | JS_PROP_C_W_E;
-                DCHECK(!gp_trapst || (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT
-                                      && JS_VALUE_GET_OBJ(gp_obj)->class_id == JS_CLASS_PROXY),
+                /* A record whose `method` is still the empty slot is not a delivery at all — it is this
+                   operation's own operands, PARKED at this label and handed back by the resume, and its object
+                   is whatever the operation was on. Only a record carrying a method is a trap read, and only a
+                   Proxy has a trap. Asking about the method rather than about `gp_trapst` being set is what
+                   keeps the assert exact instead of merely quiet. */
+                DCHECK(!gp_trapst || JS_IsUninitialized(gp_trapst->method)
+                       || (JS_VALUE_GET_TAG(gp_obj) == JS_TAG_OBJECT
+                           && JS_VALUE_GET_OBJ(gp_obj)->class_id == JS_CLASS_PROXY),
                        "a trap read was delivered to an operation whose object is not a Proxy");
                 /* a TRAPLESS proxy forwards to its target, and this label does that forward ITSELF: re-entering
                    the proxy's own [[Get]]/[[Set]]/[[Has]]/[[Delete]] would look the trap up a SECOND time, which
@@ -33993,7 +34221,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSObject *po = JS_VALUE_GET_OBJ(gp_obj);
                     if (po->class_id == JS_CLASS_PROXY) {
                         JSProxyData *pd = JS_GetOpaque(gp_obj, JS_CLASS_PROXY);
-                        if (!gp_trapst) {
+                        if (!gp_trapst || JS_IsUninitialized(gp_trapst->method)) {
                             /* GetMethod(handler, trap) has not run yet, and it is the PAGE'S CODE — the handler
                                may define the trap as an accessor, or be a Proxy itself. It is an ordinary [[Get]]
                                on the handler, so it is REQUESTED through this very entry rather than performed
@@ -34014,20 +34242,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                           gp_op == GP_PREVEXT ? JS_ATOM_preventExtensions :
                                           gp_op == GP_GETOWNPROP ? JS_ATOM_getOwnPropertyDescriptor
                                                                  : JS_ATOM_get;
-                            JSTrapGet *tg;
+                            /* A PARKED OPERATION IS ADOPTED, NEVER COPIED. gp_trapst here is a record this very
+                               operation was suspended in (its method is the empty slot), and it already holds
+                               exactly the operands this read has to park — building a second one would dup
+                               every value out of it and leave the original to be freed by an exit that is no
+                               longer taken. */
+                            JSTrapGet *tg = gp_trapst;
                             if (pd->is_revoked) { JS_ThrowTypeErrorRevokedProxy(ctx); goto getprop_throw; }
-                            tg = js_mallocz(ctx, sizeof(*tg));
-                            if (unlikely(!tg)) { JS_ThrowOutOfMemory(ctx); goto getprop_throw; }
-                            tg->obj = js_dup(gp_obj);
-                            tg->val = js_dup(gp_val);
-                            tg->recv = js_dup(gp_recv_r);
-                            tg->method = JS_UNDEFINED;
-                            tg->getter = js_dup(gp_getter_r); tg->setter = js_dup(gp_setter_r);
-                            tg->dflags = gp_dflags_r;
-                            tg->atom = JS_DupAtom(ctx, gp_atom);
-                            tg->outer = gp_outer; tg->outer_kind = gp_outer_kind;
-                            tg->op = gp_op; tg->no_throw = (uint8_t)gp_nothrow_r;
-                            tg->desc_out = gp_descout_r;
+                            if (!tg) {
+                                tg = js_mallocz(ctx, sizeof(*tg));
+                                if (unlikely(!tg)) { JS_ThrowOutOfMemory(ctx); goto getprop_throw; }
+                                tg->obj = js_dup(gp_obj);
+                                tg->val = js_dup(gp_val);
+                                tg->recv = js_dup(gp_recv_r);
+                                tg->method = JS_UNINITIALIZED;
+                                tg->getter = js_dup(gp_getter_r); tg->setter = js_dup(gp_setter_r);
+                                tg->dflags = gp_dflags_r;
+                                tg->atom = JS_DupAtom(ctx, gp_atom);
+                                tg->outer = gp_outer; tg->outer_kind = gp_outer_kind;
+                                tg->op = gp_op; tg->no_throw = (uint8_t)gp_nothrow_r;
+                                tg->desc_out = gp_descout_r;
+                            }
+                            /* the OPERATION is now waiting on the read, so it is no longer the entry's parked
+                               record: it is the read's `outer`, and the read owns it from here. */
+                            gp_trapst = NULL;
                             gp_obj = pd->handler;   /* borrowed: the proxy tg holds is what keeps it alive */
                             gp_atom = trap;
                             gp_op = GP_GET; gp_val = JS_UNDEFINED;
@@ -34052,8 +34290,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                the RECEIVER in particular does NOT change across a forward, which is the whole
                                reason it is an operand.
                                For a [[Get]] or a [[Set]] the loop takes an ORDINARY target too, because the
-                               forward is the same operation either way — 10.5.5 step 6 and 10.5.9 step 6 are
-                               both `Return ? target.[[X]](…, Receiver)`, with the receiver unchanged — and the C
+                               forward is the same operation either way — §10.5.8 [[Get]] ( propertyKey,
+                               receiver ) step 6 and §10.5.9 [[Set]] ( propertyKey, value, receiver ) step 6 are
+                               both `Return ? target.[[X]](…, receiver)`, with the receiver unchanged — and the C
                                call is what hid the target's ACCESSOR: a generator getter or setter reached
                                through a trapless proxy had its coroutine created inside JS_GetPropertyInternal /
                                JS_SetPropertyInternal2, off the chain, and a bound one ran with no flow base.
@@ -34093,8 +34332,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             handler = js_dup(pd->handler);
                         }
                     } else if (gp_op == GP_GET || gp_op == GP_SET) {
-                        /* the object is ordinary, but a PROXY can stand above it: 10.1.8 step 3 / 10.1.9 step 2.b
-                           hand the operation to `parent.[[Get]]/[[Set]](P, …, Receiver)` with the receiver
+                        /* the object is ordinary, but a PROXY can stand above it: §10.1.8.1 OrdinaryGet ( obj,
+                           propertyKey, receiver ) step 2 / §10.1.9.2 OrdinarySetWithOwnDescriptor ( obj,
+                           propertyKey, value, receiver, ownDesc ) step 1 each hand the operation to
+                           `parent.[[Get]]/[[Set]](propertyKey, …, receiver)` with the receiver
                            unchanged, which is this very entry with a different object. The read opcodes already
                            route that (tramp_proto_proxy), but a request ARRIVING here — Reflect.get(o,"r") on an
                            `Object.create(proxy)`, and every step machine's GP_GET/GP_SET — fell to
@@ -44764,6 +45005,11 @@ static void *cont_outer_get(void *st, uint8_t kind, uint8_t *out_kind)
     case CONT_STEP: case CONT_STEP_YIELD:
         *out_kind = ((JSStepHdr *)st)->outer_kind;
         return ((JSStepHdr *)st)->outer;
+    case CONT_GETPROP_YIELD:
+        /* a keyed property OPERATION parked at its own re-entry: what waits on it is what asked for the
+           property — a step machine, a coercion sequence, a bytecode operator's own record. */
+        *out_kind = ((JSTrapGet *)st)->outer_kind;
+        return ((JSTrapGet *)st)->outer;
     case CONT_TOPRIM:
         *out_kind = ((struct JSToPrim *)st)->outer_kind;
         return ((struct JSToPrim *)st)->outer;
@@ -44811,6 +45057,8 @@ static void cont_outer_set(void *st, uint8_t kind, void *outer, uint8_t outer_ki
     switch (kind) {
     case CONT_STEP: case CONT_STEP_YIELD:
         ((JSStepHdr *)st)->outer = outer; ((JSStepHdr *)st)->outer_kind = outer_kind; return;
+    case CONT_GETPROP_YIELD:
+        ((JSTrapGet *)st)->outer = outer; ((JSTrapGet *)st)->outer_kind = outer_kind; return;
     case CONT_TOPRIM:
         ((struct JSToPrim *)st)->outer = outer; ((struct JSToPrim *)st)->outer_kind = outer_kind; return;
     case CONT_PROMISE_EXEC:
@@ -44961,6 +45209,21 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             void *ns = tramp_step_state_clone(ctx, otf->cont_state);
             if (!ns) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
             ct->cont_state = ns;
+            ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0;
+        } else if (otf->cont_kind == CONT_GETPROP_YIELD) {
+            /* A KEYED PROPERTY OPERATION PARKED AT ITS OWN RE-ENTRY — the same anchor, and this walk is the
+               reason it needs an arm rather than a DFAIL naming one. A parked flow IS cloned: an instance whose
+               peer answers a cross-instance read with SEVERAL timelines forks one arm per answer off the
+               suspended flow (engine.c), so a chain parked here reaches this loop with nobody running.
+               Its record is what the sibling's registers will borrow from on ITS resume, so the two arms cannot
+               share one — the first to exit would free what the second is still reading. */
+            JSTrapGet *ntg;
+            DCHECK(i == 0,
+                   "clone_deep_flow: a keyed-operation ANCHOR below the top of a parked chain — it is bodyless, "
+                   "so the frame under it would inherit a zeroed frame as its caller");
+            ntg = js_trapget_clone(ctx, otf->cont_state);
+            if (!ntg) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            ct->cont_state = ntg;
             ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0;
         } else if (otf->async_data) {
             /* ASYNC body on the chain: clone a FRESH async_data with its OWN return-promise capability. The fork
@@ -45340,7 +45603,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
            then have to know to skip. The DCHECK above is what makes "it is always the top" a checked fact
            rather than the reason this exemption is safe. */
         ct->caller_sf        = caller_clone;
-        if (otf->cont_kind != CONT_STEP_YIELD)
+        if (otf->cont_kind != CONT_STEP_YIELD && otf->cont_kind != CONT_GETPROP_YIELD)
             tramp_live_sf(ct)->prev_frame = caller_clone;
         /* the caller's record IS the caller's frame — assert that on the ORIGINAL side, then take the clone's. */
         DCHECK(otf->caller_local_buf == cob,
@@ -45486,6 +45749,19 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
         uint8_t left = CONT_NONE;
         void *rest = tramp_step_chain_free_upto(ctx, st, &left);
         tramp_cont_free(ctx, rest, left);
+        return;
+    }
+    if (kind == CONT_GETPROP_YIELD) {
+        /* A KEYED PROPERTY OPERATION PARKED AT ITS OWN RE-ENTRY, released with nobody to answer to — a
+           cold-tier tail dropped, a flow destroyed under a throw. The operation can never finish, so whatever
+           asked for the property can never be answered either and goes with it, which is what every other arm
+           in this walk does with its requester. Taken BEFORE the free, because the free is what makes the
+           record unreadable. */
+        JSTrapGet *tg = st;
+        void *co = tg->outer;
+        uint8_t ck = tg->outer_kind;
+        js_trapget_free(ctx, tg);
+        tramp_cont_free(ctx, co, ck);
         return;
     }
     if (kind == CONT_TOPRIM) {
