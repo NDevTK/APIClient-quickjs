@@ -16845,15 +16845,22 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
                          "7.1.4 ToNumber over UNKNOWN EXTERNAL INPUT `%.240s`. Every ECMAScript OPERATOR over "
                          "an unknown answers at its own site with a derived concolic — .add for 13.15.3's `+`, "
                          ".cmp, .rel, and .arith for 13.5.4/.5/.6, the update operators, 13.7's multiplicative "
-                         "family, 13.9 Bitwise Shift Operators and 13.12 Binary Bitwise Operators — so an "
-                         "arrival here is NOT one of those. It is a CONSUMER that wants a real number: a "
-                         "builtin's ToInt32/ToLength/ToIndex, a host component's JS_ToFloat64 on an argument, "
-                         "an array index. FIX IT AT THAT SITE: derive the result there (JSConcolicHooks.builtin "
-                         "names the operation the spec was performing), or, where the consumer wants BYTES "
-                         "rather than a value, ask the unknown for its own projection (concolic_example / "
-                         "concolic_shape_c) exactly as fetch's URL and the Attr/Element text edges do. Never "
-                         "convert here: this boundary owes C a real number, and ToPrimitive hands a concolic "
-                         "straight back, so converting is an infinite coercion. Frames: %s",
+                         "family, 13.9 Bitwise Shift Operators and 13.12 Binary Bitwise Operators — and every "
+                         "BUILTIN that coerces an argument through the step sub-sequences answers too "
+                         "(step_toint64_run / _todouble_run / _tolength_run / _toint32_run / _toint32sat_run / "
+                         "_tofloat64_run all return JS_STEP_UNKNOWN, and the driver completes the machine with "
+                         "the derived unknown). So an arrival here is NEITHER. It is a C BODY doing its own "
+                         "conversion: a coerce-then-compute builtin whose body calls JS_ToFloat64 after "
+                         "PRIMARGS made its arguments primitive (the JS_CFUNC_f_f / f_f_f tail of "
+                         "js_primargs_step is one, and it has no per-builtin name to derive under until each "
+                         "PRIMARGS_DEF declares its own `.algorithm`), or a host component's own conversion. "
+                         "FIX IT AT THAT SITE: derive the result there (js_concolic_derive, naming the "
+                         "operation the spec was performing, as js_math_min_max and decodeURI do), or, where "
+                         "the consumer wants BYTES rather than a value, ask the unknown for its own projection "
+                         "(concolic_example / concolic_shape_c) exactly as fetch's URL and the Attr/Element "
+                         "text edges do. Never convert here: this boundary owes C a real number, and "
+                         "ToPrimitive hands a concolic straight back, so converting is an infinite coercion. "
+                         "Frames: %s",
                          shbuf, frames);
                 DFAIL(why);
             }
@@ -21701,17 +21708,27 @@ int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *o
    declared beside step_tostring_run alone, which was true only while that was the whole sub-sequence. */
 enum { STR_PH_START = 0, STR_PH_PRIM };
 
-/* §7.1.19 ToString ( arg ) OVER UNKNOWN EXTERNAL INPUT, PARKED FOR THE DRIVER — see JS_STEP_UNKNOWN for the
-   spec argument and for what the driver then does with it. `v` is BORROWED; the header takes its own
-   reference, because the caller's may be a value the caller is about to release. */
-static int step_tostring_unknown(JSStepHdr *h, JSValueConst v)
+/* A COERCION OVER UNKNOWN EXTERNAL INPUT, PARKED FOR THE DRIVER — see JS_STEP_UNKNOWN for the spec argument
+   and for what the driver then does with it. `v` is BORROWED; the header takes its own reference, because the
+   caller's may be a value the caller is about to release. `phase` is the SUB-SEQUENCE'S OWN cursor, reset
+   because the coercion is over either way — passed in rather than picked here, since ToString and the numeric
+   family keep separate cursors on the header and one function must not reset the other's.
+   BOTH FAMILIES, because the argument is the same one in both directions. §7.1.19 ToString ( arg ) steps 9-12
+   and §7.1.4 ToNumber ( arg ) steps 7-10 have the identical shape — assert the remaining case is an Object,
+   §7.1.1 ToPrimitive with the family's hint, assert the result is not an Object, recurse — and §7.1.1 over a
+   concolic returns it unchanged, so both recursions are a coercion of an unknown whose result is an unknown of
+   that type. Only ToString had this arm, so every builtin coercing a numeric ARGUMENT (§7.1.5
+   ToIntegerOrInfinity, §7.1.22 ToLength, §7.1.8 ToInt32) carried its unknown to a conversion boundary that owes
+   C a real double and aborts there: `Array.prototype.slice.call(a, {orphan.arg3})` ended a whole document on a
+   real page, and a crashed instance's findings are discarded. */
+static int step_coerce_unknown(JSStepHdr *h, JSValueConst v, uint8_t *phase)
 {
     DCHECK(JS_IsUninitialized(h->unknown_operand),
-           "a second ToString over unknown input on a machine that is already standing on one — the operand "
+           "a second coercion over unknown input on a machine that is already standing on one — the operand "
            "is taken by the driver before anything else runs, so two of them means a step returned "
            "JS_STEP_UNKNOWN to something that did not place its completion");
     h->unknown_operand = js_dup(v);
-    h->str_phase = STR_PH_START;   /* the coercion is over; the machine is about to be torn down either way */
+    *phase = 0;                    /* STR_PH_START / NUM_PH_START — the sub-sequence is done either way */
     return JS_STEP_UNKNOWN;
 }
 
@@ -21733,7 +21750,7 @@ int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, 
            "build it in the operator" that boundary's abort names, and it is built at the ONE sub-sequence every
            builtin's ToString goes through rather than at the sixty call sites that reach it. */
         if (unlikely(g_concolic.is && g_concolic.is(v)))
-            return step_tostring_unknown(h, v);
+            return step_coerce_unknown(h, v, &h->str_phase);
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                    "a coercion is already in flight on this machine's header");
@@ -21754,7 +21771,7 @@ int step_tostring_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, 
        the primitive is not an Object, and a concolic satisfies that assertion about the PAGE's value while
        failing it about the carrier, so this is the same case arriving one hop later. */
     if (unlikely(g_concolic.is && g_concolic.is(in))) {
-        int r = step_tostring_unknown(h, in);
+        int r = step_coerce_unknown(h, in, &h->str_phase);
         JS_FreeValue(ctx, in);
         return r;
     }
@@ -21967,6 +21984,9 @@ int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, i
 {
     if (h->num_phase == NUM_PH_START) {
         JS_FreeValue(ctx, in);
+        /* §7.1.4 steps 7-10 over unknown external input — see step_coerce_unknown. */
+        if (unlikely(g_concolic.is && g_concolic.is(v)))
+            return step_coerce_unknown(h, v, &h->num_phase);
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                    "a coercion is already in flight on this machine's header");
@@ -21981,6 +22001,12 @@ int step_toint64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, i
     JS_FreeValue(ctx, h->coerce);
     h->coerce = JS_UNDEFINED;
     h->num_phase = NUM_PH_START;
+    /* …and the other way in: the page's own valueOf ANSWERED with unknown external input. */
+    if (unlikely(g_concolic.is && g_concolic.is(in))) {
+        int r = step_coerce_unknown(h, in, &h->num_phase);
+        JS_FreeValue(ctx, in);
+        return r;
+    }
     return JS_ToInt64SatFree(ctx, pres, in);
 }
 
@@ -21994,6 +22020,9 @@ int step_todouble_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, 
 {
     if (h->num_phase == NUM_PH_START) {
         JS_FreeValue(ctx, in);
+        /* §7.1.4 steps 7-10 over unknown external input — see step_coerce_unknown. */
+        if (unlikely(g_concolic.is && g_concolic.is(v)))
+            return step_coerce_unknown(h, v, &h->num_phase);
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                    "a coercion is already in flight on this machine's header");
@@ -22008,6 +22037,12 @@ int step_todouble_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValue in, 
     JS_FreeValue(ctx, h->coerce);
     h->coerce = JS_UNDEFINED;
     h->num_phase = NUM_PH_START;
+    /* …and the other way in: the page's own valueOf ANSWERED with unknown external input. */
+    if (unlikely(g_concolic.is && g_concolic.is(in))) {
+        int r = step_coerce_unknown(h, in, &h->num_phase);
+        JS_FreeValue(ctx, in);
+        return r;
+    }
     return JS_ToFloat64Free(ctx, pres, in);
 }
 
@@ -22105,6 +22140,9 @@ static int step_tolength_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSVal
 {
     if (h->num_phase == NUM_PH_START) {
         JS_FreeValue(ctx, in);
+        /* §7.1.4 steps 7-10 over unknown external input — see step_coerce_unknown. */
+        if (unlikely(g_concolic.is && g_concolic.is(v)))
+            return step_coerce_unknown(h, v, &h->num_phase);
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                    "a coercion is already in flight on this machine's header");
@@ -22119,6 +22157,12 @@ static int step_tolength_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSVal
     JS_FreeValue(ctx, h->coerce);
     h->coerce = JS_UNDEFINED;
     h->num_phase = NUM_PH_START;
+    /* …and the other way in: the page's own valueOf ANSWERED with unknown external input. */
+    if (unlikely(g_concolic.is && g_concolic.is(in))) {
+        int r = step_coerce_unknown(h, in, &h->num_phase);
+        JS_FreeValue(ctx, in);
+        return r;
+    }
     return JS_ToLengthFree(ctx, pres, in);
 }
 
@@ -22130,6 +22174,9 @@ static int step_toint32_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValu
 {
     if (h->num_phase == NUM_PH_START) {
         JS_FreeValue(ctx, in);
+        /* §7.1.4 steps 7-10 over unknown external input — see step_coerce_unknown. */
+        if (unlikely(g_concolic.is && g_concolic.is(v)))
+            return step_coerce_unknown(h, v, &h->num_phase);
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                    "a coercion is already in flight on this machine's header");
@@ -22144,6 +22191,12 @@ static int step_toint32_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSValu
     JS_FreeValue(ctx, h->coerce);
     h->coerce = JS_UNDEFINED;
     h->num_phase = NUM_PH_START;
+    /* …and the other way in: the page's own valueOf ANSWERED with unknown external input. */
+    if (unlikely(g_concolic.is && g_concolic.is(in))) {
+        int r = step_coerce_unknown(h, in, &h->num_phase);
+        JS_FreeValue(ctx, in);
+        return r;
+    }
     return JS_ToInt32Free(ctx, pres, in);
 }
 
@@ -22157,6 +22210,9 @@ static int step_toint32sat_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSV
 {
     if (h->num_phase == NUM_PH_START) {
         JS_FreeValue(ctx, in);
+        /* §7.1.4 steps 7-10 over unknown external input — see step_coerce_unknown. */
+        if (unlikely(g_concolic.is && g_concolic.is(v)))
+            return step_coerce_unknown(h, v, &h->num_phase);
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                    "a coercion is already in flight on this machine's header");
@@ -22171,6 +22227,12 @@ static int step_toint32sat_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSV
     JS_FreeValue(ctx, h->coerce);
     h->coerce = JS_UNDEFINED;
     h->num_phase = NUM_PH_START;
+    /* …and the other way in: the page's own valueOf ANSWERED with unknown external input. */
+    if (unlikely(g_concolic.is && g_concolic.is(in))) {
+        int r = step_coerce_unknown(h, in, &h->num_phase);
+        JS_FreeValue(ctx, in);
+        return r;
+    }
     { int r = JS_ToInt32Sat(ctx, pres, in); JS_FreeValue(ctx, in); return r; }
 }
 
@@ -22179,6 +22241,9 @@ static int step_tofloat64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSVa
 {
     if (h->num_phase == NUM_PH_START) {
         JS_FreeValue(ctx, in);
+        /* §7.1.4 steps 7-10 over unknown external input — see step_coerce_unknown. */
+        if (unlikely(g_concolic.is && g_concolic.is(v)))
+            return step_coerce_unknown(h, v, &h->num_phase);
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             DCHECK(JS_VALUE_GET_TAG(h->coerce) != JS_TAG_OBJECT,
                    "a coercion is already in flight on this machine's header");
@@ -22193,6 +22258,12 @@ static int step_tofloat64_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, JSVa
     JS_FreeValue(ctx, h->coerce);
     h->coerce = JS_UNDEFINED;
     h->num_phase = NUM_PH_START;
+    /* …and the other way in: the page's own valueOf ANSWERED with unknown external input. */
+    if (unlikely(g_concolic.is && g_concolic.is(in))) {
+        int r = step_coerce_unknown(h, in, &h->num_phase);
+        JS_FreeValue(ctx, in);
+        return r;
+    }
     return JS_ToFloat64Free(ctx, pres, in);
 }
 

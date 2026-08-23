@@ -463,7 +463,7 @@ typedef struct JSStepHdr {
        one per suspension point. Every coercing prologue needs exactly this, so it lives in the header rather
        than being re-declared (and mis-declared) in each state. */
     JSValue coerce;
-    /* THE OPERAND WHOSE ToString IS UNKNOWN EXTERNAL INPUT — see JS_STEP_UNKNOWN. OWNED, and it lives for
+    /* THE OPERAND WHOSE COERCION IS OVER UNKNOWN EXTERNAL INPUT — see JS_STEP_UNKNOWN. OWNED, and it lives for
        exactly as long as the return that names it: the machine parks the operand here, returns
        JS_STEP_UNKNOWN, and the driver takes it at the one place a machine's completion is placed, with no
        opcode, no request and no suspension in between. So it is NOT in any machine's `visit` and must not be —
@@ -618,10 +618,13 @@ JS_EXTERN JSValueConst JS_StepClosureData(const JSStepHdr *h, int i);
 /* "MY COMPLETION IS ONE OF N FEASIBLE OUTCOMES — FORK HERE." Returned by step_fork_run; the driver decides the
    arm and snapshots the flow for the others. Never returned by a machine directly — see step_fork_run. */
 #define JS_STEP_FORK    23
-/* "MY COMPLETION IS A VALUE THIS ENGINE WAS NEVER GIVEN." Returned by step_tostring_run, never by a machine
- * directly, and it is the answer to ECMAScript §7.1.19 ToString ( arg ) over UNKNOWN EXTERNAL INPUT.
+/* "MY COMPLETION IS A VALUE THIS ENGINE WAS NEVER GIVEN." Returned by the COERCION SUB-SEQUENCES — ToString
+ * (step_tostring_run) and the numeric family (step_toint64_run, step_todouble_run, step_tolength_run,
+ * step_toint32_run, step_toint32sat_run, step_tofloat64_run) — never by a machine directly, and it is the
+ * answer to ECMAScript §7.1.19 ToString ( arg ) and §7.1.4 ToNumber ( arg ) over UNKNOWN EXTERNAL INPUT.
  *
- * §7.1.19 step 9 asserts the remaining case is an Object and step 10 is `ToPrimitive(arg, string)`. §7.1.1
+ * §7.1.19 step 9 asserts the remaining case is an Object and step 10 is `ToPrimitive(arg, string)`; §7.1.4
+ * steps 7-8 are the same pair with hint `number`, which is why one mechanism answers both. §7.1.1
  * ToPrimitive ( input [ , preferredType ] ) over a concolic returns it unchanged — a concolic stands for a
  * value that IS primitive in the page and wears an Object only because the solver needs a carrier with an
  * exotic [[Get]] — so step 12's recursive ToString is a ToString over an unknown String, whose result is an
