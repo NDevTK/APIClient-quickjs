@@ -46557,6 +46557,24 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
            back-jump is enough) then resumed after a sibling's await continuation, so `export const {x} =
            globalThis` read a value the sibling had already changed. The host pump drains this slot before
            starting any job, so the resume is transparent. */
+        /* WHOSE SLOT THIS IS, ASKED AT THE PARK RATHER THAN AT THE NEXT UNRELATED CALL. JS_ParkFlow's own
+           contract is that a flow preempting inside JOB-DRIVEN code parks here — nothing is running above it,
+           so the host pump drains the slot before anything else starts and the resume is transparent. A
+           `prev_base` that is not NULL says the opposite: this async function was called from a live activation
+           that is STILL RUNNING, its caller gets a pending promise back and carries on executing bytecode, and
+           the park sits in the runtime until the next C->JS call from any component trips
+           "JS was entered while a flow is PARKED" — an abort that names a site with no relationship to the
+           producer. This assert moves that report to where the state is created.
+           WHAT TO BUILD when it fires, and the tree already argues it one function away: JS_FlowResume's
+           FLOW_BASE_ASYNC_CALL arm reports suspension to the SCHEDULER rather than parking it here, precisely
+           because "two drivers for one state is how a flow gets resumed twice". A nested async call's prefix
+           preempt needs the same answer — the continuation riding the CALLER's flow — or the preempt must be
+           declined here so the outer frame takes it at its own next suspend point, which the scheduler owns.
+           Declining is lossless: the yield request stays raised, so no work item is dropped. */
+        DCHECK(prev_base == NULL,
+               "an async function's synchronous prefix preempted and parked into the runtime slot while its "
+               "CALLER's activation is still live — the parked-flow slot is for job-driven code, and a caller "
+               "that resumes bytecode over a live park makes the next C->JS call abort somewhere unrelated");
         JS_REF_COUNT(s)++;   /* the slot holds a reference until the resume releases it */
         JS_ParkFlow(ctx, js_async_resume_park, js_async_resume_park_free, s);
         return true;
