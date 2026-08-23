@@ -28985,25 +28985,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSObject *p;
     JSFunctionBytecode *b;
     JSStackFrame sf_s, *sf = &sf_s;
-    /* NOTHING RUNS WHILE A FLOW IS PARKED, asserted where running begins.
-       A forced preempt is only transparent if the flow resumes before anything observable happens, and the only
-       observable thing this engine does is run JS — so the invariant is not "do not drain a job while parked",
-       it is "do not execute AT ALL while parked", and this is the single door execution comes through.
-       It was learned three times, each time as a different-looking bug. run-test262 had three job pumps and one
-       drained without resuming parked flows first. The promise reaction parked onto the job FIFO instead of the
-       slot, so its handler finished a tick late and the promise it owed settled late with it. Module evaluation
-       read a parked body as a finished one and started the next module, so two siblings interleaved and
-       eval-rqstd-order evaluated 123456798 for 123456789. Three sites, three fixes, one rule — and the rule was
-       being kept by whoever remembered it, which is how it was missed three times.
-       Asserted here it is structural: any future driver that holds a parked flow and reaches for more work
-       crashes at the first instruction of that work, naming the rule, instead of shipping a reordering that
-       surfaces as a promise bug somewhere else. The scheduler's own switch is unaffected by construction —
-       flow_switch_out TAKES the parked continuation out of the runtime and carries it on the Flow, precisely so
-       a sibling can run — and JS_ResumeParkedFlow clears the slot before it calls the resume, so the resume
-       itself comes through here with the slot empty. */
-    DCHECK(rt->parked_flow.fn == NULL,
-           "JS was entered while a flow is PARKED — resume it first (while (JS_ResumeParkedFlow(rt));). A "
-           "forced preempt is transparent only if nothing runs between the park and its resume");
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
@@ -29517,6 +29498,37 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                          argv, flags);
     }
     b = p->u.func.function_bytecode;
+
+    /* NOTHING OBSERVABLE RUNS WHILE A FLOW IS PARKED, asserted where PAGE CODE begins — which is HERE, past the
+       callee dispatch, and not at this function's door.
+       A forced preempt is only transparent if the flow resumes before anything observable happens, and the only
+       observable thing this engine does is run the page's code — so the invariant is not "do not drain a job
+       while parked", it is "do not run the page while parked".
+       It was learned three times, each time as a different-looking bug. run-test262 had three job pumps and one
+       drained without resuming parked flows first. The promise reaction parked onto the job FIFO instead of the
+       slot, so its handler finished a tick late and the promise it owed settled late with it. Module evaluation
+       read a parked body as a finished one and started the next module, so two siblings interleaved and
+       eval-rqstd-order evaluated 123456798 for 123456789. Three sites, three fixes, one rule — and the rule was
+       being kept by whoever remembered it, which is how it was missed three times.
+       IT WAS ASSERTED AT THE TOP OF THIS FUNCTION, WHERE ITS CONDITION IS BROADER THAN THE INVARIANT. That door
+       is not the door page code comes through: `JS_Call` on a C-FUNCTION callee arrives there too and leaves at
+       the class dispatch above (`call_func`), having run no page code and reordered nothing — and the reasoning
+       that placed it there said so in its own words, "the single door execution comes through", which is true of
+       bytecode and not of this function. So every browser component that reached a native method through
+       JS_Call between a park and the pump aborted for a transparency it could not break, while the C entry that
+       CAN break it is the one below. Narrowing to the bytecode dispatch does not weaken the rule: a C builtin
+       that goes on to run the page re-enters here and is caught on that entry, at the frame that actually runs.
+       That is the same correction the routability condition below already made once — an earlier version of it
+       required `rt->current_stack_frame != NULL` and quietly wrote a host-boundary exemption in — and it is why
+       `current_stack_frame` is not the question either.
+       The scheduler's own switch is unaffected by construction: flow_switch_out TAKES the parked continuation
+       out of the runtime and carries it on the Flow, precisely so a sibling can run, and JS_ResumeParkedFlow
+       clears the slot before it calls the resume — and a resume arrives through the GENERATOR branch above, so
+       it does not reach this line at all. */
+    DCHECK(rt->parked_flow.fn == NULL,
+           "the page's own code was entered while a flow is PARKED — resume it first (while "
+           "(JS_ResumeParkedFlow(rt));). A forced preempt is transparent only if nothing observable runs "
+           "between the park and its resume, and a bytecode body is the observable thing");
 
     if (unlikely(g_flow_base_gen != NULL)) {
         /* A BYTECODE BODY ENTERED BY C RECURSION while a flow exists. It cannot suspend — the scheduler has no
@@ -46562,9 +46574,9 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
            so the host pump drains the slot before anything else starts and the resume is transparent. A
            `prev_base` that is not NULL says the opposite: this async function was called from a live activation
            that is STILL RUNNING, its caller gets a pending promise back and carries on executing bytecode, and
-           the park sits in the runtime until the next C->JS call from any component trips
-           "JS was entered while a flow is PARKED" — an abort that names a site with no relationship to the
-           producer. This assert moves that report to where the state is created.
+           the park sits in the runtime until the next entry into the page's own code trips the parked-flow
+           assert at the bytecode dispatch — an abort that names a site with no relationship to the producer.
+           This assert moves that report to where the state is created.
            WHAT TO BUILD when it fires, and the tree already argues it one function away: JS_FlowResume's
            FLOW_BASE_ASYNC_CALL arm reports suspension to the SCHEDULER rather than parking it here, precisely
            because "two drivers for one state is how a flow gets resumed twice". A nested async call's prefix
