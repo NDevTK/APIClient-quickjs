@@ -367,6 +367,18 @@ typedef struct JSTrampStepDef {
    dispatch is what stops the OTHER half, which is a stage having no body at all. */
 #define STEP_ARM(name) step_arm_##name: (void)(name)
 
+/* THE SAME TRANSFER THE DISPATCH MAKES, MADE BY THE ALGORITHM ITSELF. An entry-stage dispatch picks one of
+   several continuations (21.4.2.1 step 2's numberOfArgs picks three), and the stage list is in ALGORITHM order,
+   so the arms it does not pick lie BETWEEN it and the one it does. Falling through them is wrong and a
+   hand-written label beside the arm's own is a second name for one point — which is the drift STEP_DISPATCH
+   exists to remove, one level down. This names the arm, so the mangling is stated once and a name that is not
+   an arm of this function is an undeclared label: a hard error in every C compiler, exactly as a stage with no
+   arm is.
+   IT IS NOT A REST POINT AND MUST NOT BE READ AS ONE — the stage is assigned through STEP_GOTO as always, and
+   the algorithm continues in the SAME entry, which is legitimate only where what it crosses is one O(1) engine
+   action. A transfer over anything of the page's size is a stage that must return instead. */
+#define STEP_JUMP(name) goto step_arm_##name
+
 #define STEP_DISPATCH(list, stage, algorithm, undeclared) do {                                          \
         switch ((int)(stage)) {                                                                         \
         list(JS_STEP_STAGE_CASE)                                                                        \

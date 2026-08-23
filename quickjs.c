@@ -76593,75 +76593,121 @@ static JSValue js_array_copywithin_fini(JSContext *ctx, void *st, bool take_resu
 /* 21.4.2.1's three shapes share one machine and one stage list: no argument, one argument (a Date object read
    from its slot, or a ToPrimitive), or several (a ToNumber per field). The per-field stage carries its own `i`
    cursor, and each field's conversion completes before the next begins — which is the ordering step 5 states and
-   what a NaN in an earlier field must not skip. */
+   what a NaN in an earlier field must not skip.
+   THE SUB-STEP LETTERS ARE THE STANDARD'S, RE-READ RATHER THAN RECALLED. Four of the five labels below named
+   letters 21.4.2.1 does not carry at those steps: the [[DateValue]] slot read is 4.b.i and not 4.a, the
+   ToPrimitive is 4.c.i and not 4.b, the one-argument TimeClip is 4.d, and the multi-argument one is 5.k with
+   MakeFullYear at 5.i and MakeDate at 5.j. A label is what a parked flow resolves its rest point BY, so a wrong
+   letter is a rest point named after a step its arm does not perform — authoritative, and pointing elsewhere. */
 #define DATECTOR_STAGES(X) \
-    X(DATECTOR_ENTRY,  "21.4.2.1 steps 1-4.a (numberOfArgs; a Date argument's [[DateValue]] is read from its slot)") \
-    X(DATECTOR_ONE,    "21.4.2.1 step 4.b (v is ToPrimitive(value), then a String is parsed and anything else is ToNumber)") \
-    X(DATECTOR_FIELD,  "21.4.2.1 steps 5.b-5.h (each provided field is ToNumber, in argument order)") \
-    X(DATECTOR_CLIP,   "21.4.2.1 steps 4.c and 5.i (dv is TimeClip(MakeDate(MakeDay, MakeTime)))") \
-    X(DATECTOR_CREATE, "21.4.2.1 step 6 (O is OrdinaryCreateFromConstructor(NewTarget, \"%Date.prototype%\"))")
+    X(DATECTOR_ENTRY,  "21.4.2.1 steps 2-4.b.i and 5.a (numberOfArgs; step 3.a's current time; step 4.b.i's " \
+                       "[[DateValue]] slot read with step 4.d's TimeClip over it; the else halves of steps " \
+                       "5.d-5.h) - ONE O(1) dispatch on numberOfArgs over at most 7 argument slots") \
+    X(DATECTOR_ONE,    "21.4.2.1 step 4.c.i (v is ToPrimitive(value)) - step 4.c.ii's date parse (bounded to a " \
+                       "128-byte buffer), step 4.c.iii's ToNumber and step 4.d's TimeClip run on the PRIMITIVE " \
+                       "it yields and are together ONE O(1) engine action") \
+    X(DATECTOR_FIELD,  "21.4.2.1 steps 5.b-5.i (each provided field is ToNumber, in argument order, then " \
+                       "MakeFullYear over values[0])") \
+    X(DATECTOR_CLIP,   "21.4.2.1 steps 5.j-5.k (dv is TimeClip(UTC(MakeDate(MakeDay(yr, m, dt), " \
+                       "MakeTime(h, min, s, milli)))))") \
+    X(DATECTOR_CREATE, "21.4.2.1 step 6 (obj is OrdinaryCreateFromConstructor(NewTarget, " \
+                       "\"%Date.prototype%\")) - step 7's [[DateValue]] write, step 8's return and step 1.b's " \
+                       "ToDateString for the function form are each O(1) and rest at no further point")
 enum { DATECTOR_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_date_ctor_steps[] = { DATECTOR_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
+/* THE SUB-SEQUENCE CURSORS THIS MACHINE CAN LEAVE IN FLIGHT, named once so two transitions cannot list
+   different sets: step_toprim_run's (num_phase) and the [[Get]] inside step_create_from_ctor_run (get_phase).
+   The machine holds no request buffer of its own, so there is nothing else to leave behind. */
+#define DATECTOR_CURSORS  &s->hdr.num_phase, &s->hdr.get_phase, NULL
 
 static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSDateCtor *s = st;
     int r;
 
-    if (s->hdr.stage == DATECTOR_ENTRY) {
+    /* THE ARM EACH SHAPE NEEDS IS JUMPED TO, NEVER FALLEN INTO. Step 2's dispatch on numberOfArgs picks one of
+       three continuations and the stage list is in ALGORITHM order, so two of the three lie past arms belonging
+       to the other shapes.
+       WHAT THIS REPLACED WAS A CHAIN OF `if (stage == X)` TESTS WITH TWO NEGATIONS IN IT, and the second was
+       load-bearing in a way that is invisible at the site: `stage != DATECTOR_CREATE` stood in for
+       `stage == DATECTOR_CLIP`, so the ZERO- and ONE-argument shapes were routed THROUGH the multi-argument arm
+       and only an `if (s->n >= 2)` inside it kept them from running steps 5.j-5.k. A body was being selected by
+       a DATA test while the cursor said it was somewhere else; the DCHECK in that arm is now what the `if` was
+       silently asserting, and the shapes that do not perform those steps cannot reach them. The first,
+       `stage != DATECTOR_CLIP`, read the cursor as a "did the slot path fire" flag — the one question
+       quickjs-step.h says a machine can never answer from its stage — and is a local now. */
+    STEP_DISPATCH(DATECTOR_STAGES, s->hdr.stage, s->hdr.def->algorithm, JS_STEP_ABRUPT);
+
+    STEP_ARM(DATECTOR_ENTRY);
+    {
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         /* FIRST, before anything that can throw: the teardown frees exactly what the state holds. */
         s->result = JS_UNDEFINED; s->prim = JS_UNDEFINED;
         s->val = 0; s->i = 0;
         /* `Date(...)` called as a FUNCTION ignores its arguments entirely — it does not coerce them. */
         s->n = JS_IsUndefined(s->hdr.this_val) ? 0 : s->hdr.argc;
-        if (s->n == 0) { s->val = date_now(); s->hdr.stage = DATECTOR_CLIP; }
-        else if (s->n == 1) {
-            /* a Date OBJECT is read from its slot: step 4.a, no coercion */
-            if (JS_VALUE_GET_TAG(step_arg(&s->hdr, 0)) == JS_TAG_OBJECT) {
-                JSObject *p = JS_VALUE_GET_OBJ(step_arg(&s->hdr, 0));
+        if (s->n == 0) {
+            s->val = date_now();                                   /* step 3.a */
+            STEP_GOTO(s->hdr.stage, DATECTOR_CREATE, DATECTOR_CURSORS);
+            STEP_JUMP(DATECTOR_CREATE);
+        }
+        if (s->n == 1) {
+            JSValueConst arg0 = step_arg(&s->hdr, 0);
+            bool from_slot = false;
+            /* step 4.b: a Date OBJECT's value comes out of its slot and needs no coercion */
+            if (JS_VALUE_GET_TAG(arg0) == JS_TAG_OBJECT) {
+                JSObject *p = JS_VALUE_GET_OBJ(arg0);
                 if (p->class_id == JS_CLASS_DATE && JS_IsNumber(p->u.object_data)) {
-                    if (JS_ToFloat64(ctx, &s->val, p->u.object_data)) return -1;
-                    s->val = time_clip(s->val);
-                    s->hdr.stage = DATECTOR_CLIP;
+                    if (JS_ToFloat64(ctx, &s->val, p->u.object_data)) return -1;   /* step 4.b.i */
+                    s->val = time_clip(s->val);                                    /* step 4.d */
+                    from_slot = true;
                 }
             }
-            if (s->hdr.stage != DATECTOR_CLIP) s->hdr.stage = DATECTOR_ONE;
+            STEP_GOTO(s->hdr.stage, from_slot ? DATECTOR_CREATE : DATECTOR_ONE, DATECTOR_CURSORS);
+            if (from_slot)
+                STEP_JUMP(DATECTOR_CREATE);
         } else {
+            /* step 5.a, and the else halves of steps 5.d-5.h: dt is 1, h/min/s/milli are +0 */
             static const double init[7] = { 0, 0, 1, 0, 0, 0, 0 };
+            DCHECK(s->n >= 2, "21.4.2.1 step 5.a asserts numberOfArgs is at least 2");
             memcpy(s->fields, init, sizeof(init));
             if (s->n > 7) s->n = 7;
-            s->hdr.stage = DATECTOR_FIELD;
+            STEP_GOTO(s->hdr.stage, DATECTOR_FIELD, DATECTOR_CURSORS);
+            STEP_JUMP(DATECTOR_FIELD);
         }
     }
-    if (s->hdr.stage == DATECTOR_ONE) {
-        /* step 4.b's ToPrimitive with the DEFAULT hint */
+    STEP_ARM(DATECTOR_ONE);
+    {
+        JSValue v;
+        /* step 4.c.i's ToPrimitive with the DEFAULT hint — the one place this shape runs the page's code */
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, 0), HINT_NONE, cb_result, &s->prim, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
-        {   /* a STRING is parsed, anything else is ToNumber — both on a PRIMITIVE, so neither invokes anything */
-            JSValue v = s->prim;
-            s->prim = JS_UNDEFINED;
-            if (JS_IsString(v)) {
-                JSValue dv = js_Date_parse(ctx, JS_UNDEFINED, 1, vc(&v));
-                JS_FreeValue(ctx, v);
-                if (JS_IsException(dv)) return -1;
-                if (JS_ToFloat64Free(ctx, &s->val, dv)) return -1;
-            } else if (JS_ToFloat64Free(ctx, &s->val, v)) {
-                return -1;
-            }
-            s->val = time_clip(s->val);
+        /* steps 4.c.ii and 4.c.iii, both on a PRIMITIVE, so neither invokes anything */
+        v = s->prim;
+        s->prim = JS_UNDEFINED;
+        if (JS_IsString(v)) {
+            JSValue dv = js_Date_parse(ctx, JS_UNDEFINED, 1, vc(&v));
+            JS_FreeValue(ctx, v);
+            if (JS_IsException(dv)) return -1;
+            if (JS_ToFloat64Free(ctx, &s->val, dv)) return -1;
+        } else if (JS_ToFloat64Free(ctx, &s->val, v)) {
+            return -1;
         }
-        s->hdr.stage = DATECTOR_CLIP;
+        s->val = time_clip(s->val);                                /* step 4.d */
+        STEP_GOTO(s->hdr.stage, DATECTOR_CREATE, DATECTOR_CURSORS);
+        STEP_JUMP(DATECTOR_CREATE);
     }
-    while (s->hdr.stage == DATECTOR_FIELD) {
+    STEP_ARM(DATECTOR_FIELD);
+    /* steps 5.b-5.h's ToNumber per field. EVERY provided argument is coerced, in order, before any of them is
+       examined — a NaN in an earlier one does not skip the later coercions the page can observe. The NUMERIC
+       half runs right here, on a primitive, so it invokes nothing and needs no stage: a stage between the two
+       would be entered and left inside one step() call and rest at no step at all. The loop condition is `i`
+       and not the stage, so a resume re-enters at the field it parked on and collects its own answer. */
+    while (s->i < s->n) {
         JSValue v;
         double a;
-        if (s->i >= s->n) { s->hdr.stage = DATECTOR_CLIP; break; }
-        /* the ToNumber per field. EVERY provided argument is coerced, in order, before any of them is
-           examined — a NaN in an earlier one does not skip the later coercions the page can observe. The
-           NUMERIC half runs right here, on a primitive, so it invokes nothing and needs no stage: a stage
-           between the two would be entered and left inside one step() call and rest at no step at all. */
         r = step_toprim_run(ctx, &s->hdr, step_arg(&s->hdr, s->i), HINT_NUMBER, cb_result, &s->prim,
                             out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -76670,33 +76716,51 @@ static int js_date_ctor_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
         s->prim = JS_UNDEFINED;
         if (JS_ToFloat64Free(ctx, &a, v)) return -1;
         s->fields[s->i] = isfinite(a) ? trunc(a) : NAN;
+        /* step 5.i MakeFullYear, over values[0] */
         if (s->i == 0 && isfinite(a) && s->fields[0] >= 0 && s->fields[0] < 100)
             s->fields[0] += 1900;
         s->i++;
     }
-    if (s->hdr.stage != DATECTOR_CREATE) {
+    JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+    /* AND IT RETURNS RATHER THAN RUNNING ON. Steps 5.j-5.k are the next stage, and a stage the machine assigns
+       and then falls into is a rest point the driver never sees — a label naming a step no park, no fork and no
+       cold-tier resume can land at. This one could not be landed at before: every assignment of DATECTOR_CLIP
+       fell straight through to the arm below it, so the stage was declared and unreachable. JS_STEP_YIELD is
+       what asks; when nobody outranks this flow it is re-entered immediately. */
+    STEP_GOTO(s->hdr.stage, DATECTOR_CLIP, DATECTOR_CURSORS);
+    return JS_STEP_YIELD;
+
+    STEP_ARM(DATECTOR_CLIP);
+    {
+        int k;
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
-        if (s->n >= 2) {
-            int k;
-            for (k = 0; k < s->n; k++)
-                if (!isfinite(s->fields[k])) break;
-            s->val = (k == s->n) ? set_date_fields(s->fields, 1) : NAN;
-        }
-        s->hdr.stage = DATECTOR_CREATE;
+        DCHECK(s->n >= 2,
+               "21.4.2.1 steps 5.j-5.k were reached for a Date built from fewer than two arguments — those "
+               "shapes take their dv from step 3.a or step 4.d and have no fields to make a day and a time "
+               "out of, so this arm would clip a fields[] nothing wrote");
+        /* steps 5.j-5.k: set_date_fields is MakeDay, MakeTime, MakeDate, UTC and TimeClip as one O(1) action */
+        for (k = 0; k < s->n; k++)
+            if (!isfinite(s->fields[k])) break;
+        s->val = (k == s->n) ? set_date_fields(s->fields, 1) : NAN;
+        STEP_GOTO(s->hdr.stage, DATECTOR_CREATE, DATECTOR_CURSORS);
     }
+    STEP_ARM(DATECTOR_CREATE);
+    /* step 6. The function form passes an undefined NewTarget, which step_proto_from_ctor_run answers from the
+       realm without a read, so that shape never parks here. */
     r = step_create_from_ctor_run(ctx, &s->hdr, s->hdr.this_val, JS_CLASS_DATE, cb_result, &s->result,
                                   out_cb, out_argc);
     if (r) return r < 0 ? -1 : r;
-    JS_SetObjectData(ctx, s->result, js_float64(s->val));
+    JS_SetObjectData(ctx, s->result, js_float64(s->val));          /* step 7 */
     if (JS_IsUndefined(s->hdr.this_val)) {
-        /* invoked as a function: the value is (new Date()).toString() */
+        /* step 1.b: invoked as a function, the value is ToDateString(now) */
         JSValue str = get_date_string(ctx, s->result, 0, NULL, 0x13);
         JS_FreeValue(ctx, s->result);
         s->result = JS_IsException(str) ? JS_UNDEFINED : str;
         if (JS_IsUndefined(s->result)) return -1;
     }
-    return 0;
+    return 0;                                                      /* step 8 */
 }
+#undef DATECTOR_CURSORS
 
 /* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). */
 static void js_date_ctor_visit(JSContext *ctx, void *st, JSStepVisit *v)
