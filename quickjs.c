@@ -284,6 +284,13 @@ struct JSRuntime {
        CALLEE needs to reach this — and that one has the object, hence the runtime. */
     const JSTrampStepDef **host_step_defs;
     int host_step_def_count;
+    /* HOW MANY FUNCTION OBJECTS THIS RUNTIME HAS EVER MADE — bumped at js_closure2, which is the one line every
+       one of them passes through, and read by JS_OrphanGen. It is not a statistic: it is the exact answer to
+       "could the orphan set have grown since I last looked", because creating a function object is the only
+       event that can add to it. A host takes the orphans when this number has moved and skips the heap walk
+       when it has not. Wraps at 2^32 as a MONOTONE COUNTER is entitled to — a host compares it for INEQUALITY
+       only, so a wrap costs one redundant walk and never a skipped one. */
+    uint32_t orphan_gen;
     JSMallocFunctions mf;
     JSMallocState malloc_state;
     JSArenaState arena_state;
@@ -1026,7 +1033,19 @@ typedef struct JSFunctionBytecode {
        legacy `f.caller` walk needs to tell it apart from a function DECLARED inside eval code, which carries
        from_eval too and IS a real activation. */
     uint8_t is_program : 1;
-    /* XXX: 3 bits available */
+    /* HAS A CALL FRAME FOR THIS BODY EVER BEGUN — the one fact an ORPHAN is defined by, and the reason it is a
+       bit on the BYTECODE rather than a set kept beside the heap. A function the page DEFINED is a compiled
+       body; a closure is one instantiation of it, and a factory called three times makes three closures of one
+       body that are one function to anybody reading the source. So the question "did the page ever run this
+       code" has exactly one answer per body and it is stored where the body is.
+       IT IS SET AT `restart:` AND NOWHERE ELSE. Every way of entering a bytecode body — the C entry, each of
+       the trampoline's three pushes, the coroutine resume — converges on that one label before it executes an
+       opcode, so a call shape added later cannot forget to mark, because there is no marking to remember. The
+       cost is one predictable byte store per frame entry into a struct the interpreter is about to read anyway.
+       IT IS ALSO SET BY JS_OrphanTake, which is what makes an orphan a work item taken once rather than a
+       question re-asked: see that function for why that is not a seen-set. */
+    uint8_t entered : 1;
+    /* XXX: 2 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -20105,6 +20124,14 @@ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
     p->u.func.function_bytecode = b;
     p->u.func.home_object = NULL;
     p->u.func.var_refs = NULL;
+    /* A NEW FUNCTION OBJECT EXISTS, which is the ONE event that can add to the set JS_OrphanTake enumerates —
+       and this is the one line every function object in this runtime passes through, whether it came from a
+       fresh compile or from an enclosing body running for the first time and instantiating a body that had no
+       closure until now. Nothing else can add one: executing a body only marks it entered, taking one only
+       marks it taken, and collecting one only removes it. So a host that walked the heap at generation G and
+       took what it found may SKIP the walk until this number moves, which is what keeps the enumeration off
+       the critical path of a frontier whose members each finish. One increment on the closure path. */
+    ctx->rt->orphan_gen++;
     if (b->closure_var_count) {
         var_refs = js_mallocz(ctx, sizeof(var_refs[0]) * b->closure_var_count);
         if (!var_refs)
@@ -28858,6 +28885,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #endif
 
  restart:
+    /* THIS BODY IS NOW RUNNING, so it is not a function nothing has called. Set HERE because this is the one
+       label every entry into a bytecode body reaches before its first opcode — the C entry below, each of the
+       trampoline's pushes (do_tramp_call, the construct push, the apply reshape), and the coroutine resume —
+       so the mark cannot be missed by a call shape nobody thought of. See JSFunctionBytecode.entered. */
+    b->entered = 1;
     for(;;) {
 
         SWITCH(pc) {
@@ -43750,7 +43782,19 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
             JS_FreeValue(ctx, r);
             return 1;   /* suspended: the scheduler resumes it with its COW delta swapped back in */
         }
-        return flow_reaction_complete(ctx, s, r);
+        result = flow_reaction_complete(ctx, s, r);
+        /* A CALL ROOT THAT THREW COMPLETED WITH A THROW, and the completion is what `pres` is for. This arm used
+           to leave `*pres` at UNDEFINED unconditionally, so a call-root flow the SCHEDULER drives — a driven
+           orphan, and equally the sibling of a forked promise reaction — reported success to its host while the
+           exception sat live on the context, to be found later by whatever asked next. The bytecode base below
+           hands its JS_EXCEPTION back through the same field; both kinds of base now answer the same way, which
+           is what lets one host read one completion. flow_reaction_complete has already consumed `r` (phase 1
+           discards the result, phase 0 gives it to the capability), so the live exception is the only thing left
+           to report and JS_HasException is how it is asked — `current_exception` holds the thrown VALUE and is
+           JS_UNINITIALIZED when there is none, never the JS_TAG_EXCEPTION sentinel. */
+        if (result == 0 && JS_HasException(ctx))
+            *pres = JS_EXCEPTION;
+        return result;
     }
     for (;;) {
         g_flow_base_gen = s;   /* this is the flow's BASE activation — a branch here may snapshot-fork; a branch
@@ -43852,8 +43896,11 @@ void JS_FlowFree(JSContext *ctx, JSValue *flow) {
    SHARES the closed var_ref cells (+ref, COW-isolated per-flow by the delta), dups cur_func, and copies
    is_strict/pc/arg_count. The caller sets cur_sp (deepest=live point via XL; a dormant/mid-call frame=NULL).
    ONE contract used by BOTH the base frame and an async-body frame — never two copies of the frame-clone logic. */
-/* A CALL-ROOT frame has NO BYTECODE — it is a fixed block of STEP_FLOW_SLOTS operands with the callee at [1],
-   built by reaction_call_flow_init — so its size cannot be read off cur_func's bytecode. Reading it anyway is
+/* A CALL-ROOT frame has NO BYTECODE — it is a block of STEP_FLOW_SLOTS operands PLUS the callee's arguments,
+   with the callee at [1], built by reaction_call_flow_init — so its size cannot be read off cur_func's
+   bytecode, and it is not a constant either: a call root built for a page's own function (JS_FlowNewCall's
+   driven orphan) carries that function's declared parameters. The frame states its own size — `var_refs` is
+   the top of the block — and clone_susp_frame reads it there. Reading it off cur_func anyway is
    what a clone of a promise-reaction base used to do: cur_func there is a step CLOSURE whose union member is a
    JSCFunctionDataRecord, so every size came out of unrelated memory and the resumed sibling walked into the
    "non-bytecode cur_func" DCHECK — an async body that forked AFTER an await, which is as ordinary as this
@@ -43880,7 +43927,12 @@ static int clone_susp_frame(JSContext *ctx, JSAsyncFunctionState *cs, const JSAs
            "and the frame borrows it, so a frame holding a different value has an owner nothing will find");
 
     if (of->is_call_root) {
-        lc = STEP_FLOW_SLOTS;
+        /* READ OFF THE SOURCE FRAME, NOT FROM THE CONSTANT. A call-root block is the operands plus a scratch
+           reserve (reaction_call_flow_init), so its size varies with the callee's argument count the moment a
+           call root drives a function this engine did not write. `var_refs` is the top of the block — the same
+           thing TRAMP_SP_LIMIT reads — so the frame carries its own size and a clone cannot disagree with the
+           original about it. The DCHECK below is what says the placement and the allocation still agree. */
+        lc = (int)((JSValue *)of->var_refs - of->arg_buf);
         nrefs = 0;
     } else {
         /* the ONE layout law — the clone is the SAME frame, so it is sized by the same macro the interpreter
@@ -43898,7 +43950,7 @@ static int clone_susp_frame(JSContext *ctx, JSAsyncFunctionState *cs, const JSAs
     cf->arg_count = al;
     /* a call root's stack starts AT the block (0 args, 0 vars); a bytecode frame's after its arguments */
     cf->var_buf = cf->arg_buf + (of->is_call_root ? 0 : al);
-    cf->var_refs = of->is_call_root ? (JSVarRef **)(cf->arg_buf + STEP_FLOW_SLOTS)
+    cf->var_refs = of->is_call_root ? (JSVarRef **)(cf->arg_buf + lc)
                                     : TRAMP_VAR_REFS(cf->var_buf + b->var_count, b);
     DCHECK((JSValue *)cf->var_refs == cf->arg_buf + lc,
            "clone_susp_frame: the var-ref array is not at the end of the frame slots — the allocation size and "
@@ -44377,16 +44429,72 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                        "clone_deep_flow: a constructor continuation with an OUTER continuation under it — clone "
                        "that kind through its own arm before this one adopts the pointer");
                 ct->cont_state = ncs;
+            } else if (otf->cont_kind == CONT_TOPRIM) {
+                /* A CONCOLIC BRANCH INSIDE A COERCION METHOD. 7.1.1 ToPrimitive drives `@@toPrimitive` /
+                   `valueOf` / `toString` on this chain (see CONT_TOPRIM), so a `toString` that branches on
+                   unknown external input forks exactly where any other callee does — and every `"" + o`,
+                   every `${o}`, every `o == s` and every `obj[o]` in a bundle is one such drive. nodejs.org
+                   stopped here.
+                   THE SEQUENCE IS THE SIBLING'S OWN, for the reason the two arms above give: `do_toprim_step`
+                   ADVANCES this record (it frees the finished call's operands, moves `stage`, and on a
+                   primitive result frees the whole JSToPrim) — so two flows sharing one would each walk the
+                   ordinary-method order once and each free it. What the record NAMES is shared and duped
+                   rather than rebuilt: `obj` is the pre-fork object being coerced, and cb[0..2] are this
+                   call's `this`, method and hint string, all three OWNED here (js_toprim_free_cb frees
+                   exactly them) and none of them a value the sibling could re-derive without re-running the
+                   page's own property reads.
+                   `op_byte` IS NOT RELOCATED and that is not an omission: it points into the CALLER's
+                   bytecode, which the clone shares — `ct->sf.cur_func` is the same JSFunctionBytecode — so it
+                   names the same opcode in both timelines. `slot` is an offset from `sp` and is relative for
+                   the same reason. */
+                JSToPrim *ots = (JSToPrim *)otf->cont_state;
+                JSToPrim *nts = js_malloc(ctx, sizeof(*nts));
+
+                if (!nts) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                *nts = *ots;
+                nts->obj = js_dup(ots->obj);
+                nts->cb[0] = js_dup(ots->cb[0]);
+                nts->cb[1] = js_dup(ots->cb[1]);
+                nts->cb[2] = js_dup(ots->cb[2]);
+                /* A METHOD READ IN FLIGHT DOES NOT REACH HERE, and asserting it is what keeps the three dups
+                   above a complete list. While `reading` is set the frame on this chain is the [[Get]]'s, whose
+                   own kind is the getter's and whose `gp_outer` is this record — so a fork there is that kind's
+                   arm and not this one, and cb[0..2] are not yet the live call's operands. */
+                DCHECK(!ots->reading,
+                       "clone_deep_flow: a ToPrimitive sequence forked with a METHOD READ in flight — the "
+                       "frame carrying that read is the property-get continuation's, so its clone arm is the "
+                       "one that must adopt this record");
+                /* An OUTER is a step machine (or an `import()` capability) waiting on this primitive —
+                   MACHINE mode, where the sequence has no interpreter label of its own. Cloning it is that
+                   kind's arm, not this one's; the same sentence the two records above carry. */
+                DCHECK(ots->outer == NULL,
+                       "clone_deep_flow: a ToPrimitive continuation with an OUTER requester under it — clone "
+                       "that kind through its own arm before this one adopts the pointer");
+                ct->cont_state = nts;
+                /* cb[2] IS THE CALL'S ARGUMENT VECTOR (`call_argv = &tp->cb[2]` at toprim_dispatch), an
+                   EXTERNAL allocation the generic XL relocation leaves pointing at the ORIGINAL record — the
+                   identical repoint the Promise executor's cb_args[2] needs, and for the identical reason. */
+                if (otf->sf.arg_buf == &ots->cb[2])
+                    ct->sf.arg_buf = &nts->cb[2];
             } else {
                 /* The KIND is the one fact needed to act on this, so it is in the message. A DFAIL that says
                    "some other continuation" sends the reader back to a bisection to learn what it already knew. */
-                char why[320];   /* see step_request_check: sized past the format's minimum so the sentence
-                                    naming the arm to write is not the half that gets cut */
-                snprintf(why, sizeof why,
-                         "clone_deep_flow: deep-fork of a C-continuation callback frame of kind %d — neither a "
-                         "step machine nor a Promise executor. Give THAT continuation its own clone arm: the "
-                         "sibling must not share a state both flows advance and both free",
-                         (int)otf->cont_kind);
+                /* THE BUFFER IS SIZED FROM THE FORMAT STRING and no longer from a number someone chose. It was
+                   a fixed 320 against a message that then reached 312 bytes — eight to spare, and the next arm
+                   struck off this list is what spends them. That is not hypothetical: css_rule.c's
+                   rule_unbuilt_fail carried a fixed 600 against a message that grew to 839, so every reader of
+                   that crash lost the half naming what to build, silently, at the one call that existed to
+                   deliver it. `sizeof` the literal is what it will actually be, and `%d` is replaced by at most
+                   11 characters of `int`. */
+#define CLONE_KIND_FMT                                                                                        \
+    "clone_deep_flow: deep-fork of a C-continuation callback frame of kind %d — not a step machine, a "        \
+    "Promise executor, a constructor body or a ToPrimitive sequence, which are the four this has arms for. "   \
+    "Give THAT continuation its own clone arm: the sibling must not share a state both flows advance and "     \
+    "both free"
+                char why[sizeof CLONE_KIND_FMT + 11];
+
+                snprintf(why, sizeof why, CLONE_KIND_FMT, (int)otf->cont_kind);
+#undef CLONE_KIND_FMT
                 DCHECK(otf->cont_kind == CONT_NONE, why);
             }
         }
@@ -98059,9 +98167,20 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
 {
     JSStackFrame *sf = &fs->frame;
     JSValue *blk;
+    /* THE BLOCK IS THE OPERANDS PLUS A SCRATCH RESERVE, NOT A CONSTANT — because the arguments are the CALLEE'S
+       and this engine now builds a call root for a callee it did not write. STEP_FLOW_SLOTS was a fixed 16 and
+       a DCHECK refused `argc + 2 > 16`, which held for every caller here (a reaction passes one argument, a
+       thenable's `then` two) and does NOT hold for a page's own function driven as a flow: a bundle is entitled
+       to declare fifteen formal parameters, and refusing that is a BOUND on what may be explored rather than a
+       fact about the frame. The reserve above the operands is what the constant was actually providing — the
+       scratch the trampoline's push needs in the caller — so it is kept at exactly its old value and the
+       operands are added to it. Every existing caller therefore gets a block at least as large as before.
+       ITS SIZE IS RECOVERABLE FROM THE FRAME (`var_refs` is the top of the block, which is what TRAMP_SP_LIMIT
+       reads), which is what lets clone_susp_frame size a call-root clone without being told. */
+    int slots = STEP_FLOW_SLOTS + argc;
     int i;
-    DCHECK(argc >= 0 && argc + 2 <= STEP_FLOW_SLOTS, "a call-root flow's arguments exceed its pre-pushed block");
-    blk = js_malloc(ctx, sizeof(JSValue) * STEP_FLOW_SLOTS);
+    DCHECK(argc >= 0, "a call-root flow was built with a negative argument count");
+    blk = js_malloc(ctx, sizeof(JSValue) * slots);
     if (unlikely(!blk))
         return -1;
     fs->this_val = JS_UNDEFINED;
@@ -98071,7 +98190,7 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     fs->tramp_top = NULL;
     sf->arg_buf = blk;
     sf->var_buf = blk;                                    /* 0 args, 0 vars: the stack starts at blk */
-    sf->var_refs = (JSVarRef **)(blk + STEP_FLOW_SLOTS);  /* TRAMP_SP_LIMIT(sf) = sf->var_refs = stack top */
+    sf->var_refs = (JSVarRef **)(blk + slots);  /* TRAMP_SP_LIMIT(sf) = sf->var_refs = stack top */
     sf->var_ref_count = 0;
     sf->arg_count = 0;
     sf->is_strict_mode = false;
@@ -98333,6 +98452,127 @@ static int js_settle_as_flow(JSContext *ctx, JSValueConst func, JSValueConst val
 int JS_CallAsFlow(JSContext *ctx, JSValueConst func, JSValueConst value)
 {
     return js_settle_as_flow(ctx, func, value);
+}
+
+/* A FLOW WHOSE WHOLE PROGRAM IS ONE CALL — the flow ABI's missing entry, and the primitive ORPHAN-INVOKE is
+ * built on. JS_FlowNew makes a flow out of SOURCE and JS_FlowClone makes one out of another flow; there was no
+ * way to make one out of a CALLABLE, so the scheduler could run a page's program and never a page's function.
+ *
+ * It is deliberately NOT new machinery. The base it builds is the one a promise reaction already runs on
+ * (FLOW_BASE_STEP_ROOT, reaction_call_flow_init), so `func` may be of ANY kind — a bytecode body, an async or
+ * generator function, a bound or proxied function, a C builtin, a step machine — because the base dispatches
+ * its pre-pushed operands through the interpreter's ONE call convergence point rather than through a call shape
+ * of its own. Whatever loops or awaits inside PARKS into this base, which is the whole reason the host may not
+ * simply JS_Call the function it wants driven: that is a C activation with no flow base under it, which is the
+ * drive-to-completion this engine aborts on.
+ *
+ * PHASE 1, which is this file's name for "the call IS the flow": the result is not observable and is discarded,
+ * and a throw is the flow's completion, reported through JS_FlowResume's `pres` exactly as a program's is. There
+ * is no derived promise, so `resolve`/`reject` are undefined and nothing is settled.
+ *
+ * Returns the same opaque handle JS_FlowNew returns — resumed by JS_FlowResume, snapshot-forked by
+ * JS_FlowClone, released by JS_FlowFree — or NULL if the allocation failed. */
+/* IS THIS FLOW'S BASE A CALL RATHER THAN A PROGRAM — asked of the handle, because the two complete differently
+   and a host that is running both cannot tell them apart from outside. A program's completion advances the
+   document's script sequence and its throw is the page's; a call's completion advances nothing and, when the
+   call is a driven orphan, its throw is this engine's invocation on unknown input and not the page's. The
+   position in a script sequence cannot answer it: a program the running call queues moves the host's cursor
+   back inside the sequence while the call frame is still live. */
+int JS_FlowIsCall(const JSValue *flow)
+{
+    const JSAsyncFunctionState *s = (const JSAsyncFunctionState *)flow;
+    DCHECK(flow != NULL, "JS_FlowIsCall was asked about no flow at all");
+    return s->base_kind == FLOW_BASE_STEP_ROOT;
+}
+
+JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSReactionFlow *rf = js_mallocz(ctx, sizeof(*rf));
+    if (unlikely(!rf)) { JS_ThrowOutOfMemory(ctx); return NULL; }
+    /* EVERY FIELD WRITTEN, because an allocator's zero bytes are the INTEGER 0 and not JS_UNDEFINED —
+       reaction_flow_hook_after DCHECKs exactly that about `hook_promise`. */
+    rf->resolve = JS_UNDEFINED;
+    rf->reject = JS_UNDEFINED;
+    rf->hook_promise = JS_UNDEFINED;   /* no `.then` invocation here, so no BEFORE/AFTER bracket to close */
+    rf->phase = 1;
+    if (reaction_call_flow_init(ctx, &rf->fs, this_val, func, argc, argv) < 0) {
+        reaction_flow_free(ctx, rf);
+        return NULL;
+    }
+    return (JSValue *)&rf->fs;   /* opaque handle, exactly as JS_FlowNew's */
+}
+
+/* TAKE THE ORPHANS — every function object on this runtime's heap whose BODY no call frame has ever begun.
+ *
+ * WHAT AN ORPHAN IS. A function the page defined that nothing has run: an admin handler behind a login the
+ * visitor does not have, a lazy chunk's export nothing imported, a route the bundle ships and never mounts.
+ * Driving one is how this project learns the logged-in API surface while logged out, and the fact it turns on
+ * is one bit — JSFunctionBytecode.entered, set at the interpreter's one body-entry label.
+ *
+ * WHY THE HEAP AND NOT A REGISTRY. The three places the set could come from answer different questions. The
+ * bytecode's own function table (a program's cpool tree) names every function the page DECLARED, including
+ * ones no closure exists for — and a body with no closure has no scope chain to be called with, so it is not
+ * callable and not yet an orphan; it becomes one when its enclosing function runs, which is what driving the
+ * enclosing orphan does. A registry filled at closure creation would cost a write per closure and would ROOT
+ * every one of them, turning a factory called in a loop into a leak the GC cannot collect. The heap walk asks
+ * the question at the moment it is asked, costs nothing between asks, and roots nothing: what is here is
+ * exactly what is live and callable.
+ *
+ * WHY IT IS A TAKE AND NOT A PEEK, and why that is not a seen-set. A driven orphan is a WORK ITEM, and the bit
+ * that says it is one is consumed by taking it — so an orphan is handed over exactly once and there is no memo
+ * anywhere remembering a decision about it. The alternative shape, which the old implementation had, was a peek
+ * plus a host-side buffer of already-seeded functions compared by pointer: that IS a seen-set, it was capped at
+ * 4096 entries, and the cap silently truncated the surface it existed to find. Nothing here is capped and
+ * nothing is remembered: the bit means "a frame for this body has begun or is scheduled to", and after the take
+ * the second half is true.
+ *
+ * `visit` MUST NOT ALLOCATE A GC OBJECT. It is called from inside the walk of the object list, so an allocation
+ * would insert into the list being iterated. It may DUP the value it is handed (a refcount bump allocates
+ * nothing) and may use the host allocator, which this runtime does not count; the DCHECK below is that
+ * statement made enforceable.
+ *
+ * Returns how many were handed over. `arg_count` is the callee's own declared formal parameter count, which is
+ * how many unknowns its caller has to supply. */
+uint32_t JS_OrphanGen(JSRuntime *rt) { return rt->orphan_gen; }
+
+int JS_OrphanTake(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque)
+{
+    JSRuntime *rt = ctx->rt;
+    struct list_head *el;
+    int n = 0;
+#if APICLIENT_DEV
+    size_t mc0 = rt->malloc_state.malloc_count;
+#endif
+
+    DCHECK(visit != NULL, "JS_OrphanTake was given no visitor — the orphans would be marked taken and handed to "
+                          "nobody, which is the one way to lose them permanently");
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        JSObject *p;
+        JSFunctionBytecode *b;
+
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+        p = (JSObject *)gp;
+        if (!js_class_has_bytecode(p->class_id)) continue;
+        b = p->u.func.function_bytecode;
+        if (!b || !b->byte_code_buf || b->entered) continue;
+        /* A TOP-LEVEL PROGRAM IS NOT A FUNCTION THE PAGE DEFINED. A script, a module body and an eval's body
+           are each compiled as a function because that is how the interpreter runs them, and the scheduler
+           already owns running them — calling one as an orphan would run a whole script a second time, with
+           its side effects, against a delta that may already hold them. */
+        if (b->is_program) continue;
+        b->entered = 1;   /* TAKEN: this body is now scheduled, so a second closure of it is not a second orphan */
+        visit(ctx, JS_MKPTR(JS_TAG_OBJECT, p), b->arg_count, opaque);
+        n++;
+    }
+#if APICLIENT_DEV
+    DCHECK(rt->malloc_state.malloc_count == mc0,
+           "an orphan visitor allocated inside the runtime while the object list was being walked — a GC "
+           "object created here is inserted into the very list this walk is iterating, so the walk either "
+           "visits it or runs off a freed link. A visitor RECORDS (a dup costs no allocation) and acts after "
+           "the take returns");
+#endif
+    return n;
 }
 
 static JSValue promise_reaction_job(JSContext *ctx, int argc,

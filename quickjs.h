@@ -1962,6 +1962,35 @@ JS_EXTERN void JS_SetEvalSinkHook(JSEvalSinkFunc *cb);
    CALLBACK that parks a running flow lives in JSFlowControlHooks above; these are the host-driven counterpart.)
    A flow runs as a preemptible heap-resident async-function frame, so it interleaves under the WFQ. */
 JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags);
+/* A FLOW WHOSE WHOLE PROGRAM IS ONE CALL — `func(argv…)` with `this_val` as the receiver. The third way to make
+   a flow, beside a SOURCE and a CLONE, and the one ORPHAN-INVOKE needs: a function nothing has called is
+   reachable only by calling it, and a host that JS_Calls it from C runs it in an activation with no flow base
+   under it, which is the drive-to-completion this engine aborts on. The base built here is the one a promise
+   reaction runs on, so `func` may be of any kind and a loop or an await inside it PARKS like any other flow's.
+   The call's result is not observable and is discarded; a throw is the flow's completion and arrives through
+   JS_FlowResume's `pres` exactly as a program's does. Resumed, cloned and freed by the three calls below.
+   NULL if the allocation failed (the exception is live). */
+JS_EXTERN JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueConst this_val,
+                                  int argc, JSValueConst *argv);
+/* IS THIS HANDLE A CALL FLOW (JS_FlowNewCall's) rather than a program flow (JS_FlowNew's)? A program's
+   completion advances a document's script sequence and its throw is the page's; a call's completion advances
+   nothing and its throw belongs to whoever made the call. A host running both must be able to tell them apart,
+   and a position in a script sequence cannot say: a program the running call queues moves the cursor back
+   inside the sequence while the call frame is still live. */
+JS_EXTERN int      JS_FlowIsCall(const JSValue *flow);
+/* THE ORPHANS — every function object on this runtime's heap whose BODY no call frame has ever begun, handed
+   over one at a time with the callee's own declared formal parameter count. See JS_OrphanTake in quickjs.c for
+   what an orphan is, why the heap is where they are enumerated from, and why taking one is not a seen-set.
+   `visit` is called from inside the walk of the object list and MUST NOT ALLOCATE A GC OBJECT — it records (a
+   JS_DupValue costs no allocation) and acts once the take has returned; a dev build asserts it. `fn` is
+   BORROWED. Returns how many were handed over. */
+typedef void JSOrphanVisitFn(JSContext *ctx, JSValueConst fn, int arg_count, void *opaque);
+JS_EXTERN int      JS_OrphanTake(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque);
+/* COULD THE ORPHAN SET HAVE GROWN — the count of function objects this runtime has ever made. Creating one is
+   the only event that can add to the set (running a body only marks it entered, taking one only marks it
+   taken, collecting one only removes it), so a host that took the orphans at generation G may skip the heap
+   walk until this differs from G. Compared for INEQUALITY only, so its wrap costs one redundant walk. */
+JS_EXTERN uint32_t JS_OrphanGen(JSRuntime *rt);
 /* MODULE sources: a graph to link and evaluate, not a program to wrap. Returns the evaluation PROMISE. */
 JS_EXTERN JSValue  JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags);   /* eval_flags: JS_EVAL_FLAG_STRICT threaded through; opaque flow handle (NULL on error) */
 /* 1 = suspended (preempted), 0 = completed. *pres receives the program's COMPLETION VALUE (or JS_EXCEPTION) on
