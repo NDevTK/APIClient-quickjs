@@ -12169,6 +12169,18 @@ int JS_GetOwnSlotDesc(JSContext *ctx, JSPropertyDescriptor *pd, JSValueConst obj
            "a COW delta is capturing a typed-array element as a property SLOT: its storage is the buffer's "
            "BYTES, which no JSValue round-trips (a NaN payload normalises), so route this capture through "
            "cow_capture_bytes");
+    /* AND THE DECLARATION EVERY OTHER C-SIDE OWN-PROPERTY READ DEMANDS, which this one had never asked for.
+       It reaches em->get_own_property for any exotic class below, and it does so from inside a write hook and
+       from inside a context switch — strictly harder ground than JS_GetOwnPropertyNoUserCode's callers stand
+       on, and the only thing that had been keeping it safe was that every exotic class in this engine happens
+       to declare the flag. The first one that did not would have run the page's code with no flow base and
+       nothing to say so. */
+    DCHECK(!p->is_exotic || !ctx->rt->class_array[p->class_id].exotic ||
+           !ctx->rt->class_array[p->class_id].exotic->get_own_property ||
+           ctx->rt->class_array[p->class_id].exotic->get_own_property_no_user_code,
+           "a COW slot read reached an exotic [[GetOwnProperty]] hook whose class has not declared it free of "
+           "the page's code — a capture runs inside a write hook and a swap runs between two flows, so there "
+           "is no flow base to run one on; declare get_own_property_no_user_code where that hook is defined");
     has = JS_GetOwnPropertyInternal2(ctx, pd, p, prop, NULL, /*as_slot*/true);
     /* WHAT IS LEFT OF -1 IS AN ALLOCATION, and the caller has nowhere to put one. The non-object case returned
        above; the Proxy and typed-array cases are refused above; and the TDZ ReferenceError is the OPERATION's,
@@ -12870,7 +12882,13 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
    and a refusal in a context switch has no flow to report to. That is the same line JS_SetOwnSlotDesc draws on
    the write side and JS_GetOwnSlotDesc on the read side: the scheduler is not the page, and a swap moves
    storage. The capture is likewise the OPERATION's — a slot removal made by the swap is not a write of the
-   page's that any delta records. */
+   page's that any delta records.
+   BOTH HALVES OF "NEITHER" ARE THE CODE'S NOW. The exotic half used to be an assert saying no delta could ever
+   name an exotic object, and the GLOBAL OBJECT of this engine is one (JS_SetGlobalClass installs the Window
+   class, whose exotic hooks answer §7.2.2.2's supported indices) — so it named the most-captured object there
+   is. `delete globalThis.x` captures the absent slot at this function's head, removes nothing, and the next
+   context switch asks this body to take out a slot that was never in the shape; on an ordinary object that is
+   the `return true` below, and on the global it was an abort before one page script had finished. */
 static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom, bool as_slot)
 {
     JSShape *sh;
@@ -12951,15 +12969,18 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom, bool as_slo
                     return false;
                 }
             }
-        } else {
+        } else if (!as_slot) {
+            /* 10.1.10.1 step 1's `obj.[[GetOwnProperty]]` on an exotic object is the CLASS's, and this is
+               where the OPERATION asks it. A slot removal does not: an exotic named-property hook is a VIEW
+               over storage that is NOT this object's shape — Storage's is a JS map object written through
+               JS_SetProperty, DOMStringMap's is the element's attributes written through dom_cow's chokepoints,
+               Window's supported indices are child navigables and a String object's are the string's own code
+               units — so the storage a flow can mutate through the view is captured on the object that OWNS it
+               and never as a slot on the viewer. Consulting the hook here would remove state the delta never
+               named, mid-context-switch, with no flow base to run it on. */
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
-            if (em && em->delete_property) {
-                DCHECK(!as_slot,
-                       "a COW slot removal reached an exotic [[Delete]] handler: a Proxy's trap is the page's "
-                       "own code and a String object's index is non-configurable storage, so neither is a slot "
-                       "a flow can have created — the delta names an object it must never have captured");
+            if (em && em->delete_property)
                 return em->delete_property(ctx, JS_MKPTR(JS_TAG_OBJECT, p), atom);
-            }
         }
     }
     /* not found */
@@ -18441,6 +18462,23 @@ static __exception int js_post_inc_slow(JSContext *ctx,
 {
     JSValue op1;
 
+    /* §13.4.2.1 / §13.4.3.1 Runtime Semantics: Evaluation step 3, `Let oldValue be ? ToNumeric(? GetValue(lhs))`,
+       OVER UNKNOWN EXTERNAL INPUT — the HALF of the update operators that was never answered. `++x` and `--x`
+       reach js_unary_arith_slow, whose .arith hook derives the result; `x++` and `x--` come through here first
+       and CONVERTED, so `for (; e--; )` over a driven orphan's argument aborted the whole instance at the
+       ToNumber boundary. One real bundle's route loader is exactly that loop.
+       §7.1.3 ToNumeric ( arg ) step 1 is `? ToPrimitive(arg, number)`, which over a concolic is the IDENTITY,
+       and its step 3's ToNumber is then not a conversion at all — it is the operator's own operation, which is
+       precisely what js_tonumeric_eager already says for §13.15.3 steps 3-4. So the unknown IS oldValue, the
+       value step 6 returns; step 4's Number::subtract( oldValue, 1𝔽 ) is the derivation js_unary_arith_slow
+       makes for OP_dec, and it RUNS the real subtraction on the operand's example, so the decremented value
+       carries a concrete rather than a placeholder.
+       The stack shape is the fast path's and is not restated: sp[-1] stays oldValue (the expression's value)
+       and sp[0] becomes newValue, which is why the arithmetic is asked for at sp + 1. */
+    if (!js_tonumeric_eager(sp[-1])) {
+        sp[0] = js_dup(sp[-1]);
+        return js_unary_arith_slow(ctx, sp + 1, op - OP_post_dec + OP_dec);
+    }
     /* XXX: allow custom operators */
     op1 = sp[-1];
     op1 = JS_ToNumericFree(ctx, op1);
@@ -44645,6 +44683,20 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             ct->async_data = as2;
             ct->async_promise = aprom2;        /* fresh capability's promise (owned by this frame) */
             ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0; /* async frame owns its buffers via as2->func_state */
+            /* AND THE CONTINUATION AN ASYNC FRAME CAN CARRY, which this arm did not clone at all: an async
+               function reached AS A CALLBACK — `[1,2].map(async function(){…})`, `str.replace(re, async fn)` —
+               is pushed with the driving machine on the frame, and the struct copy above handed the sibling the
+               ORIGINAL's. Two flows then advanced one cursor and both freed it, silently, because the arm that
+               refuses an unknown kind lives in the bytecode branch and this branch never reached it. Cloned
+               through the ONE function the link walk uses, so a kind with no arm crashes there by name instead
+               of here by a second copy of the same message. `ct->sf` is dead for an async frame (the live state
+               is as2->func_state, whose buffers clone_susp_frame allocated fresh), so there is no borrowed
+               arg_buf to repoint — the one thing the bytecode arm has to do and this one does not. */
+            if (otf->cont_kind != CONT_NONE && otf->cont_state) {
+                void *acs = tramp_cont_clone_one(ctx, otf->cont_state, otf->cont_kind);
+                if (!acs) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                ct->cont_state = acs;
+            }
         } else if (otf->gen_data) {
             /* GENERATOR body on the chain: clone a FRESH gen_data with its OWN cloned body frame so the sibling's
                generator advances on an independent timeline (mirrors the async_data branch, minus the promise —
@@ -44846,9 +44898,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                    flows and both finishes free it — the field was simply missing from the list, which is the
                    defect this whole clone is a list against. */
                 ns->executor_own = js_dup(os->executor_own);
-                DCHECK(os->outer == NULL,
-                       "clone_deep_flow: a Promise executor continuation with an OUTER requester under it — "
-                       "clone that kind through its own arm before this one adopts the pointer");
+                /* `outer` is left naming the ORIGINAL requester and BOUND by tramp_cont_relink_outer below —
+                   the refusal that stood here asked for exactly that walk and it now exists. */
                 ns->cb_args[0] = JS_UNDEFINED;
                 ns->cb_args[1] = os->cb_args[1];   /* the executor: borrowed, kept alive by the cloned caller stack */
                 ns->cb_args[2] = ns->resolving_funcs[0];
@@ -44890,10 +44941,9 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ncs->created_obj = js_dup(ocs->created_obj);
                 ncs->super_ref = js_dup(ocs->super_ref);
                 /* An OUTER continuation is a second record under this one (a `new` reached through another
-                   continuation). Cloning it is that kind's arm, not this one's. */
-                DCHECK(ocs->outer == NULL,
-                       "clone_deep_flow: a constructor continuation with an OUTER continuation under it — clone "
-                       "that kind through its own arm before this one adopts the pointer");
+                   continuation — `.finally`'s PromiseResolve delegates to a machine whose NewPromiseCapability
+                   Constructs a page-defined Promise subclass, and the body of that constructor is this frame).
+                   It is left naming the ORIGINAL and BOUND by tramp_cont_relink_outer below. */
                 ct->cont_state = ncs;
             } else if (otf->cont_kind == CONT_TOPRIM) {
                 /* A CONCOLIC BRANCH INSIDE A COERCION METHOD. §7.1.1 ToPrimitive ( input [ , preferredType ] )
@@ -44933,6 +44983,43 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 snprintf(why, sizeof why, CLONE_KIND_FMT, (int)otf->cont_kind);
 #undef CLONE_KIND_FMT
                 DCHECK(otf->cont_kind == CONT_NONE, why);
+            }
+        }
+        /* THE OTHER HALF OF THIS FRAME'S CONTINUATION: whoever is waiting on the record the arm just built.
+           ONE call for every arm above — a per-arm `if` here would be plumbing each new arm has to remember,
+           and every omission a link the sibling silently shares. */
+        /* KEYED ON THE KIND, never on the pointer: tramp_frame_new does not zero, so `cont_state` reads as
+           whatever the recycled block held until a push writes the pair — which is the same reason the arm
+           chain above asks the kind and not the record. */
+        if (ct->cont_kind != CONT_NONE && otf->cont_state) {
+            DCHECK(ct->cont_state != otf->cont_state,
+                   "clone_deep_flow: a frame's C continuation was carried into the sibling by the struct copy "
+                   "rather than cloned — its kind's arm must produce the sibling's OWN record, or two flows "
+                   "advance one cursor and both free it");
+            /* A RECORD WAITS ON EXACTLY ONE THING, so it is EITHER a frame's cont_state OR reachable through
+               exactly one `outer` link, never both. That is what lets the walk below clone a chain's link-only
+               tail without a translation table: a record that were both would leave the fork TWICE — once from
+               its frame's arm, once from the walk — and the sibling would hold two half-advanced copies of one
+               cursor with two owners for everything it holds. Asked of the ORIGINALS, which is the only side on
+               which it is a fact about the flow being forked. */
+            {
+                uint8_t lk = otf->cont_kind;
+                void *lst = otf->cont_state;
+                for (;;) {
+                    uint8_t nk;
+                    void *nx = cont_outer_get(lst, lk, &nk);
+                    int j;
+                    if (!nx) break;
+                    for (j = 0; j < n; j++)
+                        DCHECK(oa[j]->cont_state != nx,
+                               "clone_deep_flow: a continuation record is BOTH a frame's own and another "
+                               "record's requester — whichever of the two owns it has to be the only one that "
+                               "does, or the fork copies it twice");
+                    lst = nx; lk = nk;
+                }
+            }
+            if (tramp_cont_relink_outer(ctx, ct->cont_state, ct->cont_kind) < 0) {
+                js_free(ctx, oa); js_free(ctx, ca); return NULL;
             }
         }
         ct->up = (i == n - 1) ? NULL : ca[i + 1];
@@ -44996,17 +45083,27 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
        the ORIGINAL flow's chain. Re-deriving it here is the same search that set it, run over the frames just
        built, so the cache is correct rather than merely absent: a sibling with NULL would miss a cycle and
        recurse forever on `a[0] = a`. This is why the fork no longer has to refuse a join that has one. */
+    /* AND IT IS EVERY JOIN ON THE SIBLING'S CHAIN, not only the ones a frame owns. A join is at its most
+       ordinary precisely when it owns no frame: `[a, b].join(sep)` coercing an element or its separator is
+       waiting on a ToPrimitive sequence, so the machine is a LINK — reached through `outer`, cloned by
+       tramp_cont_relink_outer — and a loop that read frames alone left exactly those caches naming the
+       original flow. The search each one gets is js_join_enclosing's, in js_join_enclosing's ORDER: this
+       machine's own requester chain first, then outward along the frames. */
     for (int ji = 0; ji < n; ji++) {
-        TrampFrame *tf = ca[ji];
-        struct JSArrayJoin *j;
-        int k;
-        if (tf->cont_kind != CONT_STEP || !tf->cont_state) continue;
-        if (((JSStepHdr *)tf->cont_state)->def->visit != js_array_join_visit) continue;
-        j = (struct JSArrayJoin *)tf->cont_state;
-        j->outer_join = NULL;
-        for (k = ji + 1; k < n; k++) {   /* outward along the clone chain, exactly as js_join_enclosing walks up */
-            struct JSArrayJoin *o = js_join_chain_find(ca[k]->cont_state, ca[k]->cont_kind);
-            if (o) { j->outer_join = o; break; }
+        uint8_t lk = ca[ji]->cont_kind;
+        void *lst = ca[ji]->cont_state;
+        while (lst) {
+            uint8_t nk;
+            void *nx = cont_outer_get(lst, lk, &nk);
+            if (lk == CONT_STEP && ((JSStepHdr *)lst)->def->visit == js_array_join_visit) {
+                struct JSArrayJoin *j = (struct JSArrayJoin *)lst;
+                int k;
+                j->outer_join = nx ? js_join_chain_find(nx, nk) : NULL;
+                for (k = ji + 1; !j->outer_join && k < n; k++)
+                    j->outer_join = js_join_chain_find(ca[k]->cont_state, ca[k]->cont_kind);
+            }
+            if (!nx) break;
+            lst = nx; lk = nk;
         }
     }
     c->tramp_top = ca[0];
@@ -45087,9 +45184,31 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
         tramp_cont_free(ctx, rest, left);
         return;
     }
+    if (kind == CONT_TOPRIM) {
+        /* THE ARM THE CLONE HAD AND THIS DID NOT. clone_deep_flow has copied a coercion sequence since the
+           frame it rides was first cloned, so a parked flow could hold one and could not be released — the
+           kind DFAILed here, which means a flow suspended inside `${o}` or `"" + o` could be forked and could
+           not be evicted, paged or freed. The two are one ownership list read in opposite directions, and a
+           kind present in only one of them is the defect that list exists to prevent.
+           §7.1.1 ToPrimitive ( input [ , preferredType ] ) step 1.b.iv is "? Call(exoticToPrimitive, input,
+           « hint »)" and §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3.b.i is "? Call(method, obj)" — an
+           abrupt completion from either PROPAGATES, so the sequence dies and takes its requester with it, and
+           that is what the shared walk performs. */
+        uint8_t left = CONT_NONE;
+        void *rest = tramp_chain_unwind(ctx, st, CONT_TOPRIM, &left);
+        tramp_cont_free(ctx, rest, left);
+        return;
+    }
     if (kind == CONT_ITER_CONSUME) {
+        /* AND WHOEVER WAS WAITING ON IT — `Reflect.construct(Map, entries)` puts a machine under a consume, and
+           the record's `outer` was read by nothing here, so that machine was dropped with the flow. Taken
+           BEFORE the free, because the free is what makes the record unreadable. The clone takes the second
+           reference to this same link (tramp_cont_relink_outer); this releases the first. */
+        void *co = ((struct JSIterConsume *)st)->outer;
+        uint8_t ck = ((struct JSIterConsume *)st)->outer_kind;
         js_iter_consume_end(ctx, (struct JSIterConsume *)st);
         js_free_rt(rt, st);
+        tramp_cont_free(ctx, co, ck);
         return;
     }
     if (kind == CONT_PROMISE_ALL) {
@@ -45103,26 +45222,29 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
         return;
     }
     if (kind == CONT_PROMISE_EXEC) {
+        /* THE REQUESTER IS RELEASED, NOT REFUSED — the mirror of the clone's relink, and the reason both arms
+           read their link BEFORE the free: the free is what makes the record unreadable. The refusal that stood
+           here was the free half of the pair the clone has now built. */
         JSPromiseExec *ps = (JSPromiseExec *)st;
-        DCHECK(ps->outer == NULL,
-               "tramp_cont_free: a Promise executor continuation with an OUTER requester under it — release that "
-               "kind through its own arm before this one drops the pointer");
+        void *po = ps->outer;
+        uint8_t pk = ps->outer_kind;
         JS_FreeValue(ctx, ps->promise);
         JS_FreeValue(ctx, ps->resolving_funcs[0]);
         JS_FreeValue(ctx, ps->resolving_funcs[1]);
         JS_FreeValue(ctx, ps->super_ref);
         JS_FreeValue(ctx, ps->executor_own);   /* the Reflect.construct spelling's argsList element */
         js_free_rt(rt, ps);
+        tramp_cont_free(ctx, po, pk);
         return;
     }
     if (kind == CONT_CONSTRUCT) {
         struct JSConstruct *cs = (struct JSConstruct *)st;
-        DCHECK(cs->outer == NULL,
-               "tramp_cont_free: a constructor continuation with an OUTER requester under it — release that kind "
-               "through its own arm before this one drops the pointer");
+        void *co = cs->outer;
+        uint8_t ck = cs->outer_kind;
         JS_FreeValue(ctx, cs->created_obj);
         JS_FreeValue(ctx, cs->super_ref);
         js_free_rt(rt, cs);
+        tramp_cont_free(ctx, co, ck);
         return;
     }
     {
@@ -86611,6 +86733,14 @@ static const JSClassExoticMethods js_string_exotic_methods = {
     .get_own_property = js_string_get_own_property,
     .define_own_property = js_string_define_own_property,
     .delete_property = js_string_delete_property,
+    /* 10.4.3.1 [[GetOwnProperty]] ( propertyKey ) step 3 is what this hook is — the engine has already done
+       step 1's OrdinaryGetOwnProperty by missing the shape — and step 3 is 10.4.3.5 StringGetOwnProperty
+       ( string, propertyKey ), which reads the code unit at the index out of [[StringData]] and builds a
+       descriptor from it. No accessor, no page code, so the engine's own C-side own-property reads
+       (JS_GetOwnPropertyNoUserCode, and the COW capture's slot read) may run it with no flow base under them.
+       Every host class in this engine declared this; the one class quickjs itself owns did not, which is only
+       invisible for as long as nobody asserts it. */
+    .get_own_property_no_user_code = true,
 };
 
 
