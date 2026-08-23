@@ -2022,6 +2022,24 @@ JS_EXTERN int      JS_OrphanTakeOne(JSContext *ctx, JSOrphanVisitFn *visit, void
    taken, collecting one only removes it), so a host that took the orphans at generation G may skip the heap
    walk until this differs from G. Compared for INEQUALITY only, so its wrap costs one redundant walk. */
 JS_EXTERN uint32_t JS_OrphanGen(JSRuntime *rt);
+/* THE CROSS-SESSION NAME OF ONE ORPHAN'S BODY — what a host writes down so a LATER session can drive the same
+   function again. Neither of the two names a session already has survives it: a function object is a live heap
+   reference, and a position in the heap walk above is a fact about one heap at one instant. So the locator is
+   composed of what the BUNDLE determines and the session does not — the script the body was compiled from, WHERE
+   IN THAT SCRIPT the body begins, and the body's own source text — and it is stable across sessions for the
+   simple reason that the same bytes compile the same way.
+   ALL THREE ARE LOAD-BEARING. Source text alone does not identify a body in a minified bundle: `function(e){
+   return e.default}` occurs dozens of times in one webpack output, so a hash of the text alone would name a set
+   and the resume would drive whichever member it met first. Position alone changes with every byte the server
+   prepends, so a hash of the position alone silently stops matching the day a banner is added. Together, a
+   mismatch means the file genuinely changed, which is the honest answer.
+   IT NAMES THE BYTECODE, NOT THE CLOSURE, for the same reason the take does: `entered` is a bit on the
+   JSFunctionBytecode, so one body is one orphan however many closures of it a factory has made, and two
+   closures of one body must therefore hash the same.
+   ALLOCATION-FREE — the interned filename's characters and the source buffer are read in place — so it may be
+   called from inside the object-list walk above. `fn` must be an object with a bytecode body; a C function, a
+   bound function and a Proxy have no body to name and are never orphans. */
+JS_EXTERN uint64_t JS_OrphanHash(JSContext *ctx, JSValueConst fn);
 /* MODULE sources: a graph to link and evaluate, not a program to wrap. Returns the evaluation PROMISE. */
 JS_EXTERN JSValue  JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags);   /* eval_flags: JS_EVAL_FLAG_STRICT threaded through; opaque flow handle (NULL on error) */
 /* 1 = suspended (preempted), 0 = completed. *pres receives the program's COMPLETION VALUE (or JS_EXCEPTION) on

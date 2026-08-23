@@ -20916,11 +20916,75 @@ static inline JSContext *step_realm(JSContext *ctx, const JSStepHdr *h)
      0 = *pout holds the element, 6 = the caller must return that step code, -1 = threw. */
 enum { GET_PH_START = 0, GET_PH_GOT };
 
+/* WHICH SPEC STEP A STAGE RESTS AT, as a string, for a diagnostic that reports one — the machine's own
+   declaration, or a sentence saying the stage is not among them. Written once because three checks now format a
+   stage, and a message that walks the list by hand is a third copy of the walk. */
+static const char *step_stage_label(const JSStepHdr *h, unsigned stage)
+{
+    int n = 0;
+
+    while (h->def->steps[n]) n++;
+    return stage < (unsigned)n ? h->def->steps[stage]
+                               : "(a stage past the end of its declared steps)";
+}
+
+/* A KEYED REQUEST GOES IN FLIGHT — the one point every spelling of one passes, so the fact its ANSWER is
+ * checked against is recorded once instead of at the six begin sites. See JSStepHdr::req_stage for why the
+ * STAGE is the discriminator the key could never be.
+ *
+ * IT REFUSES AN OVERLAP ACROSS A STAGE, NOT AN OVERLAP. Two keyed cursors legitimately stand together inside
+ * one stage (Web IDL's record<> takes the key list and then reads each key), and that is the shape keys_phase
+ * and desc_phase were given their own bytes for. What is refused is the SECOND stage: once a request outlives
+ * the stage that issued it, the next stage's request site is the one that will collect its answer, and both
+ * sites see a real value belonging to the wrong question. */
+static void step_keyed_inflight(JSStepHdr *h)
+{
+#if APICLIENT_DEV
+    if (h->get_atom != JS_ATOM_NULL || h->desc_phase != GET_PH_START || h->keys_phase != GET_PH_START) {
+        char why[600];   /* the tail names what to do about it; a truncated DFAIL loses exactly that */
+
+        snprintf(why, sizeof why,
+                 "%s issued a keyed request at stage %u (%s) while one issued at stage %u (%s) is still in "
+                 "flight — a keyed sub-sequence is answered at the call site that parked on it, so two of them "
+                 "spanning a stage boundary means this stage's request site will collect the earlier stage's "
+                 "answer, as a real value belonging to another question. A stage that holds a request does "
+                 "nothing but hold it: let the outstanding one END before leaving its stage",
+                 h->def->algorithm, (unsigned)h->stage, step_stage_label(h, h->stage),
+                 (unsigned)h->req_stage, step_stage_label(h, h->req_stage));
+        DCHECK(h->req_stage == h->stage, why);
+    }
+#endif
+    h->req_stage = h->stage;
+}
+
+/* AND ITS ANSWER ARRIVES AT THE STAGE THAT ASKED — the other half, asserted at the one point every keyed
+   request ends. */
+static void step_keyed_answered(const JSStepHdr *h)
+{
+#if APICLIENT_DEV
+    char why[600];
+
+    if (h->req_stage == h->stage) return;
+    snprintf(why, sizeof why,
+             "%s answered a keyed request at stage %u (%s) that was ISSUED at stage %u (%s) — the machine left "
+             "the stage that parked on the request, so this call site is collecting another site's answer and "
+             "the value it takes is a real one belonging to the other question. The key cannot see this when "
+             "the two sites name the same property, and cannot see it at all for an INDEX form, which carries "
+             "no key: the stage is what tells them apart",
+             h->def->algorithm, (unsigned)h->stage, step_stage_label(h, h->stage),
+             (unsigned)h->req_stage, step_stage_label(h, h->req_stage));
+    DFAIL(why);
+#else
+    (void)h;
+#endif
+}
+
 /* the head both entries share: `atom` is OWNED and moves onto the header. */
 static int step_getprop_begin(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom,
                               JSValue **out_cb, int *out_argc)
 {
     DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed read is already in flight on this machine's header");
+    step_keyed_inflight(h);
     h->get_atom = atom;
     h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver across the read */
     *out_cb = h->cb_coerce; *out_argc = (int)atom;
@@ -20946,6 +21010,7 @@ static int step_getprop_begin(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JS
 static bool step_keyed_abrupt(JSContext *ctx, JSStepHdr *h, JSValueConst in)
 {
     DCHECK(h->get_atom != JS_ATOM_NULL, "a keyed operation was delivered with none in flight on this header");
+    step_keyed_answered(h);
     JS_FreeAtom(ctx, h->get_atom);
     h->get_atom = JS_ATOM_NULL;
     h->get_phase = GET_PH_START;
@@ -21108,6 +21173,7 @@ int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom a
 {
     if (h->desc_phase == GET_PH_START) {
         JS_FreeValue(ctx, in);
+        step_keyed_inflight(h);
         h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver across the request */
         *out_cb = h->cb_coerce; *out_argc = (int)atom;
         h->desc_phase = GET_PH_GOT;
@@ -21115,6 +21181,10 @@ int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom a
     }
     DCHECK(h->desc_phase == GET_PH_GOT,
            "a [[GetOwnProperty]] request was delivered with none in flight on this header");
+    /* THIS REQUEST HAS NO KEY CHECK AT ALL — `atom` is what it ASKS about and is recomputed by the caller on
+       the answering path, so it says nothing about which site parked. The stage is the whole of its site
+       identity, which is why it is the one that most needed one. */
+    step_keyed_answered(h);
     h->desc_phase = GET_PH_START;
     if (JS_IsException(in))
         return -1;
@@ -21132,12 +21202,14 @@ int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in,
 {
     if (h->keys_phase == GET_PH_START) {
         JS_FreeValue(ctx, in);
+        step_keyed_inflight(h);
         h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver across the request */
         *out_cb = h->cb_coerce; *out_argc = 0;
         h->keys_phase = GET_PH_GOT;
         return 11;
     }
     DCHECK(h->keys_phase == GET_PH_GOT, "an own-keys request was delivered with none in flight on this header");
+    step_keyed_answered(h);   /* it carries no key either, so the stage is its whole site identity */
     h->keys_phase = GET_PH_START;
     if (JS_IsException(in))
         return -1;
@@ -21255,6 +21327,7 @@ static int step_setprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
     if (h->get_phase == GET_PH_START) {
         JS_FreeValue(ctx, in);
         DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        step_keyed_inflight(h);
         h->get_atom = JS_DupAtom(ctx, atom);
         h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds both across the write */
         h->cb_coerce[1] = (JSValue)value;
@@ -21316,6 +21389,7 @@ static int step_delidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
         atom = JS_NewAtomInt64(ctx, idx);
         if (atom == JS_ATOM_NULL) return -1;
         DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        step_keyed_inflight(h);
         h->get_atom = atom;                 /* the conversion already owns it */
         h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds it across the delete */
         *out_cb = h->cb_coerce; *out_argc = (int)atom;
@@ -21339,6 +21413,7 @@ static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
         atom = JS_NewAtomInt64(ctx, idx);
         if (atom == JS_ATOM_NULL) return -1;
         DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        step_keyed_inflight(h);
         h->get_atom = atom;                 /* the conversion already owns it */
         h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds both across the define */
         h->cb_coerce[1] = (JSValue)value;
@@ -21357,13 +21432,22 @@ static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
    [[DefineOwnProperty]] answers false, and CreateDataProperty (25.5.1.1's, InternalizeJSONProperty) YIELDS that
    false and carries on. A trap returning false is what tells the two apart, so the caller names which one the
    step it is implementing says.
-     0 = done, 10 = the caller must return that step code. */
+     0 = done, 10 = the caller must return that step code, -1 = threw.
+   A TRAP THAT THREW IS NOT A TRAP THAT ANSWERED FALSE, and this used to answer as if it were: the answering
+   path rewound the cursor by hand and returned 0 whatever arrived, so a `defineProperty` trap's throw was
+   delivered as a successful define. Its own INDEX twin two functions up reports the same event as -1 through
+   step_keyed_abrupt, and both of this one's callers were already written for that (`if (r < 0) return -1`) —
+   one request answering differently depending on whether its key was a name or an index, with the caller's
+   handling for the honest answer already in place and unreachable. §Iterator's SetterThatIgnoresPrototype-
+   Properties then COMPLETED with the throw still live in the context, which no check downstream reports,
+   because step_request_check only fires on a machine that goes on to ASK for something. */
 static int step_defprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValueConst value,
                             bool or_throw, JSValue in, JSValue **out_cb, int *out_argc)
 {
     if (h->get_phase == GET_PH_START) {
         JS_FreeValue(ctx, in);
         DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        step_keyed_inflight(h);
         h->get_atom = JS_DupAtom(ctx, atom);
         h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds both across the define */
         h->cb_coerce[1] = (JSValue)value;
@@ -21378,9 +21462,7 @@ static int step_defprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
         h->get_phase = GET_PH_GOT;
         return 10;
     }
-    JS_FreeAtom(ctx, h->get_atom);
-    h->get_atom = JS_ATOM_NULL;
-    h->get_phase = GET_PH_START;
+    if (step_keyed_abrupt(ctx, h, in)) return -1;   /* a throwing `defineProperty` trap */
     JS_FreeValue(ctx, in);                  /* a define delivers no value */
     return 0;
 }
@@ -21395,6 +21477,7 @@ static int step_delprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
     if (h->get_phase == GET_PH_START) {
         JS_FreeValue(ctx, in);
         DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        step_keyed_inflight(h);
         h->get_atom = JS_DupAtom(ctx, atom);
         h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds it across the delete */
         *out_cb = h->cb_coerce; *out_argc = (int)atom;
@@ -24431,12 +24514,9 @@ static void step_request_check(JSContext *ctx, const JSStepHdr *h, int st, bool 
     if (abrupt_in && st > 0 && JS_HasException(ctx)) {
         /* The stage may still be past the end (that is step_stage_check's diagnosis, and this message should not
            read as if it were the same fault), but the LIST is always there — js_step_def_check saw to that. */
-        const char *label = "(a stage past the end of its declared steps)";
+        const char *label = step_stage_label(h, h->stage);
         char why[640];   /* the compiler knows the format's minimum length; a truncated DFAIL loses its tail,
                             which is where every one of these names the capability to build */
-        int n = 0;
-        while (h->def->steps[n]) n++;
-        if (h->stage < (uint16_t)n) label = h->def->steps[h->stage];
         snprintf(why, sizeof why,
                  "%s asked for step code %d at stage %u (%s) with a throw still live in the context — an abrupt "
                  "request completion was delivered to this machine and never consumed, so the driver is about to "
@@ -99310,6 +99390,10 @@ JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueConst this_val
  * the remaining orphans are represented by the heap itself — the `entered` bit is the only state — so there is
  * no host-side buffer to fork per flow, to serialize to the cold tier, or to drop on a park.
  *
+ * WHAT CROSSES A SESSION IS NOT THIS. Neither the function object nor the position it was found at survives the
+ * runtime that produced it, so a host that wants to drive the SAME body again after a restart writes down
+ * JS_OrphanHash below and asks the take of the next session which of the bodies it hands over matches.
+ *
  * Returns 1 if one was handed over, 0 if this heap holds none. `arg_count` is the callee's own declared formal
  * parameter count, which is how many unknowns its caller has to supply. */
 uint32_t JS_OrphanGen(JSRuntime *rt) { return rt->orphan_gen; }
@@ -99353,6 +99437,89 @@ int JS_OrphanTakeOne(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque)
            "the take returns");
 #endif
     return n;
+}
+
+/* FNV-1a, 64 bits. Sixty-four and not thirty-two because this is an IDENTITY and not a bucket index: a bundle
+   with twenty thousand function bodies has a birthday collision probability near five percent at 32 bits, and a
+   collision here does not degrade anything visibly — it silently drives the WRONG function under a resumed
+   flow's recorded path, which is the one failure this locator exists to make impossible. At 64 bits the same
+   bundle is at 10^-11. */
+static uint64_t orphan_hash_bytes(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        h ^= b[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* EVERY NUMBER GOES IN BIG-ENDIAN AND WITH ITS OWN LENGTH BESIDE IT, so the composition is unambiguous: the
+   host writes this hash into a document another BUILD reads back, and a byte order taken from the machine
+   would make a residue written on one host unreadable on another with nothing anywhere to say so. */
+static uint64_t orphan_hash_u32(uint64_t h, uint32_t v)
+{
+    uint8_t b[4];
+
+    b[0] = (uint8_t)(v >> 24); b[1] = (uint8_t)(v >> 16);
+    b[2] = (uint8_t)(v >> 8);  b[3] = (uint8_t)v;
+    return orphan_hash_bytes(h, b, sizeof b);
+}
+
+uint64_t JS_OrphanHash(JSContext *ctx, JSValueConst fn)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p;
+    JSFunctionBytecode *b;
+    JSAtom filename;
+    uint64_t h = 0xcbf29ce484222325ULL;
+
+    DCHECK(JS_VALUE_GET_TAG(fn) == JS_TAG_OBJECT,
+           "the cross-session name of an orphan was asked of something that is not an object — only a function "
+           "with a body can be an orphan, and a locator computed from anything else names nothing");
+    p = JS_VALUE_GET_OBJ(fn);
+    DCHECK(js_class_has_bytecode(p->class_id) && p->u.func.function_bytecode &&
+           p->u.func.function_bytecode->byte_code_buf,
+           "the cross-session name of an orphan was asked of a function with no bytecode body — a C function, a "
+           "bound function and a Proxy are never handed over by JS_OrphanTakeOne, so a caller that reached here "
+           "with one is naming something the resume can never take back");
+    b = p->u.func.function_bytecode;
+
+    /* WHICH SCRIPT, by the interned filename's own characters rather than through a formatting buffer: a URL is
+       longer than any fixed buffer worth putting on this stack, and a truncated one would make two chunks that
+       differ only in their content hash suffix name the same body. Wide and narrow are folded identically to
+       their code units, so an atom's storage width — which is a property of how it was built — cannot change
+       the answer. */
+    filename = b->filename;
+    if (__JS_AtomIsTaggedInt(filename)) {
+        h = orphan_hash_u32(h, __JS_AtomToUInt32(filename));
+    } else {
+        JSString *s;
+        DCHECK(filename != JS_ATOM_NULL && filename < rt->atom_size,
+               "an orphan's body names no script at all — every compile in this engine is given a filename, so "
+               "a body without one cannot be found again and the locator would collapse to its position");
+        s = rt->atom_array[filename];
+        h = orphan_hash_u32(h, s->len);
+        if (s->is_wide_char) {
+            uint32_t i;
+            for (i = 0; i < s->len; i++) h = orphan_hash_u32(h, str16(s)[i]);
+        } else {
+            h = orphan_hash_bytes(h, str8(s), s->len);
+        }
+    }
+    /* WHERE IN IT — the two coordinates the parser recorded, which is what separates the dozens of identical
+       one-line bodies a minifier emits. */
+    h = orphan_hash_u32(h, (uint32_t)b->line_num);
+    h = orphan_hash_u32(h, (uint32_t)b->col_num);
+    /* AND THE BODY'S OWN TEXT, which is what makes a position that has MOVED fail to match rather than match
+       the wrong body. It is saved unconditionally at parse time in this fork; a body that has none (bytecode
+       read back with its source stripped) contributes its zero length and is still named by the two coordinates
+       above, which is why this is a fold and not an assertion. */
+    h = orphan_hash_u32(h, (uint32_t)b->source_len);
+    if (b->source) h = orphan_hash_bytes(h, b->source, (size_t)b->source_len);
+    return h;
 }
 
 static JSValue promise_reaction_job(JSContext *ctx, int argc,
