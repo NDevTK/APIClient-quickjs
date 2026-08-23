@@ -28555,6 +28555,20 @@ void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, vo
        embedder can only dispose of by RUNNING it, which is the state this parameter exists to end. */
     DCHECK(free_fn != NULL, "a flow parked without a disposer — the slot owns the reference this site just "
                             "took, so a teardown or a page-out could only give it back by resuming the body");
+    /* NOTHING MAY BE PROPAGATING WHEN A FLOW PARKS, and this is the origin of the invariant rather than a
+       restatement of it. A park is reached only from a FUNC_RET_PREEMPT, which the interpreter produces at
+       exactly two points: do_yield_poll, which runs at an opcode boundary where nothing is propagating, and
+       do_step_park, which MOVES the completion onto the parked machine's header first precisely because the
+       slot is per-runtime. So a throw standing here is a third producer, and it is asked about here because
+       here is the last line at which the producer is still on the C stack: by the time the pump resumes this
+       continuation the scheduler may have run somebody else, and the resume's own assert can then only say
+       that the completion belongs to another flow, never which flow made it. */
+    DCHECK(!JS_HasException(ctx),
+           "a flow was PARKED with a completion still live in the runtime — the exception slot is per-RUNTIME "
+           "and this continuation resumes after the scheduler may have chosen another flow, so the throw would "
+           "be delivered to an evaluation that did not produce it. A completion still propagating INSIDE a "
+           "suspended flow rides the flow (do_step_park's park_exc); one that has finished propagating is "
+           "reported at the boundary (JS_ResumeParkedFlow's `pres`). Route this one to whichever it is");
     rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn;
     rt->parked_flow.free_fn = free_fn; rt->parked_flow.opaque = opaque;
 }
@@ -28591,10 +28605,16 @@ void JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, JSFlowPar
    thing the session's first line does not have. Asked before the slot is read, so a step that finds nothing
    parked still adopts; ordinarily a no-op, one list_empty on a list that is empty for the whole of every
    session after the first flow's first step. */
-bool JS_ResumeParkedFlow(JSRuntime *rt) {
+bool JS_ResumeParkedFlow(JSRuntime *rt, JSValue *pres) {
     JSFlowParkFn *fn;
     JSContext *ctx;
     void *op;
+    /* THE COMPLETION IS PART OF THE COMPLETION — the same sentence JS_FlowResume's own DCHECK makes, and the
+       same reason: a caller that cannot be handed the abrupt one is a caller that leaves it in a per-runtime
+       slot for the next evaluation to find. */
+    DCHECK(pres != NULL, "JS_ResumeParkedFlow: the completion of a parked continuation is part of the "
+                         "completion — the caller must take it, exactly as JS_FlowResume's caller must");
+    *pres = JS_UNDEFINED;
     js_adopt_baseline_calls(rt);
     fn = rt->parked_flow.fn;
     ctx = rt->parked_flow.ctx;
@@ -28606,6 +28626,16 @@ bool JS_ResumeParkedFlow(JSRuntime *rt) {
     rt->parked_flow.fn = NULL; rt->parked_flow.free_fn = NULL;
     rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
     fn(ctx, op);   /* may park again at the next back-edge — the pump loops */
+    /* AND ITS COMPLETION, READ ONCE, HERE. A continuation completes ABRUPTLY exactly when a throw is still
+       propagating out of it — that is what §6.2.4's throw completion IS, and reading the slot is reading the
+       completion rather than guessing at it (the same expression JS_FlowResume's call-root arm already uses to
+       answer the same question about the same kind of flow). It is read by the PUMP and not by the three park
+       functions because `JSFlowParkFn` has no result: a site that forgot would report a normal completion over
+       a live throw, and the pump's caller would then carry it into the next flow's first evaluation, which is
+       precisely the failure this line ends. A parked continuation's normal VALUE is nobody's — a reaction's
+       goes to its capability and an async body's to its promise — so the normal answer is UNDEFINED. */
+    if (JS_HasException(ctx))
+        *pres = JS_EXCEPTION;
     return true;
 }
 
@@ -44312,6 +44342,21 @@ static void free_tramp_chain(JSContext *ctx, JSAsyncFunctionState *s);
 int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
     JSAsyncFunctionState *s = (JSAsyncFunctionState *)flow;
     DCHECK(pres != NULL, "JS_FlowResume: the completion value is part of the completion — the caller must take it");
+    /* AND NOTHING MAY BE PROPAGATING WHEN ONE STARTS. This is the host↔engine boundary for every flow the
+       scheduler runs, so it is where "a completion belongs to the evaluation that produced it" (ECMA-262
+       §6.2.4 The Completion Record Specification Type) becomes checkable: a throw standing at this line was
+       produced by whatever ran BEFORE this flow — the previous flow's step, a job, a parked continuation the
+       pump resumed — and was not taken there. Asked HERE rather than only where it is eventually noticed,
+       because the two answer different questions: the deep resume into a parked step machine can say the
+       completion belongs to another flow, and this can say which step handed it over. Same invariant, two
+       granularities, exactly as JS_ExecutePendingJob's parked-flow check sits a step ahead of
+       JS_CallInternal's. */
+    DCHECK(!JS_HasException(ctx),
+           "a flow was RESUMED with a completion already live in the runtime — the exception slot is "
+           "per-RUNTIME and a completion is per-EVALUATION, so this throw belongs to whatever the host ran "
+           "before this flow and was never taken there. Take it where it is produced: a program's through "
+           "JS_FlowResume's own `pres`, a job's at the job, a parked continuation's through "
+           "JS_ResumeParkedFlow's `pres`");
     /* THE BASELINE'S QUEUED WORK BECOMES THIS FLOW'S — see baseline_call_list. This is the ONE line in the
        engine at which a flow is executing and the scheduler owns the queues, which are the two things a
        platform callback queued before the frontier existed has been waiting for. It is here rather than at the
@@ -60574,9 +60619,19 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
        A forced preempt must be transparent to observable ordering, and module evaluation order is observable,
        so this drains exactly as the host pump does before it starts a job — the same rule in the third place
        that needed it. A real top-level AWAIT does not come through here: it registers on its promise and
-       returns without parking, so genuine asynchrony is untouched and only the forced preempt is absorbed. */
-    while (JS_ResumeParkedFlow(ctx->rt))
-        ;
+       returns without parking, so genuine asynchrony is untouched and only the forced preempt is absorbed.
+       AND THE DRAIN TAKES EACH COMPLETION, because this function has an error protocol of its own and dropping
+       one would report a module body that threw as one that evaluated. The body's abrupt completion normally
+       settles its evaluation promise inside the resume; one that escapes to here is this evaluation's, and
+       `-1` with the throw live is exactly how every other failure in this function leaves it. */
+    for (;;) {
+        JSValue pcv;
+        if (!JS_ResumeParkedFlow(ctx->rt, &pcv))
+            break;
+        if (JS_IsException(pcv))
+            return -1;
+        JS_FreeValue(ctx, pcv);
+    }
     return 0;
 }
 
@@ -99531,11 +99586,14 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
     }
 }
 
-/* The slot's resume. reaction_flow_step leaves any exception on the context, which is where the pump's caller
-   reads it from — the same place the job wrapper's return value ended up. */
+/* The slot's resume. reaction_flow_step's JS_EXCEPTION marker carries no reference and the throw it names is the
+   one live in the context, so the marker is dropped here and the THROW is the completion — which JS_ResumeParkedFlow
+   reads off the context and reports through its `pres`. It used to be reported by nothing at all: the sentence that
+   stood here said the pump's caller read the exception off the context, and the interleaving host had no such read,
+   so an uncaught completion from this half of a job stood in the per-runtime slot until the next flow found it. */
 static void js_reaction_park_resume(JSContext *ctx, void *opaque)
 {
-    reaction_flow_step(ctx, (JSReactionFlow *)opaque);
+    JS_FreeValue(ctx, reaction_flow_step(ctx, (JSReactionFlow *)opaque));
 }
 
 /* …AND THE SAME RELEASE FOR A PARK THAT WILL NEVER RUN — WHICH IS JS_FlowFree'S TWO STEPS, NOT reaction_flow_free

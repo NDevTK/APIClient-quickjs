@@ -673,9 +673,18 @@ static void agent_start(void *arg)
            the resume razor forbids — or is never resumed at all and the agent silently stops mid-script.
            Three pumps with two of them transparent is the same class of gap as one call spelling behaving
            differently from another: the property has to hold wherever a flow can park, not where we happened
-           to look. */
-        while (JS_ResumeParkedFlow(JS_GetRuntime(ctx)))
-            ;
+           to look.
+           AND THE COMPLETION IS TAKEN, exactly as the job below it is: a parked continuation is the LATE half
+           of a job, so an uncaught throw out of one is reported the way an uncaught throw out of a job is.
+           Leaving it in the per-runtime slot is what let it reach the next evaluation. */
+        for (;;) {
+            JSValue pcv;
+            if (!JS_ResumeParkedFlow(JS_GetRuntime(ctx), &pcv))
+                break;
+            if (JS_IsException(pcv))
+                js_std_dump_error(ctx);
+            JS_FreeValue(ctx, pcv);
+        }
         host_pump_atomics_async(JS_GetRuntime(ctx), false);
         ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
         if (ret < 0) {
@@ -1537,9 +1546,27 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
             JSContext *ctx1;
             /* THE PUMP: a flow parked inside job-driven code resumes BEFORE any queued job — a forced preempt
                must not reorder observable microtasks. With one flow that is immediately, which is exactly what
-               the scheduler decides when nothing else is runnable. */
-            while (JS_ResumeParkedFlow(JS_GetRuntime(ctx)))
-                ;
+               the scheduler decides when nothing else is runnable.
+               ITS COMPLETION IS THE TEST'S, taken here and reported exactly as the job below reports one: a
+               parked continuation is the LATE half of a job, so an uncaught throw out of one is a failed test
+               and not a value to leave in the runtime for the promise check below to trip over. */
+            {
+                bool parked_abrupt = false;
+                for (;;) {
+                    JSValue pcv;
+                    if (!JS_ResumeParkedFlow(JS_GetRuntime(ctx), &pcv))
+                        break;
+                    if (JS_IsException(pcv))
+                        parked_abrupt = true;
+                    JS_FreeValue(ctx, pcv);
+                    if (parked_abrupt)
+                        break;
+                }
+                if (parked_abrupt) {
+                    res_val = JS_EXCEPTION;
+                    break;
+                }
+            }
             host_pump_atomics_async(JS_GetRuntime(ctx), false);
             ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
             if (ret < 0) {
@@ -2230,9 +2257,20 @@ int run_test262_harness_test(ThreadLocalStorage *tls, const char *filename,
             JSContext *ctx1;
             /* THE PUMP: a flow parked inside job-driven code resumes BEFORE any queued job — a forced preempt
                must not reorder observable microtasks. With one flow that is immediately, which is exactly what
-               the scheduler decides when nothing else is runnable. */
-            while (JS_ResumeParkedFlow(JS_GetRuntime(ctx)))
-                ;
+               the scheduler decides when nothing else is runnable.
+               ITS COMPLETION IS TAKEN AND REPORTED, exactly as the job below it is — a parked continuation is
+               the LATE half of a job, and an uncaught throw out of one used to be left in the per-runtime slot
+               with nothing to read it. */
+            for (;;) {
+                JSValue pcv;
+                if (!JS_ResumeParkedFlow(JS_GetRuntime(ctx), &pcv))
+                    break;
+                if (JS_IsException(pcv)) {
+                    js_std_dump_error(ctx);
+                    ret_code = 1;
+                }
+                JS_FreeValue(ctx, pcv);
+            }
             host_pump_atomics_async(JS_GetRuntime(ctx), false);
             ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
             if (ret < 0) {

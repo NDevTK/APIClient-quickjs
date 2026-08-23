@@ -2088,7 +2088,7 @@ JS_EXTERN uint64_t  JS_SyncDriveToCompletionCount(void);
 /* THE PUMP. A flow that preempts inside job-driven code (an async-generator body) parks here instead of
    re-queuing behind the job FIFO — re-queuing lets other microtasks run first and CHANGES observable
    interleaving. The host must resume parked flows BEFORE draining a job, so a forced preempt stays transparent
-   to ordering:  while (JS_ResumeParkedFlow(rt)) ;  then run one job. */
+   to ordering:  while (JS_ResumeParkedFlow(rt, &completion)) ;  then run one job. */
 typedef void JSFlowParkFn(JSContext *ctx, void *opaque);
 /* …AND HOW TO RELEASE THE SAME REFERENCE WITHOUT RUNNING THE BODY. The slot OWNS its continuation: every park
    site takes a reference and only the resume discharges it, so an embedder that tears a flow down — or pages it
@@ -2107,7 +2107,22 @@ JS_EXTERN bool     JS_HasParkedFlow(JSRuntime *rt);
    "between tasks" — and a sibling built on that belief resumes at a scheduler step that will never re-reach
    the ask. */
 JS_EXTERN bool     JS_HasActivation(JSRuntime *rt);
-JS_EXTERN bool     JS_ResumeParkedFlow(JSRuntime *rt);
+/* RESUME THE PARKED CONTINUATION, AND HAND BACK ITS COMPLETION — `*pres` is JS_UNDEFINED for a normal one and
+   JS_EXCEPTION with the throw still live in the context for an abrupt one, which is JS_FlowResume's `pres`
+   contract and deliberately the same one: a parked continuation IS a piece of a flow, so it completes the way a
+   flow completes, and one contract read at two entries is what stops a host from handling only the entry it
+   happened to think of. Returns false (and writes JS_UNDEFINED) when nothing was parked.
+   IT IS A PARAMETER BECAUSE THE COMPLETION USED TO HAVE NOWHERE TO GO. `JSFlowParkFn` returns void, so every
+   park site left its abrupt completion standing in `rt->current_exception` and relied on prose — "the pump's
+   caller reads it from the context" — to name a reader that one host did not have. That slot is per-RUNTIME
+   while a completion is per-EVALUATION (ECMA-262 §6.2.4 The Completion Record Specification Type; §5.2.4.3
+   Shorthands for Unwrapping Completion Records: "?" propagates an abrupt completion TO THE CALLER), so a throw
+   left in it outlives the evaluation that produced it and is found by whatever the scheduler runs next — under
+   an interleaving host, a different flow's timeline entirely. Taking it here is what makes the slot empty
+   again at the one boundary where it can be.
+   The read is done ONCE, by the pump, rather than by each park site: a fourth site that forgot would report a
+   normal completion over a live throw, which is the exact defect this parameter exists to make impossible. */
+JS_EXTERN bool     JS_ResumeParkedFlow(JSRuntime *rt, JSValue *pres);
 /* A PARKED FLOW IS A PIECE OF ONE FLOW'S TIMELINE, so a host that INTERLEAVES flows must carry it with the flow
    rather than leave it in the runtime. Its continuation owns a suspended async activation and resumes under
    that flow's COW delta; a scheduler that switched to a sibling and resumed it there would run it against the
