@@ -529,6 +529,24 @@ typedef struct JSStepHdr {
        BORROWS the atom the request carries, and released by the shared teardown so an abandon mid-read cannot
        leak it. JS_ATOM_NULL is zero, so a js_mallocz'd state already reads as "no read in flight". */
     JSAtom get_atom;
+    /* WHICH STAGE ISSUED THE KEYED REQUEST THAT IS IN FLIGHT — the half of the two-phase contract that was
+       missing, and the half that makes a keyed resume EXACT rather than merely plausible.
+       A keyed sub-sequence parks on its first call and answers on its second, and the answering branch TAKES
+       the value — so the second call has to be the same call site. That was checked by the KEY, and a key names
+       the PROPERTY rather than the site: two reads of the same key at two stages are indistinguishable by it
+       (STEP_GOTO below says so in as many words: "only when the two call sites happen to name DIFFERENT keys;
+       when they name the same one it says nothing"), the INDEX forms pass JS_ATOM_NULL and were checked by
+       nothing at all, and the own-keys and own-descriptor requests carried no site check of any kind.
+       The STAGE is what the algorithm already declares (JSTrampStepDef.steps) and it is exactly what tells two
+       sites apart, because a machine that has not moved is at the site that parked. A request answered at a
+       stage other than the one that asked is a resume continuing in a DIFFERENT STEP of the algorithm with
+       another step's value in hand — the loss §Time-travel calls a cap, and the one Streams §4.2.4's shutdown
+       shipped: the pipe fulfilled with its destination still locked and nothing said so.
+       ONE STAMP FOR THE THREE KEYED CURSORS rather than one each. They are in flight together only WITHIN one
+       stage — Web IDL's record<> takes the key list and then reads each key — so an overlapping request issued
+       at a DIFFERENT stage is refused where it is ISSUED, which names the machine that walked away from its
+       own request instead of leaving a later end to read a stamp the newer request had overwritten. */
+    uint16_t req_stage;
 } JSStepHdr;
 
 
