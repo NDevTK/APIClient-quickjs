@@ -1728,9 +1728,22 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
        reached it would have handed the driver nothing to run. Nothing pointed at that hole until
        js_step_defs_check_table walked the table, which found it on its first run. A "first" marker earns its id
        only if something asks it a question; DV_STEPDEF_LIST is the list, and it is the one to extend. */
-#define DV_STEPDEF_LIST(F) F(INT8) F(UINT8) F(INT16) F(UINT16) F(INT32) F(UINT32) \
-                           F(BIG_INT64) F(BIG_UINT64) F(FLOAT16) F(FLOAT32) F(FLOAT64)
-#define DV_STEPDEF_ID(N) STEPDEF_DV_GET_##N, STEPDEF_DV_SET_##N,
+/* …and each entry carries the SPEC CITATION of the two accessors it declares, because a coerce-then-compute
+   definition names its own algorithm (see PRIMARGS_DEF_FULL) and eleven kinds × two directions is where a
+   shared name would silently make twenty-two coercions one identity. */
+#define DV_STEPDEF_LIST(F) \
+    F(INT8,       "25.3.4.10 DataView.prototype.getInt8 ( byteOffset )",                             "25.3.4.21 DataView.prototype.setInt8 ( byteOffset, value )") \
+    F(UINT8,      "25.3.4.13 DataView.prototype.getUint8 ( byteOffset )",                            "25.3.4.24 DataView.prototype.setUint8 ( byteOffset, value )") \
+    F(INT16,      "25.3.4.11 DataView.prototype.getInt16 ( byteOffset [ , littleEndian ] )",         "25.3.4.22 DataView.prototype.setInt16 ( byteOffset, value [ , littleEndian ] )") \
+    F(UINT16,     "25.3.4.14 DataView.prototype.getUint16 ( byteOffset [ , littleEndian ] )",        "25.3.4.25 DataView.prototype.setUint16 ( byteOffset, value [ , littleEndian ] )") \
+    F(INT32,      "25.3.4.12 DataView.prototype.getInt32 ( byteOffset [ , littleEndian ] )",         "25.3.4.23 DataView.prototype.setInt32 ( byteOffset, value [ , littleEndian ] )") \
+    F(UINT32,     "25.3.4.15 DataView.prototype.getUint32 ( byteOffset [ , littleEndian ] )",        "25.3.4.26 DataView.prototype.setUint32 ( byteOffset, value [ , littleEndian ] )") \
+    F(BIG_INT64,  "25.3.4.5 DataView.prototype.getBigInt64 ( byteOffset [ , littleEndian ] )",       "25.3.4.16 DataView.prototype.setBigInt64 ( byteOffset, value [ , littleEndian ] )") \
+    F(BIG_UINT64, "25.3.4.6 DataView.prototype.getBigUint64 ( byteOffset [ , littleEndian ] )",      "25.3.4.17 DataView.prototype.setBigUint64 ( byteOffset, value [ , littleEndian ] )") \
+    F(FLOAT16,    "25.3.4.7 DataView.prototype.getFloat16 ( byteOffset [ , littleEndian ] )",        "25.3.4.18 DataView.prototype.setFloat16 ( byteOffset, value [ , littleEndian ] )") \
+    F(FLOAT32,    "25.3.4.8 DataView.prototype.getFloat32 ( byteOffset [ , littleEndian ] )",        "25.3.4.19 DataView.prototype.setFloat32 ( byteOffset, value [ , littleEndian ] )") \
+    F(FLOAT64,    "25.3.4.9 DataView.prototype.getFloat64 ( byteOffset [ , littleEndian ] )",        "25.3.4.20 DataView.prototype.setFloat64 ( byteOffset, value [ , littleEndian ] )")
+#define DV_STEPDEF_ID(N, GALG, SALG) STEPDEF_DV_GET_##N, STEPDEF_DV_SET_##N,
     DV_STEPDEF_LIST(DV_STEPDEF_ID)
 #undef DV_STEPDEF_ID
     STEPDEF_FUNCTION_CALL, STEPDEF_FUNCTION_APPLY, STEPDEF_REFLECT_APPLY, STEPDEF_REFLECT_CONSTRUCT,
@@ -16826,7 +16839,9 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
                    mechanism names no work. The SHAPE identifies the unknown that died and the frames identify
                    the operator or edge that coerced it. The shape projection runs no page code either —
                    key_name answers the concolic's own display form as a real String. */
-                char why[4096];
+                /* SIZED SO THE FRAMES SURVIVE: they are the last field and the only one that names the CALL
+                   SITE, so a message that outgrows the buffer truncates exactly the half a reader needs. */
+                char why[6144];
                 char frames[2048];
                 char shbuf[256];
                 JSValue sv = JS_UNINITIALIZED;
@@ -16850,13 +16865,20 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
                          "(step_toint64_run / _todouble_run / _tolength_run / _toint32_run / _toint32sat_run / "
                          "_tofloat64_run all return JS_STEP_UNKNOWN, and the driver completes the machine with "
                          "the derived unknown). So an arrival here is NEITHER. It is a C BODY doing its own "
-                         "conversion: a coerce-then-compute builtin whose body calls JS_ToFloat64 after "
-                         "PRIMARGS made its arguments primitive (the JS_CFUNC_f_f / f_f_f tail of "
-                         "js_primargs_step is one, and it has no per-builtin name to derive under until each "
-                         "PRIMARGS_DEF declares its own `.algorithm`), or a host component's own conversion. "
+                         "conversion: a coerce-then-compute builtin's GENERIC body, which the declaration hands "
+                         "operands 7.1.1 has made primitive and which then performs the declared family's "
+                         "7.1.4 / 7.1.19 itself with a JS_ToInt32 / JS_ToFloat64 / JS_ToString of its own — "
+                         "7.1.1 over a concolic is the IDENTITY, so the declaration passes one straight through "
+                         "to that call — or a host component's own conversion. (A definition whose body is the "
+                         "JS_CFUNC_f_f / f_f_f prototype is NOT one of them: the machine performs that ToNumber "
+                         "itself through step_tofloat64_run and completes as the unknown derived under the "
+                         "definition's own `.algorithm`, which is why PRIMARGS_DEF takes one.) "
                          "FIX IT AT THAT SITE: derive the result there (js_concolic_derive, naming the "
-                         "operation the spec was performing, as js_math_min_max and decodeURI do), or, where "
-                         "the consumer wants BYTES rather than a value, ask the unknown for its own projection "
+                         "operation the spec was performing, as 19.2.6.1 decodeURI ( encodedURI ) and 22.1.2.1 "
+                         "String.fromCharCode ( ...codeUnits ) do — both RUNNING their real operation on the "
+                         "operand's own example so the derived value carries one, which 20.4.1.1 "
+                         "Symbol ( [ description ] ) cannot because there is no concrete Symbol to run), or "
+                         "where the consumer wants BYTES rather than a value, ask the unknown for its own projection "
                          "(concolic_example / concolic_shape_c) exactly as fetch's URL and the Attr/Element "
                          "text edges do. Never convert here: this boundary owes C a real number, and "
                          "ToPrimitive hands a concolic straight back, so converting is an infinite coercion. "
@@ -22746,9 +22768,19 @@ static void *tramp_step_state_clone(JSContext *ctx, const void *src)
            "deep-fork of a step machine holding a BORROWED link into another machine on this flow's chain — "
            "the sibling's copy would still name the ORIGINAL flow's, so the link has to be re-resolved against "
            "the clone chain before this is allowed");
-    DCHECK(o->outer == NULL && o->delegate == NULL,
-           "deep-fork of a step machine that is nested (an outer machine waiting on it, or an inner it has not "
-           "handed over) — the clone must walk the whole chain so the sibling's links point at its OWN copies");
+    /* `outer` IS NO LONGER REFUSED — it is RELINKED. This clone produces ONE machine and leaves `outer` naming
+       the ORIGINAL requester; tramp_cont_relink_outer walks outward from the clone, clones each link and binds
+       it, which is what the refusal here used to ask for ("the clone must walk the whole chain so the sibling's
+       links point at its OWN copies"). The one consumer that is not that walk is js_step_visit_dup_machine, and
+       the machine it clones is a FORWARDED delegate — it never reached the driver, so it has no outer at all.
+       `delegate` STAYS refused, and it is a different fact rather than the other half of one: the field is live
+       only between the machine's `return 17` and the driver's adoption two statements later, with no request,
+       no opcode and no suspension in between — so a fork that sees one means something suspended where nothing
+       can, exactly as `unknown_operand` below does. */
+    DCHECK(o->delegate == NULL,
+           "deep-fork of a step machine still owning a DELEGATE it has not handed over — the field is live only "
+           "across the `return 17` that names it, so a fork reaching it means something suspended between the "
+           "machine's return and the driver's adoption");
     /* AND NOT WHILE IT IS STANDING ON AN UNKNOWN OPERAND. `unknown_operand` is deliberately absent from every
        machine's `visit` (see JSStepHdr) because it is set only across the return that names it, with nothing
        between it and the driver that could fork; the memcpy below would hand the sibling a reference nobody
@@ -24525,6 +24557,49 @@ static void js_toprim_free(JSContext *ctx, struct JSToPrim *tp)
     js_toprim_free_cb(ctx, tp);
     JS_FreeValue(ctx, tp->obj);
     js_free_rt(ctx->rt, tp);
+}
+
+/* DEEP-FORK OF A 7.1.1 SEQUENCE, and it is written HERE because this is where the ownership list is: the four
+ * dups below are exactly the four releases above, read in the other direction, so a field added to JSToPrim
+ * lands in one function's field of view. It had ONE caller (clone_deep_flow's frame arm) and now has two — the
+ * frame that IS the coercion's method call, and the link walk that finds a sequence a machine is waiting on —
+ * and a second copy of the list at the second site is the drift this placement exists to make impossible.
+ *
+ * WHY THE SIBLING NEEDS ITS OWN. §7.1.1 ToPrimitive ( input [ , preferredType ] ) step 1.d is
+ * "Return ? OrdinaryToPrimitive(input, preferredType)", and §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3
+ * is "For each element name of methodNames, do … Let result be ? Call(method, obj)" — so the sequence is a
+ * CURSOR over « "valueOf", "toString" » (or the reverse) that advances as each of the page's methods returns.
+ * do_toprim_step advances it, frees the finished call's operands, and on a primitive frees the whole record;
+ * two flows sharing one would each walk the order once and each free it.
+ *
+ * WHAT IS SHARED RATHER THAN REBUILT: `obj` is the pre-fork object being coerced and cb[0..2] are this call's
+ * `this`, method and hint string. All four are OWNED here and none is a value the sibling could re-derive
+ * without re-running the page's own property reads — §7.1.1.1 step 3.a is `? Get(obj, name)`, which is
+ * observable.
+ *
+ * WHAT IS NOT RELOCATED, and it is not an omission: `op_byte` points into the CALLER's bytecode, which the
+ * clone shares (`cur_func` is the same JSFunctionBytecode), so it names the same opcode in both timelines;
+ * `slot` is an offset from `sp`. `outer` is left naming the ORIGINAL requester — tramp_cont_relink_outer binds
+ * it, for the reason tramp_step_state_clone's `outer` is left the same way. */
+static struct JSToPrim *js_toprim_clone(JSContext *ctx, const struct JSToPrim *o)
+{
+    struct JSToPrim *n = js_malloc(ctx, sizeof(*n));
+    if (unlikely(!n))
+        return NULL;
+    *n = *o;
+    n->obj   = js_dup(o->obj);
+    n->cb[0] = js_dup(o->cb[0]);
+    n->cb[1] = js_dup(o->cb[1]);
+    n->cb[2] = js_dup(o->cb[2]);
+    /* A METHOD READ IN FLIGHT DOES NOT REACH HERE, and asserting it is what keeps those four a complete list.
+       While `reading` is set the frame on this chain is the [[Get]]'s — §7.1.1 step 1.a's
+       "? GetMethod(input, %Symbol.toPrimitive%)" or §7.1.1.1 step 3.a's "? Get(obj, name)" — whose own kind is
+       the getter's and whose gp_outer is this record, so a fork there is that kind's arm and not this one, and
+       cb[0..2] are not yet the live call's operands. */
+    DCHECK(!o->reading,
+           "deep-fork of a ToPrimitive sequence with a METHOD READ in flight — the frame carrying that read is "
+           "the property-get continuation's, so its clone arm is the one that must adopt this record");
+    return n;
 }
 
 /* ONE LOOP OVER THE WHOLE CHAIN, and the reason is depth. A machine's outer is another machine EXCEPT where a
@@ -44312,6 +44387,151 @@ struct JSArrayJoin;
 static struct JSArrayJoin *js_join_chain_find(const void *st, uint8_t kind);
 static void js_array_join_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
+/* THE REQUESTER CHAIN, CLONED — the half of the snapshot that is not a frame.
+ *
+ * A frame's continuation record says what is waiting for THAT FRAME. It does not say what is waiting for the
+ * RECORD, and that second question has its own answer: `outer`. A step machine that asked for a primitive is
+ * not on any frame — the frame belongs to the coercion METHOD it is waiting on — so a fork inside that method
+ * reached a chain in which the machine was invisible, and the clone shared it. Two flows then advanced one
+ * cursor and both freed it. That was refused by a pair of asserts (one on JSToPrim.outer, one on JSStepHdr.outer)
+ * whose own text named the fix: "the clone must walk the whole chain so the sibling's links point at its OWN
+ * copies". This is that walk.
+ *
+ * IT IS A LOOP AND NOT A RECURSION, for the reason tramp_chain_unwind is: the chain ALTERNATES machine and
+ * sequence links and the PAGE chooses how many —
+ * `[{valueOf(){ return [{valueOf(){…}}].sort() }}].sort()` adds a pair per nesting level — so a C frame per
+ * level of somebody else's object graph is a stack bound the flow machinery exists to not have.
+ *
+ * THE INVARIANT THAT MAKES IT SOUND, asserted in clone_deep_flow rather than assumed here: a record waits on
+ * exactly ONE thing, so it is EITHER a frame's cont_state OR reachable through exactly one `outer` link, never
+ * both. Without it a record would be cloned twice — once by its frame's arm and once by this walk — and the
+ * sibling would hold two half-advanced copies of one cursor. The one place a machine is owned by another
+ * machine (js_step_visit_dup_machine, str.replace's FORWARDED @@replace delegate) is not a counterexample: a
+ * forwarded delegate never reached the driver, so it has no `outer` and is on no chain. */
+
+/* The link a record is waiting to be answered BY. Exhaustive over the kinds a cloned record can carry: every
+   frame continuation clone_deep_flow has an arm for, plus every kind this walk can itself reach. A kind that
+   is absent CRASHES rather than answering "none" — a record whose requester silently reads as absent is the
+   original defect wearing a default. */
+static void *cont_outer_get(void *st, uint8_t kind, uint8_t *out_kind)
+{
+    *out_kind = CONT_NONE;
+    if (!st || kind == CONT_NONE)
+        return NULL;
+    switch (kind) {
+    case CONT_STEP: case CONT_STEP_YIELD:
+        *out_kind = ((JSStepHdr *)st)->outer_kind;
+        return ((JSStepHdr *)st)->outer;
+    case CONT_TOPRIM:
+        *out_kind = ((struct JSToPrim *)st)->outer_kind;
+        return ((struct JSToPrim *)st)->outer;
+    case CONT_PROMISE_EXEC:
+        *out_kind = ((JSPromiseExec *)st)->outer_kind;
+        return ((JSPromiseExec *)st)->outer;
+    case CONT_CONSTRUCT:
+        *out_kind = ((struct JSConstruct *)st)->outer_kind;
+        return ((struct JSConstruct *)st)->outer;
+    case CONT_ITER_CONSUME:
+        *out_kind = ((struct JSIterConsume *)st)->outer_kind;
+        return ((struct JSIterConsume *)st)->outer;
+    case CONT_PROMISE_ALL:
+        /* JSPromiseAll HAS no requester field: a combinator is reached from an opcode and settles a capability,
+           so nothing waits on the record. Stated rather than defaulted — if one is ever added it belongs here,
+           and the DCHECK on the sibling's links is what will say so. */
+        return NULL;
+    case CONT_ASYNC_FROM_SYNC:
+        /* `call_outer` is the requester of an IN-FLIGHT CALL, not of the record, and the wrapper is reached
+           from a for-await opcode. A fork standing on one has a link this walk has never carried. */
+        DCHECK(((struct JSAsyncFromSync *)st)->call_outer == NULL,
+               "deep-fork of an async-from-sync wrapper whose in-flight call has a REQUESTER under it — give "
+               "that link its arm in cont_outer_get/cont_outer_set so the sibling's copy names its own");
+        return NULL;
+    default: break;
+    }
+    {
+#define CONT_OUTER_FMT                                                                                     \
+    "cont_outer_get: a cloned continuation of kind %d was asked what is WAITING on it and this walk does "  \
+    "not know. Give THAT kind its arm here and in cont_outer_set: a requester that reads as absent is a "   \
+    "link the sibling shares with the flow it was forked from"
+        char why[sizeof CONT_OUTER_FMT + 11];
+        snprintf(why, sizeof why, CONT_OUTER_FMT, (int)kind);
+#undef CONT_OUTER_FMT
+        DFAIL(why);
+    }
+    return NULL;
+}
+
+/* The mirror, and it is separate from the read for the reason every other two-sided pair in this file is: the
+   walk reads the ORIGINAL's link and writes the CLONE's, so one function doing both would need the two records
+   to be the same one. */
+static void cont_outer_set(void *st, uint8_t kind, void *outer, uint8_t outer_kind)
+{
+    switch (kind) {
+    case CONT_STEP: case CONT_STEP_YIELD:
+        ((JSStepHdr *)st)->outer = outer; ((JSStepHdr *)st)->outer_kind = outer_kind; return;
+    case CONT_TOPRIM:
+        ((struct JSToPrim *)st)->outer = outer; ((struct JSToPrim *)st)->outer_kind = outer_kind; return;
+    case CONT_PROMISE_EXEC:
+        ((JSPromiseExec *)st)->outer = outer; ((JSPromiseExec *)st)->outer_kind = outer_kind; return;
+    case CONT_CONSTRUCT:
+        ((struct JSConstruct *)st)->outer = outer; ((struct JSConstruct *)st)->outer_kind = outer_kind; return;
+    case CONT_ITER_CONSUME:
+        ((struct JSIterConsume *)st)->outer = outer; ((struct JSIterConsume *)st)->outer_kind = outer_kind; return;
+    default: break;
+    }
+    DFAIL("cont_outer_set: a kind cont_outer_get answered with a link has no way to write one back — the two "
+          "are one accessor read in opposite directions and a kind present in only one of them is a link that "
+          "is cloned and then dropped");
+}
+
+/* Clone ONE link-only record — one that no frame owns, so no frame's arm builds it. The two built here are the
+   two the alternation is made of: a step machine waiting on a coercion, and a coercion sequence waiting on a
+   machine. Everything else CRASHES BY KIND, because a link this cannot copy is a link the sibling would share,
+   and the record it names is what the next agent has to write an arm for. */
+static void *tramp_cont_clone_one(JSContext *ctx, void *st, uint8_t kind)
+{
+    if (kind == CONT_STEP || kind == CONT_STEP_YIELD)
+        return tramp_step_state_clone(ctx, st);
+    if (kind == CONT_TOPRIM)
+        return js_toprim_clone(ctx, (const struct JSToPrim *)st);
+    {
+#define CONT_CLONE_FMT                                                                                       \
+    "tramp_cont_clone_one: a REQUESTER of kind %d is waiting on a forked continuation and this walk has no "  \
+    "arm for it — a step machine and a ToPrimitive sequence are the two it has. Give THAT record its arm "    \
+    "here (dup every field its release frees) and in tramp_cont_free together: the sibling must not share a "  \
+    "record both flows advance and both free"
+        char why[sizeof CONT_CLONE_FMT + 11];
+        snprintf(why, sizeof why, CONT_CLONE_FMT, (int)kind);
+#undef CONT_CLONE_FMT
+        DFAIL(why);
+    }
+    return NULL;
+}
+
+/* Walk OUTWARD from a freshly cloned record whose `outer` still names the original flow's chain, cloning each
+   link and binding it. Returns 0, or -1 on OOM with the partial chain left for the fork's own abort path (the
+   same discipline every other allocation in clone_deep_flow follows). */
+static int tramp_cont_relink_outer(JSContext *ctx, void *clone, uint8_t kind)
+{
+    while (clone) {
+        uint8_t ok;
+        void *o = cont_outer_get(clone, kind, &ok);
+        void *n;
+        if (!o) {
+            /* A kind with NO record — CONT_FOROF_NEXT's enum_rec offset is the whole of what its delivery
+               needs — is carried unchanged: there is nothing to copy and the field the sibling reads is
+               `outer_forof`, which the byte copy already brought. */
+            return 0;
+        }
+        n = tramp_cont_clone_one(ctx, o, ok);
+        if (!n)
+            return -1;
+        cont_outer_set(clone, kind, n, ok);
+        clone = n; kind = ok;
+    }
+    return 0;
+}
+
 static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     JSStackFrame *ob = &s->frame;
     /* Collect the chain deepest(tramp_top)-first .. bottom-last. arr[i].up == arr[i+1]; bottom.up == NULL. */
@@ -44676,46 +44896,17 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                        "that kind through its own arm before this one adopts the pointer");
                 ct->cont_state = ncs;
             } else if (otf->cont_kind == CONT_TOPRIM) {
-                /* A CONCOLIC BRANCH INSIDE A COERCION METHOD. 7.1.1 ToPrimitive drives `@@toPrimitive` /
-                   `valueOf` / `toString` on this chain (see CONT_TOPRIM), so a `toString` that branches on
-                   unknown external input forks exactly where any other callee does — and every `"" + o`,
-                   every `${o}`, every `o == s` and every `obj[o]` in a bundle is one such drive. nodejs.org
-                   stopped here.
-                   THE SEQUENCE IS THE SIBLING'S OWN, for the reason the two arms above give: `do_toprim_step`
-                   ADVANCES this record (it frees the finished call's operands, moves `stage`, and on a
-                   primitive result frees the whole JSToPrim) — so two flows sharing one would each walk the
-                   ordinary-method order once and each free it. What the record NAMES is shared and duped
-                   rather than rebuilt: `obj` is the pre-fork object being coerced, and cb[0..2] are this
-                   call's `this`, method and hint string, all three OWNED here (js_toprim_free_cb frees
-                   exactly them) and none of them a value the sibling could re-derive without re-running the
-                   page's own property reads.
-                   `op_byte` IS NOT RELOCATED and that is not an omission: it points into the CALLER's
-                   bytecode, which the clone shares — `ct->sf.cur_func` is the same JSFunctionBytecode — so it
-                   names the same opcode in both timelines. `slot` is an offset from `sp` and is relative for
-                   the same reason. */
+                /* A CONCOLIC BRANCH INSIDE A COERCION METHOD. §7.1.1 ToPrimitive ( input [ , preferredType ] )
+                   drives `@@toPrimitive` / `valueOf` / `toString` on this chain (see CONT_TOPRIM), so a
+                   `toString` that branches on unknown external input forks exactly where any other callee does
+                   — and every `"" + o`, every `${o}`, every `o == s` and every `obj[o]` in a bundle is one such
+                   drive. nodejs.org stopped here.
+                   THE FIELD LIST LIVES AT js_toprim_clone, beside the release it mirrors, because this is no
+                   longer its only caller: the requester walk below finds sequences no frame owns. */
                 JSToPrim *ots = (JSToPrim *)otf->cont_state;
-                JSToPrim *nts = js_malloc(ctx, sizeof(*nts));
+                JSToPrim *nts = js_toprim_clone(ctx, ots);
 
                 if (!nts) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
-                *nts = *ots;
-                nts->obj = js_dup(ots->obj);
-                nts->cb[0] = js_dup(ots->cb[0]);
-                nts->cb[1] = js_dup(ots->cb[1]);
-                nts->cb[2] = js_dup(ots->cb[2]);
-                /* A METHOD READ IN FLIGHT DOES NOT REACH HERE, and asserting it is what keeps the three dups
-                   above a complete list. While `reading` is set the frame on this chain is the [[Get]]'s, whose
-                   own kind is the getter's and whose `gp_outer` is this record — so a fork there is that kind's
-                   arm and not this one, and cb[0..2] are not yet the live call's operands. */
-                DCHECK(!ots->reading,
-                       "clone_deep_flow: a ToPrimitive sequence forked with a METHOD READ in flight — the "
-                       "frame carrying that read is the property-get continuation's, so its clone arm is the "
-                       "one that must adopt this record");
-                /* An OUTER is a step machine (or an `import()` capability) waiting on this primitive —
-                   MACHINE mode, where the sequence has no interpreter label of its own. Cloning it is that
-                   kind's arm, not this one's; the same sentence the two records above carry. */
-                DCHECK(ots->outer == NULL,
-                       "clone_deep_flow: a ToPrimitive continuation with an OUTER requester under it — clone "
-                       "that kind through its own arm before this one adopts the pointer");
                 ct->cont_state = nts;
                 /* cb[2] IS THE CALL'S ARGUMENT VECTOR (`call_argv = &tp->cb[2]` at toprim_dispatch), an
                    EXTERNAL allocation the generic XL relocation leaves pointing at the ORIGINAL record — the
@@ -72164,8 +72355,10 @@ static int prim_arg_check(JSContext *ctx, JSValueConst v, int hint)
 /* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). This machine is
    SHARED by every coerce-then-compute builtin, and what it performs is not one of their algorithms: it is
    7.1.1 over the arguments each of them DECLARES it coerces, after which the body has no user code left to
-   reach. So the algorithm named here is that operation, and which builtin's body follows it is what the
-   definition's `body` says. */
+   reach. So the STAGE LABELS name that operation — which is the half of a derived unknown's identity that says
+   "this was the declared-argument coercion" — while the ALGORITHM half is the builtin's own, declared at its
+   definition (see PRIMARGS_DEF_FULL). Naming the shared operation in BOTH halves is what would collapse sixty
+   builtins' coercions into one identity. */
 #define PRIMARGS_STAGES(X) \
     X(PRIMARGS_ENTRY,  "7.1.1 over a coerce-then-compute builtin's declared arguments: the leading validation " \
                        "the spec performs BEFORE any coercion (the definition's `precheck`), then the padded " \
@@ -72224,18 +72417,31 @@ static int js_primargs_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     }
     DCHECK(s->hdr.def->body.generic != NULL, "a coerce-then-compute definition with no body");
     /* The f_f / f_f_f prototypes take a DOUBLE, so js_call_c_function did their ToNumber — which is where the whole
-       Math surface reached a page's valueOf from C. The conversion happens here instead, on operands this machine
-       has already made primitive, so it invokes nothing and only throws (a Symbol, a BigInt). The order is
-       argument order, which is the order the spec's ToNumber steps are in. */
+       Math surface reached a page's valueOf from C. The conversion happens here instead, in argument order, which
+       is the order the spec's ToNumber steps are in.
+       AND IT GOES THROUGH THE COERCION SUB-SEQUENCE rather than JS_ToFloat64, because 7.1.4 ToNumber ( argument )
+       over UNKNOWN EXTERNAL INPUT has an answer and the conversion boundary is not where it is given. 7.1.1
+       ToPrimitive over a concolic is the IDENTITY — the value is primitive in the page and wears an Object only
+       as the solver's carrier — so the loop above hands one straight through, and every f_f builtin then asked
+       that boundary for a real double and aborted the whole instance: `Math.floor({orphan0.arg0}.size)` is two
+       lines of a real bundle and one @WHY for the document. step_tofloat64_run reports JS_STEP_UNKNOWN instead,
+       and this machine's completion becomes the unknown derived under the DEFINITION'S OWN algorithm — which is
+       why PRIMARGS_DEF_FULL takes one.
+       On anything else the sub-sequence invokes nothing and can only throw (a Symbol, a BigInt), and it cannot
+       ask for a ToPrimitive: every declared argument is already primitive here, and a REQUEST would be re-entered
+       above as an argument coercion's answer and overwrite the wrong slot. */
     if (s->hdr.def->body_proto == JS_CFUNC_f_f || s->hdr.def->body_proto == JS_CFUNC_f_f_f) {
-        double d0 = 0, d1 = 0;
-        if (JS_ToFloat64(ctx, &d0, s->argp[0]))
-            return -1;
-        if (s->hdr.def->body_proto == JS_CFUNC_f_f_f && JS_ToFloat64(ctx, &d1, s->argp[1]))
-            return -1;
-        s->result = js_float64(s->hdr.def->body_proto == JS_CFUNC_f_f
-                                   ? s->hdr.def->body.f_f(d0)
-                                   : s->hdr.def->body.f_f_f(d0, d1));
+        int nf = s->hdr.def->body_proto == JS_CFUNC_f_f ? 1 : 2;
+        double d[2] = { 0, 0 };
+        for (i = 0; i < nf; i++) {
+            int r = step_tofloat64_run(ctx, &s->hdr, s->argp[i], JS_UNDEFINED, &d[i], out_cb, out_argc);
+            DCHECK(r != 5, "a coerce-then-compute builtin's own ToNumber asked for a ToPrimitive — the argument "
+                           "the declaration says was made primitive is still an object");
+            if (r != 0)
+                return r;
+        }
+        s->result = js_float64(nf == 1 ? s->hdr.def->body.f_f(d[0])
+                                       : s->hdr.def->body.f_f_f(d[0], d[1]));
         return 0;
     }
     /* The BODY's argc is the call's REAL argc, never the padded vector length — exactly what js_call_c_function
@@ -79294,7 +79500,7 @@ static const JSTrampStepDef js_boolean_ctor_def =
 static const JSTrampStepDef js_bigint_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_NUMBER, 1),
       { .generic = js_bigint_constructor }, JS_CFUNC_constructor_or_func, 0, NULL, NULL, NULL, .visit = js_primargs_visit,
-      .algorithm = "7.1.1 ToPrimitive over a coerce-then-compute builtin's declared arguments", .steps = js_primargs_steps };
+      .algorithm = "21.2.1.1 BigInt ( value )", .steps = js_primargs_steps };
 static JSValue js_symbol_constructor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv);
 static int js_symbol_ctor_precheck(JSContext *ctx, const JSStepHdr *h);
 /* 20.4.1.1 Symbol([description]): step 1 rejects a NewTarget, step 2 is `? ToString(description)`, and the rest
@@ -79316,7 +79522,7 @@ static const JSTrampStepDef js_error_tostring_def =
 static const JSTrampStepDef js_symbol_ctor_def =
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, PRIMARGS(0x1, HINT_STRING, 1),
       { .generic = js_symbol_constructor }, JS_CFUNC_constructor_or_func, 0, js_symbol_ctor_precheck, NULL, NULL,
-      .visit = js_primargs_visit, .algorithm = "7.1.1 ToPrimitive over a coerce-then-compute builtin's declared arguments",
+      .visit = js_primargs_visit, .algorithm = "20.4.1.1 Symbol ( [ description ] )",
       .steps = js_primargs_steps };
 static const char *const js_array_indexOf_steps[];
 static const char *const js_array_lastIndexOf_steps[];
@@ -79613,13 +79819,21 @@ static const char *const js_array_fromlike_steps[];
 static const JSTrampStepDef js_array_fromlike_def  = { sizeof(JSArrayFromLike), js_array_fromlike_step, js_array_fromlike_fini, 0, .visit = js_array_fromlike_visit,
                         .algorithm = "23.1.2.1 Array.from, over an array-like source", .steps = js_array_fromlike_steps };
 static const char *const js_primargs_steps[];
-#define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err) \
+/* `algo` IS THE BUILTIN'S OWN ALGORITHM AND THERE IS NO SHARED DEFAULT, because this machine can now COMPLETE
+   an algorithm rather than only coerce for it: a declared argument that is unknown external input ends the
+   coercion with JS_STEP_UNKNOWN, and js_step_unknown_result names the derived value by (algorithm, stage
+   label). One shared string there would give sixty builtins ONE identity, which is decide.c keying
+   `Math.floor(x)`'s branch and `String.fromCharCode(x)`'s branch to the same predicate — an arm pruned by a
+   question nobody asked. The STAGE half stays shared and stays right: what this machine performs is 7.1.1 over
+   the arguments the definition declares, and that is what its labels say. A parameter with no default is what
+   makes forgetting one a compile error rather than a silent collision. */
+#define PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, err, algo) \
     { sizeof(JSPrimArgs), js_primargs_step, js_primargs_fini, (spec), { .proto = (fn) }, JS_CFUNC_##proto, (magic), (pre), (mid), (err), \
       .visit = js_primargs_visit, \
-      .algorithm = "7.1.1 ToPrimitive over a coerce-then-compute builtin's declared arguments", \
+      .algorithm = (algo), \
       .steps = js_primargs_steps }
-#define PRIMARGS_DEF(spec, proto, fn, magic)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL)
-#define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid)  PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, NULL)
+#define PRIMARGS_DEF(spec, proto, fn, magic, algo)                PRIMARGS_DEF_FULL(spec, proto, fn, magic, NULL, NULL, NULL, algo)
+#define PRIMARGS_DEF_PRE(spec, proto, fn, magic, pre, mid, algo)  PRIMARGS_DEF_FULL(spec, proto, fn, magic, pre, mid, NULL, algo)
 static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int isComponent);
 static JSValue js_global_encodeURI(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int isComponent);
 static JSValue js_global_escape(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
@@ -79636,13 +79850,13 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val, int arg
    the site the ToPrimitive forcing function named, and the fix is the mechanism that already exists rather
    than a second one. */
 static JSValue js_bigint_toString(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-static const JSTrampStepDef js_bigint_tostring_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic, js_bigint_toString, 0);
-static const JSTrampStepDef js_decodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_decodeURI, 0);
-static const JSTrampStepDef js_decodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_decodeURI, 1);
-static const JSTrampStepDef js_encodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_encodeURI, 0);
-static const JSTrampStepDef js_encodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_encodeURI, 1);
-static const JSTrampStepDef js_global_escape_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_escape, 0);
-static const JSTrampStepDef js_global_unescape_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_unescape, 0);
+static const JSTrampStepDef js_bigint_tostring_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic, js_bigint_toString, 0, "21.2.3.3 BigInt.prototype.toString ( [ radix ] )");
+static const JSTrampStepDef js_decodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_decodeURI, 0, "19.2.6.1 decodeURI ( encodedURI )");
+static const JSTrampStepDef js_decodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_decodeURI, 1, "19.2.6.2 decodeURIComponent ( encodedURIComponent )");
+static const JSTrampStepDef js_encodeURI_def      = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_encodeURI, 0, "19.2.6.3 encodeURI ( uri )");
+static const JSTrampStepDef js_encodeURIComp_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic_magic, js_global_encodeURI, 1, "19.2.6.4 encodeURIComponent ( uriComponent )");
+static const JSTrampStepDef js_global_escape_def  = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_escape, 0, "B.2.1.1 escape ( string )");
+static const JSTrampStepDef js_global_unescape_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_STRING, 1), generic, js_global_unescape, 0, "B.2.1.2 unescape ( string )");
 static JSValue js_date_setTime(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static int js_date_this_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
@@ -79752,7 +79966,7 @@ static const JSTrampStepDef js_atomics_xor_def   = ATOMICS_DEF(0x6, 3, 0, 1, gen
 static const JSTrampStepDef js_atomics_xchg_def  = ATOMICS_DEF(0x6, 3, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_EXCHANGE);
 static const JSTrampStepDef js_atomics_cmpxchg_def = ATOMICS_DEF(0xE, 4, 0, 1, generic_magic, js_atomics_op, ATOMICS_OP_COMPARE_EXCHANGE);
 static const JSTrampStepDef js_atomics_store_def = ATOMICS_DEF(0x6, 3, 0, 1, generic, js_atomics_store, 0);
-/* 25.4.8 load has no value argument at all, and its access mode is ~read~ */
+/* 25.4.9 Atomics.load ( ta, index ) has no value argument at all, and its access mode is ~read~ */
 static const JSTrampStepDef js_atomics_load_def  = ATOMICS_DEF(0x2, 2, 0, 0, generic_magic, js_atomics_op, ATOMICS_OP_LOAD);
 /* wait and notify are the WAITABLE forms — Int32Array or BigInt64Array only, and wait additionally requires a
    SharedArrayBuffer. Both read rather than write. */
@@ -79764,14 +79978,15 @@ static const JSTrampStepDef js_atomics_wait_def  = ATOMICS_DEF(0xE, 4, 2, 0, gen
    these tests were un-skipped. */
 static const JSTrampStepDef js_atomics_waitasync_def = ATOMICS_DEF(0xE, 4, 2, 0, generic, js_atomics_wait_async, 0);
 static const JSTrampStepDef js_atomics_notify_def = ATOMICS_DEF(0x6, 3, 1, 0, generic, js_atomics_notify, 0);
-/* 25.4.9 isLockFree takes a plain number and no typed array, so it is the ordinary one-argument declaration. */
+/* 25.4.8 Atomics.isLockFree ( size ) takes a plain number and no typed array, so it is the ordinary
+   one-argument declaration. */
 static const JSTrampStepDef js_atomics_islockfree_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic,
-                                                                    js_atomics_isLockFree, 0);
+                                                                    js_atomics_isLockFree, 0, "25.4.8 Atomics.isLockFree ( size )");
 #endif /* CONFIG_ATOMICS */
 static const JSTrampStepDef js_date_setTime_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic,
-                                                                  js_date_setTime, 0, js_date_this_precheck, NULL);
-static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 0);
-static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 1);
+                                                                  js_date_setTime, 0, js_date_this_precheck, NULL, "21.4.4.27 Date.prototype.setTime ( time )");
+static const JSTrampStepDef js_bigint_asUintN_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 0, "21.2.2.2 BigInt.asUintN ( bits, bigint )");
+static const JSTrampStepDef js_bigint_asIntN_def  = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic_magic, js_bigint_asUintN, 1, "21.2.2.1 BigInt.asIntN ( bits, bigint )");
 static int js_gopd_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_gopd_fini(JSContext *ctx, void *st, bool take_result);
 static void js_gopd_visit(JSContext *ctx, void *st, JSStepVisit *v);
@@ -79843,11 +80058,11 @@ static const JSTrampStepDef js_iter_flatmap_def   = ITER_HELPER_NEW_DEF(JS_ITERA
                                                         "27.1.4.6 Iterator.prototype.flatMap", js_iter_flatmap_steps);
 /* resize/grow and the three transfers are the same declared shape: ONE numeric argument, then a tail that runs
    no user code. The receiver validation the spec orders ahead of the coercion is the precheck. */
-static const JSTrampStepDef js_ab_resize_def     = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_resize, JS_CLASS_ARRAY_BUFFER, js_array_buffer_resize_precheck, NULL);
-static const JSTrampStepDef js_sab_grow_def      = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_resize, JS_CLASS_SHARED_ARRAY_BUFFER, js_array_buffer_resize_precheck, NULL);
-static const JSTrampStepDef js_ab_transfer_def   = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER, js_array_buffer_transfer_precheck, NULL);
-static const JSTrampStepDef js_ab_transferImm_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE, js_array_buffer_transfer_precheck, NULL);
-static const JSTrampStepDef js_ab_transferFix_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH, js_array_buffer_transfer_precheck, NULL);
+static const JSTrampStepDef js_ab_resize_def     = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_resize, JS_CLASS_ARRAY_BUFFER, js_array_buffer_resize_precheck, NULL, "25.1.6.6 ArrayBuffer.prototype.resize ( newLength )");
+static const JSTrampStepDef js_sab_grow_def      = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_resize, JS_CLASS_SHARED_ARRAY_BUFFER, js_array_buffer_resize_precheck, NULL, "25.2.5.3 SharedArrayBuffer.prototype.grow ( newLength )");
+static const JSTrampStepDef js_ab_transfer_def   = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER, js_array_buffer_transfer_precheck, NULL, "25.1.6.8 ArrayBuffer.prototype.transfer ( [ newLength ] )");
+static const JSTrampStepDef js_ab_transferImm_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE, js_array_buffer_transfer_precheck, NULL, "ArrayBuffer.prototype.transferToImmutable ( ), the Immutable ArrayBuffer proposal, which ECMA-262 does not number yet");
+static const JSTrampStepDef js_ab_transferFix_def = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_transfer, JS_ARRAY_BUFFER_TRANSFER_TO_FIXED_LENGTH, js_array_buffer_transfer_precheck, NULL, "25.1.6.9 ArrayBuffer.prototype.transferToFixedLength ( [ newLength ] )");
 /* the step table is defined with the machine; the definition here needs its name */
 static const char *const js_regexp_exec_steps[];
 static const JSTrampStepDef js_regexp_exec_def    = { sizeof(JSRegExpExec), js_regexp_exec_step, js_regexp_exec_fini, 0,
@@ -79859,44 +80074,44 @@ static const JSTrampStepDef js_regexp_exec_def    = { sizeof(JSRegExpExec), js_r
    themselves — so a page's `valueOf` containing a loop aborted in `Math.max(o, 1)` while the identical method
    suspended in `o + 1`. They are all the same shape: coerce the named arguments left to right, then compute from
    primitives, which is exactly what PRIMARGS says, so each is ONE line and none of them grows a machine. */
-static const JSTrampStepDef js_math_abs_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_fabs, 0);
-static const JSTrampStepDef js_math_floor_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_floor, 0);
-static const JSTrampStepDef js_math_ceil_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_ceil, 0);
-static const JSTrampStepDef js_math_round_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_round, 0);
-static const JSTrampStepDef js_math_sqrt_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sqrt, 0);
-static const JSTrampStepDef js_math_acos_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_acos, 0);
-static const JSTrampStepDef js_math_asin_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_asin, 0);
-static const JSTrampStepDef js_math_atan_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_atan, 0);
-static const JSTrampStepDef js_math_cos_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cos, 0);
-static const JSTrampStepDef js_math_exp_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_exp, 0);
-static const JSTrampStepDef js_math_log_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log, 0);
-static const JSTrampStepDef js_math_sin_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sin, 0);
-static const JSTrampStepDef js_math_tan_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_tan, 0);
-static const JSTrampStepDef js_math_trunc_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_trunc, 0);
-static const JSTrampStepDef js_math_sign_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sign, 0);
-static const JSTrampStepDef js_math_cosh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cosh, 0);
-static const JSTrampStepDef js_math_sinh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sinh, 0);
-static const JSTrampStepDef js_math_tanh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_tanh, 0);
-static const JSTrampStepDef js_math_acosh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_acosh, 0);
-static const JSTrampStepDef js_math_asinh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_asinh, 0);
-static const JSTrampStepDef js_math_atanh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_atanh, 0);
-static const JSTrampStepDef js_math_expm1_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_expm1, 0);
-static const JSTrampStepDef js_math_log1p_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log1p, 0);
-static const JSTrampStepDef js_math_log2_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log2, 0);
-static const JSTrampStepDef js_math_log10_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log10, 0);
-static const JSTrampStepDef js_math_cbrt_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cbrt, 0);
-static const JSTrampStepDef js_math_f16round_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_f16round, 0);
-static const JSTrampStepDef js_math_fround_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_fround, 0);
-static const JSTrampStepDef js_math_atan2_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), f_f_f, js_math_atan2, 0);
-static const JSTrampStepDef js_math_pow_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), f_f_f, js_math_pow, 0);
-static const JSTrampStepDef js_math_min_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic_magic, js_math_min_max, 0);
-static const JSTrampStepDef js_math_max_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic_magic, js_math_min_max, 1);
-static const JSTrampStepDef js_math_hypot_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic, js_math_hypot, 0);
-static const JSTrampStepDef js_math_imul_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic, js_math_imul, 0);
-static const JSTrampStepDef js_math_clz32_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic, js_math_clz32, 0);
-static const JSTrampStepDef js_str_fromCharCode_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 1), generic, js_string_fromCharCode, 0);
-static const JSTrampStepDef js_str_fromCodePoint_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 1), generic, js_string_fromCodePoint, 0);
-static const JSTrampStepDef js_date_UTC_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 7), generic, js_Date_UTC, 0);
+static const JSTrampStepDef js_math_abs_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_fabs, 0, "21.3.2.1 Math.abs ( x )");
+static const JSTrampStepDef js_math_floor_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_floor, 0, "21.3.2.16 Math.floor ( x )");
+static const JSTrampStepDef js_math_ceil_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_ceil, 0, "21.3.2.10 Math.ceil ( x )");
+static const JSTrampStepDef js_math_round_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_round, 0, "21.3.2.29 Math.round ( x )");
+static const JSTrampStepDef js_math_sqrt_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sqrt, 0, "21.3.2.33 Math.sqrt ( x )");
+static const JSTrampStepDef js_math_acos_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_acos, 0, "21.3.2.2 Math.acos ( x )");
+static const JSTrampStepDef js_math_asin_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_asin, 0, "21.3.2.4 Math.asin ( x )");
+static const JSTrampStepDef js_math_atan_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_atan, 0, "21.3.2.6 Math.atan ( x )");
+static const JSTrampStepDef js_math_cos_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cos, 0, "21.3.2.12 Math.cos ( x )");
+static const JSTrampStepDef js_math_exp_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_exp, 0, "21.3.2.14 Math.exp ( x )");
+static const JSTrampStepDef js_math_log_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log, 0, "21.3.2.21 Math.log ( x )");
+static const JSTrampStepDef js_math_sin_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sin, 0, "21.3.2.31 Math.sin ( x )");
+static const JSTrampStepDef js_math_tan_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_tan, 0, "21.3.2.35 Math.tan ( x )");
+static const JSTrampStepDef js_math_trunc_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_trunc, 0, "21.3.2.37 Math.trunc ( x )");
+static const JSTrampStepDef js_math_sign_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sign, 0, "21.3.2.30 Math.sign ( x )");
+static const JSTrampStepDef js_math_cosh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cosh, 0, "21.3.2.13 Math.cosh ( x )");
+static const JSTrampStepDef js_math_sinh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_sinh, 0, "21.3.2.32 Math.sinh ( x )");
+static const JSTrampStepDef js_math_tanh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_tanh, 0, "21.3.2.36 Math.tanh ( x )");
+static const JSTrampStepDef js_math_acosh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_acosh, 0, "21.3.2.3 Math.acosh ( x )");
+static const JSTrampStepDef js_math_asinh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_asinh, 0, "21.3.2.5 Math.asinh ( x )");
+static const JSTrampStepDef js_math_atanh_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_atanh, 0, "21.3.2.7 Math.atanh ( x )");
+static const JSTrampStepDef js_math_expm1_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_expm1, 0, "21.3.2.15 Math.expm1 ( x )");
+static const JSTrampStepDef js_math_log1p_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log1p, 0, "21.3.2.22 Math.log1p ( x )");
+static const JSTrampStepDef js_math_log2_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log2, 0, "21.3.2.24 Math.log2 ( x )");
+static const JSTrampStepDef js_math_log10_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_log10, 0, "21.3.2.23 Math.log10 ( x )");
+static const JSTrampStepDef js_math_cbrt_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_cbrt, 0, "21.3.2.9 Math.cbrt ( x )");
+static const JSTrampStepDef js_math_f16round_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_f16round, 0, "21.3.2.18 Math.f16round ( x )");
+static const JSTrampStepDef js_math_fround_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), f_f, js_math_fround, 0, "21.3.2.17 Math.fround ( x )");
+static const JSTrampStepDef js_math_atan2_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), f_f_f, js_math_atan2, 0, "21.3.2.8 Math.atan2 ( y, x )");
+static const JSTrampStepDef js_math_pow_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), f_f_f, js_math_pow, 0, "21.3.2.27 Math.pow ( base, exponent )");
+static const JSTrampStepDef js_math_min_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic_magic, js_math_min_max, 0, "21.3.2.26 Math.min ( ...args )");
+static const JSTrampStepDef js_math_max_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic_magic, js_math_min_max, 1, "21.3.2.25 Math.max ( ...args )");
+static const JSTrampStepDef js_math_hypot_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 2), generic, js_math_hypot, 0, "21.3.2.19 Math.hypot ( ...args )");
+static const JSTrampStepDef js_math_imul_def = PRIMARGS_DEF(PRIMARGS(0x3, HINT_NUMBER, 2), generic, js_math_imul, 0, "21.3.2.20 Math.imul ( x, y )");
+static const JSTrampStepDef js_math_clz32_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 1), generic, js_math_clz32, 0, "21.3.2.11 Math.clz32 ( x )");
+static const JSTrampStepDef js_str_fromCharCode_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 1), generic, js_string_fromCharCode, 0, "22.1.2.1 String.fromCharCode ( ...codeUnits )");
+static const JSTrampStepDef js_str_fromCodePoint_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 1), generic, js_string_fromCodePoint, 0, "22.1.2.2 String.fromCodePoint ( ...codePoints )");
+static const JSTrampStepDef js_date_UTC_def = PRIMARGS_DEF(PRIMARGS_ALL | PRIMARGS(0, HINT_NUMBER, 7), generic, js_Date_UTC, 0, "21.4.3.4 Date.UTC ( year [ , month [ , date [ , hours [ , minutes [ , seconds [ , ms ] ] ] ] ] ] )");
 /* new Function(a, b, body) / the generator and async variants. The receiver slot is new_target on a constructor
    step, which is what step 29's GetPrototypeFromConstructor reads. */
 static const char *const js_dynfunc_steps[];
@@ -79911,9 +80126,9 @@ static const JSTrampStepDef js_asyncfn_ctor_def   = DYNFUNC_DEF(JS_FUNC_ASYNC,
 static const JSTrampStepDef js_asyncgenfn_ctor_def= DYNFUNC_DEF(JS_FUNC_ASYNC_GENERATOR,
     "27.4.1.1 AsyncGeneratorFunction ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
 #undef DYNFUNC_DEF
-#define DV_STEPDEF_DEF(N) \
-    static const JSTrampStepDef js_dv_get_##N##_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 2), generic_magic, js_dataview_getValue, JS_CLASS_##N##_ARRAY); \
-    static const JSTrampStepDef js_dv_set_##N##_def = PRIMARGS_DEF_PRE(PRIMARGS(0x3, HINT_NUMBER, 3), generic_magic, js_dataview_setValue, JS_CLASS_##N##_ARRAY, js_dataview_set_precheck, js_dataview_set_midcheck);
+#define DV_STEPDEF_DEF(N, GALG, SALG) \
+    static const JSTrampStepDef js_dv_get_##N##_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 2), generic_magic, js_dataview_getValue, JS_CLASS_##N##_ARRAY, GALG); \
+    static const JSTrampStepDef js_dv_set_##N##_def = PRIMARGS_DEF_PRE(PRIMARGS(0x3, HINT_NUMBER, 3), generic_magic, js_dataview_setValue, JS_CLASS_##N##_ARRAY, js_dataview_set_precheck, js_dataview_set_midcheck, SALG);
 DV_STEPDEF_LIST(DV_STEPDEF_DEF)
 #undef DV_STEPDEF_DEF
 static const char *const js_num_ctor_steps[];
@@ -81941,7 +82156,7 @@ static const JSTrampStepDef *const js_tramp_step_defs[STEPDEF_COUNT] = {
     [STEPDEF_GENERATOR_FUNCTION_CTOR] = &js_genfn_ctor_def,
     [STEPDEF_ASYNC_FUNCTION_CTOR] = &js_asyncfn_ctor_def,
     [STEPDEF_ASYNC_GENERATOR_FUNCTION_CTOR] = &js_asyncgenfn_ctor_def,
-#define DV_STEPDEF_ROW(N) [STEPDEF_DV_GET_##N] = &js_dv_get_##N##_def, [STEPDEF_DV_SET_##N] = &js_dv_set_##N##_def,
+#define DV_STEPDEF_ROW(N, GALG, SALG) [STEPDEF_DV_GET_##N] = &js_dv_get_##N##_def, [STEPDEF_DV_SET_##N] = &js_dv_set_##N##_def,
     DV_STEPDEF_LIST(DV_STEPDEF_ROW)
 #undef DV_STEPDEF_ROW
     [STEPDEF_NUM_TOSTRING]    = &js_num_tostring_def,
@@ -86542,11 +86757,75 @@ static JSValue js_thisStringValue(JSContext *ctx, JSValueConst this_val)
     return JS_ThrowTypeError(ctx, "not a string");
 }
 
+/* §22.1.2.1 String.fromCharCode ( ...codeUnits ) RUN OVER THE OPERANDS' OWN EXAMPLES — the concrete this
+   engine really has for each code unit, so a derived unknown carries what the function really produces rather
+   than a placeholder. §solver models a spec codec faithfully and never enumerates or predicts it, which is why
+   this RE-ENTERS the same walk a page with known values takes instead of restating it.
+   A code unit with NO example makes the whole result exampleless, and that is the honest answer rather than a
+   thin one: §@H only lets a value the code DETERMINED become concrete, and defaulting a missing example to 0
+   would put a NUL the page never computed into a string a later sink reads back. */
+static JSValue js_str_fromcharcode_example(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    StringBuffer b_s, *b = &b_s;
+    int i;
+
+    string_buffer_init(ctx, b, argc);
+    for (i = 0; i < argc; i++) {
+        JSValue ex = js_concolic_operand(ctx, argv[i]);   /* UNINITIALIZED when argv[i] is a known primitive */
+        bool owned = !JS_IsUninitialized(ex);
+        JSValueConst v = owned ? (JSValueConst)ex : argv[i];
+        int32_t c;
+        bool fail = owned && JS_IsUndefined(ex);          /* the unknown carries no concrete code unit */
+
+        DCHECK(!owned || !(JS_IsObject(ex) || JS_IsSymbol(ex)),
+               "an unknown's example is not an operable primitive — an example rides the value the interpreter "
+               "actually produced, so a producer attached something this engine never computed");
+        if (!fail)
+            fail = JS_ToInt32(ctx, &c, v) < 0 || string_buffer_putc16(b, c & 0xffff) < 0;
+        if (owned)
+            JS_FreeValue(ctx, ex);
+        if (fail) {
+            /* The marker is returned rather than the throw swallowed here: js_concolic_derive takes a model
+               run's exception out of the context at the ONE point every derivation converges on, and a value
+               returned with one still pending is a throw from an expression that never threw. */
+            string_buffer_free(b);
+            return JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
+        }
+    }
+    return string_buffer_end(b);
+}
+
 static JSValue js_string_fromCharCode(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv)
 {
     int i;
     StringBuffer b_s, *b = &b_s;
+
+    /* §22.1.2.1 String.fromCharCode ( ...codeUnits ) OVER UNKNOWN EXTERNAL INPUT. Step 2.a is "Let nextCU be
+       the code unit whose numeric value is ℝ(? ToUint16(next))", and §7.1.11 ToUint16 ( argument ) step 1 is
+       §7.1.4 ToNumber ( argument ) — so this loop IS that coercion. The declaration's own coercion is §7.1.1
+       ToPrimitive, which over a concolic is the identity (the value is primitive in the page and wears an
+       Object only as the solver's carrier), so unknown input arrives here uncoerced and JS_ToInt32 below asked
+       the conversion boundary for a real double, which owes C one and can only abort — taking the whole
+       document's findings with it. A real bundle's own decoder is `String.fromCharCode(x.charCode)` over an
+       argument it was handed, which is how this was found.
+       ONE unknown code unit makes the WHOLE result unknown, which is the rule §23.1.3.18
+       Array.prototype.join ( separator )'s site already states and for the same reason: a string built out of a code unit nobody has is a string
+       nobody has, and keeping the known prefix would be a value the page never computed. The derivation keeps
+       the operand's source and root, so a branch over the result still forks and an @S candidate still injects
+       at the source that fed it. §7.1.11 cannot throw on a Number, and the declaration's prim_arg_check has
+       already rejected a Symbol, so there is no throw arm here to fork. */
+    for (i = 0; i < argc; i++) {
+        JSValue c;
+        if (!js_value_is_concolic(argv[i]))
+            continue;
+        c = js_concolic_derive(ctx, argv[i], "String.fromCharCode",
+                               js_str_fromcharcode_example(ctx, argc, argv));
+        DCHECK(!JS_IsUninitialized(c),
+               "the concolic derivation declined an operand this function had already recognised as unknown "
+               "external input — the value semantics were installed without the builtin-derivation hook");
+        return c;
+    }
 
     // shortcut for single argument common case
     if (argc == 1 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
