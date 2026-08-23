@@ -28542,6 +28542,10 @@ void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, vo
     rt->parked_flow.free_fn = free_fn; rt->parked_flow.opaque = opaque;
 }
 bool JS_HasParkedFlow(JSRuntime *rt) { return rt->parked_flow.fn != NULL; }
+/* See quickjs.h. The frame chain is what "the page called into this" means; nothing else in the runtime states
+   it, and every other candidate (a flow's frame handle, the tramp-frame count, the step-machine count) is
+   either NULL during a job or counts every PARKED flow's chain as well as the running one. */
+bool JS_HasActivation(JSRuntime *rt) { return rt->current_stack_frame != NULL; }
 bool JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn,
                        JSFlowParkFreeFn **pfree, void **popaque) {
     if (!rt->parked_flow.fn) return false;

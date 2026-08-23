@@ -2100,6 +2100,13 @@ typedef void JSFlowParkFn(JSContext *ctx, void *opaque);
 typedef void JSFlowParkFreeFn(JSContext *ctx, void *opaque);
 JS_EXTERN void     JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque);
 JS_EXTERN bool     JS_HasParkedFlow(JSRuntime *rt);
+/* IS ANY JS ACTIVATION ON THIS THREAD RIGHT NOW — the runtime's current stack frame, exported because nothing
+   outside the interpreter can otherwise tell engine code running BETWEEN a flow's tasks from engine code the
+   page called into. A flow's own suspended-frame handle answers neither question: it is NULL while a queued
+   job's callback runs, so a consumer that read it would call a builtin invoked from a promise reaction
+   "between tasks" — and a sibling built on that belief resumes at a scheduler step that will never re-reach
+   the ask. */
+JS_EXTERN bool     JS_HasActivation(JSRuntime *rt);
 JS_EXTERN bool     JS_ResumeParkedFlow(JSRuntime *rt);
 /* A PARKED FLOW IS A PIECE OF ONE FLOW'S TIMELINE, so a host that INTERLEAVES flows must carry it with the flow
    rather than leave it in the runtime. Its continuation owns a suspended async activation and resumes under
