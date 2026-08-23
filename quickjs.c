@@ -26401,10 +26401,23 @@ static const JSTrampStepDef js_afs_cont_def;
 static void js_async_from_sync_end(JSContext *ctx, struct JSAsyncFromSync *s);
 static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 static __exception int remainingElementsCount_add(JSContext *ctx, JSValueConst resolve_element_env, int addend);
-/* arr.sort(cmpFn) with a NORMAL bytecode comparator: a SUSPENDABLE bottom-up (iterative) stable merge sort whose
-   ONLY suspension point is cmp(array[l], array[r]) inside the inner merge. All algorithm state (width, block
-   index, merge cursors) lives in the heap struct, so no C-stack recursion — a comparator body loop preempts and
-   the sort resumes byte-identically. O(n log n), stable. Default/native-comparator sorts stay on rqsort. */
+/* 23.1.3.30.1 SortIndexedProperties ( obj, length, sortCompare, holes ) step 4 — "Sort items using an
+   implementation-defined sequence of calls to sortCompare" — as a SUSPENDABLE bottom-up (iterative) stable merge
+   sort. All algorithm state (width, block index, merge cursors, which buffer holds the data) lives in the heap
+   struct, so there is no C-stack recursion and the sort resumes byte-identically at any depth.
+
+   IT RESTS AT EVERY ELEMENT, not only at the page's code. A comparator call parks and so do the default
+   ordering's two ToStrings, but between two of those the merge used to run an unbounded stretch of engine work:
+   `[…].sort()` over primitives reaches NO page code at all, so the whole O(n log n) walk of an array the page
+   grew ran inside one def->step(). Being O(1) is what makes a C body safe to leave un-parkable, not running no
+   user code (JS_STEP_YIELD says so), so ONE element moves from a source run to the output per entry and the
+   scheduler is offered the next.
+
+   PING-PONG, so there is no block copy-back. A copy-back is a single pass over the block, and the last width's
+   block IS the whole array — the same un-parkable page-sized span one level down. Each width pass merges the
+   source buffer into the other one and the two swap; the elements are MOVED (sort_slot_move), so at every rest
+   point each one is named by exactly one slot of exactly one buffer and every other slot is empty, which is
+   what lets both buffers declare an exact live range to the fork and the teardown. */
 struct ValueSlot;
 typedef struct JSArraySort {
     JSStepHdr hdr;                  /* MUST be first: the generic step driver casts the state to JSStepHdr * and
@@ -26413,11 +26426,18 @@ typedef struct JSArraySort {
                                        the teardown. */
     JSValue obj;                    /* the array object (owned) */
     JSValueConst method;            /* the comparator (borrowed from the caller's live stack) */
-    struct ValueSlot *array, *tmp;  /* present-non-undefined elements + merge scratch */
-    int64_t n;                      /* count in array[] */
+    /* THE TWO PING-PONG BUFFERS, both `len` slots, both owning. They are interchangeable BY CONSTRUCTION —
+       one allocation shape, one live range — because the merge swaps them, and a swap between a `len`-slot
+       array and an `n`-slot one would leave the visit's declared capacity naming the wrong allocation. */
+    struct ValueSlot *array, *tmp;
+    int64_t n;                      /* count of gathered elements; both buffers hold them within [0, n) */
     int64_t len, undefined_count;
     int64_t width, i, lo, mid, hi, l, r, k;   /* bottom-up merge-sort cursors */
-    uint8_t pending;                /* a cmp(array[l],array[r]) result is awaited */
+    uint8_t flip;                   /* 0 = the elements are in `array`, 1 = in `tmp`. The merge re-derives its
+                                       source and destination from this on EVERY entry rather than caching a
+                                       pointer across a rest point, and normalises it to 0 before it returns, so
+                                       nothing downstream (the write-back, the teardown) has to ask. */
+    uint8_t pending;                /* a cmp(src[l],src[r]) result is awaited */
     uint8_t cmp_ph;                 /* the DEFAULT ordering coerces two operands; this says which one is due.
                                        The header's str_phase resumes each ToString, this says whose. */
     int64_t col_i;                  /* the COLLECT cursor: which index is being gathered */
@@ -26425,13 +26445,14 @@ typedef struct JSArraySort {
                                        tells the teardown which slots the writeback has not consumed yet. */
     int present;                    /* HasProperty(O, k) for that index — sort skips holes */
     JSValue coerced;                /* the string a ToString delivered, until the slot adopts it (owned) */
-    JSValue cmpres;                 /* the comparator's RESULT, held across its own ToNumber (owned). 23.1.3.30
-                                       SortCompare step 3.a is `ToNumber(? Call(comparator, …))` and the operand
-                                       of that ToNumber is the page's value, so an object result runs its
-                                       valueOf/@@toPrimitive — which is a suspension point like any other and
+    JSValue cmpres;                 /* the comparator's RESULT, held across its own ToNumber (owned).
+                                       23.1.3.30.2 CompareArrayElements ( x, y, comparator ) step 4.a is
+                                       `Let result be ? ToNumber(? Call(comparator, undefined, « x, y »))` and
+                                       the operand of that ToNumber is the page's value, so an object result runs
+                                       its valueOf/@@toPrimitive — a suspension point like any other, which
                                        therefore cannot live in a C local across it. */
     JSValue copy;                   /* toSorted's ArrayCreate(len), until it becomes the thing being sorted (owned) */
-    JSValue cb_args[4];             /* [this=undefined, method, array[l].val, array[r].val]; call_argv=&cb_args[2], argc=2 */
+    JSValue cb_args[4];             /* [this=undefined, method, src[l].val, src[r].val]; call_argv=&cb_args[2], argc=2 */
 } JSArraySort;
 static int js_array_sort_step(JSContext *ctx, struct JSArraySort *s, JSValue res, JSValueConst out_args[2],
                               JSValue **out_cb, int *out_argc);
@@ -26443,7 +26464,7 @@ static void js_array_sort_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
    js_typed_array_sort drove cutils' rqsort with js_TA_cmp_generic, which called the comparator with JS_Call: the
    sort's whole state was the C stack, so the comparator could not suspend at any depth — a DRIVE-TO-COMPLETION,
-   not merely an unrouted call. Two more of the page's operations rode inside that comparator: 23.2.4.7 step 2.a
+   not merely an unrouted call. Two more of the page's operations rode inside that comparator: 23.2.4.8 step 2.a
    is `ToNumber(? Call(comparator, …))`, coerced there with JS_ToFloat64Free.
 
    Making it a machine also makes it the SPEC's algorithm. SortIndexedProperties reads every element into a List
@@ -26452,9 +26473,10 @@ static void js_array_sort_visit(JSContext *ctx, void *st, JSStepVisit *v);
    survive one that resized. A snapshot of Numbers and BigInts needs neither: the elements cannot be reached
    again, and step 9's write-back is where a shrunk buffer shows up, as the no-op 10.4.5.5 makes it.
 
-   The DEFAULT ordering (no comparator) is not a fallback beside this and is not tracked as one: 23.2.4.7 steps
-   3-9 are a numeric comparison of two elements the buffer holds, reaching no property, no coercion and no
-   callable. It is the raw in-place sort, run inside stage 0, and nothing about it can suspend. */
+   The DEFAULT ordering (no comparator) is not a fallback beside this and is not tracked as one: 23.2.4.8
+   CompareTypedArrayElements steps 3-10 are a numeric comparison of two elements the buffer holds, reaching no
+   property, no coercion and no callable. It is the raw in-place sort, run inside stage 0, and nothing about it
+   can suspend. */
 typedef struct JSTASort {
     JSStepHdr hdr;          /* MUST be first: the generic step driver casts the state to JSStepHdr * */
     JSValue obj;            /* what the sorted list is written to — the receiver, or toSorted's fresh copy (owned) */
@@ -84333,8 +84355,12 @@ static const char *const js_array_sort_steps[] = {
         "23.1.3.30 step 4 (SortCompare is a new Abstract Closure — sort creates no result object)",
         "23.1.3.30.1 step 3.b.i (kRead is HasProperty(obj, Pk) — sort gathers with SKIP-HOLES)",
         "23.1.3.30.1 step 3.d.i (kValue is Get(obj, Pk))",
-        "23.1.3.30.2 step 3.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))"
-            " / steps 4-5 (the default ordering's ToString(x), ToString(y))",
+        "23.1.3.30.1 SortIndexedProperties step 4 (the implementation-defined sequence of calls to sortCompare),"
+            " resting BETWEEN two of them: one element moves from a source run into the merge's output per"
+            " entry, then the scheduler is offered the next. The comparison it rests around is 23.1.3.30.2"
+            " CompareArrayElements step 4.a (result is ToNumber(Call(comparator, undefined, <<x, y>>))), or"
+            " steps 5-6 (the default ordering's xString is ToString(x), yString is ToString(y)) when no"
+            " comparator was supplied",
         "23.1.3.30 step 8.a (Set(obj, ToString(j), sortedList[j], true))",
         "23.1.3.30 step 10.a (DeletePropertyOrThrow(obj, ToString(j)) for the holes the gather skipped))")
     NULL };
@@ -84345,21 +84371,53 @@ static const char *const js_array_toSorted_steps[] = {
         "23.1.3.34 steps 4-5 (A is ArrayCreate(len); SortCompare is a new Abstract Closure)",
         "23.1.3.34 step 6 (the holes argument is READ-THROUGH-HOLES, so 23.1.3.30.1 step 3.b is not performed)",
         "23.1.3.30.1 step 3.d.i (kValue is Get(O, Pk))",
-        "23.1.3.30.2 step 3.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))"
-            " / steps 4-5 (the default ordering's ToString(x), ToString(y))",
+        "23.1.3.30.1 SortIndexedProperties step 4 (the implementation-defined sequence of calls to sortCompare),"
+            " resting BETWEEN two of them: one element moves from a source run into the merge's output per"
+            " entry, then the scheduler is offered the next. The comparison it rests around is 23.1.3.30.2"
+            " CompareArrayElements step 4.a (result is ToNumber(Call(comparator, undefined, <<x, y>>))), or"
+            " steps 5-6 (the default ordering's xString is ToString(x), yString is ToString(y)) when no"
+            " comparator was supplied",
         "23.1.3.34 step 8.a (CreateDataPropertyOrThrow(A, ToString(j), sortedList[j]))",
         "23.1.3.34 step 8 (read-through-holes gathered every index, so there is nothing past j = len to delete)")
     NULL };
 
-/* read the present, non-undefined elements into s->array (undefined -> the end, holes -> after that), alloc tmp,
-   set up the first merge block. Returns 0 ok / -1 exception (safe to tear down). */
+/* AN EMPTY SLOT, which is what every slot of the ping-pong's destination buffer must be before the merge writes
+   it. A gathered element's `val` is never undefined — 23.1.3.30.2 CompareArrayElements steps 1-3 order the
+   undefineds without comparing them, so the gather counts them instead of giving them slots — which is why an
+   empty slot and a live one are distinguishable at all, and is the whole basis of the two assertions below. */
+static void sort_slot_empty(ValueSlot *v)
+{
+    v->val = JS_UNDEFINED;
+    v->str = NULL;
+    v->pos = 0;
+}
+
+/* MOVE one gathered element from a merge source run into the output. Refcount-NEUTRAL — no dup, no free — so a
+   borrowed view of the value taken before the move (the comparator's operands) still names a live value after
+   it. Emptying the source is not bookkeeping: it is what makes the OWNERSHIP DECLARATION exact. With the
+   ping-pong there is no copy-back, so at every rest point each element is named by exactly ONE slot of exactly
+   one of the two buffers; without the clear the vacated source slot would name it a second time and the fork
+   would hand two flows one reference. */
+static void sort_slot_move(ValueSlot *dst, ValueSlot *src)
+{
+    DCHECK(!JS_IsUndefined(src->val),
+           "the merge moved a source slot that holds no element — a cursor is standing outside the run it names");
+    DCHECK(JS_IsUndefined(dst->val) && dst->str == NULL,
+           "the merge wrote an output slot that still holds an element — the ping-pong's destination is the "
+           "buffer the PREVIOUS pass emptied, so a live element here is one this write is about to lose");
+    *dst = *src;
+    sort_slot_empty(src);
+}
+
+/* read the present, non-undefined elements into s->array (undefined -> counted, holes -> skipped) and empty the
+   ping-pong's other buffer at each index it fills. Returns 0 ok / -1 exception (safe to tear down). */
 /* The receiver half. `method` is hdr.argv[0] — owned by the header for the machine's whole life, which is why
    the state can borrow it. */
 static int js_array_sort_recv(JSContext *ctx, JSArraySort *s)
 {
     int64_t i;
     s->obj = JS_UNDEFINED; s->method = step_arg(&s->hdr, 0); s->array = NULL; s->tmp = NULL;
-    s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0;
+    s->n = 0; s->len = 0; s->undefined_count = 0; s->pending = 0; s->flip = 0;
     s->width = 1; s->i = 0; s->lo = s->mid = s->hi = s->l = s->r = s->k = 0; s->wb = 0;
     s->coerced = JS_UNDEFINED; s->copy = JS_UNDEFINED; s->cmpres = JS_UNDEFINED;
     for (i = 0; i < 4; i++) s->cb_args[i] = JS_UNDEFINED;
@@ -84403,36 +84461,49 @@ static int js_array_sort_collect(JSContext *ctx, JSArraySort *s, JSValue in, JSV
             if (r) return r < 0 ? -1 : r;
             s->hdr.stage = ASORT_HAS;
             if (JS_IsUndefined(v)) {
-                s->undefined_count++;   /* SortCompare puts undefined last, so they need no slot */
+                /* 23.1.3.30.2 steps 1-3 order the undefineds without ever comparing them, so they need no slot
+                   — and that is also what makes an empty slot recognisable (see sort_slot_empty). */
+                s->undefined_count++;
             } else {
-                s->array[s->n].val = v; s->array[s->n].str = NULL; s->array[s->n].pos = s->col_i; s->n++;
+                DCHECK(s->array != NULL && s->tmp != NULL,
+                       "the sort gathered an element with a merge buffer unallocated");
+                s->array[s->n].val = v; s->array[s->n].str = NULL; s->array[s->n].pos = s->col_i;
+                /* THE PING-PONG'S OTHER BUFFER STARTS EMPTY at every index this one fills, one slot per
+                   gathered element, INSIDE the walk that is already per-element. A separate pass to empty it
+                   would be the page-sized un-parkable span the copy-back it replaces already was. */
+                sort_slot_empty(&s->tmp[s->n]);
+                s->n++;
             }
             s->col_i++;
         }
     }
     JS_FreeValue(ctx, in);
     if (s->n > 1) {
-        s->tmp = js_malloc(ctx, (size_t)s->n * sizeof(ValueSlot));
-        if (!s->tmp) return -1;
         s->lo = 0; s->mid = 1 < s->n ? 1 : s->n; s->hi = 2 < s->n ? 2 : s->n;   /* first block, width=1 */
         s->l = 0; s->r = s->mid; s->k = 0;
     }
     return 0;
 }
 
-/* Drive the merge until the next comparison is needed (return 1, out_args = the two element values) or the sort
-   is complete (return 0). `res` (owned) is the comparator's return value for the pending comparison, or JS_UNDEFINED
-   on the first call. Returns -1 on exception. */
+/* Drive the merge by ONE ELEMENT. It returns JS_STEP_YIELD once an element has moved (the scheduler is offered
+   the frontier before the next one), 1 when a comparison of the page's comparator is due (out_args = the two
+   element values), 5 when a default-ordering ToString is, 0 when the sort is complete, -1 on exception.
+   `res` (owned) is the answer to whichever of those the previous entry asked for, or JS_UNDEFINED. */
 static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSValueConst out_args[2],
                               JSValue **out_cb, int *out_argc)
 {
+    /* WHICH BUFFER HOLDS THE ELEMENTS, RE-DERIVED ON EVERY ENTRY and never held across a rest point. The two
+       swap at the end of each width pass, so a pointer taken before a suspension names the buffer the sort was
+       reading LAST pass — the same reason the dense array-search prefix re-derives its fast-array view. */
+    ValueSlot *src = s->flip ? s->tmp : s->array;
+    ValueSlot *dst = s->flip ? s->array : s->tmp;
     int rc;
     if (s->pending) {
         double v;
-        /* SortCompare step 3.a coerces what the comparator RETURNED, and JS_ToFloat64Free did that from C — so
-           a comparator returning an object ran its valueOf in an activation with no flow base, in the one
-           machine that had already been built to park everything else. The result is held on the state because
-           the coercion suspends. */
+        /* 23.1.3.30.2 CompareArrayElements step 4.a coerces what the comparator RETURNED, and JS_ToFloat64Free
+           did that from C — so a comparator returning an object ran its valueOf in an activation with no flow
+           base, in the one machine that had already been built to park everything else. The result is held on
+           the state because the coercion suspends. */
         if (s->hdr.num_phase == NUM_PH_START) {
             DCHECK(JS_IsUndefined(s->cmpres), "a comparator result is already being coerced on this sort");
             s->cmpres = res;
@@ -84443,12 +84514,13 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
         if (rc) return rc < 0 ? -1 : rc;
         JS_FreeValue(ctx, s->cmpres); s->cmpres = JS_UNDEFINED;
         s->pending = 0;
-        /* step 3.b: a NaN v is +0, which a stable sort keeps in original order. `v <= 0` is FALSE for NaN, so
-           every comparison took the right element and `[1,2,3,4].sort(() => NaN)` came out reversed. Asking
+        /* step 4.b: a NaN result is +0𝔽, which a stable sort keeps in original order. `v <= 0` is FALSE for NaN,
+           so every comparison took the right element and `[1,2,3,4].sort(() => NaN)` came out reversed. Asking
            whether v is GREATER than zero is the one form that answers both cases: NaN and 0 alike keep the
            left (earlier) element, which is what stability means. */
-        if (!(v > 0)) s->tmp[s->k++] = s->array[s->l++];
-        else          s->tmp[s->k++] = s->array[s->r++];
+        if (!(v > 0)) sort_slot_move(&dst[s->k++], &src[s->l++]);
+        else          sort_slot_move(&dst[s->k++], &src[s->r++]);
+        return JS_STEP_YIELD;
     } else if (s->hdr.str_phase == STR_PH_START) {
         JS_FreeValue(ctx, res);   /* JS_UNDEFINED on the first call, or a stray value */
         res = JS_UNDEFINED;
@@ -84458,6 +84530,15 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
     for (;;) {
         if (s->width >= s->n) break;                 /* fully sorted (n<=1 lands here immediately) */
         if (s->i >= s->n) {                          /* this width pass done -> next width */
+            /* THE PASS IS OVER: every element has moved into `dst` and `src` is empty, so the next pass reads
+               `dst`. This is where the block COPY-BACK used to be, and the copy-back is what this replaces —
+               it was a single pass over the block with no rest point in it, and at the last width the block IS
+               the whole array. A pointer swap is O(1), which a stage may do; a walk of the page's array is not. */
+            DCHECK(s->k == s->n,
+                   "a merge pass emitted a different number of elements than the sort gathered — the blocks at "
+                   "this width did not tile [0, n)");
+            s->flip ^= 1;
+            { ValueSlot *t = src; src = dst; dst = t; }
             s->width *= 2; s->i = 0;
             if (s->width >= s->n) break;
             s->lo = 0; s->mid = s->width < s->n ? s->width : s->n;
@@ -84466,8 +84547,8 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
             continue;
         }
         /* merge invariants — an active block [lo,hi) with ordered cursors, and the exactly-conserved output
-           count (each element placed into tmp is consumed from exactly one run). A violation is a state-machine
-           bug; crash at its origin (offensive programming) rather than silently mis-sorting. */
+           count (each element placed into the output is consumed from exactly one run). A violation is a
+           state-machine bug; crash at its origin (offensive programming) rather than silently mis-sorting. */
         DCHECK(s->lo <= s->l && s->l <= s->mid && s->mid <= s->r && s->r <= s->hi && s->hi <= s->n, "s->lo <= s->l && s->l <= s->mid && s->mid <= s->r && s->r <= s->hi && s->hi <= s->n");
         DCHECK(s->k - s->lo == (s->l - s->lo) + (s->r - s->mid), "s->k - s->lo == (s->l - s->lo) + (s->r - s->mid)");
         if (s->l < s->mid && s->r < s->hi) {
@@ -84479,8 +84560,9 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
                    comparator branch beside it parked correctly. ToString is not bypassed for identical values
                    (test262 Array/prototype/sort/bug_596_1.js), and ties fall back to original position for
                    stability. The cursors s->l and s->r do not move across a suspension, so the two slots this
-                   re-derives on re-entry are the same two. */
-                ValueSlot *ap = &s->array[s->l], *bp = &s->array[s->r];
+                   re-derives on re-entry are the same two — but they are re-derived from the SOURCE buffer of
+                   the pass this entry is in, which the ping-pong may have swapped since the last one. */
+                ValueSlot *ap = &src[s->l], *bp = &src[s->r];
                 int cmp;
                 if (s->cmp_ph == 0) {
                     if (!ap->str) {
@@ -84503,24 +84585,35 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
                 cmp = js_string_compare(ap->str, bp->str);
                 if (cmp == 0)
                     cmp = (ap->pos > bp->pos) - (ap->pos < bp->pos);
-                if (cmp <= 0) s->tmp[s->k++] = s->array[s->l++];
-                else          s->tmp[s->k++] = s->array[s->r++];
-                continue;
+                if (cmp <= 0) sort_slot_move(&dst[s->k++], &src[s->l++]);
+                else          sort_slot_move(&dst[s->k++], &src[s->r++]);
+                return JS_STEP_YIELD;
             }
-            out_args[0] = s->array[s->l].val;   /* the ONE suspension point (a comparator was supplied) */
-            out_args[1] = s->array[s->r].val;
+            out_args[0] = src[s->l].val;   /* the comparator is the page's code: a CALL, so a real suspension */
+            out_args[1] = src[s->r].val;
             s->pending = 1;
             return 1;
         }
-        while (s->l < s->mid) s->tmp[s->k++] = s->array[s->l++];   /* drain remainders */
-        while (s->r < s->hi)  s->tmp[s->k++] = s->array[s->r++];
-        { int64_t t; for (t = s->lo; t < s->hi; t++) s->array[t] = s->tmp[t]; }   /* copy block back */
+        /* DRAIN a remainder, ONE element per entry. These were two `while` loops that ran to the end of the
+           block, which at the last width is the whole array — and a run drains with no comparison in it, so
+           nothing inside those loops could ever have parked. */
+        if (s->l < s->mid) { sort_slot_move(&dst[s->k++], &src[s->l++]); return JS_STEP_YIELD; }
+        if (s->r < s->hi)  { sort_slot_move(&dst[s->k++], &src[s->r++]); return JS_STEP_YIELD; }
         s->i += 2 * s->width;                        /* next block at this width */
         if (s->i < s->n) {
             s->lo = s->i; s->mid = s->i + s->width < s->n ? s->i + s->width : s->n;
             s->hi = s->i + 2 * s->width < s->n ? s->i + 2 * s->width : s->n;
             s->l = s->lo; s->r = s->mid; s->k = s->lo;
         }
+    }
+    /* THE SORTED LIST MUST BE IN `array` — that is what the write-back reads and what the teardown's boundary
+       (s->wb) is a boundary in — so the ping-pong is normalised here, once, with a pointer swap. Both buffers
+       are `len` slots, which is what makes exchanging them legal. */
+    if (s->flip) {
+        DCHECK(s->array != NULL && s->tmp != NULL,
+               "the merge ended with its elements in a buffer that was never allocated");
+        { ValueSlot *t = s->array; s->array = s->tmp; s->tmp = t; }
+        s->flip = 0;
     }
     return 0;   /* the merge is done: js_array_sort_vstep writes the sorted list back */
 }
@@ -84587,8 +84680,14 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
             if (JS_IsException(s->copy)) { s->copy = JS_UNDEFINED; return -1; }
         }
         if (s->len > 0) {
+            /* BOTH ping-pong buffers, HERE and the same shape. The second one used to be allocated after the
+               gather, at the size the gather turned out to need — which is one slot count for one buffer and
+               another for the other, and the merge SWAPS them. Neither is initialised here: the gather empties
+               the twin of every slot it fills, so an un-gathered slot is never read (see js_array_sort_collect). */
             s->array = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
             if (!s->array) return -1;
+            s->tmp = js_malloc(ctx, (size_t)s->len * sizeof(ValueSlot));
+            if (!s->tmp) return -1;
         }
         s->col_i = 0; s->n = 0;
         s->hdr.stage = ASORT_HAS;
@@ -84604,13 +84703,19 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         r = js_array_sort_step(ctx, s, cb_result, (JSValueConst *)&s->cb_args[2], out_cb, out_argc);   /* consumes cb_result */
         cb_result = JS_UNDEFINED;
         if (r < 0) return -1;
-        if (r == 5) return r;   /* the default ordering's ToString: the driver coerces and re-enters here */
-        if (r != 0) {
+        /* 5 is the default ordering's ToString and JS_STEP_YIELD is the per-element rest point — both are the
+           DRIVER's to act on and this machine's to be re-entered at, unchanged. 1 is the one code this stage
+           translates: a comparison of the page's comparator is due. Spelled as the three codes it is rather
+           than as `r != 0`, because the catch-all is what would silently turn a code nobody routed into a call
+           of the comparator with the merge's operands still on the state. */
+        if (r == 5 || r == JS_STEP_YIELD) return r;
+        if (r == 1) {
             s->cb_args[0] = JS_UNDEFINED;            /* the comparator gets this = undefined */
             s->cb_args[1] = s->method;
             *out_cb = s->cb_args; *out_argc = 2;
             return JS_STEP_CALL;
         }
+        DCHECK(r == 0, "the merge reported a step code this stage does not route");
         if (s->hdr.arg) {
             /* the sorted list goes into A from here on, and A is what the machine yields */
             JS_FreeValue(ctx, s->obj);
@@ -84657,12 +84762,20 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
     }
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The comparator is the page's code and 23.1.3.30 step 3.a runs
-   ToNumber on whatever it returns, so a concolic branch inside either forks the sort mid-merge and each arm
-   merges its own array from there. `method` is BORROWED — a value on the caller's stack, which the frame clone
-   carries — and cb_args are borrowed views of two live slots. The LIVE range of `array` is [wb, n): everything
-   below wb the writeback has already consumed, everything above n was never gathered. `tmp` is merge scratch,
-   written before it is read, so the copy needs storage and none of the contents. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The comparator is the page's code and 23.1.3.30.2
+   CompareArrayElements step 4.a runs ToNumber on whatever it returns, so a concolic branch inside either forks
+   the sort mid-merge and each arm merges its own elements from there. `method` is BORROWED — a value on the
+   caller's stack, which the frame clone carries — and cb_args are borrowed views of two live slots.
+
+   BOTH PING-PONG BUFFERS ARE OWNING, AND THAT IS WHAT `tmp` STOPPED BEING. It was declared a plain `buf`
+   ("written before it is read, so the copy needs storage and none of the contents"), which was true only while
+   every element was copied back into `array` before the merge could rest — the copy-back that is gone. The
+   merge now MOVES elements between the two, so at any rest point each element is in exactly one slot of exactly
+   one buffer and every other slot is empty; both therefore declare the SAME live range [wb, n), and the empty
+   slots cost the fork and the teardown nothing (a dup of undefined and a NULL string are both no-ops). Below wb
+   the write-back has already consumed and released; at or above n nothing was ever gathered.
+   The capacity is `len` for BOTH because the merge exchanges the two pointers — a buffer whose declared
+   capacity did not follow it through that swap would be copied at the wrong size by the very next fork. */
 static void js_array_sort_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSArraySort *s = st;
@@ -84671,7 +84784,7 @@ static void js_array_sort_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->cmpres);    /* a comparator result held across its own ToNumber */
     v->val(ctx, &s->copy);      /* toSorted's result, until the gather is over and it becomes the sorted list */
     v->slots(ctx, &s->array, s->len, s->wb, s->n);
-    v->buf(ctx, (void **)&s->tmp, (size_t)s->n * sizeof(ValueSlot));
+    v->slots(ctx, &s->tmp,   s->len, s->wb, s->n);
 }
 
 static JSValue js_array_sort_vfini(JSContext *ctx, void *st, bool take_result)
@@ -107109,8 +107222,9 @@ static JSValue (*js_ta_getfun(int class_id))(JSContext *ctx, const void *a)
     return NULL;
 }
 
-/* 23.2.4.7 steps 3-9 as the raw in-place sort: with no comparator the comparison reads two elements of the
-   buffer and nothing else, so the whole sort is a computation with no suspension point in it. */
+/* 23.2.4.8 CompareTypedArrayElements steps 3-10 as the raw in-place sort: with no comparator the comparison
+   reads two elements of the buffer and nothing else, so the whole sort is a computation with no suspension
+   point in it. */
 static int (*js_ta_rawcmp(int class_id))(const void *a, const void *b, void *opaque)
 {
     switch (class_id) {
@@ -107167,14 +107281,14 @@ static const char *const js_ta_sort_steps[] = {
     TAS_STAGES(JS_STEP_STAGE_LABEL,
         "23.2.3.29 steps 1-4 and 23.1.3.30.1 steps 1-3 (the comparator check; ValidateTypedArray; the whole "
         "List is read before any comparison)",
-        "23.2.4.7 step 2.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))",
+        "23.2.4.8 CompareTypedArrayElements step 2.a (result is ToNumber(Call(comparator, undefined, <<x, y>>)))",
         "23.2.3.29 step 9.a (Set(obj, ToString(j), sortedList[j], true), the whole write-back)")
     NULL };
 static const char *const js_ta_toSorted_steps[] = {
     TAS_STAGES(JS_STEP_STAGE_LABEL,
         "23.2.3.33 steps 1-5 and 23.1.3.30.1 steps 1-3 (the comparator check; ValidateTypedArray; A is "
         "TypedArrayCreateSameType(O, <<len>>); the whole List is read)",
-        "23.2.4.7 step 2.a (v is ToNumber(Call(comparator, undefined, <<x, y>>)))",
+        "23.2.4.8 CompareTypedArrayElements step 2.a (result is ToNumber(Call(comparator, undefined, <<x, y>>)))",
         "23.2.3.33 step 9.a (Set(A, ToString(j), sortedList[j], true), the whole write-back)")
     NULL };
 
@@ -107249,7 +107363,7 @@ static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue
     if (s->hdr.stage == TAS_MERGE) {
         if (s->pending) {
             double v;
-            /* 23.2.4.7 step 2.a coerces what the comparator RETURNED, so an object result runs its valueOf. It
+            /* 23.2.4.8 CompareTypedArrayElements step 2.a coerces what the comparator RETURNED, so an object result runs its valueOf. It
                is held on the state because that coercion suspends. */
             if (s->hdr.num_phase == NUM_PH_START) {
                 DCHECK(JS_IsUndefined(s->cmpres), "a comparator result is already being coerced on this sort");
