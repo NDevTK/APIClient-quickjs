@@ -2100,12 +2100,19 @@ JS_EXTERN int      JS_TrampFrameCount(JSRuntime *rt);
 JS_EXTERN uint64_t  JS_DriveToCompletionCount(void);
 JS_EXTERN uint64_t  JS_SyncDriveToCompletionCount(void);
 
-/* THE PUMP. A flow that preempts inside job-driven code (an async-generator body) parks here instead of
-   re-queuing behind the job FIFO — re-queuing lets other microtasks run first and CHANGES observable
-   interleaving. The host must resume parked flows BEFORE draining a job, so a forced preempt stays transparent
-   to ordering:  while (JS_ResumeParkedFlow(rt, &completion)) ;  then run one job. */
+/* THE PUMP. A flow that preempts inside job-driven code (an async-generator body) parks instead of re-queuing
+   behind the job FIFO — re-queuing lets other microtasks run first and CHANGES observable interleaving. The
+   host must resume parked flows BEFORE draining a job, so a forced preempt stays transparent to ordering:
+   while (JS_ResumeParkedFlow(rt, &completion)) ;  then run one job.
+   HOW MANY MAY BE PARKED AT ONCE IS NOT A NUMBER THE ENGINE PICKS. The record used to be a single struct on the
+   JSRuntime and a second park aborted; a step reaches as many bases as it reaches, both in a ROW (a host drain
+   settling several fetch replies, each its own call root) and NESTED (an async completion settling its promise
+   while the reaction that resumed it is still on the C stack). The record now lives on the base it suspends and
+   the runtime holds only their ORDER, oldest first — which is the transparency contract as a data structure,
+   since continuations then resume in the order they would have completed had no preempt fired. The `while` above
+   is unchanged: it always was the drain, and it now has more than one thing to drain. */
 typedef void JSFlowParkFn(JSContext *ctx, void *opaque);
-/* …AND HOW TO RELEASE THE SAME REFERENCE WITHOUT RUNNING THE BODY. The slot OWNS its continuation: every park
+/* …AND HOW TO RELEASE THE SAME REFERENCE WITHOUT RUNNING THE BODY. The park OWNS its continuation: every park
    site takes a reference and only the resume discharges it, so an embedder that tears a flow down — or pages it
    out to a cold tier, where a recipe replays the WORK and frees none of the MEMORY — had no way to give it back
    and dropped the last pointer to an activation and its whole heap call chain. Recorded BESIDE the resume so
@@ -2113,7 +2120,8 @@ typedef void JSFlowParkFn(JSContext *ctx, void *opaque);
    that compares `fn` against the known park functions, which is a table that must be edited every time a fourth
    site parks and is silently wrong until someone notices. */
 typedef void JSFlowParkFreeFn(JSContext *ctx, void *opaque);
-JS_EXTERN void     JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque);
+/* Parking is the ENGINE's, never an embedder's: a park is a property of a suspended flow BASE, and a base is
+   not a thing outside quickjs.c can hold. There is no JS_ParkFlow — what a host has is the drain below. */
 JS_EXTERN bool     JS_HasParkedFlow(JSRuntime *rt);
 /* IS ANY JS ACTIVATION ON THIS THREAD RIGHT NOW — the runtime's current stack frame, exported because nothing
    outside the interpreter can otherwise tell engine code running BETWEEN a flow's tasks from engine code the
@@ -2138,17 +2146,24 @@ JS_EXTERN bool     JS_HasActivation(JSRuntime *rt);
    The read is done ONCE, by the pump, rather than by each park site: a fourth site that forgot would report a
    normal completion over a live throw, which is the exact defect this parameter exists to make impossible. */
 JS_EXTERN bool     JS_ResumeParkedFlow(JSRuntime *rt, JSValue *pres);
-/* A PARKED FLOW IS A PIECE OF ONE FLOW'S TIMELINE, so a host that INTERLEAVES flows must carry it with the flow
-   rather than leave it in the runtime. Its continuation owns a suspended async activation and resumes under
-   that flow's COW delta; a scheduler that switched to a sibling and resumed it there would run it against the
-   wrong heap, and one that simply left it behind would DROP it — the one thing the frontier may never do.
-   So the switch takes it out and the switch back puts it in, exactly as the delta and the decision cursor swap.
-   Take returns false and writes nothing when no flow is parked; Put with a NULL fn restores nothing. A host
-   that runs ONE flow (run-test262) never needs either: its slot is emptied before anything else runs. */
-JS_EXTERN bool     JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn,
-                                        JSFlowParkFreeFn **pfree, void **popaque);
-JS_EXTERN void     JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn,
-                                    void *opaque);
+/* A PARKED FLOW IS A PIECE OF ONE FLOW'S TIMELINE, so a host that INTERLEAVES flows must carry them with the
+   flow rather than leave them in the runtime. Each continuation owns a suspended async activation and resumes
+   under that flow's COW delta; a scheduler that switched to a sibling and resumed one there would run it
+   against the wrong heap, and one that simply left it behind would DROP it — the one thing the frontier may
+   never do. So the switch takes them out and the switch back puts them in, exactly as the delta and the
+   decision cursor swap.
+   THE UNIT IS THE SET, and it is the set for the same reason the record moved onto the base: a flow may have
+   parked several within one step, and a take that moved only the first would leave the rest in the runtime for
+   whichever flow ran next — both failure modes above, applied to all but one. The handle is opaque and carries
+   its own order; NULL means "no parks", which is what an empty set and an absent one both are. A host that runs
+   ONE flow (run-test262) needs neither: it drains before anything else runs. */
+JS_EXTERN void    *JS_TakeParkedFlows(JSRuntime *rt);
+JS_EXTERN void     JS_PutParkedFlows(JSRuntime *rt, void *parked);
+/* …AND THE SET THAT WILL NEVER RUN, released through each member's own disposer — a flow the host tears down or
+   pages out to the cold tier. It is the ONLY way a park ends without being resumed: the base teardowns assert
+   that no park still names them, so a flow released around this leaves the pump's order pointing into freed
+   memory. Takes the handle a JS_TakeParkedFlows returned and empties it. */
+JS_EXTERN void     JS_FreeParkedFlows(void *parked);
 /* Frame-snapshot fork: deep-copy a SUSPENDED flow into an INDEPENDENT clone that resumes from the same point.
    No fallback — an un-built frame shape (deep tramp chain / live closures) crashes loud. */
 JS_EXTERN JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow);

@@ -453,15 +453,19 @@ struct JSRuntime {
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
-    /* THE PUMP'S PARKED SLOT — see JS_ParkFlow. It lives on the RUNTIME because that is what it is: the flow it
-       holds owns an async activation belonging to THIS runtime's heap, and resuming it from anywhere else frees a
-       frame that another runtime is running. It was a process global with the rt parameter accepted and ignored,
-       which made run-test262's worker threads share one slot: thread A parked its flow, thread B's pump resumed
-       it, and the abort surfaced as "async_func_free: freeing a RUNNING async frame" in a random test. That made
-       the ONE gate nondeterministic — a DFAIL that fires 3 runs in 4 names nothing, and a green run proves
-       nothing either. Per-runtime (not merely per-thread) is the honest scope: two runtimes on one thread are
-       just as separate. */
-    struct { JSFlowParkFn *fn; JSFlowParkFreeFn *free_fn; void *opaque; JSContext *ctx; } parked_flow;
+    /* THE PUMP'S PARKED FLOWS — see flow_park. The QUEUE lives on the RUNTIME because that is what it is: each
+       parked base owns an async activation belonging to THIS runtime's heap, and resuming one from anywhere
+       else frees a frame that another runtime is running. It was a process global with the rt parameter
+       accepted and ignored, which made run-test262's worker threads share one: thread A parked its flow,
+       thread B's pump resumed it, and the abort surfaced as "async_func_free: freeing a RUNNING async frame"
+       in a random test. That made the ONE gate nondeterministic — a DFAIL that fires 3 runs in 4 names
+       nothing, and a green run proves nothing either. Per-runtime (not merely per-thread) is the honest
+       scope: two runtimes on one thread are just as separate.
+       IT HOLDS NO RECORD OF ITS OWN — the record is on the base (JSAsyncFunctionState.park_link), so this is
+       ORDER and nothing else. FIFO, which is the ordering-transparency contract stated as a data structure:
+       continuations resume in the order they parked, which is the order they would have completed had no
+       preempt fired, at any nesting depth and for any number of them. */
+    struct list_head parked_flows;   /* JSAsyncFunctionState.park_link, oldest park first */
 };
 
 struct JSClass {
@@ -1179,6 +1183,25 @@ typedef struct JSAsyncFunctionState {
     JSStackFrame frame;
     void *tramp_top;  /* APIClient forced-exec: the stashed heap-frame (TrampFrame) chain when this flow was
                          PREEMPTED mid-execution at depth; NULL when suspended at the base or not suspended. */
+    /* THE PARK — see flow_park. A parked continuation is a property of THE BASE IT SUSPENDS and of nothing
+       else: it re-enters this activation, under this activation's heap, and no other base can be handed it.
+       It used to be one struct on the JSRuntime, which is a CAPACITY where the design has none — the number
+       of continuations parked before the pump next runs is the number of bases a step reaches, and that is
+       unbounded in both directions. SEQUENTIALLY: one host drain settles several fetch replies in a row and
+       each settle is its own call-root flow, so reply A's resolve parked and reply B's park had nowhere to
+       go. NESTED: an async body's completion settles its promise through a second call-root flow while the
+       reaction that resumed it is still live on the C stack, and both can park. Neither is a bigger version
+       of the one-slot case; the slot simply could not represent them, and what it did instead was assert.
+       The link is INTRUSIVE and lives in the base rather than in a node the park allocates, for two reasons
+       that are the same reason: a park may not fail (an OOM here would DROP a work item, which §NO BOUNDS
+       forbids), and a base that is already queued has nowhere to be queued twice — so "one flow parked
+       twice" stops being a rule someone keeps and becomes a shape that cannot be built.
+       `park_ctx` is recorded rather than derived because the resume runs in the realm that parked. */
+    struct list_head park_link;     /* on JSRuntime.parked_flows while parked; empty otherwise */
+    JSFlowParkFn *park_fn;          /* NULL iff not parked — park_link is then empty */
+    JSFlowParkFreeFn *park_free_fn; /* how this site gives its reference back without running the body */
+    void *park_opaque;
+    JSContext *park_ctx;
 } JSAsyncFunctionState;
 
 /* XXX: could use an object instead to avoid the
@@ -2867,6 +2890,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->job_list);
     init_list_head(&rt->task_list);
     init_list_head(&rt->baseline_call_list);
+    init_list_head(&rt->parked_flows);
     init_list_head(&rt->finrec_pending);
 
     if (JS_InitAtoms(rt))
@@ -3377,7 +3401,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     int i, ret;
 
     /* NO JOB RUNS WHILE A FLOW IS PARKED, asserted where the job is drained rather than trusted to each host.
-       The contract is already written on JS_ParkFlow — "the host must resume parked flows BEFORE draining a
+       The contract is already written on flow_park — "the host must resume parked flows BEFORE draining a
        job, so a forced preempt stays transparent to ordering" — and it was kept by convention, which means it
        was kept by whoever remembered. Three pumps exist in run-test262 alone and one of them did not resume
        first, so an agent's parked flow would have watched queued jobs run ahead of it, or never resumed at all.
@@ -3608,15 +3632,15 @@ void JS_FreeRuntime(JSRuntime *rt)
        gc_obj_list DCHECK said the first time these tests ran. */
     js_atomics_free_async_waiters(rt);
 #endif
-    /* A PARKED FLOW AT TEARDOWN IS A DROPPED FLOW. The slot is not a GC root: it holds a raw callback plus a
-       reference the park took (the suspended async activation, or the async generator whose body is mid-run), and
-       tearing the runtime down without resuming it leaks that whole graph silently — the runtime's own object walk
-       reports the leaked objects but names nothing that explains them. The scheduler contract is that no work item
-       is ever dropped, so this is the host's invariant to keep: drain with JS_ResumeParkedFlow before the last
-       reference goes. */
-    DCHECK(rt->parked_flow.fn == NULL,
-           "JS_FreeRuntime with a flow still parked — the host tore down without draining the park slot "
-           "(JS_ResumeParkedFlow); that flow and everything it holds is dropped, not finished");
+    /* A PARKED FLOW AT TEARDOWN IS A DROPPED FLOW. The queue is not a GC root: each member holds a raw callback
+       plus a reference the park took (the suspended async activation, or the async generator whose body is
+       mid-run), and tearing the runtime down without resuming it leaks that whole graph silently — the
+       runtime's own object walk reports the leaked objects but names nothing that explains them. The scheduler
+       contract is that no work item is ever dropped, so this is the host's invariant to keep: drain with
+       JS_ResumeParkedFlow before the last reference goes. */
+    DCHECK(list_empty(&rt->parked_flows),
+           "JS_FreeRuntime with a flow still parked — the host tore down without draining the pump's parked "
+           "flows (JS_ResumeParkedFlow); that flow and everything it holds is dropped, not finished");
     JS_FreeValueRT(rt, rt->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -28773,21 +28797,53 @@ void JS_RequestFlowYield(void) { FLOW_YIELD_REQUEST(JS_PREEMPT_HOST); }
 /* ATOMIC: run-test262 increments these from many worker threads; a non-atomic ++ races so fired can overtake
    requested (a bogus >100% + underflowed gap) or undercount (a false gap on a true-100% category). Relaxed
    ordering is enough — they are pure counters, never a synchronization point. Portable to gcc + emcc. */
-/* THE PUMP'S PARKED SLOT. A forced preempt must be TRANSPARENT to observable ordering: the flow suspends, and the
-   scheduler resumes it BEFORE any queued job — with one flow that is immediately, so no microtask interleaving
-   changes. Re-queuing the resume through JS_EnqueueJob is NOT that: a FIFO puts it behind every pending job and
-   reorders them (proven: async-generator-interleaved / for-await-of-interleaved fail that way). So a flow that
-   preempts inside job-driven code parks HERE, and the host pump (JS_ResumeParkedFlow, called before draining a
-   job) resumes it. One slot is what a single-flow engine needs today; the solver's ranked frontier replaces the
-   slot, not the contract — "resume the top-ranked parked flow before starting new work" holds at both sizes. */
-void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque) {
+/* A BASE IS BORN UNPARKED, and every construction site says so through this one line rather than through the
+   allocator's zero bytes — which are not an empty list_head but a pair of NULLs, and a NULL `next` is the one
+   shape list_empty answers wrongly about. Three sites construct a base: async_func_init (every bytecode body,
+   generator, async function and module), reaction_call_flow_init (every call root) and flow_clone_state_alloc
+   (every forked sibling). The clone matters most: a sibling forked out of a base that is PARKED must not
+   inherit the park, because the continuation is one activation and running it twice frees a frame the other
+   arm is standing in. It is not a field to copy; it is a field to clear. */
+static void flow_park_init(JSAsyncFunctionState *s) {
+    init_list_head(&s->park_link);
+    s->park_fn = NULL; s->park_free_fn = NULL; s->park_opaque = NULL; s->park_ctx = NULL;
+}
+
+/* THE PUMP'S PARK. A forced preempt must be TRANSPARENT to observable ordering: the base suspends, and the
+   scheduler resumes it BEFORE any queued job, so no microtask interleaving changes. Re-queuing the resume
+   through JS_EnqueueJob is NOT that: a FIFO puts it behind every pending job and reorders them (proven:
+   async-generator-interleaved / for-await-of-interleaved fail that way). So a base that preempts inside
+   job-driven code parks HERE, and the host pump (JS_ResumeParkedFlow, called before draining a job) resumes it.
+   THE PARK IS THE BASE'S, NOT THE RUNTIME'S, which is the whole of the change this function used to need. The
+   record was one struct on the JSRuntime and a second park ABORTED — and "two parked at once" is not an error
+   state, it is the ordinary shape of a step that reaches two bases: a host drain settling two fetch replies in
+   a row, an async completion settling its promise through a second call root while the reaction that resumed
+   it is still on the C stack. The runtime now owns ORDER (its FIFO) and the base owns the RECORD, so the
+   contract — "resume the parked flows before starting new work" — holds at every count and every depth, and
+   the solver's ranked frontier refines the order without changing the sentence. */
+static void flow_park(JSContext *ctx, JSAsyncFunctionState *base,
+                      JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque) {
     JSRuntime *rt = ctx->rt;
-    DCHECK(rt->parked_flow.fn == NULL, "two flows parked at once: the slot resumes before any other work runs");
+    /* ONE BASE, ONE PARK — asserted at the link rather than discovered as a corrupted ring. A base already on
+       the queue has one continuation outstanding; a second park of it would either overwrite that record (the
+       old slot's failure, moved down a level) or splice a node into the list twice, which makes the list
+       circular through itself and the pump loop forever. */
+    DCHECK(base->park_fn == NULL && list_empty(&base->park_link),
+           "a flow base was parked while it already holds a parked continuation — one activation has one "
+           "resume point, so the second park either drops the first continuation or corrupts the pump's queue");
+    /* AND ONLY A SUSPENDED BASE HAS A CONTINUATION TO PARK. This is what makes the record MEAN something: a
+       park of a base whose frame is finished is a resume that re-enters nothing, and the disposer would then
+       release a reference to an activation that is already gone. Two of the three park sites tested this for
+       themselves and one did not; asked here it is asked for all of them and for the fourth. */
+    DCHECK(base->frame.cur_sp != NULL || base->tramp_top != NULL,
+           "a flow base was parked with no suspended frame — its continuation would resume an activation that "
+           "has already completed, and its disposer would release a reference to a frame nobody is holding");
     /* THE PARK TAKES A REFERENCE AND THIS IS HOW IT IS GIVEN BACK — see JSFlowParkFreeFn. Required, not
        optional: a site that parks without saying how its reference is released is a site whose continuation an
        embedder can only dispose of by RUNNING it, which is the state this parameter exists to end. */
-    DCHECK(free_fn != NULL, "a flow parked without a disposer — the slot owns the reference this site just "
-                            "took, so a teardown or a page-out could only give it back by resuming the body");
+    DCHECK(fn != NULL && free_fn != NULL,
+           "a flow parked without a resume or without a disposer — the queue owns the reference this site just "
+           "took, so a teardown or a page-out could only give it back by resuming the body");
     /* NOTHING MAY BE PROPAGATING WHEN A FLOW PARKS, and this is the origin of the invariant rather than a
        restatement of it. A park is reached only from a FUNC_RET_PREEMPT, which the interpreter produces at
        exactly two points: do_yield_poll, which runs at an opcode boundary where nothing is propagating, and
@@ -28802,42 +28858,97 @@ void JS_ParkFlow(JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, vo
            "be delivered to an evaluation that did not produce it. A completion still propagating INSIDE a "
            "suspended flow rides the flow (do_step_park's park_exc); one that has finished propagating is "
            "reported at the boundary (JS_ResumeParkedFlow's `pres`). Route this one to whichever it is");
-    rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn;
-    rt->parked_flow.free_fn = free_fn; rt->parked_flow.opaque = opaque;
+    base->park_ctx = ctx; base->park_fn = fn;
+    base->park_free_fn = free_fn; base->park_opaque = opaque;
+    list_add_tail(&base->park_link, &rt->parked_flows);   /* FIFO: park order IS resume order */
 }
-bool JS_HasParkedFlow(JSRuntime *rt) { return rt->parked_flow.fn != NULL; }
+bool JS_HasParkedFlow(JSRuntime *rt) { return !list_empty(&rt->parked_flows); }
 /* See quickjs.h. The frame chain is what "the page called into this" means; nothing else in the runtime states
    it, and every other candidate (a flow's frame handle, the tramp-frame count, the step-machine count) is
    either NULL during a job or counts every PARKED flow's chain as well as the running one. */
 bool JS_HasActivation(JSRuntime *rt) { return rt->current_stack_frame != NULL; }
-bool JS_TakeParkedFlow(JSRuntime *rt, JSContext **pctx, JSFlowParkFn **pfn,
-                       JSFlowParkFreeFn **pfree, void **popaque) {
-    if (!rt->parked_flow.fn) return false;
-    *pctx = rt->parked_flow.ctx; *pfn = rt->parked_flow.fn;
-    *pfree = rt->parked_flow.free_fn; *popaque = rt->parked_flow.opaque;
-    rt->parked_flow.fn = NULL; rt->parked_flow.free_fn = NULL;
-    rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
-    return true;
+/* THE WHOLE SET MOVES, and it moves without allocating. See quickjs.h: an interleaving host carries a flow's
+   parked continuations ON the flow, because each resumes an activation under THAT flow's COW delta. The unit is
+   the SET and not one park — the flow being switched out may have parked several within its step, and a take
+   that moved one would leave the rest in the runtime for whichever flow ran next, which is the two bugs this
+   whole mechanism exists to prevent (resumed against the wrong heap, or silently dropped) applied to all but
+   the first. The handle is the detached ring's first node: the runtime's head is spliced out of the circle and
+   the members keep their order, so nothing is copied, nothing is allocated, and there is no OOM path in a
+   context switch. NULL means the flow holds no parks — the same answer as an empty list. */
+void *JS_TakeParkedFlows(JSRuntime *rt) {
+    struct list_head *first, *last;
+    if (list_empty(&rt->parked_flows)) return NULL;
+    first = rt->parked_flows.next;
+    last = rt->parked_flows.prev;
+    first->prev = last; last->next = first;   /* close the ring over the members alone */
+    init_list_head(&rt->parked_flows);
+    return first;
 }
-void JS_PutParkedFlow(JSRuntime *rt, JSContext *ctx, JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque) {
-    if (!fn) return;
-    DCHECK(rt->parked_flow.fn == NULL, "a flow was switched in while another one's park is still in the slot");
-    DCHECK(free_fn != NULL, "a park was put back into the slot without its disposer — the pair is taken and "
-                            "restored together, so half of one is a continuation nothing can release");
-    rt->parked_flow.ctx = ctx; rt->parked_flow.fn = fn;
-    rt->parked_flow.free_fn = free_fn; rt->parked_flow.opaque = opaque;
+void JS_PutParkedFlows(JSRuntime *rt, void *parked) {
+    struct list_head *first = parked, *last;
+    if (!first) return;
+    /* THE RUNTIME IS EMPTY WHEN A FLOW IS SWITCHED IN, which is the same sentence the take makes from the other
+       side: the outgoing flow took ALL of its parks with it, so anything still here belongs to nobody. */
+    DCHECK(list_empty(&rt->parked_flows),
+           "a flow was switched in while parked continuations were still in the runtime — the switch out takes "
+           "the whole set, so these belong to a flow that is no longer running and would resume under this "
+           "flow's delta");
+    last = first->prev;
+    rt->parked_flows.next = first; first->prev = &rt->parked_flows;
+    rt->parked_flows.prev = last;  last->next  = &rt->parked_flows;
+#if APICLIENT_DEV
+    {   /* EVERY MEMBER IS A COMPLETE RECORD, asked of the whole ring rather than of one pair of fields. The
+           old singular form could only say "half a park was restored"; a set can also be MALFORMED — a node
+           whose base was freed, a ring stitched by something that is not the take — and this is the line that
+           walks it while the walk is still cheap. */
+        struct list_head *el;
+        list_for_each(el, &rt->parked_flows) {
+            JSAsyncFunctionState *b = list_entry(el, JSAsyncFunctionState, park_link);
+            DCHECK(b->park_fn != NULL && b->park_free_fn != NULL && b->park_ctx != NULL,
+                   "a parked continuation was restored to the runtime with no resume, no disposer or no realm "
+                   "— the four are written together at the park, so a member missing one was assembled by "
+                   "something that is not JS_TakeParkedFlows");
+        }
+    }
+#endif
+}
+/* …AND THE SET THAT WILL NEVER RUN. A flow the host tears down or pages out holds continuations whose only
+   other discharge is running them, so each one's own disposer is called — the release the park took, given
+   back. The `next` is read BEFORE the disposer, because a disposer frees the base the link is embedded in. */
+void JS_FreeParkedFlows(void *parked) {
+    struct list_head *el, *first = parked;
+    if (!first) return;
+    el = first;
+    do {
+        JSAsyncFunctionState *b = list_entry(el, JSAsyncFunctionState, park_link);
+        JSFlowParkFreeFn *free_fn = b->park_free_fn;
+        JSContext *pctx = b->park_ctx;
+        void *op = b->park_opaque;
+        struct list_head *next = el->next;
+        DCHECK(free_fn != NULL && pctx != NULL,
+               "a parked continuation reached its disposal with no disposer or no realm — it was taken out of "
+               "the runtime as a park, so the only way to give its reference back is gone");
+        b->park_fn = NULL; b->park_free_fn = NULL; b->park_opaque = NULL; b->park_ctx = NULL;
+        init_list_head(&b->park_link);
+        free_fn(pctx, op);
+        el = next;
+    } while (el != first);
 }
 /* THE STEP-BOUNDARY ADOPTION POINT — the second half of baseline_call_list, and the half that does not need
    the flow to have a PROGRAM. JS_FlowResume was the only adoption point, and it is reached only by a flow with
    bytecode to run: a document whose initial markup carries an `<iframe src>` and NO `<script>` at all seeds a
    boot flow that never compiles anything, so §7.4 step 14's navigation was adopted by nobody and the child
    document was never fetched, parsed or run — the case JS_FreeRuntime's assert names.
-   IT IS THIS FUNCTION BECAUSE OF WHO CALLS IT: the scheduler pumps the park slot ONCE PER STEP for every flow
-   it switches in, before it asks whether that flow has a program (engine/host/solver/engine.c's flow_step), so
-   this line runs with a flow switched in and running — which is the one thing the adoption needs and the one
-   thing the session's first line does not have. Asked before the slot is read, so a step that finds nothing
-   parked still adopts; ordinarily a no-op, one list_empty on a list that is empty for the whole of every
-   session after the first flow's first step. */
+   IT IS THIS FUNCTION BECAUSE OF WHO CALLS IT: the scheduler pumps ONE parked continuation PER STEP for every
+   flow it switches in, before it asks whether that flow has a program (engine/host/solver/engine.c's
+   flow_step), so this line runs with a flow switched in and running — which is the one thing the adoption
+   needs and the one thing the session's first line does not have. Asked before the queue is read, so a step
+   that finds nothing parked still adopts; ordinarily a no-op, one list_empty on a list that is empty for the
+   whole of every session after the first flow's first step.
+   ONE PER CALL, OLDEST FIRST, and the caller's `while` is what drains the rest — the loop quickjs.h documents
+   was already the contract when only one park could exist, so a queue changes what the loop ITERATES over and
+   not the loop. Oldest first is ordering-transparency itself: two continuations parked in one step resume in
+   the order they suspended, which is the order they would have completed had no preempt fired. */
 bool JS_ResumeParkedFlow(JSRuntime *rt, JSValue *pres) {
     JSFlowParkFn *fn;
     JSContext *ctx;
@@ -28849,15 +28960,29 @@ bool JS_ResumeParkedFlow(JSRuntime *rt, JSValue *pres) {
                          "completion — the caller must take it, exactly as JS_FlowResume's caller must");
     *pres = JS_UNDEFINED;
     js_adopt_baseline_calls(rt);
-    fn = rt->parked_flow.fn;
-    ctx = rt->parked_flow.ctx;
-    op = rt->parked_flow.opaque;
-    if (!fn) return false;
+    if (list_empty(&rt->parked_flows)) return false;
+    base = list_entry(rt->parked_flows.next, JSAsyncFunctionState, park_link);
+    /* THE RECORD IS THE BASE'S, SO IT IS READ OFF THE BASE THE QUEUE NAMED — never off a second copy. The old
+       slot could disagree with the flow it belonged to and nothing could tell; here the link and the record
+       are one allocation, and a member whose record is empty is a base that was queued by something other
+       than flow_park. */
+    DCHECK(base->park_fn != NULL && base->park_free_fn != NULL && base->park_ctx != NULL,
+           "the pump's queue named a flow base holding no parked continuation — the link and the record are "
+           "written together at the park, so this base was spliced onto the queue by something that is not it");
+    fn = base->park_fn;
+    ctx = base->park_ctx;
+    op = base->park_opaque;
     /* THE DISPOSER IS CLEARED AND NEVER CALLED HERE: running the body IS how this park's reference is
        discharged (each resume ends in the release its own park took), so calling it too would be the second
-       free of the same reference. The disposer is for the path that does NOT run — teardown, page-out. */
-    rt->parked_flow.fn = NULL; rt->parked_flow.free_fn = NULL;
-    rt->parked_flow.opaque = NULL; rt->parked_flow.ctx = NULL;
+       free of the same reference. The disposer is for the path that does NOT run — teardown, page-out.
+       THE LINK COMES OFF BEFORE THE BODY RUNS, and that ordering is load-bearing rather than tidy: the body
+       may park this very base again at its next back-edge, and a link still on the queue would then be added
+       to a list it is already on — which flow_park's own assert names, at the site, instead of the pump
+       discovering a ring that closes through itself. */
+    list_del(&base->park_link);
+    init_list_head(&base->park_link);
+    base->park_fn = NULL; base->park_free_fn = NULL;
+    base->park_opaque = NULL; base->park_ctx = NULL;
     fn(ctx, op);   /* may park again at the next back-edge — the pump loops */
     /* AND ITS COMPLETION, READ ONCE, HERE. A continuation completes ABRUPTLY exactly when a throw is still
        propagating out of it — that is what §6.2.4's throw completion IS, and reading the slot is reading the
@@ -29636,11 +29761,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        That is the same correction the routability condition below already made once — an earlier version of it
        required `rt->current_stack_frame != NULL` and quietly wrote a host-boundary exemption in — and it is why
        `current_stack_frame` is not the question either.
-       The scheduler's own switch is unaffected by construction: flow_switch_out TAKES the parked continuation
-       out of the runtime and carries it on the Flow, precisely so a sibling can run, and JS_ResumeParkedFlow
-       clears the slot before it calls the resume — and a resume arrives through the GENERATOR branch above, so
-       it does not reach this line at all. */
-    DCHECK(rt->parked_flow.fn == NULL,
+       The scheduler's own switch is unaffected by construction: flow_switch_out TAKES the parked continuations
+       out of the runtime and carries them on the Flow, precisely so a sibling can run, and JS_ResumeParkedFlow
+       unlinks the one it is about to run before it calls it — and a resume arrives through the GENERATOR branch
+       above, so it does not reach this line at all.
+       IT ASKS ABOUT THE WHOLE QUEUE AND NOT ABOUT ONE PARK, which is what the runtime can now be asked. While
+       the record was a single slot this could only ever catch a page entry made under the FIRST park; a second
+       one had already aborted at its own site for a reason that was about storage rather than about ordering,
+       and the transparency question was never reached. */
+    DCHECK(list_empty(&rt->parked_flows),
            "the page's own code was entered while a flow is PARKED — resume it first (while "
            "(JS_ResumeParkedFlow(rt));). A forced preempt is transparent only if nothing observable runs "
            "between the park and its resume, and a bytecode body is the observable thing");
@@ -44786,6 +44915,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
 
     sf = &s->frame;
     p = JS_VALUE_GET_OBJ(func_obj);
+    flow_park_init(s);   /* a base is born unparked — see flow_park_init */
     b = p->u.func.function_bytecode;
     sf->is_strict_mode = b->is_strict_mode;
     sf->is_constructor = false;
@@ -44849,6 +44979,15 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     JSValue *sp;
 
     sf = &s->frame;
+    /* A BASE MAY NOT BE FREED WHILE IT HOLDS A CONTINUATION, and this is the site that would otherwise turn
+       that into silence: the park link is EMBEDDED, so a state freed while queued leaves the pump's list
+       pointing into freed memory and the next drain walks it. There is exactly one legitimate way for a park
+       to end without being resumed — its own disposer (JS_FreeParkedFlows / the park_free of a flow the host
+       tears down or pages out), which clears the record BEFORE it releases the base — so a live record here
+       means the base was released by a path that never went through it, and the continuation is dropped. */
+    DCHECK(s->park_fn == NULL && list_empty(&s->park_link),
+           "an async/generator base was freed while a parked continuation still names it — the pump's queue "
+           "holds a link into this allocation, and the work that continuation was is dropped with it");
 
     if (sf->arg_buf) {
         /* close the closure variables. */
@@ -45352,6 +45491,11 @@ static JSAsyncFunctionState *flow_clone_state_alloc(JSContext *ctx, JSAsyncFunct
     }
     c->base_kind = src->base_kind;   /* a clone completes the way its ORIGINAL does */
     return c;
+    /* A CLONE IS BORN UNPARKED, and it is a CLEAR rather than a copy. The source may be parked — a fork at a
+       branch inside a body whose continuation is already on the pump's queue is ordinary — and a park is one
+       activation's one resume point: run it twice and the second resume rebuilds a frame the first already
+       freed. The sibling reaches its own suspend point and parks then, on its own record. */
+    flow_park_init(c);
 }
 
 /* Release a clone shell whose frame was never completed (an allocation failure mid-clone). */
@@ -46953,20 +47097,21 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
     func_ret = async_func_resume(ctx, &s->func_state);
     g_flow_base_gen = prev_base;
     if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_PREEMPT) {
-        /* PARK in the parked-flow SLOT, never on the job queue. A forced preempt is not a microtask: the FIFO
-           puts the continuation behind every pending job, which REORDERS observable ordering — the resume razor's
-           exact prohibition. It is observable: a module body that preempts (a destructuring cover-grammar
-           back-jump is enough) then resumed after a sibling's await continuation, so `export const {x} =
-           globalThis` read a value the sibling had already changed. The host pump drains this slot before
-           starting any job, so the resume is transparent. */
-        /* WHOSE SLOT THIS IS, ASKED AT THE PARK RATHER THAN AT THE NEXT UNRELATED CALL. JS_ParkFlow's own
-           contract is that a flow preempting inside JOB-DRIVEN code parks here — nothing is running above it,
-           so the host pump drains the slot before anything else starts and the resume is transparent. A
-           `prev_base` that is not NULL says the opposite: this async function was called from a live activation
-           that is STILL RUNNING, its caller gets a pending promise back and carries on executing bytecode, and
-           the park sits in the runtime until the next entry into the page's own code trips the parked-flow
-           assert at the bytecode dispatch — an abort that names a site with no relationship to the producer.
-           This assert moves that report to where the state is created.
+        /* PARK on the pump's parked-flow QUEUE, never on the job queue. A forced preempt is not a microtask:
+           the job FIFO puts the continuation behind every pending job, which REORDERS observable ordering — the
+           resume razor's exact prohibition. It is observable: a module body that preempts (a destructuring
+           cover-grammar back-jump is enough) then resumed after a sibling's await continuation, so `export
+           const {x} = globalThis` read a value the sibling had already changed. The host pump drains the parked
+           flows before starting any job, so the resume is transparent. */
+        /* WHO IS RUNNING ABOVE THIS PARK, ASKED AT THE PARK RATHER THAN AT THE NEXT UNRELATED CALL — and this
+           is an ORDERING question, which is why the pump holding a queue rather than one slot does not answer
+           it. flow_park's contract is that a flow preempting inside JOB-DRIVEN code parks here: nothing is
+           running above it, so the host pump drains the queue before anything else starts and the resume is
+           transparent. A `prev_base` that is not NULL says the opposite: this async function was called from a
+           live activation that is STILL RUNNING, its caller gets a pending promise back and carries on
+           executing bytecode, and that bytecode runs BETWEEN the park and its resume — which the assert at the
+           bytecode dispatch would then report at a site with no relationship to the producer. This assert moves
+           that report to where the state is created.
            WHAT TO BUILD when it fires, and the tree already argues it one function away: JS_FlowResume's
            FLOW_BASE_ASYNC_CALL arm reports suspension to the SCHEDULER rather than parking it here, precisely
            because "two drivers for one state is how a flow gets resumed twice". A nested async call's prefix
@@ -46974,11 +47119,11 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
            declined here so the outer frame takes it at its own next suspend point, which the scheduler owns.
            Declining is lossless: the yield request stays raised, so no work item is dropped. */
         DCHECK(prev_base == NULL,
-               "an async function's synchronous prefix preempted and parked into the runtime slot while its "
-               "CALLER's activation is still live — the parked-flow slot is for job-driven code, and a caller "
-               "that resumes bytecode over a live park makes the next C->JS call abort somewhere unrelated");
-        JS_REF_COUNT(s)++;   /* the slot holds a reference until the resume releases it */
-        JS_ParkFlow(ctx, js_async_resume_park, js_async_resume_park_free, s);
+               "an async function's synchronous prefix preempted and parked while its CALLER's activation is "
+               "still live — a park is transparent only if nothing observable runs before its resume, and a "
+               "caller that goes on executing bytecode over a live park is exactly that");
+        JS_REF_COUNT(s)++;   /* the park holds a reference until the resume releases it */
+        flow_park(ctx, &s->func_state, js_async_resume_park, js_async_resume_park_free, s);
         return true;
     }
     {
@@ -47688,7 +47833,11 @@ static void js_async_generator_resume_next(JSContext *ctx,
             /* PARKED mid-body: park into THE PUMP, never the job FIFO (that reorders microtasks). The state
                stays EXECUTING, so the pump's resume re-enters here at the saved point. */
             js_dup(JS_MKPTR(JS_TAG_OBJECT, s->generator));   /* the park keeps the suspended body alive */
-            JS_ParkFlow(ctx, js_async_gen_park_resume, js_async_gen_park_free, s->generator);
+            /* THE BASE IS THE BODY'S STATE; the OPAQUE is the generator object, because that is what this
+               site's resume and disposer take and what the reference above was taken on. The two are not the
+               same thing and the park records both — the record belongs to the state that suspended, the
+               callbacks take the handle that owns it. */
+            flow_park(ctx, &s->func_state, js_async_gen_park_resume, js_async_gen_park_free, s->generator);
             return;
         }
         {
@@ -60047,9 +60196,12 @@ static JSValue js_load_module_fulfilled(JSContext *ctx, JSValueConst this_val,
    so each is phase 0 of promise_reaction_job's call-root flow and its completion already has somewhere to go.
    There the rejection is the handler's OWN THROW — the exception stays in flight, the handler returns
    JS_EXCEPTION, and phase 1 of that same flow delivers it to the capability on the base the handler ran on.
-   js_settle_as_flow at those three would be a SECOND flow nested inside the first, and BOTH can park: the inner
-   one takes the pump's one park slot and the outer one's phase 1 then trips JS_ParkFlow's "two flows parked at
-   once". A nested flow is not a smaller version of the right answer, it is a different one.
+   js_settle_as_flow at those three would be a SECOND flow nested inside the first, which is not a smaller
+   version of the right answer but a different one: the handler's completion ALREADY reaches the capability, on
+   the base the handler ran on, so a nested flow settles what phase 1 was going to settle and the reaction's own
+   throw then has nowhere to go. (It used to be argued from the pump instead — "both can park and there is one
+   slot" — and that argument is gone: a park is the BASE's, so nesting them queues rather than collides. The
+   conclusion did not depend on it.)
    THAT ONLY WORKS BECAUSE THE REACTION'S DERIVED CAPABILITY IS NOW THE IMPORT'S REJECT — see js_load_module_then
    and JS_LoadModuleInternal, which hand perform_promise_then {undefined, resolving_funcs[1]}. js_promise_then_
    native made a THROWAWAY capability, so a handler's throw rejected a promise nobody held and the import hung.
@@ -100197,6 +100349,7 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     fs->base_kind = FLOW_BASE_STEP_ROOT;
     fs->tramp_top = NULL;
     sf->arg_buf = blk;
+    flow_park_init(fs);   /* a base is born unparked — see flow_park_init */
     sf->var_buf = blk;                                    /* 0 args, 0 vars: the stack starts at blk */
     sf->var_refs = (JSVarRef **)(blk + slots);  /* TRAMP_SP_LIMIT(sf) = sf->var_refs = stack top */
     sf->var_ref_count = 0;
@@ -100272,6 +100425,14 @@ static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValu
     if (JS_IsUndefined(func)) { JS_FreeValue(ctx, res); return -1; }
     rf->phase = 1;
     if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&res)) < 0) { JS_FreeValue(ctx, res); return -1; }
+    /* PHASE 1 RE-INITIALISES THE BASE, which is the one place a base is built over a base that already
+       existed — so the one thing that must not be true of it is that it is parked. reaction_call_flow_init
+       clears the park record, and clearing a LIVE one would leave this base on the pump's queue with nothing
+       to resume it and its link pointing into a frame the re-init has replaced. It is not true here (phase 0
+       completed rather than parked, which is the branch that reached this call), and this is what says so. */
+    DCHECK(rf->fs.park_fn == NULL && list_empty(&rf->fs.park_link),
+           "a reaction flow's settle phase is re-initialising a base that still holds a parked continuation — "
+           "the record is about to be cleared while the pump's queue still names it");
     JS_FreeValue(ctx, res);
     return 0;
 }
@@ -100346,6 +100507,12 @@ static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s)
            "a reaction flow reached its base teardown still holding a heap-frame chain — free_tramp_chain runs "
            "at the top of JS_FlowFree, so a chain here came from a path that is not JS_FlowFree");
     if (rf->fs.frame.cur_sp != NULL)
+    /* …AND THE SAME SENTENCE ABOUT THE PARK, asked here as well as in async_func_free because the branch below
+       reaches that function only for a SUSPENDED frame: a call root whose frame completed takes the `else`
+       arm, and a park record surviving on it would have no other reader. */
+    DCHECK(rf->fs.park_fn == NULL && list_empty(&rf->fs.park_link),
+           "a reaction flow reached its base teardown while a parked continuation still names it — the pump's "
+           "queue holds a link into this allocation, and the settle it owed is dropped with it");
         async_func_free(ctx->rt, &rf->fs);   /* suspended: full frame cleanup */
     else if (rf->fs.frame.arg_buf) {
         js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
@@ -100372,17 +100539,22 @@ static JSValue reaction_flow_step(JSContext *ctx, JSReactionFlow *rf)
            never the value: a handler returning the integer 3 would collide with js_int32(FUNC_RET_PREEMPT). */
         if (rf->fs.frame.cur_sp != NULL || rf->fs.tramp_top != NULL) {
             JS_FreeValue(ctx, res);
-            /* PARK IN THE SLOT, never on the job queue — the same rule the async and async-generator resumes
-               already keep, and this was the one park that did not. A forced preempt is not a microtask: the
-               FIFO puts the continuation behind every job already queued, so the handler finishes LATER than it
-               would have and the promise it owes settles later with it. That is observable and the corpus says
-               so — Promise/allSettled/resolved-sequence counts one step too many, and
-               Promise/race/reject-ignored-immed sees a rejection that should have lost the race, because the
-               settle that would have made it a no-op had not happened yet.
+            /* PARK ON THE PUMP'S QUEUE, never on the job queue — the same rule the async and async-generator
+               resumes already keep, and this was the one park that did not. A forced preempt is not a
+               microtask: the job FIFO puts the continuation behind every job already queued, so the handler
+               finishes LATER than it would have and the promise it owes settles later with it. That is
+               observable and the corpus says so — Promise/allSettled/resolved-sequence counts one step too
+               many, and Promise/race/reject-ignored-immed sees a rejection that should have lost the race,
+               because the settle that would have made it a no-op had not happened yet.
                It was invisible while a reaction could only preempt at a loop back-edge, which a `.then` handler
-               rarely has; it is not a new bug, it is one that had nothing to reach it. The host pump drains this
-               slot before starting any job, so the resume is transparent. */
-            JS_ParkFlow(ctx, js_reaction_park_resume, js_reaction_park_free, rf);
+               rarely has; it is not a new bug, it is one that had nothing to reach it. The host pump drains the
+               parked flows before starting any job, so the resume is transparent.
+               THIS IS ALSO THE RE-ENTRANT PARK, which is why the pump's record is the base's. A call root is
+               how every settle that has no tramp chain runs (js_settle_as_flow), and settles arrive both in a
+               ROW — a host drain answering several fetch replies in one pass — and NESTED, an async body's
+               completion settling its promise while the reaction that resumed it is still on the C stack. Each
+               is its own JSReactionFlow with its own base, so each carries its own park and they queue. */
+            flow_park(ctx, &rf->fs, js_reaction_park_resume, js_reaction_park_free, rf);
             return JS_UNDEFINED;   /* PARKED: the pump resumes it; the promise settles when it completes */
         }
         /* COMPLETED via `done:` — that path frees the stack/vars inline but not the frame buffer + cur_func/this */

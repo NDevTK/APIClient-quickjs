@@ -1550,20 +1550,31 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                ITS COMPLETION IS THE TEST'S, taken here and reported exactly as the job below reports one: a
                parked continuation is the LATE half of a job, so an uncaught throw out of one is a failed test
                and not a value to leave in the runtime for the promise check below to trip over. */
+            /* THE DRAIN IS DRAINED, EVEN AFTER A THROW, and this loop used to stop at the first one. That was
+               indistinguishable from correct while at most ONE continuation could be parked — stopping after
+               the only one IS draining — and it stopped being so when the pump became a queue: a step reaches
+               as many bases as it reaches, so leaving on the first abrupt completion abandons the rest, which
+               is a dropped work item and, one line later, JS_FreeRuntime's own "torn down with a flow still
+               parked" abort. The FIRST throw is the test's completion and is held aside while the others run;
+               a later one is a second failure of an already-failed test and there is one report to make.
+               IT IS TAKEN OUT OF THE RUNTIME AT ONCE, not left standing: the exception slot is per-RUNTIME, so
+               a throw still live when the next continuation resumes is a completion delivered to an evaluation
+               that did not produce it — which is exactly what that resume's own assert refuses. */
             {
-                bool parked_abrupt = false;
+                JSValue parked_exc = JS_UNINITIALIZED;
                 for (;;) {
                     JSValue pcv;
                     if (!JS_ResumeParkedFlow(JS_GetRuntime(ctx), &pcv))
                         break;
-                    if (JS_IsException(pcv))
-                        parked_abrupt = true;
+                    if (JS_IsException(pcv)) {
+                        JSValue e = JS_GetException(ctx);
+                        if (JS_IsUninitialized(parked_exc)) parked_exc = e;
+                        else JS_FreeValue(ctx, e);
+                    }
                     JS_FreeValue(ctx, pcv);
-                    if (parked_abrupt)
-                        break;
                 }
-                if (parked_abrupt) {
-                    res_val = JS_EXCEPTION;
+                if (!JS_IsUninitialized(parked_exc)) {
+                    res_val = JS_Throw(ctx, parked_exc);
                     break;
                 }
             }
