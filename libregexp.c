@@ -75,8 +75,12 @@ typedef enum {
    quantifiers got "too many imbricated quantifiers". The index is a u32 now (see libregexp-opcode.h), so what
    remains is memory: the capture array is 2 * capture_count pointers, which is the physical floor and not a
    number anybody chose. */
-/* must be large enough to have a negligible runtime cost and small
-   enough to call the interrupt callback often. */
+/* DELETED: INTERRUPT_COUNTER_INIT and the two lines that sized it ("large enough to have a negligible runtime
+   cost and small enough to call the interrupt callback often"). Those lines outlived the constant and then read
+   as a statement about THIS file — an agent took them for evidence that the backtracker has no suspend seam,
+   when RE_YIELD_POINT sits at all four of its back-edges, lre_exec_begin/_step/_end split the match, and the
+   exec step machine parks between slices. A counted callback is the wrong mechanism here anyway: it is a
+   PERIODIC poll, and what replaced it asks the flow-control policy at the exact points a pattern can loop. */
 
 /* unicode code points */
 #define CP_LS   0x2028
@@ -299,11 +303,23 @@ static __maybe_unused void re_string_list_dump(const char *str, const REStringLi
 }
 #endif /* DUMP_REOP */
 
+/* THE POINTER AN EMPTY STRING IS NAMED BY. A string-set member of length zero still has to be a pointer to an
+   object (see re_string_find2); this is the one every caller with no bytes of its own hands over. */
+static const uint32_t re_no_code_points[1] = { 0 };
+
+/* `buf` NAMES `len` CODE POINTS AND IS NEVER NULL — including for the EMPTY string, which `/[\q{}]/v` puts in
+   a string set legitimately. memcmp and memcpy below take it, and the C standard leaves a null argument to
+   either of them undefined EVEN FOR A ZERO LENGTH: the practical cost is not a fault at the call, it is that a
+   compiler may conclude from the call that the pointer is non-null and delete a test the code makes later. The
+   caller that had it — the `\q{…}` parser, whose DynBuf holds NULL until something is written to it — hands
+   over a real pointer to no code points instead, so this stays branch-free and the assert states why. */
 static int re_string_find2(REStringList *s, int len, const uint32_t *buf,
                            uint32_t h0, bool add_flag)
 {
     uint32_t h = 0; /* avoid warning */
     REString *p;
+    DCHECK(buf != NULL, "a string-set member named by a null pointer — memcmp/memcpy require an object pointer "
+                        "even when the length is zero");
     if (s->n_strings != 0) {
         h = h0 >> (32 - s->hash_bits);
         for(p = s->hash_table[h]; p != NULL; p = p->next) {
@@ -710,6 +726,24 @@ static int re_emit_op_u32(REParseState *s, int op, uint32_t val)
     return pos;
 }
 
+/* PATCHING A RECORDED POSITION IS ONLY MEANINGFUL IF THE EMIT THAT RECORDED IT HAPPENED, and re_emit_op_u32
+   above cannot say whether it did: it returns the offset it WOULD have written at, taken before the put, so an
+   allocation failure hands back a position one past the buffer and the later put_u32 writes FOUR BYTES OUTSIDE
+   IT. That is an out-of-bounds heap write reachable from a page's own regexp under memory pressure, and it is
+   invisible because every value involved is an ordinary small integer.
+   dbuf_error is the one question that separates the two, so it is asked HERE rather than at each patch site —
+   a check per site is a check to forget at the next site added. Returns -1 with the buffer left in its error
+   state; the caller reports the allocation failure. */
+static int re_patch_u32(REParseState *s, int pos, uint32_t val)
+{
+    if (dbuf_error(&s->byte_code))
+        return -1;
+    DCHECK(pos >= 0 && (size_t)pos + 4 <= s->byte_code.size,
+           "a regexp jump patch names a position outside the byte code that was emitted");
+    put_u32(s->byte_code.buf + pos, val);
+    return 0;
+}
+
 static int re_emit_goto(REParseState *s, int op, uint32_t val)
 {
     int pos;
@@ -1106,7 +1140,12 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
                 goto fail;
             }
         }
-        if (re_string_add(cr, str.size / 4, (uint32_t *)str.buf)) {
+        /* AN EMPTY ALTERNATIVE STILL NAMES A STRING. `\q{}` and `\q{a|}` are legal ClassStringDisjunctions
+           whose member is the empty string, and a DynBuf that has never been written to holds a NULL `buf` —
+           which re_string_find2 requires not to be. re_no_code_points is that pointer: a real object of which
+           zero elements are read. */
+        if (re_string_add(cr, str.size / 4,
+                          str.buf ? (const uint32_t *)str.buf : re_no_code_points)) {
             re_parse_out_of_memory(s);
             goto fail;
         }
@@ -1381,7 +1420,9 @@ static void re_emit_char(REParseState *s, int c)
 
 static int re_emit_string_list(REParseState *s, const REStringList *sl)
 {
-    REString **tab, *p;
+    /* NULL until the string branch allocates it: the failure labels are function-scope and free it either way,
+       and lre_realloc of NULL to zero is the no-op that makes one exit correct for both branches. */
+    REString **tab = NULL, *p;
     int i, j, split_pos, last_match_pos, n;
     bool has_empty_string, is_last;
     
@@ -1426,7 +1467,8 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
             }
             if (!is_last) {
                 last_match_pos = re_emit_op_u32(s, REOP_goto, last_match_pos);
-                put_u32(s->byte_code.buf + split_pos, s->byte_code.size - (split_pos + 4));
+                if (re_patch_u32(s, split_pos, s->byte_code.size - (split_pos + 4)))
+                    goto out_of_memory;
             }
         }
 
@@ -1437,15 +1479,19 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
                 split_pos = re_emit_op_u32(s, REOP_split_next_first, 0);
             else
                 split_pos = 0; /* not used */
-            if (re_emit_range(s, &sl->cr)) {
-                lre_realloc(s->opaque, tab, 0);
-                return -1;
+            if (re_emit_range(s, &sl->cr))
+                goto fail;
+            if (!is_last) {
+                if (re_patch_u32(s, split_pos, s->byte_code.size - (split_pos + 4)))
+                    goto out_of_memory;
             }
-            if (!is_last)
-                put_u32(s->byte_code.buf + split_pos, s->byte_code.size - (split_pos + 4));
         }
 
-        /* patch the 'goto match' */
+        /* patch the 'goto match'. The chain is threaded THROUGH the byte code — each link holds the next
+           position in the u32 it will be overwritten with — so a buffer in error makes the first read of it a
+           read past the end as well as the write. One question, asked before the walk. */
+        if (dbuf_error(&s->byte_code))
+            goto out_of_memory;
         while (last_match_pos != -1) {
             int next_pos = get_u32(s->byte_code.buf + last_match_pos);
             put_u32(s->byte_code.buf + last_match_pos, s->byte_code.size - (last_match_pos + 4));
@@ -1455,6 +1501,11 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
         lre_realloc(s->opaque, tab, 0);
     }
     return 0;
+ out_of_memory:
+    re_parse_out_of_memory(s);
+ fail:
+    lre_realloc(s->opaque, tab, 0);
+    return -1;
 }
 
 /* ClassSetExpression, as ONE machine over an explicit FRAME STACK. `[[[[a]]]]` in `v` mode is a class nested

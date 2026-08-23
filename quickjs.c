@@ -33537,14 +33537,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto ki_answer;
                         }
                         if (ki->op == GP_DEFINE) {
-                            /* 10.5.6 step 16.a's IsExtensible is reached ONLY when the target has not got the
-                               property, so the trap must not run otherwise. */
-                            if (ki->facts.flags < 0) { ki->phase = KI_EXT; goto ki_next; }
-                            if (js_proxy_define_check(ctx, &ki->facts, ki->operand, ki->in_getter,
-                                                      ki->in_setter, ki->in_flags, 1) < 0)
-                                goto ki_fail_thrown;
-                            ret_val = JS_TRUE;
-                            goto ki_answer;
+                            /* 10.5.6 [[DefineOwnProperty]] ( propertyKey, propertyDesc ) step 11, "Let
+                               extensibleTarget be ? IsExtensible(target)", is UNCONDITIONAL — it sits between
+                               step 10's [[GetOwnProperty]] and step 14's test of targetDesc, and it runs
+                               whichever way that test goes. */
+                            ki->phase = KI_EXT; goto ki_next;
                         }
                         if (ki->facts.flags < 0) {
                             /* the target has not got it either: nothing to be inconsistent with. */
@@ -33582,6 +33579,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
             ki_answer:
+                /* THE TRAP THAT MUST HAVE RUN. 10.5.6 step 11's IsExtensible is unconditional, and on a Proxy
+                   target it IS the page's `isExtensible` trap — so an answer produced without passing through
+                   the request is an answer that skipped page code, which is both a missing side effect and a
+                   fork the solver never gets to explore. The phase is what records that it happened. */
+                DCHECK(ki->op != GP_DEFINE || ki->phase == KI_EXT_GOT,
+                       "a proxy defineProperty invariant answered without performing 10.5.6 step 11's "
+                       "IsExtensible on the target");
                 /* a DELETE additionally owes DeletePropertyOrThrow, which is the CONSUMER's step and not the
                    object's — the bare internal method yields the boolean instead. */
                 if ((ki->op == GP_DELETE || ki->op == GP_DEFINE) && !ki->no_throw) {
@@ -33696,6 +33700,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 cont_st = NULL;
                 for (;;) {
                     if (ok->phase == OKC_LEN) {
+                        /* 7.3.19 CreateListFromArrayLike ( obj [ , validElementTypes ] ) step 2: "If obj is not
+                           an Object, throw a TypeError exception." — the FIRST thing 10.5.11 [[OwnPropertyKeys]]
+                           step 8 performs on the trap's result, before the length read below. Without it a trap
+                           returning a PRIMITIVE was walked as an array-like: `ownKeys: () => "ab"` read length 2
+                           off the string and then indices "0"/"1", whose values are strings, so the element type
+                           test below passed and the proxy reported two own properties the spec says it cannot
+                           have. Every other CreateListFromArrayLike in this engine already gates on the tag
+                           (19.2.3.1's `.apply`, the construct spread); this one did not. */
+                        if (JS_VALUE_GET_TAG(ok->trap_res) != JS_TAG_OBJECT) {
+                            JS_ThrowTypeError(ctx, "proxy: ownKeys must return an object");
+                            goto okc_throw;
+                        }
                         ok->phase = OKC_LEN_GOT;
                         gp_obj = ok->trap_res; gp_atom = JS_ATOM_length;
                         gp_op = GP_GET; gp_val = JS_UNDEFINED;
@@ -33721,6 +33737,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             ok->phase = OKC_EXT;
                             continue;
                         }
+                        DCHECK(JS_VALUE_GET_TAG(ok->trap_res) == JS_TAG_OBJECT,
+                               "the ownKeys trap's result is being indexed as an array-like without having "
+                               "passed 7.3.19 step 2 — a primitive walked here yields keys the spec forbids");
                         ok->phase = OKC_ELEM_GOT;
                         gp_obj = ok->trap_res; gp_atom = JS_NewAtomInt64(ctx, (int64_t)ok->i);
                         if (gp_atom == JS_ATOM_NULL) goto okc_throw;
@@ -70553,8 +70572,21 @@ static JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name
                                             n_proto_fields + 1);
         if (JS_IsException(proto))
             goto fail;
-        if (class_id >= 0)
+        if (class_id >= 0) {
+            /* THE SAME SLOT, THE SAME ASSERT AS JS_AddIntrinsicDOMException'S — and deliberately not a free
+               before the store. A slot that already holds a prototype means this CONTEXT is installing the
+               intrinsic a second time (JS_AddIntrinsicBigInt is both called by JS_AddIntrinsicBaseObjects and
+               exported, so `JS_NewContext` plus an explicit call is all it takes), and freeing the old one to
+               make room hides what that costs: every object already built from the first prototype keeps it, so
+               `x instanceof BigInt` starts answering false and the realm has two prototypes for one class. The
+               leak is the visible half of a split realm. Idempotence belongs at the INSTALLER, which is where
+               DOMException puts it — this is the primitive, and it says so instead of accommodating. */
+            DCHECK(!JS_IsObject(ctx->class_proto[class_id]),
+                   "assigning over a class_proto slot that already holds a prototype — the old one's only "
+                   "reference is this slot, so the assignment leaks it and splits the realm's class identity; "
+                   "make the intrinsic installer idempotent the way JS_AddIntrinsicDOMException is");
             ctx->class_proto[class_id] = js_dup(proto);
+        }
     }
     if (JS_SetPropertyFunctionList(ctx, proto, proto_fields, n_proto_fields))
         goto fail;
@@ -95634,7 +95666,19 @@ static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValu
                 if (JS_ToInt32Clamp(ctx, &n, s->space, 0, 10, 0)) return -1;
                 s->gap = JS_NewStringLen(ctx, "          ", n);
             } else if (JS_IsString(s->space)) {
-                JSString *p = JS_VALUE_GET_STRING(s->space);
+                JSString *p;
+                /* JS_IsString IS TRUE FOR A ROPE, and JS_VALUE_GET_STRING would hand back the JSStringRope as a
+                   JSString — `p->len` would then be a rope field read as a length and js_sub_string would cut
+                   ten units out of a header. `JSON.stringify(v, null, "aaaa…" + "bbbb…")` is all it takes, and
+                   the two structs are near enough that nothing downstream complains. JS_ToStringFree flattens
+                   and is the identity on an already-flat string, the same way Symbol.for takes its key. */
+                if (JS_VALUE_GET_TAG(s->space) == JS_TAG_STRING_ROPE) {
+                    s->space = JS_ToStringFree(ctx, s->space);
+                    if (JS_IsException(s->space)) { s->space = JS_UNDEFINED; return -1; }
+                }
+                DCHECK(JS_VALUE_GET_TAG(s->space) == JS_TAG_STRING,
+                       "JSON.stringify's gap is about to read a JSString out of a value that is not one");
+                p = JS_VALUE_GET_STRING(s->space);
                 s->gap = js_sub_string(ctx, p, 0, min_int(p->len, 10));
             } else {
                 s->gap = js_dup(s->empty);
@@ -96746,8 +96790,18 @@ fail:
     return -1;
 }
 
-/* `extensible` is consulted ONLY when the property is absent from the target, which is why the machine asks for
-   it only then — running the target's `isExtensible` trap for a step 10.5.6 does not reach would be observable. */
+/* `extensible` CHANGES NO ANSWER HERE WHEN THE TARGET HAS THE PROPERTY, AND IS STILL ALWAYS READ. 10.1.6.3
+   ValidateAndApplyPropertyDescriptor consults it only at step 2.a, inside "If current is undefined" — so on the
+   present-property arm (10.5.6 step 15.a's IsCompatiblePropertyDescriptor) its value is unused, and skipping the
+   read looks free.
+   IT IS NOT FREE, BECAUSE THE READ IS THE SIDE EFFECT. On a Proxy target IsExtensible runs that target's
+   `isExtensible` trap, which is the page's code: it can log, mutate, throw, or hold a loop the scheduler must
+   park in. 10.5.6 step 11 performs it UNCONDITIONALLY, before step 14 asks whether targetDesc is undefined, so a
+   `defineProperty` that reports success on a target that already has the key must still fire that trap — and a
+   page distinguishes fired from not-fired directly. A caller therefore passes what IsExtensible ANSWERED; there
+   is no arm that may pass a constant.
+   (The skip that used to live here cited "10.5.6 step 16.a". §10.5.6 step 16 is "Return true" and has no
+   sub-steps; the step it needed does not exist.) */
 static int js_proxy_define_check(JSContext *ctx, const JSDescFacts *f, JSValueConst val,
                                  JSValueConst getter, JSValueConst setter, int flags, int extensible)
 {
@@ -99402,6 +99456,15 @@ static JSValue js_async_dispose_rethrow(JSContext *ctx, JSValueConst this_val,
     if (magic == 0) {
         return JS_Throw(ctx, prev_err);
     } else {
+        /* THE SLOT THIS READS EXISTS BECAUSE THE CLOSURE DECLARED IT. js_call_c_function_data pads arg_buf out
+           to the record's `length` and no further, so a body that reads argv[0] while declaring arity 0 is
+           reading the CALLER's stack the moment a zero-argument call arrives — and the value it then hands to
+           js_new_suppressed_error is whatever that slot held, freed or not. The arity declaration is the whole
+           of the guarantee, which is why it is asserted here rather than trusted: the reachability that makes
+           a misdeclaration harmless (this chain is built on PerformPromiseThen, so no page code ever holds this
+           handler to call it with no arguments) is a property of the CALLERS, and callers are added. */
+        DCHECK(argc >= 1, "an async-dispose rethrow handler was called with no arguments — its closure declares "
+                          "arity 1 so js_call_c_function_data pads the slot; this one did not");
         /* THIS one has a frame of its own: the rejection handler is a C closure, and js_call_c_function_data
            pushed a JSStackFrame for it. It is engine plumbing, not a place in the page, so it is skipped. */
         JSValue se = js_new_suppressed_error(ctx, argv[0], prev_err, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
@@ -99438,10 +99501,17 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
         int hint = JS_VALUE_GET_INT(rec->data[2]);
         JS_FreeValue(ctx, cb_result);
         s->hdr.stage = ADL_DONE;
+        /* A COMPLETION IS WRITTEN, NEVER LEFT. tramp_step_state_new zeroes the state block and a zeroed JSValue
+           is the INTEGER 0 — an ordinary value, indistinguishable at the teardown from a completion this link
+           computed — so the slot carries the same "no operand yet" sentinel the header uses for its own, and
+           the fini asserts every normal return wrote over it. */
+        s->result = JS_UNINITIALIZED;
         if (JS_IsUndefined(method)) {
             /* a null/undefined resource on an async stack still performs Await(undefined) */
-            if (!has_prev_err)
+            if (!has_prev_err) {
+                s->result = JS_UNDEFINED;   /* Await(undefined): the value the next link awaits */
                 return 0;
+            }
             JS_Throw(ctx, js_dup(step_arg(&s->hdr, 0)));
             return -1;
         }
@@ -99483,8 +99553,11 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
         JS_FreeValue(ctx, cb_result);
         if (JS_IsException(ret_promise))
             return -1;
+        /* THE ARITY IS THE READ, DECLARED. The fulfilment spelling reads no operand and declares none; the
+           rejection spelling reads argv[0] and therefore declares 1, which is what makes js_call_c_function_data
+           pad the slot for a call that supplies nothing. */
         resolve_fn = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 0, 0, 1, &prev_err);
-        reject_fn  = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 0, 1, 1, &prev_err);
+        reject_fn  = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 1, 1, 1, &prev_err);
         if (JS_IsException(resolve_fn) || JS_IsException(reject_fn)) {
             JS_FreeValue(ctx, resolve_fn); JS_FreeValue(ctx, reject_fn);
             JS_FreeValue(ctx, ret_promise);
@@ -99511,7 +99584,11 @@ static void js_async_dispose_link_visit(JSContext *ctx, void *st, JSStepVisit *v
 static JSValue js_async_dispose_link_fini(JSContext *ctx, void *st, bool take_result)
 {
     JSAsyncDisposeLink *s = st;
-    JSValue r = take_result ? s->result : JS_UNDEFINED;
+    JSValue r;
+    DCHECK(!take_result || !JS_IsUninitialized(s->result),
+           "an async dispose link completed without writing its completion — the teardown would hand out the "
+           "zeroed state block's INTEGER 0 as the value the next link awaits");
+    r = take_result ? s->result : JS_UNDEFINED;
     if (take_result) s->result = JS_UNDEFINED;
     return r;
 }
@@ -99533,8 +99610,13 @@ static int js_async_dispose_link_new(JSContext *ctx, JSValue value, JSValue meth
     JSValueConst data[3];
     JSValue hint_val = JS_NewInt32(ctx, hint);
     data[0] = value; data[1] = method; data[2] = hint_val;
+    /* The arity states what the spelling READS, the same as the rethrow closure's: the fulfilment link consumes
+       nothing the Await delivered, the rejection link carries the previous error in operand 0. It is not what
+       makes the read in-bounds here — a step machine takes the CALL's real operands and step_arg answers past
+       them with undefined — but a declared arity that disagrees with the body is the drift that sends the next
+       reader to the safe half of the pair. */
     *out_resolve = js_new_step_closure(ctx, &js_async_dispose_link_def, 0, 0, 3, data);
-    *out_reject  = js_new_step_closure(ctx, &js_async_dispose_link_def, 0, 1, 3, data);
+    *out_reject  = js_new_step_closure(ctx, &js_async_dispose_link_def, 1, 1, 3, data);
     JS_FreeValue(ctx, hint_val);
     JS_FreeValue(ctx, value);
     JS_FreeValue(ctx, method);
@@ -109481,6 +109563,13 @@ static JSObject *js_atomics_get_buf(JSContext *ctx,
         return NULL;
     }
     /* if the array buffer is detached, p->u.array.count = 0 */
+    /* THE ONE BOUND TEST EVERY ATOMICS BODY WRITES UNDER, and the reason the bodies no longer repeat it. Upstream
+       tested again just before the store because the VALUE coercion ran inside the body, so `{valueOf(){ ta.buffer
+       .transfer() }}` could detach or shrink between this line and the write. In this fork every coerced argument
+       is a ToPrimitive REQUEST the step machine makes before it calls the body (js_atomics_step), so the body is
+       entered with primitives and JS_ToIndex/JS_ToBigInt64/JS_ToUint32 on a primitive reach no page code at all.
+       Nothing between here and the write can move the storage, and a repeat of this test is a branch that cannot
+       be taken — which is where its own leak lived, unreachable and untestable. The bodies assert it instead. */
     if (idx >= p->u.array.count) {
         JS_ThrowRangeError(ctx, "out-of-bound access");
         return NULL;
@@ -109684,9 +109773,11 @@ static JSValue js_atomics_op(JSContext *ctx,
         }
    }
 
-    /* check if an evil .valueOf has resized or detached the array */
-    if (idx >= p->u.array.count)
-        return JS_ThrowRangeError(ctx, "out-of-bound access");
+    /* ALWAYS fatal rather than DEV-only: what it guards is an atomic read-modify-write straight into the heap
+       at an index nothing re-validated. See js_atomics_get_buf for why this holds. */
+    CHECK(idx < p->u.array.count,
+          "an Atomics read-modify-write reached its storage out of bounds - js_atomics_get_buf's is the only "
+          "bound test, and it holds because every coercion is a request the step machine makes before this body");
 
     ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
     /* every op but LOAD writes the storage; LOAD reads it, and capturing there would be a spurious entry on
@@ -109817,10 +109908,8 @@ static JSValue js_atomics_store(JSContext *ctx,
             JS_FreeValue(ctx, ret);
             return JS_EXCEPTION;
         }
-        /* check if an evil .valueOf has resized or detached the array */
-        if (idx >= p->u.array.count) {
-            return JS_ThrowRangeError(ctx, "out-of-bound access");
-        }
+        CHECK(idx < p->u.array.count,
+              "Atomics.store reached its storage out of bounds - see js_atomics_get_buf");
         ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
         atomic_store((_Atomic uint64_t *)ptr, v64);
     } else {
@@ -109833,10 +109922,8 @@ static JSValue js_atomics_store(JSContext *ctx,
             JS_FreeValue(ctx, ret);
             return JS_EXCEPTION;
         }
-        /* check if an evil .valueOf has resized or detached the array */
-        if (idx >= p->u.array.count) {
-            return JS_ThrowRangeError(ctx, "out-of-bound access");
-        }
+        CHECK(idx < p->u.array.count,
+              "Atomics.store reached its storage out of bounds - see js_atomics_get_buf");
         ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
         switch(size_log2) {
         case 0:
@@ -109987,9 +110074,8 @@ static JSValue js_atomics_wait(JSContext *ctx,
     if (!ctx->rt->can_block)
         return JS_ThrowTypeError(ctx, "cannot block in this thread");
 
-    /* check if an evil .valueOf has resized or detached the array */
-    if (idx >= p->u.array.count)
-        return JS_ThrowRangeError(ctx, "out-of-bound access");
+    CHECK(idx < p->u.array.count,
+          "an Atomics wait reached its storage out of bounds - see js_atomics_get_buf");
 
     ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
 
@@ -110186,9 +110272,8 @@ static JSValue js_atomics_wait_async(JSContext *ctx, JSValueConst this_obj,
     else
         timeout = (int64_t)d;
 
-    /* the value's own valueOf may have detached or resized the buffer between the validation and here */
-    if (idx >= p->u.array.count)
-        return JS_ThrowRangeError(ctx, "out-of-bound access");
+    CHECK(idx < p->u.array.count,
+          "Atomics.waitAsync reached its storage out of bounds - see js_atomics_get_buf");
 
     res = JS_NewObject(ctx);
     if (JS_IsException(res))
