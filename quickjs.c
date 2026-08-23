@@ -1196,9 +1196,21 @@ typedef struct JSAsyncFunctionState {
        that are the same reason: a park may not fail (an OOM here would DROP a work item, which §NO BOUNDS
        forbids), and a base that is already queued has nowhere to be queued twice — so "one flow parked
        twice" stops being a rule someone keeps and becomes a shape that cannot be built.
-       `park_ctx` is recorded rather than derived because the resume runs in the realm that parked. */
-    struct list_head park_link;     /* on JSRuntime.parked_flows while parked; empty otherwise */
-    JSFlowParkFn *park_fn;          /* NULL iff not parked — park_link is then empty */
+       `park_ctx` is recorded rather than derived because the resume runs in the realm that parked.
+       `park_fn` IS THE AUTHORITY ON WHETHER THIS BASE IS PARKED, and `park_link` means nothing at all while it
+       is NULL. That is not a convenience, it is what makes a base UNPARKED BY CONSTRUCTION: every allocator in
+       this file hands out zeroed bytes, list_add_tail WRITES both link pointers without reading them, and
+       list_del's own fail-safe leaves a detached node at {NULL,NULL} — so zero, freshly-detached and
+       deliberately-cleared are ONE state and nothing has to be remembered to reach it.
+       IT WAS WRITTEN THE OTHER WAY FIRST AND THAT COST A FALSE ABORT. The asserts read `list_empty(&park_link)`,
+       which is a HEAD predicate (`el->next == el`) and answers FALSE for the {NULL,NULL} a zeroed or detached
+       node holds — so every base built by a constructor that did not self-link the field read as parked. There
+       is a fourth constructor (js_async_frame_clone's per-flow activation clone, which builds a
+       JSAsyncFunctionData field by field rather than through async_func_init), it did not, and an ordinary
+       async body that had never parked in its life aborted at its own teardown. Asking `park_fn` is both the
+       true question and the one no constructor can get wrong by omission. */
+    struct list_head park_link;     /* on JSRuntime.parked_flows while park_fn != NULL; meaningless otherwise */
+    JSFlowParkFn *park_fn;          /* NULL iff not parked — THE authority; park_link is then unread */
     JSFlowParkFreeFn *park_free_fn; /* how this site gives its reference back without running the body */
     void *park_opaque;
     JSContext *park_ctx;
@@ -28797,16 +28809,23 @@ void JS_RequestFlowYield(void) { FLOW_YIELD_REQUEST(JS_PREEMPT_HOST); }
 /* ATOMIC: run-test262 increments these from many worker threads; a non-atomic ++ races so fired can overtake
    requested (a bogus >100% + underflowed gap) or undercount (a false gap on a true-100% category). Relaxed
    ordering is enough — they are pure counters, never a synchronization point. Portable to gcc + emcc. */
-/* A BASE IS BORN UNPARKED, and every construction site says so through this one line rather than through the
-   allocator's zero bytes — which are not an empty list_head but a pair of NULLs, and a NULL `next` is the one
-   shape list_empty answers wrongly about. Three sites construct a base: async_func_init (every bytecode body,
-   generator, async function and module), reaction_call_flow_init (every call root) and flow_clone_state_alloc
-   (every forked sibling). The clone matters most: a sibling forked out of a base that is PARKED must not
-   inherit the park, because the continuation is one activation and running it twice frees a frame the other
-   arm is standing in. It is not a field to copy; it is a field to clear. */
+/* A BASE IS BORN UNPARKED — established HERE only where the memory does not already say so, which is what
+   keeps this from becoming a list. A base's unparked state is `park_fn == NULL` and nothing else (see
+   JSAsyncFunctionState), so every constructor that allocates with js_mallocz has it for free, and this file
+   builds bases from zeroed bytes in at least six places: async_func_init's callers, flow_clone_state_alloc's
+   three arms, clone_deep_flow's async and generator arms, and js_async_frame_clone. A `flow_park_init` call
+   at "the clone sites" would be a list that is ALREADY incomplete and harmlessly so, and a list that reads as
+   complete while it is not is worse than no list at all.
+   So it is called from the two functions that turn memory into a base and initialise every OTHER field of it
+   for the same reason: async_func_init, and reaction_call_flow_init — which is also the one place the memory
+   is genuinely not zeroed (js_call_flow_complete's base lives on the C STACK) and the one place a base is
+   re-initialised over a used one (a reaction's phase 1). A constructor that somehow reaches neither and does
+   not zero fails LOUD at flow_park's `park_fn == NULL` or at its own teardown's, because garbage is not NULL.
+   It detaches the link the way list_del does — {NULL,NULL}, not self-linked — so a zeroed base, a
+   just-resumed one and a deliberately-cleared one are ONE state under one convention. */
 static void flow_park_init(JSAsyncFunctionState *s) {
-    init_list_head(&s->park_link);
     s->park_fn = NULL; s->park_free_fn = NULL; s->park_opaque = NULL; s->park_ctx = NULL;
+    s->park_link.prev = s->park_link.next = NULL;
 }
 
 /* THE PUMP'S PARK. A forced preempt must be TRANSPARENT to observable ordering: the base suspends, and the
@@ -28824,11 +28843,13 @@ static void flow_park_init(JSAsyncFunctionState *s) {
 static void flow_park(JSContext *ctx, JSAsyncFunctionState *base,
                       JSFlowParkFn *fn, JSFlowParkFreeFn *free_fn, void *opaque) {
     JSRuntime *rt = ctx->rt;
-    /* ONE BASE, ONE PARK — asserted at the link rather than discovered as a corrupted ring. A base already on
-       the queue has one continuation outstanding; a second park of it would either overwrite that record (the
-       old slot's failure, moved down a level) or splice a node into the list twice, which makes the list
-       circular through itself and the pump loop forever. */
-    DCHECK(base->park_fn == NULL && list_empty(&base->park_link),
+    /* ONE BASE, ONE PARK — asked of `park_fn`, which IS the question, rather than of the link, which is not.
+       A base already on the queue has one continuation outstanding; a second park of it would either overwrite
+       that record (the old slot's failure, moved down a level) or splice a node into the list twice, which
+       makes the list circular through itself and the pump loop forever. The link is deliberately NOT read: a
+       node's pointers are meaningless until list_add_tail below writes them, and reading them is what made a
+       constructor's omission look like a live park (see JSAsyncFunctionState). */
+    DCHECK(base->park_fn == NULL,
            "a flow base was parked while it already holds a parked continuation — one activation has one "
            "resume point, so the second park either drops the first continuation or corrupts the pump's queue");
     /* AND ONLY A SUSPENDED BASE HAS A CONTINUATION TO PARK. This is what makes the record MEAN something: a
@@ -28928,8 +28949,11 @@ void JS_FreeParkedFlows(void *parked) {
         DCHECK(free_fn != NULL && pctx != NULL,
                "a parked continuation reached its disposal with no disposer or no realm — it was taken out of "
                "the runtime as a park, so the only way to give its reference back is gone");
+        /* CLEARED BEFORE THE DISPOSER RUNS, because the disposer may free this base and its teardown asserts
+           that no park still names it. Detached the way list_del detaches — {NULL,NULL} — so this and a
+           freshly-resumed base and a zeroed one are one state. */
         b->park_fn = NULL; b->park_free_fn = NULL; b->park_opaque = NULL; b->park_ctx = NULL;
-        init_list_head(&b->park_link);
+        b->park_link.prev = b->park_link.next = NULL;
         free_fn(pctx, op);
         el = next;
     } while (el != first);
@@ -28979,9 +29003,9 @@ bool JS_ResumeParkedFlow(JSRuntime *rt, JSValue *pres) {
        THE LINK COMES OFF BEFORE THE BODY RUNS, and that ordering is load-bearing rather than tidy: the body
        may park this very base again at its next back-edge, and a link still on the queue would then be added
        to a list it is already on — which flow_park's own assert names, at the site, instead of the pump
-       discovering a ring that closes through itself. */
+       discovering a ring that closes through itself. list_del's own fail-safe leaves the node at {NULL,NULL},
+       which IS this file's detached state, so there is nothing to re-initialise after it. */
     list_del(&base->park_link);
-    init_list_head(&base->park_link);
     base->park_fn = NULL; base->park_free_fn = NULL;
     base->park_opaque = NULL; base->park_ctx = NULL;
     fn(ctx, op);   /* may park again at the next back-edge — the pump loops */
@@ -44985,7 +45009,7 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
        to end without being resumed — its own disposer (JS_FreeParkedFlows / the park_free of a flow the host
        tears down or pages out), which clears the record BEFORE it releases the base — so a live record here
        means the base was released by a path that never went through it, and the continuation is dropped. */
-    DCHECK(s->park_fn == NULL && list_empty(&s->park_link),
+    DCHECK(s->park_fn == NULL,
            "an async/generator base was freed while a parked continuation still names it — the pump's queue "
            "holds a link into this allocation, and the work that continuation was is dropped with it");
     sf = &s->frame;
@@ -45491,11 +45515,13 @@ static JSAsyncFunctionState *flow_clone_state_alloc(JSContext *ctx, JSAsyncFunct
         if (!c) return NULL;
     }
     c->base_kind = src->base_kind;   /* a clone completes the way its ORIGINAL does */
-    /* A CLONE IS BORN UNPARKED, and it is a CLEAR rather than a copy. The source may be parked — a fork at a
-       branch inside a body whose continuation is already on the pump's queue is ordinary — and a park is one
-       activation's one resume point: run it twice and the second resume rebuilds a frame the first already
-       freed. The sibling reaches its own suspend point and parks then, on its own record. */
-    flow_park_init(c);
+    /* A CLONE IS BORN UNPARKED, and that is an absence with a reason rather than an oversight: the park record
+       is NOT among the fields taken from `src`. The source may be parked — a fork at a branch inside a body
+       whose continuation is already on the pump's queue is ordinary — and a park is one activation's one
+       resume point: run it twice and the second resume rebuilds a frame the first already freed. The sibling
+       reaches its own suspend point and parks then, on its own record. Every arm above allocates with
+       js_mallocz and an unparked base IS `park_fn == NULL` (see JSAsyncFunctionState), so there is nothing to
+       clear here. */
     return c;
 }
 
@@ -46690,6 +46716,17 @@ static JSAsyncFunctionData *js_async_frame_clone(JSContext *ctx, JSAsyncFunction
     d->func_state.throw_flag = s->func_state.throw_flag;
     d->func_state.base_kind = s->func_state.base_kind;
     d->func_state.tramp_top = NULL;
+    /* AND THE PARK RECORD IS DELIBERATELY NOT AMONG THE FIELDS COPIED ABOVE — which is a decision, so it is
+       written down rather than left as an absence. The SOURCE may be parked: a body preempted at its base has
+       exactly the shape this function asserts (cur_sp set, tramp_top NULL), so a clone taken over one is
+       ordinary. A park is ONE activation's ONE resume point, and a clone that carried it would hand the pump a
+       continuation that rebuilds a frame the other arm's completion already freed. `d` came from js_mallocz,
+       and an unparked base IS `park_fn == NULL` (see JSAsyncFunctionState), so the clone is already unparked
+       and the sibling parks on its own record when it reaches its own suspend point.
+       THE FIRST VERSION OF THAT INVARIANT MADE THIS FUNCTION ABORT. It asked `list_empty(&park_link)`, a HEAD
+       predicate that answers FALSE for the {NULL,NULL} a zeroed node holds, so this clone — which builds a
+       JSAsyncFunctionData field by field rather than through async_func_init — read as parked and an ordinary
+       async body aborted at its own teardown having never parked in its life. */
     d->is_active = true;
     return d;
 }
@@ -100430,7 +100467,7 @@ static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValu
        clears the park record, and clearing a LIVE one would leave this base on the pump's queue with nothing
        to resume it and its link pointing into a frame the re-init has replaced. It is not true here (phase 0
        completed rather than parked, which is the branch that reached this call), and this is what says so. */
-    DCHECK(rf->fs.park_fn == NULL && list_empty(&rf->fs.park_link),
+    DCHECK(rf->fs.park_fn == NULL,
            "a reaction flow's settle phase is re-initialising a base that still holds a parked continuation — "
            "the record is about to be cleared while the pump's queue still names it");
     if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&res)) < 0) { JS_FreeValue(ctx, res); return -1; }
@@ -100510,7 +100547,7 @@ static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s)
     /* …AND THE SAME SENTENCE ABOUT THE PARK, asked here as well as in async_func_free because the branch below
        reaches that function only for a SUSPENDED frame: a call root whose frame completed takes the `else`
        arm, and a park record surviving on it would have no other reader. */
-    DCHECK(rf->fs.park_fn == NULL && list_empty(&rf->fs.park_link),
+    DCHECK(rf->fs.park_fn == NULL,
            "a reaction flow reached its base teardown while a parked continuation still names it — the pump's "
            "queue holds a link into this allocation, and the settle it owed is dropped with it");
     if (rf->fs.frame.cur_sp != NULL)
