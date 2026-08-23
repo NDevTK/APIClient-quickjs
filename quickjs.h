@@ -1835,8 +1835,9 @@ JS_EXTERN void  JS_ObjStateFree(JSRuntime *rt, void *blob);
    PROPAGATES through the two interpreter operators that must carry it. One concern, one owner (the concolic
    component), one registration (JS_SetConcolicHooks); not optional, a NULL argument crashes. Each returns 1 when
    it handled a concolic operand (result already placed in sp[-2]) and 0 to let the normal operator run.
-     - add: propagation through `+`. A concolic operand yields the concolic result (derived shape + example) in
-            sp[-2] — this is how `'/api/' + id` carries the URL shape.
+     - add: propagation through a CONCATENATION. A concolic operand yields the concolic result (derived shape +
+            example) in sp[-2] — this is how `'/api/' + id` carries the URL shape. WHICH concatenation is the
+            caller's to state (JSConcolicAddOp below); the hook never guesses it.
      - cmp: propagation through == / === . A concolic operand yields a concolic BOOL carrying the {src,op,tok}
             constraint, so `if (x === 'admin')` FORKS instead of collapsing to a concrete false. is_neq flips
             the recorded op.
@@ -1861,12 +1862,38 @@ JS_EXTERN void  JS_ObjStateFree(JSRuntime *rt, void *blob);
             coercion precisely so control flow keeps forking, and equality already had a hook while ordering
             did not. `op` is the OP_lt/lte/gt/gte opcode. */
 /* The arithmetic operator a concolic result is derived for — quickjs speaks these to the host so the solver
-   never has to know opcode numbers. */
+   never has to know opcode numbers.
+   THE UNARY ONES COME FIRST AND THE HOST READS THE ARITY FROM THAT ORDER (op <= JS_CARITH_DEC), so a new
+   operator is APPENDED, never inserted.
+   The set is 13.15.3 ApplyStringOrNumericBinaryOperator's `opText` minus `+`, plus the three unary operators
+   13.5.4/13.5.5/13.5.6 and the two update operators. `+` is deliberately absent: 13.15.3 step 1 ToPrimitives
+   BOTH operands and string-concatenates when either primitive is a String, so it is a different algorithm and
+   has its own hook (.add) — routing it here would turn `"/api/" + cfg.region` into arithmetic.
+   The BITWISE and SHIFT six are 13.12 Binary Bitwise Operators and 13.9 Bitwise Shift Operators, whose numeric
+   results are 6.1.6.1.16 NumberBitwiseOp ( op, x, y ), 6.1.6.1.9 Number::leftShift ( x, y ),
+   6.1.6.1.10 Number::signedRightShift ( x, y ) and 6.1.6.1.11 Number::unsignedRightShift ( x, y ). Each of
+   those begins with ToInt32/ToUint32 rather than plain arithmetic, which is why the host runs the ENGINE'S own
+   7.1.8 ToInt32 ( arg ) / 7.1.9 ToUint32 ( arg ) on the operands' examples instead of casting a double. */
 enum { JS_CARITH_NEG = 0, JS_CARITH_PLUS, JS_CARITH_NOT, JS_CARITH_INC, JS_CARITH_DEC,
-       JS_CARITH_SUB, JS_CARITH_MUL, JS_CARITH_DIV, JS_CARITH_MOD, JS_CARITH_POW };
+       JS_CARITH_SUB, JS_CARITH_MUL, JS_CARITH_DIV, JS_CARITH_MOD, JS_CARITH_POW,
+       JS_CARITH_AND, JS_CARITH_OR, JS_CARITH_XOR, JS_CARITH_SHL, JS_CARITH_SAR, JS_CARITH_SHR };
+
+/* WHICH ALGORITHM IS CONCATENATING. Two spec operations share the .add derivation and they do NOT share its
+   TYPE TEST. 13.15.3 ApplyStringOrNumericBinaryOperator step 1.c tests its own operands — "If leftPrimitive is
+   a String or rightPrimitive is a String" — and takes the NUMERIC path (step 3's 7.1.3 ToNumeric, then
+   6.1.6.1.7 Number::add) when neither is. 22.1.3.5 String.prototype.concat has ALREADY performed 7.1.19
+   ToString on every piece at its steps 3 and 5.a, so its answer is a String always and there is no arm to pick.
+   The two shared one entry for as long as the hook was string-only, and the moment its `+` arm learned 13.15.3
+   that sharing became a WRONG ANSWER for concat: `x.concat(y)` over two numeric examples would have produced
+   their SUM. So the CALLER states which operation it is performing — it is the only party that knows — and the
+   hook never infers it from the operands. */
+typedef enum JSConcolicAddOp {
+    JS_CONCOLIC_ADD_PLUS,     /* 13.15.3's `+` (js_add_slow): step 1.c decides the arm */
+    JS_CONCOLIC_ADD_CONCAT,   /* 22.1.3.5's string-concatenation: the string arm, unconditionally */
+} JSConcolicAddOp;
 
 typedef struct JSConcolicHooks {
-    int (*add)(JSContext *ctx, JSValue *sp);
+    int (*add)(JSContext *ctx, JSValue *sp, JSConcolicAddOp op);
     int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
     int (*is)(JSValueConst v);
     JSValue (*absent)(JSContext *ctx, JSAtom name);
@@ -1978,14 +2005,18 @@ JS_EXTERN JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueCons
    and a position in a script sequence cannot say: a program the running call queues moves the cursor back
    inside the sequence while the call frame is still live. */
 JS_EXTERN int      JS_FlowIsCall(const JSValue *flow);
-/* THE ORPHANS — every function object on this runtime's heap whose BODY no call frame has ever begun, handed
-   over one at a time with the callee's own declared formal parameter count. See JS_OrphanTake in quickjs.c for
-   what an orphan is, why the heap is where they are enumerated from, and why taking one is not a seen-set.
+/* ONE ORPHAN — the next function object on this runtime's heap whose BODY no call frame has ever begun, handed
+   over with the callee's own declared formal parameter count. See JS_OrphanTakeOne in quickjs.c for what an
+   orphan is, why the heap is where they are enumerated from, why taking one is not a seen-set, and why this
+   hands over ONE rather than the set: its consumer turns each into a FLOW, so a take of N mints N flows inside
+   one C loop that has no back-edge and therefore no suspend point, and the scheduler cannot re-rank, return to
+   its host or page its tail across the burst. One per call makes the scheduler's own loop the only loop over
+   orphans, and needs no queue anywhere — between two calls the remaining orphans are the heap.
    `visit` is called from inside the walk of the object list and MUST NOT ALLOCATE A GC OBJECT — it records (a
    JS_DupValue costs no allocation) and acts once the take has returned; a dev build asserts it. `fn` is
-   BORROWED. Returns how many were handed over. */
+   BORROWED. Returns 1 if one was handed over, 0 if this heap holds none. */
 typedef void JSOrphanVisitFn(JSContext *ctx, JSValueConst fn, int arg_count, void *opaque);
-JS_EXTERN int      JS_OrphanTake(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque);
+JS_EXTERN int      JS_OrphanTakeOne(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque);
 /* COULD THE ORPHAN SET HAVE GROWN — the count of function objects this runtime has ever made. Creating one is
    the only event that can add to the set (running a body only marks it entered, taking one only marks it
    taken, collecting one only removes it), so a host that took the orphans at generation G may skip the heap

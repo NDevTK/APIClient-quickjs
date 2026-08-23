@@ -1042,7 +1042,7 @@ typedef struct JSFunctionBytecode {
        the trampoline's three pushes, the coroutine resume — converges on that one label before it executes an
        opcode, so a call shape added later cannot forget to mark, because there is no marking to remember. The
        cost is one predictable byte store per frame entry into a struct the interpreter is about to read anyway.
-       IT IS ALSO SET BY JS_OrphanTake, which is what makes an orphan a work item taken once rather than a
+       IT IS ALSO SET BY JS_OrphanTakeOne, which is what makes an orphan a work item taken once rather than a
        question re-asked: see that function for why that is not a seen-set. */
     uint8_t entered : 1;
     /* XXX: 2 bits available */
@@ -3016,7 +3016,8 @@ static _Thread_local JSJobRemoveHook g_job_remove_hook = NULL;
 void JS_SetJobRemoveHook(JSJobRemoveHook h) { g_job_remove_hook = h; }
 
 /* forced-exec CONCOLIC-VALUE hooks (see JSConcolicHooks in quickjs.h): .add propagates a concolic value through
-   `+` (js_add_slow), .cmp through == / === , .is names the solver's value class. One struct, installed by
+   a concatenation — 13.15.3's `+` (js_add_slow) or 22.1.3.5's String.prototype.concat, which the caller names
+   because only it knows which — .cmp through == / === , .is names the solver's value class. One struct, installed by
    JS_SetConcolicHooks. Declared HERE, with the other engine-wide hook sets, because the string helpers a
    thousand lines below assert against unknown external input reaching them and a declaration that sits after
    its first assertion is a rule nobody can state. */
@@ -7635,10 +7636,24 @@ static void js_eval_sink_announce(JSContext *ctx, JSValueConst src)
    @@toPrimitive off it, gets a derived concolic back from its exotic [[Get]], and calls that — "not a function"
    in the page, from an operator the page never wrote. So an operator asks THIS where it would have asked the
    raw tag, and the concolic reaches the operator's slow path where the .add / .cmp hook already is.
-   do_toprim_tramp asserts the other side of this: no concolic may reach the walk. */
+   do_toprim_tramp short-circuits the other side of this: a concolic that reaches the walk is handed straight
+   back rather than read from. */
+static bool js_value_is_concolic(JSValueConst v)
+{
+    return g_concolic.is != NULL && g_concolic.is(v);
+}
 static bool js_toprim_operand(JSValueConst v)
 {
-    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && !(g_concolic.is && g_concolic.is(v));
+    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && !js_value_is_concolic(v);
+}
+/* THE OTHER HALF OF THE SAME QUESTION, for 13.15.3 steps 3-4. Once ToPrimitive has run, ToNumeric on the
+   remaining operand runs no user code and the operator may perform it eagerly to keep the spec's ORDER — but a
+   CONCOLIC is not a primitive and its ToNumeric is not a conversion at all: it is step 7's operation, which the
+   operator's own .arith / .add / .rel hook answers. Coercing one here reaches the ToNumber boundary, which owes
+   C a real number and can only crash. */
+static bool js_tonumeric_eager(JSValueConst v)
+{
+    return !js_value_is_concolic(v);
 }
 /* Ask the host to record an object's pre-write state (for per-flow revert). Whether a FLOW_LOCAL object is
    skipped is decided by the HOST hook, NOT here: a snapshot fork SHARES the parent frame's flow_local objects
@@ -14917,12 +14932,63 @@ void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id)
     return p->u.opaque;
 }
 
+#if APICLIENT_DEV
+/* PAGE TEXT ON THE DIAGNOSTIC CHANNEL — a `@WHY` is ONE JSON line and check.h embeds its reason UNESCAPED, so
+   a message carrying a backtrace carries the page's own function and file names into that line. A newline ends
+   the record early and a quote closes the string, which is not merely garbled output: the bridge parses these
+   lines, so a page could FORGE one. Every byte outside printable ASCII becomes a space, and the two bytes JSON
+   gives meaning to become an apostrophe — the same rule core/json_buf.h applies for strings the engine owns,
+   applied here because an assert cannot allocate its way out of a crash. Always NUL-terminates. */
+static void js_why_sanitize(char *dst, size_t n, const char *src)
+{
+    size_t i = 0;
+    DCHECK(n > 0, "js_why_sanitize was given no room to write the terminator");
+    if (src) {
+        for (; src[i] && i + 1 < n; i++) {
+            unsigned char c = (unsigned char)src[i];
+            dst[i] = (c == '"' || c == '\\') ? '\'' : (c < 0x20 || c >= 0x7f) ? ' ' : (char)c;
+        }
+    }
+    dst[i] = '\0';
+}
+
+/* THE FRAMES, RENDERED AND SAFE TO EMBED. build_backtrace CAPTURES frames and parks Error.prepareStackTrace
+   UNREAD (the accessor renders, this never calls it), and js_callsite_array_render is the DEFAULT rendering —
+   string work over CallSite records — so neither runs a byte of the page's code, which is what makes asking
+   for a trace legal on an assert path. */
+static void js_why_backtrace(JSContext *ctx, char *dst, size_t n)
+{
+    JSValue stack = JS_UNDEFINED, rendered = JS_UNDEFINED;
+    const char *trace = NULL;
+
+    build_backtrace(ctx, JS_UNDEFINED, JS_UNDEFINED, NULL, 0, 0, 0, &stack);
+    if (js_error_stack_is_pending(stack)) {
+        JSValue sites = JS_GetPropertyUint32(ctx, stack, 1);
+        if (!JS_IsException(sites))
+            rendered = js_callsite_array_render(ctx, sites);
+        JS_FreeValue(ctx, sites);
+        if (JS_IsString(rendered))
+            trace = JS_ToCString(ctx, rendered);
+    }
+    js_why_sanitize(dst, n, trace && trace[0] ? trace : NULL);
+    if (!dst[0])
+        snprintf(dst, n, "(no frames — the arrival is a host edge reached outside any JS activation)");
+    if (trace) JS_FreeCString(ctx, trace);
+    JS_FreeValue(ctx, rendered);
+    JS_FreeValue(ctx, stack);
+}
+#endif
+
 /* THE C-DRIVES-JS PATH IN ToPrimitive IS GONE — the body that ran @@toPrimitive / valueOf / toString through
    JS_CallFree has been DELETED, not left behind an assert. It was the last of the three functions whose mutual
    reachability manufactures the interpreter cycle (engine/check_recursion.mjs --why-blob), and a superseded
-   system kept as a fallback is what lets an unrouted site stay unrouted: the DCHECK that used to sit here was
-   silent over the whole corpus precisely because the real work had moved, and the only honest end to that
-   sequence is removal.
+   system kept as a fallback is what lets an unrouted site stay unrouted.
+   THE COVERAGE CLAIM THAT STOOD HERE — that the assert was "silent over the whole corpus" — WAS A CLAIM ABOUT
+   A CORPUS OF FIXTURES, AND REAL PAGES FALSIFIED IT: driven over thirty signed-out product surfaces in Chrome,
+   two of them (excalidraw, mastodon) abort on exactly this line. Silence under test262 and WPT proves only that
+   those corpora do not reach the unrouted edges; the routing is unfinished and the number of remaining sites is
+   not something this comment knows. So the assert now NAMES the site it fires at, which is the difference
+   between an instruction and an actionable one — see the message below.
    The trampolined form is JSToPrim (operand and machine mode); the operator dispatch, the key coercions and
    every PRIMARGS builtin route through it. Two rounds of that conversion are in the git history and both are
    worth knowing when a new site turns up: round one was BigInt.prototype.toString coercing its radix from C,
@@ -14940,10 +15006,47 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
 {
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
         return val;
-    if (g_concolic.is && g_concolic.is(val))
+    if (js_value_is_concolic(val))
         return val;
-    DFAIL("JS_ToPrimitiveFree reached with a real object — route this site to the ToPrimitive trampoline "
-          "instead of running valueOf/toString from C");
+#if APICLIENT_DEV
+    {
+        /* WHICH SITE. The instruction below names a mechanism, and for the whole of its life it could not name
+           the CALL SITE it was instructing anyone to route — a `@WHY` whose remedy is "route this site" and
+           whose text is identical wherever it fires is a crash nobody can act on, which is the twin of the
+           stale-DFAIL failure: accurate about the spec, silent about this tree. Two of a thirty-site corpus
+           aborted here and the report could say no more than the file:line of THIS function.
+           The innermost frame is the page's call INTO the unrouted builtin or host edge, which is the file:line
+           to fix; the CLASS is what tells a Date reaching an unconverted operator from a plain object handed to
+           a DOM member. */
+        char why[4096];
+        char frames[2048];
+        char cbuf[ATOM_GET_STR_BUF_SIZE];
+        const char *cname;
+        int th = hint & ~HINT_FORCE_ORDINARY;   /* the caller's hint may carry 7.1.1.1's entry bit */
+
+        cname = JS_AtomGetStr(ctx, cbuf, sizeof(cbuf),
+                              ctx->rt->class_array[JS_VALUE_GET_OBJ(val)->class_id].class_name);
+        js_why_backtrace(ctx, frames, sizeof frames);
+        snprintf(why, sizeof why,
+                 "7.1.1 ToPrimitive reached with a REAL object (class `%.40s`, hint %s) from a C activation "
+                 "with no flow base under it. 7.1.1 step 2.a is GetMethod(input, @@toPrimitive) and 7.1.1.1 "
+                 "OrdinaryToPrimitive step 3 CALLS the page's valueOf/toString, so this is not a conversion "
+                 "the boundary can perform — the C-drives-JS body was DELETED, not left behind an assert. "
+                 "ROUTE THE CALL SITE to the trampoline: a builtin declares PRIMARGS(mask, hint, nargs) at its "
+                 "JSTrampStepDef so js_primargs_step coerces the argument as a TOPRIMITIVE step; an operator "
+                 "asks js_toprim_operand and goes to do_toprim_tramp with a tp_resume_at of its own; a step "
+                 "machine already on the chain sets tp_outer/tp_value and delivers the primitive as its next "
+                 "step's result. A host component that only wants BYTES asks for them at its own edge instead. "
+                 "The innermost frame here is the page's call into the site that has not been routed: %s",
+                 cname ? cname : "(unnamed class)",
+                 th == HINT_STRING ? "string" : th == HINT_NUMBER ? "number" : "default",
+                 frames);
+        DFAIL(why);
+    }
+#endif
+    /* The release path owns `val`: DFAIL is compiled out there, so without this the operand's reference is the
+       one thing the TypeError does not take with it. */
+    JS_FreeValue(ctx, val);
     return JS_ThrowTypeError(ctx, "toPrimitive");
 }
 
@@ -16706,18 +16809,55 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
         /* THE CONVERSION CONTRACT (the twin assert is in JS_ToStringInternal). ToNumber and ToString are the C
            BOUNDARY: every caller — a URL built in C, a property atom, a printf — needs a REAL primitive back,
            and a concolic cannot be one. So this boundary stays total and honest, and a CONCOLIC MUST NEVER
-           REACH IT: the operator above must have answered with the concolic hooks (.add / .cmp / .rel) before
-           converting, because opacity has to SURVIVE the coercion or the value stops forking control flow.
+           REACH IT: the operator above must have answered with the concolic hooks (.add / .cmp / .rel / .arith)
+           before converting, because opacity has to SURVIVE the coercion or the value stops forking control
+           flow.
            Asserted HERE rather than at the eighteen coercion sites, because this is the one place all of them
            funnel into — an operator with no concolic semantics yet crashes naming ToNumber instead of looping
            forever (ToPrimitive hands a concolic straight back, which is an infinite coercion) or silently
            collapsing to NaN. Where C genuinely wants a concrete projection of a concolic it asks EXPLICITLY —
            concolic_shape_c for a DOM text node's bytes, concolic_example for a learned value — never implicitly
            through a coercion. In release the DCHECK is gone and the throw is what keeps it from looping. */
-        if (unlikely(g_concolic.is && g_concolic.is(val))) {
-            DCHECK(0, "ToNumber over a CONCOLIC operand — arithmetic on unknown external input has no concolic "
-                      "semantics yet. Build it in the operator (a derived concolic, the way .add and .rel "
-                      "already answer), never by converting here: this boundary owes C a real number.");
+        if (unlikely(js_value_is_concolic(val))) {
+#if APICLIENT_DEV
+            {
+                /* WHICH VALUE AND WHICH SITE — the twin's rule (see JS_ToStringInternal): a reader standing at
+                   a real page's abort has the message and nothing else, so a `@WHY` that names only the
+                   mechanism names no work. The SHAPE identifies the unknown that died and the frames identify
+                   the operator or edge that coerced it. The shape projection runs no page code either —
+                   key_name answers the concolic's own display form as a real String. */
+                char why[4096];
+                char frames[2048];
+                char shbuf[256];
+                JSValue sv = JS_UNINITIALIZED;
+
+                snprintf(shbuf, sizeof shbuf, "%s", "(a shape this engine could not spell)");
+                if (g_concolic.key_name) {
+                    sv = g_concolic.key_name(ctx, val);
+                    if (JS_IsString(sv)) {
+                        const char *s = JS_ToCString(ctx, sv);
+                        if (s) { js_why_sanitize(shbuf, sizeof shbuf, s); JS_FreeCString(ctx, s); }
+                    }
+                }
+                JS_FreeValue(ctx, sv);
+                js_why_backtrace(ctx, frames, sizeof frames);
+                snprintf(why, sizeof why,
+                         "7.1.4 ToNumber over UNKNOWN EXTERNAL INPUT `%.240s`. Every ECMAScript OPERATOR over "
+                         "an unknown answers at its own site with a derived concolic — .add for 13.15.3's `+`, "
+                         ".cmp, .rel, and .arith for 13.5.4/.5/.6, the update operators, 13.7's multiplicative "
+                         "family, 13.9 Bitwise Shift Operators and 13.12 Binary Bitwise Operators — so an "
+                         "arrival here is NOT one of those. It is a CONSUMER that wants a real number: a "
+                         "builtin's ToInt32/ToLength/ToIndex, a host component's JS_ToFloat64 on an argument, "
+                         "an array index. FIX IT AT THAT SITE: derive the result there (JSConcolicHooks.builtin "
+                         "names the operation the spec was performing), or, where the consumer wants BYTES "
+                         "rather than a value, ask the unknown for its own projection (concolic_example / "
+                         "concolic_shape_c) exactly as fetch's URL and the Attr/Element text edges do. Never "
+                         "convert here: this boundary owes C a real number, and ToPrimitive hands a concolic "
+                         "straight back, so converting is an infinite coercion. Frames: %s",
+                         shbuf, frames);
+                DFAIL(why);
+            }
+#endif
             JS_FreeValue(ctx, val);
             return JS_ThrowTypeError(ctx, "arithmetic over unknown external input is not modelled yet");
         }
@@ -18527,7 +18667,9 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
     JSValue op1, op2;
     uint32_t tag1, tag2;
 
-    if (g_concolic.add && g_concolic.add(ctx, sp)) return 0;   /* forced-exec: a concolic operand -> concolic result in sp[-2] */
+    /* forced-exec: a concolic operand -> concolic result in sp[-2]. This IS 13.15.3, so step 1.c is the hook's
+       to decide — over the operands' EXAMPLES, which is where this operator's concrete half lives. */
+    if (g_concolic.add && g_concolic.add(ctx, sp, JS_CONCOLIC_ADD_PLUS)) return 0;
 
     op1 = sp[-2];
     op2 = sp[-1];
@@ -18649,6 +18791,24 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
     JSValue op1, op2;
     uint32_t tag1, tag2;
     uint32_t v1, v2, r;
+
+    /* THE BINARY-ARITHMETIC RULE, FOR 13.12 Binary Bitwise Operators AND 13.9 Bitwise Shift Operators. This
+       family reached the conversion boundary with unknown external input while `-` `*` `/` `%` `**` did not,
+       so `h = (h << 5) - h + c | 0` — a minified bundle's string hash — aborted the whole document at
+       ToNumber. The result is a DERIVED concolic computed HERE, because 13.15.3 step 7's operation is what a
+       concolic's ToNumeric means and the boundary below owes C a real number. */
+    {
+        int cop = op == OP_and ? JS_CARITH_AND : op == OP_or ? JS_CARITH_OR
+                : op == OP_xor ? JS_CARITH_XOR : op == OP_shl ? JS_CARITH_SHL
+                : op == OP_sar ? JS_CARITH_SAR : -1;
+        DCHECK(cop >= 0, "js_binary_logic_slow reached with an opcode outside the bitwise/shift family — "
+                         ">>> has its own tail in js_shr_slow and every other operator has its own slow path");
+        if (g_concolic.arith && cop >= 0 && g_concolic.arith(ctx, sp, cop, 2))
+            return 0;
+    }
+    DCHECK(!js_value_is_concolic(sp[-2]) && !js_value_is_concolic(sp[-1]),
+           "a CONCOLIC operand survived the bitwise/shift operator's own hook and is about to reach ToNumeric, "
+           "which owes C a real number — the .arith hook must answer every operand it is handed");
 
     op1 = sp[-2];
     op2 = sp[-1];
@@ -19198,6 +19358,14 @@ static no_inline int js_shr_slow(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;
     uint32_t v1, v2, r;
+
+    /* 13.9's third operator, whose numeric result is 6.1.6.1.11 Number::unsignedRightShift ( x, y ) — the one
+       that is ToUint32 on BOTH sides, which is why it has its own id rather than sharing OP_sar's. */
+    if (g_concolic.arith && g_concolic.arith(ctx, sp, JS_CARITH_SHR, 2))
+        return 0;
+    DCHECK(!js_value_is_concolic(sp[-2]) && !js_value_is_concolic(sp[-1]),
+           "a CONCOLIC operand survived >>>'s own hook and is about to reach ToNumeric, which owes C a real "
+           "number — the .arith hook must answer every operand it is handed");
 
     op1 = sp[-2];
     op2 = sp[-1];
@@ -20124,7 +20292,7 @@ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
     p->u.func.function_bytecode = b;
     p->u.func.home_object = NULL;
     p->u.func.var_refs = NULL;
-    /* A NEW FUNCTION OBJECT EXISTS, which is the ONE event that can add to the set JS_OrphanTake enumerates —
+    /* A NEW FUNCTION OBJECT EXISTS, which is the ONE event that can add to the set JS_OrphanTakeOne enumerates —
        and this is the one line every function object in this runtime passes through, whether it came from a
        fresh compile or from an enclosing body running for the first time and instantiating a body that had no
        closure until now. Nothing else can add one: executing a body only marks it entered, taking one only
@@ -41262,21 +41430,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                loop in that method preempts in an activation with no flow base. Coerce the LEFT object operand on
                the tramp and continue at do_arith_after_left, where the right operand is coerced by the same
                path, in spec order. Every opcode reaching this label is one byte, so `pc - 1` is its own byte. */
-            if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+            if (js_toprim_operand(sp[-2])) {
                 tp_slot = -2; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
                 tp_resume_at = TPR_ARITH_AFTER_LEFT;
                 goto do_toprim_tramp;
             }
         do_arith_after_left:
-            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+            if (js_toprim_operand(sp[-1])) {
                 /* These operators are ToNumeric(lhs) THEN ToNumeric(rhs), and ToNumeric is ToPrimitive plus the
                    numeric conversion — so the LEFT operand's conversion must COMPLETE before the right is touched
                    at all. Interleaving the two ToPrimitives (which is right for `+`, whose two ToPrimitives do
                    precede any conversion) let a left `valueOf` returning a Symbol run the right's valueOf before
                    throwing: order-of-evaluation traced "1234" where the spec says "123". The left is already a
-                   primitive here, so this conversion runs no user code — it only throws. */
-                sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
-                if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
+                   primitive here, so this conversion runs no user code — it only throws. A CONCOLIC left is
+                   neither, and its ToNumeric is the operator's own; see js_tonumeric_eager. */
+                if (js_tonumeric_eager(sp[-2])) {
+                    sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
+                    if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
+                }
                 tp_slot = -1; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
                 tp_resume_at = TPR_ARITH_AFTER_RIGHT;
                 goto do_toprim_tramp;
@@ -41299,7 +41470,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                there was no such place — the retry re-entered the opcode only to reach its own copy of it. The
                shape is binary_arith_slow's, one label owning the family's slow path. */
             sf->cur_pc = pc;
-            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+            if (js_toprim_operand(sp[-1])) {
                 tp_slot = -1; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
                 tp_resume_at = TPR_UNARY_AFTER_COERCE;
                 goto do_toprim_tramp;
@@ -41456,7 +41627,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    instead, where the family's coercion can park it. */
                 *sp++ = js_dup(*pv);
                 sf->cur_pc = pc;
-                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                if (js_toprim_operand(sp[-1])) {
                     tp_slot = -1; tp_hint = HINT_NUMBER; tp_op_byte = pc - 2;
                     tp_resume_at = TPR_UNARY_LOC_AFTER_COERCE;
                     goto do_toprim_tramp;
@@ -41578,18 +41749,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        never reached them.
                        Every opcode reaching this label is one byte, so `pc - 1` is its own byte. */
                     sf->cur_pc = pc;
-                    if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT) {
+                    if (js_toprim_operand(sp[-2])) {
                         tp_slot = -2; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
                         tp_resume_at = TPR_LOGIC_AFTER_LEFT;
                         goto do_toprim_tramp;
                     }
                 do_logic_after_left:
-                    if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
+                    if (js_toprim_operand(sp[-1])) {
                         /* ToNumeric(lhs) must COMPLETE before the rhs is touched (the same ordering rule the
                            arithmetic label spells out). The left is already primitive here, so this conversion
-                           runs no user code — it only throws. */
-                        sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
-                        if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
+                           runs no user code — it only throws. A CONCOLIC left is neither primitive nor an
+                           object the walk may read, and its ToNumeric is the operator's own; performing it here
+                           reached the ToNumber boundary and crashed. */
+                        if (js_tonumeric_eager(sp[-2])) {
+                            sp[-2] = JS_ToNumericFree(ctx, sp[-2]);
+                            if (unlikely(JS_IsException(sp[-2]))) { sp[-2] = JS_UNDEFINED; goto exception; }
+                        }
                         tp_slot = -1; tp_hint = HINT_NUMBER; tp_op_byte = pc - 1;
                         tp_resume_at = TPR_LOGIC_AFTER_RIGHT;
                         goto do_toprim_tramp;
@@ -87164,9 +87339,11 @@ static int js_str_concat_prologue(JSContext *ctx, JSStrConcat *s)
    receiver's, which seeds the accumulator rather than concatenating onto it.
    A CONCOLIC PIECE MAKES THE WHOLE CONCATENATION CONCOLIC. An untagged template literal COMPILES to
    String.prototype.concat, so `v${x}` is this machine — and stringifying unknown external input has no answer at
-   the ToString boundary, which owes C a real string. The answer is the one `+` already gives: concat IS string
-   concatenation, so folding through the .add hook reuses the exact semantics (shape joined, source kept, example
-   produced by actually concatenating the examples) rather than inventing a second rule for the same operation. */
+   the ToString boundary, which owes C a real string. The answer folds through the .add hook, which owns the
+   derivation (shape joined, source kept, example produced by actually concatenating the examples) rather than
+   inventing a second rule for the same operation — but it declares WHICH concatenation this is. 22.1.3.5 has
+   already ToString'd every piece at steps 3 and 5.a, so its arm is the string one ALWAYS, where 13.15.3 step 1.c
+   would take the numeric path over two numeric examples: `(x*2).concat(y*3)` is "1020" and never 30. */
 static int js_str_concat_join(JSContext *ctx, JSStrConcat *s, JSValue val, bool first)
 {
     JSValue pair[2], str;
@@ -87174,7 +87351,7 @@ static int js_str_concat_join(JSContext *ctx, JSStrConcat *s, JSValue val, bool 
     if (g_concolic.is && g_concolic.add && g_concolic.is(val)) {
         if (first) { s->acc = val; return 0; }
         pair[0] = s->acc; pair[1] = val;
-        if (!g_concolic.add(ctx, pair + 2))
+        if (!g_concolic.add(ctx, pair + 2, JS_CONCOLIC_ADD_CONCAT))
             DFAIL("the concolic + hook declined a concolic concat operand");
         s->acc = pair[0];
         return 0;
@@ -87187,7 +87364,7 @@ static int js_str_concat_join(JSContext *ctx, JSStrConcat *s, JSValue val, bool 
     if (g_concolic.is && g_concolic.add && g_concolic.is(s->acc)) {
         /* the accumulator went concolic earlier: every later piece joins it the same way. */
         pair[0] = s->acc; pair[1] = str;
-        if (!g_concolic.add(ctx, pair + 2))
+        if (!g_concolic.add(ctx, pair + 2, JS_CONCOLIC_ADD_CONCAT))
             DFAIL("the concolic + hook declined a concolic accumulator");
         s->acc = pair[0];
         return 0;
@@ -98531,11 +98708,22 @@ JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueConst this_val
  * nothing) and may use the host allocator, which this runtime does not count; the DCHECK below is that
  * statement made enforceable.
  *
- * Returns how many were handed over. `arg_count` is the callee's own declared formal parameter count, which is
- * how many unknowns its caller has to supply. */
+ * ONE PER CALL, AND THAT IS THE WHOLE OF THE SUSPEND/RESUME SEAM ON THIS PATH. Handing the caller the entire
+ * set was the shape a scheduler cannot interleave: its consumer turns each orphan into a flow, so a take of N
+ * is N flows minted inside ONE uninterruptible C loop, with no back-edge on it and therefore no preempt check —
+ * measured at 3890 units of work in a single scheduler step on a real bundle, with `points asked=0`. Nothing
+ * was dropped and nothing was capped; the engine simply could not return to its host, re-rank, or page its tail
+ * across the burst. Taking ONE makes the SCHEDULER's loop the only loop over orphans, which is what
+ * §scheduler's "orphan-driving is just another BFS flow" says and what a driver of its own would be.
+ * IT NEEDS NO QUEUE ANYWHERE, which is why this is the take's business and not its caller's: between two takes
+ * the remaining orphans are represented by the heap itself — the `entered` bit is the only state — so there is
+ * no host-side buffer to fork per flow, to serialize to the cold tier, or to drop on a park.
+ *
+ * Returns 1 if one was handed over, 0 if this heap holds none. `arg_count` is the callee's own declared formal
+ * parameter count, which is how many unknowns its caller has to supply. */
 uint32_t JS_OrphanGen(JSRuntime *rt) { return rt->orphan_gen; }
 
-int JS_OrphanTake(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque)
+int JS_OrphanTakeOne(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque)
 {
     JSRuntime *rt = ctx->rt;
     struct list_head *el;
@@ -98544,8 +98732,8 @@ int JS_OrphanTake(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque)
     size_t mc0 = rt->malloc_state.malloc_count;
 #endif
 
-    DCHECK(visit != NULL, "JS_OrphanTake was given no visitor — the orphans would be marked taken and handed to "
-                          "nobody, which is the one way to lose them permanently");
+    DCHECK(visit != NULL, "JS_OrphanTakeOne was given no visitor — the orphan would be marked taken and handed "
+                          "to nobody, which is the one way to lose it permanently");
     list_for_each(el, &rt->gc_obj_list) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
         JSObject *p;
@@ -98563,7 +98751,8 @@ int JS_OrphanTake(JSContext *ctx, JSOrphanVisitFn *visit, void *opaque)
         if (b->is_program) continue;
         b->entered = 1;   /* TAKEN: this body is now scheduled, so a second closure of it is not a second orphan */
         visit(ctx, JS_MKPTR(JS_TAG_OBJECT, p), b->arg_count, opaque);
-        n++;
+        n = 1;
+        break;   /* ONE per call — see above; the caller's next step walks again for the next one */
     }
 #if APICLIENT_DEV
     DCHECK(rt->malloc_state.malloc_count == mc0,
