@@ -23763,7 +23763,8 @@ typedef struct JSArrayLen {
 } JSArrayLen;
 
 /* AL_UINT32/AL_NUMBER/AL_COMPARE are 10.4.2.4's two coercions of V and their comparison. AL_TA_PRIM/AL_TA_WRITE
-   are 10.4.5.16 TypedArraySetElement step 1's SINGLE coercion — a different algorithm in the same carrier,
+   are 10.4.5.18 TypedArraySetElement ( obj, index, value ) steps 1-2's SINGLE coercion — a different algorithm
+   in the same carrier,
    because what the carrier IS is "a keyed write parked across a coercion of V, finished here". */
 enum { AL_UINT32 = 0, AL_NUMBER, AL_COMPARE, AL_TA_PRIM, AL_TA_WRITE };
 static void js_array_len_free(JSContext *ctx, JSArrayLen *al);
@@ -33496,12 +33497,62 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSArrayLen *al = (JSArrayLen *)cont_st;
                 uint32_t len1;
+                /* AN ARRAY'S LENGTH SET TO UNKNOWN EXTERNAL INPUT — ANSWERED BEFORE THE FIRST COERCION IS EVEN
+                   ASKED FOR, the same shape step_tostring_run gives its own arm, because 7.1.1 ToPrimitive over
+                   a concolic is the identity and both of this algorithm's coercions would hand it straight to a
+                   boundary that owes C a real uint32.
+                   THIS IS NOT A VALUE TO DERIVE, IT IS STATE THIS ENGINE CANNOT HOLD, and the difference is the
+                   whole reason it says so here instead of at the conversion. 10.4.2.4 ArraySetLength
+                   ( array, propertyDesc ) step 5 is "If SameValueZero(newLen, numberLen) is false, throw a
+                   RangeError exception" — undecided over an unknown, so the operation has a feasible throw arm
+                   AND a feasible proceed arm and this boundary has no fork. Step 6 then stores newLen into the
+                   Array's exotic length, which in this object model is a real uint32_t beside u.array.count:
+                   there is no slot for an unknown one, and PICKING a length (0, or the operand's example)
+                   fabricates the answer to every `for (i = 0; i < a.length; i++)` downstream — a control-flow
+                   fact the page never determined, which is exactly what @H forbids.
+                   WHAT TO BUILD IS THE OBJECT-MODEL HALF: an Array whose [[Length]] is unknown external input,
+                   read back as that unknown so a bound over it forks per position — the READ side of which
+                   already exists, in the per-position outcome-fork chain step_length_unknown drives for a
+                   LengthOfArrayLike that produced unknown input. Until the write side can hold one, converting
+                   here is the one thing that must not happen. */
+                if (al->phase == AL_UINT32 && unlikely(js_value_is_concolic(al->val))) {
+                    DFAIL("10.4.2.4 ArraySetLength ( array, propertyDesc ) over UNKNOWN EXTERNAL INPUT: `a.length "
+                          "= x` where x is unknown. Step 5's SameValueZero is undecided (a feasible RangeError "
+                          "arm and a feasible proceed arm, and this boundary has no fork), and step 6 stores a "
+                          "real uint32 into the Array's exotic length slot, which cannot hold an unknown. "
+                          "BUILD THE OBJECT-MODEL HALF — an Array [[Length]] that IS unknown external input, "
+                          "whose read-back forks per position the way step_length_unknown already answers an "
+                          "unknown LengthOfArrayLike. Do NOT convert here and do NOT pick a length: any pick "
+                          "decides every `i < a.length` downstream, which is a fact the page never determined.");
+                    JS_ThrowTypeError(ctx, "an Array length that is unknown external input is not modelled yet");
+                    goto do_array_len_throw;
+                }
                 if (al->phase == AL_UINT32) {
                     al->phase = AL_NUMBER;
                     tp_outer = al; tp_outer_kind = CONT_ARRAY_LEN;
                     tp_value = al->val; tp_hint = HINT_NUMBER;
                     tp_slot = 0;
                     goto do_toprim_tramp;
+                }
+                /* THE SAME ANSWER FOR THE OTHER ALGORITHM IN THIS CARRIER, and it is a SHARPER case rather than
+                   a parallel one. 10.4.5.18 TypedArraySetElement ( obj, index, value ) steps 1-2 are
+                   `? ToBigInt(value)` / `? ToNumber(value)`, and step 3's SetValueInBuffer writes RAW BYTES into
+                   a data block — a uint8_t, not a JSValue, so there is nowhere for an unknown to live even in
+                   principle. Converting would not merely lose precision: `t[0] = x` followed by `t[0]` would
+                   hand the page a CONCRETE number where it had unknown external input, laundering away the
+                   fork and everything behind the arm it deleted. That is worse than the abort, which is why
+                   this says so instead. What to build is the same shape as the length's — a typed-array
+                   element store that can hold unknown input, or a documented refusal at the store. */
+                if (al->phase == AL_TA_PRIM && unlikely(js_value_is_concolic(al->val))) {
+                    DFAIL("10.4.5.18 TypedArraySetElement ( obj, index, value ) over UNKNOWN EXTERNAL INPUT: "
+                          "`ta[i] = x` where x is unknown. Steps 1-2 coerce V with ToBigInt/ToNumber and step 3 "
+                          "writes the result as RAW BYTES into the ArrayBuffer's data block, which holds "
+                          "uint8_t and not JSValues — so there is no slot for an unknown, and converting would "
+                          "make the very next `ta[i]` read hand the page a concrete number where it had unknown "
+                          "external input, deleting the fork and everything behind the other arm. Do NOT "
+                          "convert here. BUILD the element store that can hold unknown input.");
+                    JS_ThrowTypeError(ctx, "a TypedArray element that is unknown external input is not modelled yet");
+                    goto do_array_len_throw;
                 }
                 if (al->phase == AL_TA_PRIM) {
                     al->phase = AL_TA_WRITE;
@@ -33511,13 +33562,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_toprim_tramp;
                 }
                 if (al->phase == AL_TA_WRITE) {
-                    /* 10.4.5.16 step 1 is done, so what remains is STEPS 2-3 AND NOTHING ELSE: store if the
+                    /* 10.4.5.18 TypedArraySetElement's coercion (its steps 1-2) is done, so what remains is
+                       STEP 3 AND NOTHING ELSE: store if the
                        index is still valid, and either way the operation succeeds. Re-running the enclosing
                        [[Set]]/[[DefineOwnProperty]] instead would re-ask questions the spec already answered
                        before the coercion — a valueOf that DETACHES the buffer would turn 10.4.5.3 step 1.a
                        false on the second reading and make the define report failure, where the spec says it
                        returns true with the store simply skipped. JS_SetPropertyValue on a PRIMITIVE V is
-                       exactly steps 1-3 with step 1 already spent, including the out-of-bounds no-op. */
+                       exactly steps 1-3 with the coercion already spent, including the out-of-bounds no-op. */
                     JSValue coerced = ret_val, key;
                     int wres;
                     ret_val = JS_UNDEFINED;
@@ -89572,6 +89624,45 @@ static double js_fmax(double a, double b)
     }
 }
 
+/* §21.3.2.25 Math.max ( ...args ) / §21.3.2.26 Math.min ( ...args ) RUN OVER THE OPERANDS' OWN EXAMPLES. Both
+   are "For each element arg of args: Let n be ? ToNumber(arg)" followed by a comparison walk, so the real
+   function is re-entered with each unknown replaced by the concrete this engine has for it — the same shape
+   22.1.2.1's example builder uses, and for the same reason: the value the page would have computed is worth
+   more than a placeholder. An argument with NO example makes the whole result exampleless rather than letting
+   a picked number decide a later `if`. */
+static JSValue js_math_min_max(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int magic);
+static JSValue js_math_min_max_example(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv, int magic)
+{
+    JSValue *ex = js_malloc(ctx, sizeof(JSValue) * (size_t)(argc > 0 ? argc : 1));
+    JSValue r;
+    int i, n = 0;
+
+    /* ALWAYS FATAL rather than a dropped example: a derivation that silently loses its concrete is a value the
+       @H surface then reports as shape-only, which is indistinguishable from an operand that never had one. */
+    CHECK(ex != NULL, "out of memory building a derived unknown's example operands");
+    for (i = 0; i < argc; i++) {
+        JSValue e = js_concolic_operand(ctx, argv[i]);
+        if (JS_IsUninitialized(e))
+            e = js_dup(argv[i]);
+        else if (JS_IsUndefined(e)) {          /* the unknown carries no concrete operand */
+            r = JS_UNDEFINED;
+            goto done;
+        }
+        DCHECK(!JS_IsObject(e) && !JS_IsSymbol(e),
+               "an unknown's example is not an operable primitive — an example rides the value the interpreter "
+               "actually produced, so a producer attached something this engine never computed");
+        ex[n++] = e;
+    }
+    r = js_math_min_max(ctx, this_val, argc, (JSValueConst *)ex, magic);
+done:
+    for (i = 0; i < n; i++)
+        JS_FreeValue(ctx, ex[i]);
+    js_free(ctx, ex);
+    return r;
+}
+
 static JSValue js_math_min_max(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv, int magic)
 {
@@ -89579,6 +89670,26 @@ static JSValue js_math_min_max(JSContext *ctx, JSValueConst this_val,
     double r, a;
     int i;
     uint32_t tag;
+
+    /* §21.3.2.25 / §21.3.2.26 OVER UNKNOWN EXTERNAL INPUT. The coerce-then-compute declaration's coercion is
+       §7.1.1 ToPrimitive, which over a concolic is the identity, so an unknown argument arrives here uncoerced
+       and every JS_ToFloat64 below asked the conversion boundary for a real double and aborted the instance.
+       `Math.max(0, Math.min(255, x))` is the clamp every bundle writes, which is how this was found.
+       ONE unknown argument makes the WHOLE result unknown: step 4's `number > highest` is undecided against a
+       value nobody has, so no argument can be shown to win, and a partial maximum over the KNOWN arguments
+       would be a value the page never computes. The derivation keeps the operand's source and root, so a
+       branch over the clamped value still forks and an @S candidate still injects at the source that fed it. */
+    for (i = 0; i < argc; i++) {
+        JSValue c;
+        if (!js_value_is_concolic(argv[i]))
+            continue;
+        c = js_concolic_derive(ctx, argv[i], is_max ? "Math.max" : "Math.min",
+                               js_math_min_max_example(ctx, this_val, argc, argv, magic));
+        DCHECK(!JS_IsUninitialized(c),
+               "the concolic derivation declined an operand this function had already recognised as unknown "
+               "external input — the value semantics were installed without the builtin-derivation hook");
+        return c;
+    }
 
     if (unlikely(argc == 0)) {
         return js_float64(is_max ? -INFINITY : INFINITY);
