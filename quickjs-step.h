@@ -559,6 +559,32 @@ typedef struct JSStepHdr {
        at a DIFFERENT stage is refused where it is ISSUED, which names the machine that walked away from its
        own request instead of leaving a later end to read a stamp the newer request had overwritten. */
     uint16_t req_stage;
+    /* WHAT THE DRIVER OWES THIS MACHINE WHILE IT IS PARKED — the value it will be re-entered with, and the
+     * completion that was live in the context when it parked. Both JS_UNINITIALIZED exactly when the machine is
+     * NOT sitting in a CONT_STEP_YIELD anchor, which is the invariant the park and the resume each assert.
+     *
+     * A STEP MACHINE'S REST POINT IS NOT ONLY ITS OWN YIELD. It rests every time it hands the driver a request
+     * and the driver hands an answer back, and for a machine walking a structure of the PAGE'S SIZE by keyed
+     * requests — Array.prototype.concat's HasProperty/Get/CreateDataProperty per element, sort's gather and its
+     * write-back — that round trip IS the iteration. The answer to a plain data slot is computed by the driver
+     * in place, so no page code runs, nothing yields, and the walk used to reach the machine's next step with
+     * the scheduler never once consulted: an un-parkable span the length of the receiver, which is the cap
+     * §Time-travel forbids however carefully the frames under it were flattened.
+     *
+     * THE ANSWER IS WHY THIS HAS TO BE ON THE HEAP. It lives in an interpreter local on its way from the driver
+     * to the machine, and a local is exactly what a snapshot cannot reach — the same reason the machine itself
+     * is put in an anchor frame rather than left in `cont_st`. So the park MOVES it here and the resume takes it
+     * back, and the resume is then byte-identical: the machine re-enters at the call site that parked on its
+     * request, holding the value that request produced, with nothing replayed and nothing recomputed.
+     *
+     * `park_exc` IS MOVED, NEVER DUPLICATED, and it is a separate field rather than a flag on `park_in` because
+     * the two are different facts: `park_in` may be JS_EXCEPTION (the delivery is abrupt) while a machine's
+     * FIRST entry may equally carry a live throw with an ordinary delivery — step_request_check says so in as
+     * many words. rt->current_exception is per-RUNTIME, so a flow that parks with one standing would hand its
+     * completion to whichever flow ran next; the exception rides the flow instead, exactly as the anchor's
+     * close_saved_exc rides an unwinding close. */
+    JSValue park_in;
+    JSValue park_exc;
 } JSStepHdr;
 
 

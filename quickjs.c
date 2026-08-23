@@ -20854,6 +20854,11 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
        unknown operand" has to be a value no operand can be. UNINITIALIZED is the same answer ctor_ntgt gives
        for the same question one line up. */
     h->unknown_operand = JS_UNINITIALIZED;
+    /* WHAT THE DRIVER OWES A PARKED MACHINE — absent until it parks, and absent is not a value a delivery can
+       be, for the reason one line up: js_mallocz reads as the INTEGER 0, and 0 is a perfectly ordinary answer
+       to a keyed read. */
+    h->park_in = JS_UNINITIALIZED;
+    h->park_exc = JS_UNINITIALIZED;
     h->cap_promise = JS_UNDEFINED;     /* a CAPABILITY request's [promise, resolve, reject], filled by its delivery */
     h->cap_funcs[0] = JS_UNDEFINED; h->cap_funcs[1] = JS_UNDEFINED;
     h->desc_get = JS_UNDEFINED; h->desc_set = JS_UNDEFINED; h->desc_flags = 0;
@@ -22500,6 +22505,11 @@ static JSValue tramp_step_state_free_1(JSContext *ctx, void *st, bool take_resul
     JS_FreeValue(ctx, h->cap_funcs[1]);  h->cap_funcs[1] = JS_UNDEFINED;
     JS_FreeAtom(ctx, h->get_atom);  /* set only while a property read is in flight */
     h->get_atom = JS_ATOM_NULL;
+    /* WHAT THE DRIVER OWED A MACHINE THAT IS BEING ABANDONED PARKED — a cold-tier tail dropped, a chain freed
+       under a throw. Both are real references and neither is named by any machine's `visit`, because neither is
+       the MACHINE's: they are the driver's, held on the header for exactly as long as the anchor stands. */
+    JS_FreeValue(ctx, h->park_in);   h->park_in = JS_UNINITIALIZED;
+    JS_FreeValue(ctx, h->park_exc);  h->park_exc = JS_UNINITIALIZED;
     for (i = 0; i < h->argc; i++)
         JS_FreeValue(ctx, h->argv[i]);
     h->argc = 0;                     /* the block is freed below; nothing may read the captures after this */
@@ -22937,6 +22947,13 @@ static void *tramp_step_state_clone(JSContext *ctx, const void *src)
     h->cap_funcs[0] = js_dup(h->cap_funcs[0]);
     h->cap_funcs[1] = js_dup(h->cap_funcs[1]);
     if (h->get_atom != JS_ATOM_NULL) h->get_atom = JS_DupAtom(ctx, h->get_atom);
+    /* THE PARKED DELIVERY, TAKEN A SECOND TIME. A fork can arrive at a machine that is sitting in an anchor —
+       that is what the CONT_STEP_YIELD arm of clone_deep_flow clones — and the sibling resumes into ITS OWN
+       copy of the anchor, so it needs its own reference to the value it will be re-entered with and to the
+       completion it parked holding. UNINITIALIZED is not refcounted, so the not-parked case needs no test,
+       exactly as ctor_ntgt's does. */
+    h->park_in = js_dup(h->park_in);
+    h->park_exc = js_dup(h->park_exc);
     o->def->visit(ctx, h, (JSStepVisit *)&js_step_visit_dup);   /* the machine's own owned fields, taken a second time */
     return h;
 }
@@ -28719,12 +28736,18 @@ static int branch_arm_fork(JSContext *ctx, JSValueConst op1, uint8_t *if_pc,
    With this gone there is exactly ONE place in the BYTECODE interpreter that asks the preempt hook:
    do_yield_poll. That is what makes "a new call opcode cannot forget to route" true of PARKING as well — an
    opcode does not offer a suspend point, so it cannot omit one; the dispatch offers it.
-   The step driver in this same function asks it too, at JS_STEP_YIELD and at an outcome fork, and that is NOT a
-   second system to fold in: a stage boundary is a C machine's opcode boundary, declared by the spec algorithm
-   the machine implements (JSTrampStepDef.steps) rather than by the page's bytecode, so it is already on the
-   right side of "the engine decides where a flow may park". It asks directly instead of through the request bit
-   because its boundaries are rare — one per spec step, not one per opcode — so the ask is affordable there and
-   gating it would only make the forced-exploration policy unable to force it.
+   The step driver in this same function asks it too, and it asks at ONE point for the same reason this file has
+   one: do_step_step, which every re-entry of every machine passes through, plus the outcome fork's own ask,
+   which is a rank-changing event rather than a rest point. That is NOT a second system to fold in: a stage
+   boundary is a C machine's opcode boundary, declared by the spec algorithm the machine implements
+   (JSTrampStepDef.steps) rather than by the page's bytecode, so it is already on the right side of "the engine
+   decides where a flow may park". It asks directly instead of through the request bit because its boundaries are
+   rare — one per spec step, not one per opcode — so the ask is affordable there and gating it would only make
+   the forced-exploration policy unable to force it.
+   IT USED TO ASK AT JS_STEP_YIELD INSTEAD, which made the only C span this driver could be preempted inside the
+   one a machine had explicitly declared — and a machine that walks a page-sized structure with KEYED REQUESTS
+   declares none, because the round trip through the driver is its iteration. So concat's per-element
+   HasProperty/Get/Define and the sort's gather and write-back were each un-parkable the length of the receiver.
    A callee with no bytecode body (a C builtin) executes no dispatch, so its request stands until control
    returns to bytecode and is answered there. That is lossless, and it is also right: a step machine's own
    yield is where a long C builtin offers its points, and parking immediately BEFORE one would have been the
@@ -29187,8 +29210,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     rt->current_stack_frame = sf;
                     tramp_frame_free(rt, dtf);
                     cont_st = ystt;
-                    ret_val = JS_UNDEFINED;
-                    goto do_step_step;
+                    /* WHAT THE DRIVER OWED IT, TAKEN BACK — the delivery it parked holding and the completion
+                       that was live in the context then. This is what makes the resume byte-identical: the
+                       machine re-enters at the call site that parked on its request, with that request's answer
+                       in hand, rather than with the undefined a rest-point-only park could offer.
+                       AND IT RESUMES PAST THE OFFER, at do_step_run. A flow the scheduler has just chosen to
+                       run being asked, before it executes anything, whether to yield again is not a suspension
+                       point — it is the same point, and taking it would park a flow that has made no progress. */
+                    {
+                        JSStepHdr *yh = ystt;
+                        DCHECK(!JS_IsUninitialized(yh->park_in),
+                               "a step machine resumed from its anchor with no parked delivery — do_step_park is "
+                               "the one thing that builds one of these frames and it always leaves one");
+                        DCHECK(!JS_HasException(ctx),
+                               "a flow resumed into a parked step machine with a completion already live in the "
+                               "runtime — the exception slot is shared, so this one belongs to another flow");
+                        ret_val = yh->park_in;
+                        yh->park_in = JS_UNINITIALIZED;
+                        /* through JS_Throw, which is exactly a move-in that releases whatever the slot held:
+                           the DCHECK above says it holds nothing, and in a build with no DCHECKs left a stale
+                           completion is dropped rather than leaked. JS_UNINITIALIZED is the empty slot. */
+                        JS_Throw(ctx, yh->park_exc);
+                        yh->park_exc = JS_UNINITIALIZED;
+                    }
+                    goto do_step_run;
                 }
                 /* An ASYNC or GENERATOR frame's sf IS its func_state.frame (not the embedded dtf->sf); re-enter it
                    there so a preempted async/generator body loop resumes correctly. */
@@ -31793,6 +31838,38 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_step_step:
+            /* THE ONE PLACE THE SCHEDULER IS OFFERED A STEP MACHINE'S NEXT STEP.
+             *
+             * Every re-entry of every machine reaches this label, whatever produced the value it is re-entered
+             * with — a first entry, a request the driver answered in place, a request that suspended in the
+             * page's code, an inner machine's completion, a delegate, a fork's arm. So the offer is made HERE,
+             * once, and not at the thirty-odd sites that jump here: a consultation at a call site is per-spelling
+             * plumbing, and every spelling it is not written at is a walk the scheduler is silently never asked
+             * inside. The keyed-request path is what that cost. step_getidx_run and its kin ALWAYS return a
+             * request, do_getprop_tramp answers a plain data slot in place (nothing user-written is involved),
+             * and the answer came back here — so Array.prototype.concat's per-element HasProperty/Get/Define and
+             * the sort's gather, write-back and hole-delete each round-tripped this driver once per element with
+             * the preempt hook never once consulted. Running no user code is not what makes a C span safe to
+             * leave un-parkable; being O(1) is.
+             *
+             * AND THE OFFER IS LOSSLESS BECAUSE THE ONLY THING IT ADDS IS ret_val. A machine's very first step
+             * can return JS_STEP_YIELD or fork, both of which park through do_step_park — so every site that
+             * jumps here has ALREADY had to leave the interpreter in a parkable state (operands dropped, sp at
+             * the caller's live top, the chain in tf_top), because one `def->step()` call cannot put it into
+             * one. What that call does consume is the delivery, and that is exactly what park_in exists to carry.
+             *
+             * NO FLOW, NO PARK — the same statement do_yield_poll makes, and for the same reason: baseline setup
+             * runs machines before any flow exists, and there is nothing there to suspend. */
+            if (unlikely(g_flow_base_gen != NULL) && g_flow_control.preempt != NULL
+                && g_flow_control.preempt(JS_PREEMPT_BACKEDGE)) {
+                FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                if (gen_state != g_flow_base_gen)
+                    DFAIL("a step machine was preempted in an activation that is not the flow base — give that "
+                          "driver a resume-as-flow path, never drive it to completion");
+                FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                goto do_step_park;   /* ret_val is the delivery; do_step_park is what puts it on the heap */
+            }
+        do_step_run:
             {
                 void *stt = cont_st;
                 JSStepHdr *h = stt;
@@ -32276,23 +32353,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_promise_cap_tramp;
                 }
                 if (st == 22) {
-                    /* YIELD: "I have more work; preempt me if you want." The BYTECODE half of this exists — a
-                       loop back-edge asks g_flow_control.preempt() and takes do_preempt — and a step machine had
-                       no equivalent, which is why a long parse inside a builtin ran to completion inside one
-                       opcode however the frame stack under it was written. Flattening a parser's recursion is
-                       the substrate; THIS is the feature.
-                       When nobody is waiting the machine is simply re-entered, which costs one predicted call
-                       per back-edge and is why a machine may ask at every iteration. */
-                    if (likely(g_flow_control.preempt == NULL || !g_flow_control.preempt(JS_PREEMPT_BACKEDGE))) {
-                        ret_val = JS_UNDEFINED;
-                        goto do_step_step;
-                    }
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
-                    if (gen_state != g_flow_base_gen)
-                        DFAIL("a step machine yielded in an activation that is not the flow base — give that "
-                              "driver a resume-as-flow path, never drive it to completion");
-                    FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
-                    goto do_step_park;
+                    /* YIELD: "I have more work; re-enter me." It ASKS NOTHING, and that is the point: the offer
+                       is made at do_step_step for every re-entry there is, so a machine's own back-edge is one
+                       more of them rather than a second consultation site. It used to ask here, which made the
+                       only C span this driver could be preempted inside the one a machine explicitly declared —
+                       so a walk built out of keyed requests, which is most of them, had no rest point at all. */
+                    ret_val = JS_UNDEFINED;
+                    goto do_step_step;
                 }
                 if (st == JS_STEP_FORK) {
                     /* AN OUTCOME FORK. The machine's completion depends on UNKNOWN input and is one of N
@@ -32333,6 +32400,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            chain is rebuilt from here and re-enters the machine; WHERE in its algorithm the
                            machine is, is the machine's own state, and its ASK is what it re-enters on. */
                         sf->cur_pc = pc; sf->cur_sp = sp;
+                        /* THE CLONE IS A MACHINE SITTING IN AN ANCHOR, so it must carry what a resume from one
+                           takes back — the invariant park_in/park_exc state, which the sibling would otherwise
+                           resume without. Held only across the clone: the PARENT is running, so the completion
+                           it parked with is handed straight back to it below. */
+                        DCHECK(JS_IsUninitialized(h->park_in) && JS_IsUninitialized(h->park_exc),
+                               "an outcome fork found the driver already owing this machine a parked delivery");
+                        h->park_in = JS_UNDEFINED;
+                        h->park_exc = rt->current_exception;
+                        rt->current_exception = JS_UNINITIALIZED;
                         gen_state->tramp_top = ftf;
                         cl = JS_FlowClone(ctx, (JSValue *)gen_state);
                         CHECK(cl != NULL, "the outcome fork could not snapshot the flow — the other completion "
@@ -32340,6 +32416,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         g_flow_control.fork(ctx, cl);
                         gen_state->tramp_top = NULL;   /* the parent's chain is live in tf_top, never stashed */
                         sf->cur_sp = NULL;             /* running again */
+                        h->park_in = JS_UNINITIALIZED;
+                        rt->current_exception = h->park_exc;   /* the parent's own, taken back unduplicated */
+                        h->park_exc = JS_UNINITIALIZED;
                         tramp_frame_free(rt, ftf);
                         h->fork_arm = harm; h->fork_phase = FORK_PH_ANSWERED;
                         /* §scheduler's VALUE YIELD: a fork is the event that changes the ranking, because the
@@ -32350,6 +32429,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (g_flow_control.preempt != NULL && g_flow_control.preempt(JS_PREEMPT_FORK)) {
                             FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                             FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                            /* do_step_park is the shared label and it names the machine by cont_st, which every
+                               other way in already sets. This arm is inside the step body, where the machine is
+                               `stt`; they are the same one and the assignment says so rather than relying on it. */
+                            cont_st = stt;
+                            ret_val = JS_UNDEFINED;
                             goto do_step_park;
                         }
                     } else {
@@ -32375,17 +32459,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argc = cbn; tramp_first = -2; tramp_is_tail = 0;
                 cd_outer = stt; cd_outer_kind = CONT_STEP;
                 goto do_cont_dispatch;
-
-            do_step_park:
-                /* PARK THE MACHINE. do_preempt stashes tf_top into the base, so a machine that is on the chain
-                   is parked by the ordinary back-edge path with nothing special about it. */
-                {
-                    TrampFrame *ytf;
-                    STEP_ANCHOR_NEW(ytf);
-                    ytf->cont_state = stt; ytf->cont_kind = CONT_STEP_YIELD;
-                    tf_top = ytf;
-                    goto do_preempt;
-                }
 
             step_request_abrupt:
                 /* AN IN-PLACE REQUEST COMPLETED ABRUPTLY — and whether that is a DELIVERY or a demolition is the
@@ -32417,6 +32490,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    the CALL arm set left the CONSTRUCT arm freeing a machine that was already gone. */
                 tramp_step_chain_free(ctx, cont_st);
                 goto exception;
+            }
+
+        do_step_park:
+            /* PARK THE MACHINE. do_preempt stashes tf_top into the base, so a machine that is on the chain is
+               parked by the ordinary back-edge path with nothing special about it.
+               IT SITS OUTSIDE THE STEP BODY because the offer that reaches it is made BEFORE the step, at
+               do_step_step, where there is no `stt` yet — the machine is `cont_st`, which is the one variable
+               every way in already agrees on (step_abandon says the same thing for the same reason). */
+            {
+                TrampFrame *ytf;
+                void *stt = cont_st;
+                JSStepHdr *ph = stt;
+                /* WHAT THE DRIVER OWES THE MACHINE GOES ON THE HEAP HERE, and here is the only place it does —
+                   an anchor and a parked delivery are one event. `ret_val` is an interpreter local, which is
+                   exactly what a snapshot cannot reach, and rt->current_exception is per-RUNTIME, so a
+                   completion left standing across the park would belong to whichever flow ran next. */
+                DCHECK(JS_IsUninitialized(ph->park_in) && JS_IsUninitialized(ph->park_exc),
+                       "a step machine was parked while the driver already owed it a parked delivery — park_in "
+                       "and park_exc are set exactly while the machine sits in a CONT_STEP_YIELD anchor, so a "
+                       "second one means an anchor was built over a machine that is still in one");
+                ph->park_in = ret_val;
+                ph->park_exc = rt->current_exception;   /* MOVED, never dup'd */
+                rt->current_exception = JS_UNINITIALIZED;
+                ret_val = JS_UNDEFINED;
+                STEP_ANCHOR_NEW(ytf);
+                ytf->cont_state = stt; ytf->cont_kind = CONT_STEP_YIELD;
+                tf_top = ytf;
+                goto do_preempt;
             }
 
         do_cont_dispatch:
