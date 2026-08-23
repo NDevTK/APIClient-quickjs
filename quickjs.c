@@ -20981,7 +20981,9 @@ enum { GET_PH_START = 0, GET_PH_GOT };
 
 /* WHICH SPEC STEP A STAGE RESTS AT, as a string, for a diagnostic that reports one — the machine's own
    declaration, or a sentence saying the stage is not among them. Written once because three checks now format a
-   stage, and a message that walks the list by hand is a third copy of the walk. */
+   stage, and a message that walks the list by hand is a third copy of the walk. Dev-only, like every reader it
+   has: in release there is no DCHECK left to report a stage. */
+#if APICLIENT_DEV
 static const char *step_stage_label(const JSStepHdr *h, unsigned stage)
 {
     int n = 0;
@@ -20990,6 +20992,7 @@ static const char *step_stage_label(const JSStepHdr *h, unsigned stage)
     return stage < (unsigned)n ? h->def->steps[stage]
                                : "(a stage past the end of its declared steps)";
 }
+#endif
 
 /* A KEYED REQUEST GOES IN FLIGHT — the one point every spelling of one passes, so the fact its ANSWER is
  * checked against is recorded once instead of at the six begin sites. See JSStepHdr::req_stage for why the
@@ -21501,9 +21504,12 @@ static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
    delivered as a successful define. Its own INDEX twin two functions up reports the same event as -1 through
    step_keyed_abrupt, and both of this one's callers were already written for that (`if (r < 0) return -1`) —
    one request answering differently depending on whether its key was a name or an index, with the caller's
-   handling for the honest answer already in place and unreachable. §Iterator's SetterThatIgnoresPrototype-
-   Properties then COMPLETED with the throw still live in the context, which no check downstream reports,
-   because step_request_check only fires on a machine that goes on to ASK for something. */
+   handling for the honest answer already in place and unreachable.
+   THE SPEC SAYS THE THROW PROPAGATES, with a `?`: §7.3.37 SetterThatIgnoresPrototypeProperties ( thisValue,
+   home, propertyKey, value ) step 4.a is "Perform ? CreateDataPropertyOrThrow(thisValue, propertyKey, value)",
+   so a `defineProperty` trap that threw on the receiver is that setter's completion. It COMPLETED NORMALLY
+   instead, with the throw still live in the context, and nothing downstream reports that: step_request_check
+   fires only on a machine that goes on to ASK for something, and this one returns DONE. */
 static int step_defprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValueConst value,
                             bool or_throw, JSValue in, JSValue **out_cb, int *out_argc)
 {
