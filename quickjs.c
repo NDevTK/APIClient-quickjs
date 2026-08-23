@@ -28848,10 +28848,10 @@ static void flow_park(JSContext *ctx, JSAsyncFunctionState *base,
        restatement of it. A park is reached only from a FUNC_RET_PREEMPT, which the interpreter produces at
        exactly two points: do_yield_poll, which runs at an opcode boundary where nothing is propagating, and
        do_step_park, which MOVES the completion onto the parked machine's header first precisely because the
-       slot is per-runtime. So a throw standing here is a third producer, and it is asked about here because
-       here is the last line at which the producer is still on the C stack: by the time the pump resumes this
-       continuation the scheduler may have run somebody else, and the resume's own assert can then only say
-       that the completion belongs to another flow, never which flow made it. */
+       exception slot is per-runtime. So a throw standing here is a third producer, and it is asked about here
+       because here is the last line at which the producer is still on the C stack: by the time the pump
+       resumes this continuation the scheduler may have run somebody else, and the resume's own assert can then
+       only say that the completion belongs to another flow, never which flow made it. */
     DCHECK(!JS_HasException(ctx),
            "a flow was PARKED with a completion still live in the runtime — the exception slot is per-RUNTIME "
            "and this continuation resumes after the scheduler may have chosen another flow, so the throw would "
@@ -28950,6 +28950,7 @@ void JS_FreeParkedFlows(void *parked) {
    not the loop. Oldest first is ordering-transparency itself: two continuations parked in one step resume in
    the order they suspended, which is the order they would have completed had no preempt fired. */
 bool JS_ResumeParkedFlow(JSRuntime *rt, JSValue *pres) {
+    JSAsyncFunctionState *base;
     JSFlowParkFn *fn;
     JSContext *ctx;
     void *op;
@@ -44914,8 +44915,8 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     size_t alloc_size;
 
     sf = &s->frame;
-    p = JS_VALUE_GET_OBJ(func_obj);
     flow_park_init(s);   /* a base is born unparked — see flow_park_init */
+    p = JS_VALUE_GET_OBJ(func_obj);
     b = p->u.func.function_bytecode;
     sf->is_strict_mode = b->is_strict_mode;
     sf->is_constructor = false;
@@ -44978,7 +44979,6 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     JSStackFrame *sf;
     JSValue *sp;
 
-    sf = &s->frame;
     /* A BASE MAY NOT BE FREED WHILE IT HOLDS A CONTINUATION, and this is the site that would otherwise turn
        that into silence: the park link is EMBEDDED, so a state freed while queued leaves the pump's list
        pointing into freed memory and the next drain walks it. There is exactly one legitimate way for a park
@@ -44988,6 +44988,7 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     DCHECK(s->park_fn == NULL && list_empty(&s->park_link),
            "an async/generator base was freed while a parked continuation still names it — the pump's queue "
            "holds a link into this allocation, and the work that continuation was is dropped with it");
+    sf = &s->frame;
 
     if (sf->arg_buf) {
         /* close the closure variables. */
@@ -45490,12 +45491,12 @@ static JSAsyncFunctionState *flow_clone_state_alloc(JSContext *ctx, JSAsyncFunct
         if (!c) return NULL;
     }
     c->base_kind = src->base_kind;   /* a clone completes the way its ORIGINAL does */
-    return c;
     /* A CLONE IS BORN UNPARKED, and it is a CLEAR rather than a copy. The source may be parked — a fork at a
        branch inside a body whose continuation is already on the pump's queue is ordinary — and a park is one
        activation's one resume point: run it twice and the second resume rebuilds a frame the first already
        freed. The sibling reaches its own suspend point and parks then, on its own record. */
     flow_park_init(c);
+    return c;
 }
 
 /* Release a clone shell whose frame was never completed (an allocation failure mid-clone). */
@@ -100348,8 +100349,8 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     fs->throw_flag = false;
     fs->base_kind = FLOW_BASE_STEP_ROOT;
     fs->tramp_top = NULL;
-    sf->arg_buf = blk;
     flow_park_init(fs);   /* a base is born unparked — see flow_park_init */
+    sf->arg_buf = blk;
     sf->var_buf = blk;                                    /* 0 args, 0 vars: the stack starts at blk */
     sf->var_refs = (JSVarRef **)(blk + slots);  /* TRAMP_SP_LIMIT(sf) = sf->var_refs = stack top */
     sf->var_ref_count = 0;
@@ -100424,7 +100425,6 @@ static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValu
     func = is_reject ? rf->reject : rf->resolve;
     if (JS_IsUndefined(func)) { JS_FreeValue(ctx, res); return -1; }
     rf->phase = 1;
-    if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&res)) < 0) { JS_FreeValue(ctx, res); return -1; }
     /* PHASE 1 RE-INITIALISES THE BASE, which is the one place a base is built over a base that already
        existed — so the one thing that must not be true of it is that it is parked. reaction_call_flow_init
        clears the park record, and clearing a LIVE one would leave this base on the pump's queue with nothing
@@ -100433,6 +100433,7 @@ static int reaction_flow_settle_start(JSContext *ctx, JSReactionFlow *rf, JSValu
     DCHECK(rf->fs.park_fn == NULL && list_empty(&rf->fs.park_link),
            "a reaction flow's settle phase is re-initialising a base that still holds a parked continuation — "
            "the record is about to be cleared while the pump's queue still names it");
+    if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&res)) < 0) { JS_FreeValue(ctx, res); return -1; }
     JS_FreeValue(ctx, res);
     return 0;
 }
@@ -100506,13 +100507,13 @@ static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s)
     DCHECK(rf->fs.tramp_top == NULL,
            "a reaction flow reached its base teardown still holding a heap-frame chain — free_tramp_chain runs "
            "at the top of JS_FlowFree, so a chain here came from a path that is not JS_FlowFree");
-    if (rf->fs.frame.cur_sp != NULL)
     /* …AND THE SAME SENTENCE ABOUT THE PARK, asked here as well as in async_func_free because the branch below
        reaches that function only for a SUSPENDED frame: a call root whose frame completed takes the `else`
        arm, and a park record surviving on it would have no other reader. */
     DCHECK(rf->fs.park_fn == NULL && list_empty(&rf->fs.park_link),
            "a reaction flow reached its base teardown while a parked continuation still names it — the pump's "
            "queue holds a link into this allocation, and the settle it owed is dropped with it");
+    if (rf->fs.frame.cur_sp != NULL)
         async_func_free(ctx->rt, &rf->fs);   /* suspended: full frame cleanup */
     else if (rf->fs.frame.arg_buf) {
         js_free_rt(ctx->rt, rf->fs.frame.arg_buf);
