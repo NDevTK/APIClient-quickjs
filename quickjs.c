@@ -7922,6 +7922,32 @@ static void cow_capture_buffer_lifetime(JSContext *ctx, JSValueConst abuf)
     if (g_time_travel.buf_lifetime)
         g_time_travel.buf_lifetime(ctx, abuf);
 }
+#if APICLIENT_DEV
+/* WHAT THE TIME-TRAVEL CAPTURE TOOK ON ONE KEY, so a define's own ledger can subtract it.
+ *
+ * A CAPTURE IS A SECOND OWNER OF THE KEY, AND IT IS A LEGITIMATE ONE. The delta's entry names the slot it
+ * restores by (object, atom) and holds a reference on that atom for as long as the entry lives — it dups on
+ * append and frees on drop — so a [[DefineOwnProperty]] on a SHARED object raises the key's refcount by the
+ * capture's one AND the new shape property's one. Neither came from anybody's argument list and neither is
+ * leaked. A ledger admitting only the shape's therefore reports a caller bug for ordinary isolated execution,
+ * which is what it did. ECMAScript §13.2.5.5 Runtime Semantics: Evaluation builds the target FIRST — "Let obj
+ * be OrdinaryObjectCreate(%Object.prototype%). Perform ? PropertyDefinitionEvaluation of
+ * PropertyDefinitionList with argument obj" — and §13.2.5.6 Runtime Semantics: PropertyDefinitionEvaluation
+ * then runs each definition left to right, the spread arm as CopyDataProperties(obj, fromValue, …). So
+ * `{k: cfg.admin ? 1 : 2, ...src}` forks with the target already built: the fork raises the flow's fork_gen to
+ * the target's own generation, the target is shared with the sibling from then on, and every key the spread
+ * defines on it is captured. Four lines of page script, and it aborted a real bundle on every run.
+ *
+ * MEASURED HERE RATHER THAN ASSUMED AWAY, because both alternative spellings are wrong: subtracting a constant
+ * "the capture may have taken one" widens the ledger to admit the very +1 it exists to catch, and hoisting the
+ * capture out of the measured window would run it TWICE in release to satisfy a dev-only check. The window is
+ * ARMED by the ledger with the one atom it is watching and reads only that atom, so a capture of a
+ * NEIGHBOURING key during the same define credits nothing.
+ * ONE HOOK IS WRAPPED BECAUSE ONE HOOK IS HANDED A KEY: JSTimeTravelHooks has exactly two taking a JSAtom, and
+ * arr_append's is a dense index (__JS_AtomFromUInt32) — const, and const atoms maintain no refcount at all. */
+static _Thread_local JSAtom g_key_ledger_atom = JS_ATOM_NULL;
+static _Thread_local int g_key_ledger_refs;
+#endif
 /* Ask the host to record an object's pre-write state (for per-flow revert). Whether a FLOW_LOCAL object is
    skipped is decided by the HOST hook, NOT here: a snapshot fork SHARES the parent frame's flow_local objects
    with the sibling, so once a flow has forked those objects are shared and their mutations MUST be captured. The
@@ -7971,6 +7997,15 @@ static inline void cow_capture(JSContext *ctx, JSValueConst obj, JSAtom prop) {
                 }
             }
         }
+#if APICLIENT_DEV
+        /* the armed key's account, taken across the hook and nowhere else — see g_key_ledger_atom. */
+        if (prop == g_key_ledger_atom) {
+            int rc_before = js_atom_refcount(ctx->rt, prop);
+            g_time_travel.prop_write(ctx, obj, prop);
+            g_key_ledger_refs += js_atom_refcount(ctx->rt, prop) - rc_before;
+            return;
+        }
+#endif
         g_time_travel.prop_write(ctx, obj, prop);
     }
 }
@@ -14744,27 +14779,41 @@ int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
  *
  * THE ASSERT IS THE LEDGER, and it is here rather than at those sites so the next key-holding builtin inherits
  * it. A define takes AT MOST the one reference the new shape property owns — and none at all when the key is
- * already in the shape or a hashed shape that already names it is reused — so a rise of more than one came from
- * the CALLER and is a reference the runtime will never get back. The value is freed AFTER the reading, which is
- * why this does not simply wrap JS_DefinePropertyValue: releasing it can drop the last object that interned this
- * same name, and that moves the very number the ledger is about. */
+ * already in the shape or a hashed shape that already names it is reused — PLUS whatever the TIME-TRAVEL
+ * CAPTURE took, which is the term this ledger was missing and which is not a caller's reference at all.
+ * [[DefineOwnProperty]] on a SHARED object records the slot in the running flow's delta, and the delta's entry
+ * NAMES that slot by its atom and owns a reference on it (g_key_ledger_atom carries the whole argument). So
+ * the admitted rise is `1 + what the capture took`, measured rather than assumed: an armed window over that
+ * one atom, credited only where the hook actually runs. Anything above that came from the CALLER and is a
+ * reference the runtime will never get back. The value is freed AFTER the reading, which is why this does not
+ * simply wrap JS_DefinePropertyValue: releasing it can drop the last object that interned this same name, and
+ * that moves the very number the ledger is about.
+ * THE WINDOW IS SAVED AND RESTORED rather than merely armed, because the ledger is a mechanism the next
+ * key-holding builtin inherits and none of them may silently zero an outer one's account. */
 static int js_define_prop_borrowed_key(JSContext *ctx, JSValueConst this_obj,
                                        JSAtom prop, JSValue val, int flags)
 {
     int ret;
 #if APICLIENT_DEV
-    int rc0 = js_atom_refcount(ctx->rt, prop);
+    JSAtom outer_atom = g_key_ledger_atom;
+    int outer_refs = g_key_ledger_refs, rc0;
+    g_key_ledger_atom = prop;
+    g_key_ledger_refs = 0;
+    rc0 = js_atom_refcount(ctx->rt, prop);
 #endif
     ret = JS_DefinePropertyValueConst(ctx, this_obj, prop, val, flags);
 #if APICLIENT_DEV
     /* the ledger, spelled as a guarded DFAIL rather than a DCHECK because a DCHECK's condition is still
        TYPE-CHECKED in a release build (`(void)sizeof(cond)`), and every term of this one is dev-only. */
-    if (ret >= 0 && js_atom_refcount(ctx->rt, prop) > rc0 + 1)
+    if (ret >= 0 && js_atom_refcount(ctx->rt, prop) > rc0 + 1 + g_key_ledger_refs)
         DFAIL("a define under a BORROWED key raised its atom's refcount by more than the one reference the new "
-              "property owns, so the caller handed over a reference this call never takes back — a JS_DupAtom "
-              "in the argument list of a define that borrows its key. That reference is leaked for the lifetime "
-              "of the runtime and would otherwise surface only as an `[atomleak]` line at JS_FreeRuntime, with "
-              "the run already over and every frame that could name this site gone");
+              "property owns and the one the time-travel capture took, so the caller handed over a reference "
+              "this call never takes back — a JS_DupAtom in the argument list of a define that borrows its key. "
+              "That reference is leaked for the lifetime of the runtime and would otherwise surface only as an "
+              "`[atomleak]` line at JS_FreeRuntime, with the run already over and every frame that could name "
+              "this site gone");
+    g_key_ledger_atom = outer_atom;
+    g_key_ledger_refs = outer_refs;
 #endif
     JS_FreeValue(ctx, val);
     return ret;
