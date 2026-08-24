@@ -2164,6 +2164,15 @@ JS_EXTERN void     JS_PutParkedFlows(JSRuntime *rt, void *parked);
    that no park still names them, so a flow released around this leaves the pump's order pointing into freed
    memory. Takes the handle a JS_TakeParkedFlows returned and empties it. */
 JS_EXTERN void     JS_FreeParkedFlows(void *parked);
+/* …AND THE SET AN ARM GETS, which is the OTHER half of the frame snapshot below. A flow suspended inside a
+   PROGRAM forks by cloning its frame (JS_FlowClone); a flow suspended inside a JOB has no frame at all — a job
+   runs only between programs — and its suspension IS its parked continuations, so an arm of it is a clone of
+   THOSE. Returns a detached ring in the same currency the take does, for the flow that is switched IN (its
+   parks are in the runtime, not on it): put it on the arm, and the arm's switch-in hands it to the pump.
+   ONE PARK PER ARM: each member is a clone parked on its own record, and the source set is left untouched —
+   a park is one activation's one resume point, so two records naming one activation resume it twice and the
+   second rebuilds a frame the first already freed. NULL when the runtime holds no parks. */
+JS_EXTERN void    *JS_CloneParkedFlows(JSContext *ctx);
 /* Frame-snapshot fork: deep-copy a SUSPENDED flow into an INDEPENDENT clone that resumes from the same point.
    No fallback — an un-built frame shape (deep tramp chain / live closures) crashes loud. */
 JS_EXTERN JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow);
