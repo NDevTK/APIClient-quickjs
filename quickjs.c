@@ -8617,6 +8617,12 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
     sf->step_func = sf->step_this = JS_UNDEFINED;
+    /* A C ACTIVATION HAS NO BYTECODE, SO IT HAS NO LOCALS, NO VAR-REF ARRAY AND NO OWNER — written as the
+       absence it is, because this frame is a C-stack local and an unwritten field here is not zero. See
+       get_captured_cell, whose bound DCHECK is what makes a frame that reaches it anyway say so. */
+    sf->var_refs = NULL;
+    sf->var_ref_count = 0;
+    sf->cur_gc_obj = NULL;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->this_val = this_val;
     sf->arg_count = argc;
@@ -8799,6 +8805,12 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
     sf->step_func = sf->step_this = JS_UNDEFINED;
+    /* A C ACTIVATION HAS NO BYTECODE, SO IT HAS NO LOCALS, NO VAR-REF ARRAY AND NO OWNER — written as the
+       absence it is, because this frame is a C-stack local and an unwritten field here is not zero. See
+       get_captured_cell, whose bound DCHECK is what makes a frame that reaches it anyway say so. */
+    sf->var_refs = NULL;
+    sf->var_ref_count = 0;
+    sf->cur_gc_obj = NULL;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->this_val = this_val;
     sf->arg_count = argc;
@@ -20469,7 +20481,27 @@ static JSVarRef *js_create_var_ref(JSContext *ctx, bool is_gc_object)
    slot — a snapshot fork isolates it and the escaped closure sees the per-flow value. */
 static JSVarRef *get_captured_cell(JSContext *ctx, JSStackFrame *sf, JSValue *pvalue, int var_ref_idx)
 {
-    JSVarRef *vr = sf->var_refs[var_ref_idx];
+    JSVarRef *vr;
+    /* THE FRAME BEING MINTED INTO CAN ACTUALLY HOST A CELL, ASKED BEFORE THE FIRST INDEX RATHER THAN DISCOVERED
+       BY IT. Every line below reaches through a field only a BYTECODE activation has — the array indexed on the
+       next line, and `cur_gc_obj`, which decides whether the cell takes a counted reference and which pointer
+       free_var_ref later hands to js_release_coro. A frame that has neither answers both questions with
+       whatever its memory held, and neither answer faults where it is read: the array write lands somewhere and
+       the owner is incremented and eventually FREED as an async activation or a generator object.
+       IT HAS ALREADY HAPPENED ONCE, WHICH IS WHY THE BOUND IS ASKED HERE AND NOT ONLY WRITTEN AT THE
+       CONSTRUCTORS. A trampolined callee's activation is built at `nsf = &ntf->sf` inside JS_CallInternal, and
+       that block assigned every other member and not `cur_gc_obj`; the field arrived as whatever the freshly
+       allocated TrampFrame block held, and a direct eval creating a closure inside any trampolined call took a
+       reference through it. tramp_frame_new now writes the field at the one point every heap frame is born, and
+       the three C activations (js_call_c_function, js_call_c_function_data, js_call_c_closure) write the whole
+       absence — they have no bytecode, so they have no locals, no array and no owner. This DCHECK is what makes
+       the NEXT constructor that forgets say so by name instead of corrupting: a frame with no locals has
+       var_ref_count 0, so no index is in bounds and there is no shape of this call it can reach. */
+    DCHECK(var_ref_idx >= 0 && var_ref_idx < sf->var_ref_count,
+           "a captured local was minted into a frame that has no slot for it — only a bytecode activation has a "
+           "var-ref array and an owner field, so this frame's array write lands outside any allocation and its "
+           "owner is whatever its memory held, which the cell would take a reference on and later free");
+    vr = sf->var_refs[var_ref_idx];
     if (vr)
         return vr;
     vr = js_malloc(ctx, sizeof(JSVarRef));
@@ -23323,6 +23355,12 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->is_call_root = false;
     sf->step_func = sf->step_this = JS_UNDEFINED;
+    /* A C ACTIVATION HAS NO BYTECODE, SO IT HAS NO LOCALS, NO VAR-REF ARRAY AND NO OWNER — written as the
+       absence it is, because this frame is a C-stack local and an unwritten field here is not zero. See
+       get_captured_cell, whose bound DCHECK is what makes a frame that reaches it anyway say so. */
+    sf->var_refs = NULL;
+    sf->var_ref_count = 0;
+    sf->cur_gc_obj = NULL;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->this_val = this_obj;
     sf->arg_count = argc;
@@ -30131,10 +30169,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->var_ref_count = b->var_ref_count;
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
-    /* AN ACTIVATION'S STORAGE IS OWNED BY THE RUNNING FLOW, WHICH NO COLLECTION CAN FREE — this frame's block
-       is either on the C stack or a heap-stack TrampFrame the flow's chain owns, and either way it is torn down
-       by a return or an unwind, never by the collector. So a cell minted here roots nothing; see
-       JSStackFrame.cur_gc_obj. Written rather than assumed because this frame is not zeroed. */
+    /* AN ACTIVATION'S STORAGE IS OWNED BY THE RUNNING FLOW, WHICH NO COLLECTION CAN FREE — it is torn down by a
+       return or an unwind, never by the collector, so a cell minted here roots nothing. Written rather than
+       assumed because this frame is a C-stack local; see JSStackFrame.cur_gc_obj.
+       THIS LINE COVERS THIS ACTIVATION ONLY, AND SAYING OTHERWISE COST A SEGFAULT. It is `sf_s`, the OUTERMOST
+       activation of this call; every trampolined callee gets a DIFFERENT frame, built at `nsf = &ntf->sf` and
+       entered by `goto restart`, which never runs this line. That frame's field is written where every heap
+       frame is born (tramp_frame_new) for the reason recorded there — a per-push assignment is a line each new
+       call opcode must remember. Reading this line as "the interpreter writes it" is what left the tramp
+       frame's copy unwritten. */
     sf->cur_gc_obj = NULL;
     sp = stack_buf;
     pc = b->byte_code_buf;
