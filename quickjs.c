@@ -514,6 +514,24 @@ typedef struct JSStackFrame {
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
+    /* THE COLLECTABLE OBJECT THIS FRAME'S STORAGE BELONGS TO, or NULL when nothing the collector can free owns
+       it. A SUSPENDED COROUTINE IS LIVE — ECMA-262 §9.4 Execution Contexts: "At some later time a suspended
+       execution context may again become the running execution context and continue evaluating its code at the
+       point where it had previously been suspended" — but its frame is a HEAP allocation hanging off a GC
+       object, not a C activation the collector cannot reach past. A closure that captured one of its locals
+       holds an OPEN cell whose storage IS a slot in that allocation, and the cell names the frame by a bare
+       pointer: without this field the edge closure -> cell -> coroutine has no counted reference and no mark
+       edge, so a coroutine reachable ONLY through such a closure is a cycle to the collector and is freed while
+       the closure still points into it. get_captured_cell reads this to decide whether the cell it is about to
+       mint must root its owner (see JSVarRef.is_coro).
+       NULL IS THE ANSWER FOR EVERY FRAME NOTHING COLLECTABLE OWNS, and that is a positive statement rather than
+       an absence: an interpreter activation and a heap-stack TrampFrame are owned by the running flow, a
+       JS_FlowNew base and a per-flow generator-data clone are owned by the host and by a COW delta's counted
+       reference — none of those can be freed by a collection, so a cell in them needs no root. It is written by
+       EVERY constructor of a frame, including the ones that build one field by field (clone_susp_frame's
+       callers, js_async_frame_clone, reaction_call_flow_init), because a frame whose owner nobody recorded is
+       indistinguishable from one that has none. */
+    struct JSGCObjectHeader *cur_gc_obj;
 } JSStackFrame;
 
 typedef enum {
@@ -540,6 +558,19 @@ typedef struct JSVarRef {
     uint8_t is_detached;
     uint8_t is_lexical; /* only used with global variables */
     uint8_t is_const; /* only used with global variables */
+    /* THIS OPEN CELL ROOTS THE FRAME IT ALIASES. Set at creation for a cell minted in a frame whose storage a
+       collectable object owns (JSStackFrame.cur_gc_obj): the cell then holds ONE counted reference to that
+       object and is itself a GC object, so the collector can see closure -> cell -> coroutine and cannot free a
+       suspended coroutine out from under a closure that captured one of its locals. The owner is recovered as
+       stack_frame->cur_gc_obj, which is valid for exactly as long as the cell is open.
+       IT IS A SNAPSHOT OF cur_gc_obj != NULL TAKEN AT CREATION, NEVER RE-DERIVED AT READ TIME. cur_gc_obj
+       transitions NULL -> owner for a generator and an async generator, whose object does not exist until the
+       prologue has run, so a cell minted before that point is not this cell's kind and must not be read as one
+       — the ref it never took would be released. async_func_set_owner closes that window by adopting those
+       cells at the instant the owner is minted, which is a strictly narrower thing than re-deriving.
+       Cleared when the cell detaches; the reference is given back on detach and on free, and on exactly one of
+       the two, because a detached cell no longer aliases anything. */
+    uint8_t is_coro;
     JSValue *pvalue; /* pointer to the value, either on the stack or
                         to 'value' */
     union {
@@ -2052,6 +2083,8 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
                           JSGCObjectTypeEnum type);
 static void remove_gc_object(JSGCObjectHeader *h);
 static void js_async_function_free0(JSRuntime *rt, JSAsyncFunctionData *s);
+static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s);
+static void js_release_coro(JSRuntime *rt, JSGCObjectHeader *coro);
 static JSValue js_instantiate_prototype(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque);
 static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                  void *opaque);
@@ -8873,6 +8906,33 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr,
     return NULL;
 }
 
+/* GIVE BACK THE ONE REFERENCE AN OPEN CELL TOOK ON THE OBJECT THAT OWNS THE FRAME IT ALIASES. There are exactly
+   two kinds of owner a frame's storage can have — an async activation, whose header IS the allocation, and a
+   generator or async generator, whose frame lives in the state its object holds by opaque — so the release is a
+   two-arm dispatch on the header's own type and anything else is a frame that recorded an owner of a kind that
+   cannot own one. DFAIL rather than a silent default: a third kind here means some constructor wrote a pointer
+   into cur_gc_obj that is not the thing keeping the frame alive, and the cell has been rooting the wrong object
+   for its whole life. */
+static void js_release_coro(JSRuntime *rt, JSGCObjectHeader *coro)
+{
+    DCHECK(coro != NULL,
+           "an open cell recorded that it holds a reference on the object owning its frame, and the frame names "
+           "no owner — the reference it took at creation now has nothing to give back");
+    switch (JS_GC_TYPE(coro)) {
+    case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
+        js_async_function_free(rt, (JSAsyncFunctionData *)coro);
+        break;
+    case JS_GC_OBJ_TYPE_JS_OBJECT: /* a generator or async generator object: it owns the state, the state the frame */
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, (JSObject *)coro));
+        break;
+    default:
+        DFAIL("a frame recorded an owner that is neither an async activation nor a generator object — only "
+              "those two own a frame's storage, so this cell has been holding a reference on something that "
+              "does not keep its storage alive and its aliased slot can be freed while it is still open");
+        break;
+    }
+}
+
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
     if (var_ref) {
@@ -8885,6 +8945,14 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
                 JSStackFrame *sf = var_ref->stack_frame;
                 DCHECK(sf->var_refs[var_ref->var_ref_idx] == var_ref, "sf->var_refs[var_ref->var_ref_idx] == var_ref");
                 sf->var_refs[var_ref->var_ref_idx] = NULL;
+                /* AN OPEN CELL THAT ROOTED ITS FRAME'S OWNER DIES HERE WITHOUT EVER DETACHING, so its GC-list
+                   membership and its root both come off here — the mirror of the mint, which took both. The
+                   owner is read off the FRAME, which the slot above being cleared does not affect, and the
+                   release is last because it can free that frame and nothing below reads it again. */
+                if (var_ref->is_coro) {
+                    remove_gc_object(&var_ref->header);
+                    js_release_coro(rt, sf->cur_gc_obj);
+                }
             }
             js_free_rt(rt, var_ref);
         }
@@ -8983,7 +9051,12 @@ static void js_bytecode_function_mark(JSRuntime *rt, JSValueConst val,
         if (var_refs) {
             for(i = 0; i < b->closure_var_count; i++) {
                 JSVarRef *var_ref = var_refs[i];
-                if (var_ref && var_ref->is_detached) {
+                /* A detached cell is a GC object because it owns its value; an OPEN one is a GC object only
+                   when it roots the owner of the frame it aliases (see get_captured_cell). Those two are the
+                   whole set, and this closure holds a counted reference to each cell it names, so each is one
+                   mark edge — which is the edge that makes a suspended coroutine reachable through a closure
+                   over one of its locals. */
+                if (var_ref && (var_ref->is_detached || var_ref->is_coro)) {
                     mark_func(rt, &var_ref->header);
                 }
             }
@@ -9093,6 +9166,11 @@ static void free_gc_object(JSRuntime *rt, JSGCObjectHeader *gp)
         break;
     case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE:
         free_function_bytecode(rt, (JSFunctionBytecode *)gp);
+        break;
+    case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
+        /* an async activation can be the whole of a cycle together with a cell aliasing its frame, with no
+           JSObject in the pair at all — see js_async_function_free0 */
+        js_async_function_free0(rt, (JSAsyncFunctionData *)gp);
         break;
     default:
         abort();
@@ -9301,7 +9379,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                             if (pr->u.getset.setter)
                                 mark_func(rt, &pr->u.getset.setter->header);
                         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
-                            if (pr->u.var_ref->is_detached) {
+                            if (pr->u.var_ref->is_detached ||
+                                pr->u.var_ref->is_coro) {
                                 /* Note: the tag does not matter
                                    provided it is a GC object */
                                 mark_func(rt, &pr->u.var_ref->header);
@@ -9343,9 +9422,23 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     case JS_GC_OBJ_TYPE_VAR_REF:
         {
             JSVarRef *var_ref = (JSVarRef *)gp;
-            /* only detached variable referenced are taken into account */
-            DCHECK(var_ref->is_detached, "var_ref->is_detached");
-            JS_MarkValue(rt, *var_ref->pvalue, mark_func);
+            if (var_ref->is_detached) {
+                /* the cell owns its value */
+                JS_MarkValue(rt, *var_ref->pvalue, mark_func);
+            } else {
+                /* AN OPEN CELL OWNS NO VALUE — its storage IS a slot in the frame it aliases, and that frame's
+                   owner marks the slot. What it owns is the ONE reference it took on that owner, so that is the
+                   one edge it has, and it is the edge the collector was missing: without it a coroutine whose
+                   only anchor is a closure over one of its locals is a cycle and is freed while live. An open
+                   cell is on the GC list for no other reason, which is why the alternative here is an assert
+                   and not a second case. */
+                DCHECK(var_ref->is_coro,
+                       "an OPEN cell that roots nothing is on the GC object list — an open cell owns no value, "
+                       "so the only thing it can contribute to a walk is the reference it holds on the owner of "
+                       "the frame it aliases, and a cell with no such reference was added to the list by "
+                       "something other than the mint that takes one");
+                mark_func(rt, var_ref->stack_frame->cur_gc_obj);
+            }
         }
         break;
     case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
@@ -9466,6 +9559,12 @@ static void gc_free_cycles(JSRuntime *rt)
         switch(JS_GC_TYPE(p)) {
         case JS_GC_OBJ_TYPE_JS_OBJECT:
         case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE:
+        /* AND THE ASYNC ACTIVATION, which the comment above no longer covers. "The rest will be automatically
+           removed because they must be referenced by them" was true while an activation's only holders were its
+           resolving functions; a cell aliasing its frame roots it too, and that pair is two GC objects and no
+           JSObject — so nothing in the walk would ever reach it and both members ended on the zero-refcount
+           list, where the assert at the end of this function is what would have reported it. */
+        case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
 #ifdef ENABLE_DUMPS // JS_DUMP_GC_FREE
             if (check_dump_flag(rt, JS_DUMP_GC_FREE)) {
                 if (!header_done) {
@@ -9488,11 +9587,14 @@ static void gc_free_cycles(JSRuntime *rt)
 
     list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
         p = list_entry(el, JSGCObjectHeader, link);
-        /* ONLY THE TWO KINDS THAT DEFER THEIR OWN MEMORY reach this raw free. Everything else on this list got
-           here from the walk above and is expected to have been unlinked by the teardown of whatever referenced
-           it — so a REALM still sitting here is one nothing released, which is not a spare pointer to free but
-           an entire realm (its global, its prototypes, its modules) about to go with no teardown at all. */
-        DCHECK(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT || JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE,
+        /* ONLY THE KINDS THAT DEFER THEIR OWN MEMORY reach this raw free. Everything else on this list got here
+           from the walk above and is expected to have been unlinked by the teardown of whatever referenced it —
+           so a REALM still sitting here is one nothing released, which is not a spare pointer to free but an
+           entire realm (its global, its prototypes, its modules) about to go with no teardown at all. The async
+           activation joined the list of deferrers when the collector began tearing one down directly
+           (js_async_function_free0): torn down in the phase, memory released here, exactly as free_object's is. */
+        DCHECK(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT || JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE ||
+               JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_ASYNC_FUNCTION,
                "a collected GC object of a kind that does not own its own deferred memory reached the raw free "
                "at the end of a collection — for a realm that means nothing released its last reference "
                "(js_context_release_refs never ran) and the whole realm is being dropped rather than torn down");
@@ -20058,8 +20160,13 @@ static void js_mapped_arguments_mark(JSRuntime *rt, JSValueConst val,
         int i;
         if (var_refs) {
             for(i = 0; i < p->u.array.count; i++) {
-                if (var_refs[i] && var_refs[i]->is_detached)
-                    mark_func(rt, &var_refs[i]->header);
+                /* mapped arguments hold a counted reference to each cell, so each cell that IS a GC object is
+                   one mark edge — the same predicate every other holder uses. A mapped `arguments` is the one
+                   holder that can name an open cell without any closure existing, so a coroutine's arguments
+                   object escaping is the second way the missing edge was reachable. */
+                JSVarRef *vr = var_refs[i];
+                if (vr && (vr->is_detached || vr->is_coro))
+                    mark_func(rt, &vr->header);
             }
         }
     }
@@ -20347,6 +20454,7 @@ static JSVarRef *js_create_var_ref(JSContext *ctx, bool is_gc_object)
         return NULL;
     JS_REF_COUNT(var_ref) = 1;
     var_ref->is_detached = true;
+    var_ref->is_coro = false;   /* born detached: it aliases no frame, so there is no owner to root */
     var_ref->value = JS_UNDEFINED;
     var_ref->pvalue = &var_ref->value;
     if (is_gc_object)
@@ -20383,9 +20491,28 @@ static JSVarRef *get_captured_cell(JSContext *ctx, JSStackFrame *sf, JSValue *pv
     vr->var_ref_idx = var_ref_idx;
     vr->stack_frame = sf;
     vr->pvalue = pvalue;                  /* -> the live var_buf/arg_buf slot */
-    /* NOT add_gc_object here: an OPEN var_ref is not a standalone GC object (its value lives in the frame slot,
-       which the frame marks); it is added to the GC list only when close_var_ref detaches it on teardown/escape.
-       Adding it at creation double-added it (close_var_ref adds again) -> gc_obj_list corruption + leaks. */
+    /* THE CELL ROOTS THE OWNER OF THE FRAME IT ALIASES, DECIDED HERE BECAUSE HERE IS WHERE EVERY OPEN CELL IS
+       BORN. Its storage IS a slot in that frame, so anything that can free the frame can free the storage; when
+       the frame belongs to something the COLLECTOR can free — a suspended async activation, a generator, an
+       async generator (ECMA-262 §9.4 Execution Contexts: a suspended execution context may become the running
+       one again and continue where it left off, so it is LIVE, not garbage) — the cell takes one counted
+       reference on that owner and becomes a GC object so the walk can see closure -> cell -> coroutine. Without
+       it the collector sees a cycle where there is a live coroutine, frees it, and the closure is left aliasing
+       released memory.
+       WHEN NOTHING COLLECTABLE OWNS THE FRAME THERE IS NOTHING TO ROOT and the cell stays off the GC list: its
+       value lives in a slot the frame's own walk marks, so an open cell contributes no other edge and adding it
+       to the list would put an object there with nothing to say. (It also double-added — close_var_ref adds
+       again on detach — which corrupted the list; close_var_ref now adds only for a cell that was NOT already
+       on the list, which is the same rule stated where the second add would happen rather than a blanket ban on
+       ever adding an open cell.) */
+    vr->is_coro = (sf->cur_gc_obj != NULL);
+    if (vr->is_coro) {
+        DCHECK(JS_REF_COUNT(sf->cur_gc_obj) > 0,
+               "a frame named an owner that is already released — the cell about to alias one of its slots "
+               "would take a reference on freed memory, and the frame it is minted in is memory nobody holds");
+        JS_REF_COUNT(sf->cur_gc_obj)++;
+        add_gc_object(ctx->rt, &vr->header, JS_GC_OBJ_TYPE_VAR_REF);
+    }
     sf->var_refs[var_ref_idx] = vr;
     return vr;
 }
@@ -20427,6 +20554,7 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
             return NULL;
         JS_REF_COUNT(var_ref) = 1;
         var_ref->is_detached = true;
+        var_ref->is_coro = false;   /* a detached copy aliases no frame */
         var_ref->value = js_dup(*pvalue);
         var_ref->pvalue = &var_ref->value;
         add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
@@ -20699,16 +20827,28 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
 
 static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
-    if (var_ref->is_detached) return;   /* idempotent — prerequisite for eager-CLOSED captured-local cells
-                                           (V8-Context model): a cell already closed at creation must not be
-                                           re-closed on frame return (that would js_dup its own value + double
-                                           add_gc_object, corrupting the GC list). No-op for the current lazy
-                                           model (cells are open until return), so safe to land ahead. */
+    JSGCObjectHeader *coro;
+    /* ALREADY DETACHED, AND THIS IS NOT ONLY TIDINESS. A cell is named by more than one frame's array the
+       moment a flow forks (clone_susp_frame shares the frame's cells with the clone), so the sibling's teardown
+       can detach a cell this frame is still walking; and releasing the root below can free the owner and
+       re-enter this frame's own teardown. Once detached the union holds `value` rather than {var_ref_idx,
+       stack_frame}, so re-reading stack_frame here would read a JSValue as a frame pointer. */
+    if (var_ref->is_detached) return;
+    /* READ THE OWNER BEFORE js_dup WRITES `value` OVER THE UNION MEMBER THAT ALIASES stack_frame. */
+    coro = var_ref->is_coro ? var_ref->stack_frame->cur_gc_obj : NULL;
     var_ref->value = js_dup(*var_ref->pvalue);
     var_ref->pvalue = &var_ref->value;
     /* the reference is no longer to a local variable */
     var_ref->is_detached = true;
-    add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
+    var_ref->is_coro = false;
+    /* A CELL THAT ROOTED ITS FRAME'S OWNER IS ALREADY A GC OBJECT AND GIVES THE ROOT BACK HERE — it aliases
+       nothing now, so it neither needs the owner alive nor may be added to the list a second time. The release
+       is LAST because it can free the owner, and this cell must be a complete detached cell before anything
+       that teardown reaches can look at it. */
+    if (coro)
+        js_release_coro(rt, coro);
+    else
+        add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 }
 
 static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
@@ -28526,7 +28666,6 @@ static inline bool tramp_is_reflect_apply(JSValueConst method) {
 /* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
                                        JSValueConst this_obj, int argc, JSValueConst *argv);
-static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s);
 static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret,
                                           JSAsyncPost *out);
 /* Await's remaining steps once its resolve call has run: create the continuation's resolving functions and
@@ -29971,6 +30110,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->var_ref_count = b->var_ref_count;
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
+    /* AN ACTIVATION'S STORAGE IS OWNED BY THE RUNNING FLOW, WHICH NO COLLECTION CAN FREE — this frame's block
+       is either on the C stack or a heap-stack TrampFrame the flow's chain owns, and either way it is torn down
+       by a return or an unwind, never by the collector. So a cell minted here roots nothing; see
+       JSStackFrame.cur_gc_obj. Written rather than assumed because this frame is not zeroed. */
+    sf->cur_gc_obj = NULL;
     sp = stack_buf;
     pc = b->byte_code_buf;
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
@@ -45087,6 +45231,12 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     sf->cur_sp = sf->var_buf + b->var_count;
     sf->var_refs = TRAMP_VAR_REFS(sf->cur_sp, b);
     sf->var_ref_count = b->var_ref_count;
+    /* NO OWNER YET — a base's frame is built BEFORE the thing that will own it exists for two of the three
+       coroutine kinds (a generator and an async generator run their prologue, which can mint cells, before
+       js_create_from_ctor makes the object), and for a flow base there is never one at all. Whoever mints an
+       owner records it through async_func_set_owner, which also adopts the cells the prologue already made.
+       See JSStackFrame.cur_gc_obj. */
+    sf->cur_gc_obj = NULL;
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
     for(i = 0; i < argc; i++)
@@ -45097,15 +45247,77 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     return 0;
 }
 
+/* RECORD THE OBJECT THAT OWNS THIS BASE'S FRAME, AND ADOPT THE CELLS THAT ALREADY ALIAS IT. Called by whoever
+   mints the owner, which for a generator and an async generator is AFTER their prologue has run — and this
+   engine's prologue is not a formality: parameter destructuring and default-value expressions are user code, so
+   a closure can escape from it and hold an open cell before the object it must root exists. Upstream leaves
+   that window open by taking the decision purely as a snapshot at each cell's creation; snapshotting stays
+   right (the frame's answer genuinely changes, and re-deriving at read time would release a reference no cell
+   took), so the window is closed from the other side instead — at the one instant the answer changes, every
+   cell that predates it is adopted, which is a bounded walk of the frame's own array and not a re-derivation.
+   The frame's array is the COMPLETE set of open cells that alias this frame: get_captured_cell is the only mint
+   and it always stores there, and a cell leaves only by detaching or by being freed. */
+static void async_func_set_owner(JSRuntime *rt, JSAsyncFunctionState *s, JSGCObjectHeader *owner)
+{
+    JSStackFrame *sf = &s->frame;
+    int i;
+
+    DCHECK(owner != NULL, "a base was handed no owner — the caller knows which object owns this frame, and NULL "
+                          "here says the frame is owned by nothing collectable, which is a different claim");
+    DCHECK(JS_REF_COUNT(owner) > 0,
+           "a base was given an owner that holds no reference of its own — the cells about to root it would "
+           "take theirs on an object nobody is keeping, which is the state this whole mechanism exists to end");
+    DCHECK(sf->cur_gc_obj == NULL,
+           "a base's frame was given a second owner — a frame's storage belongs to exactly one object, and the "
+           "cells already aliasing it took their reference on the first, so the two answers disagree about who "
+           "keeps the storage alive");
+    sf->cur_gc_obj = owner;
+    for (i = 0; i < sf->var_ref_count; i++) {
+        JSVarRef *vr = sf->var_refs[i];
+        if (!vr || vr->is_detached)
+            continue;
+        /* A CELL THIS FRAME DID NOT MINT ALIASES THE FRAME IT NAMES, NOT THIS ONE. A clone's array is filled by
+           SHARING the source frame's cells (clone_susp_frame, js_async_frame_clone), so an entry here can point
+           into another frame's slot and already root THAT frame's owner. Adopting it would root this owner for
+           storage this owner does not hold, and would take a second reference for a cell that has one — so the
+           question asked is which frame the cell aliases, which is the cell's own field and not a guess. */
+        if (vr->stack_frame != sf)
+            continue;
+        DCHECK(!vr->is_coro,
+               "an open cell minted in this frame already roots an owner while the frame records none — the "
+               "cell and the frame disagree about who owns the storage, so the reference the cell is holding is "
+               "on an object that does not own the slot it aliases");
+        vr->is_coro = true;
+        JS_REF_COUNT(owner)++;
+        add_gc_object(rt, &vr->header, JS_GC_OBJ_TYPE_VAR_REF);
+    }
+}
+
 static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
                             JS_MarkFunc *mark_func)
 {
     JSStackFrame *sf;
     JSValue *sp;
+    int i;
 
     sf = &s->frame;
     JS_MarkValue(rt, sf->cur_func, mark_func);
     JS_MarkValue(rt, s->this_val, mark_func);
+    /* THE FRAME OWNS ITS CELLS, SO THE FRAME MARKS THEM — and in this engine that is not upstream's arrangement
+       and cannot be omitted. Upstream's frame merely RECORDS its open cells (close_var_refs only closes them);
+       here get_captured_cell mints each with the FRAME holding the first reference and close_var_refs gives it
+       back, so a cell in this array is a counted edge out of this state and every counted edge a collectable
+       holder has must be a mark edge or the collector cannot see the far end drop. Leaving it out is not merely
+       conservative once cells root their owner: state -> cell is then counted-and-unmarked while cell -> state
+       is counted-and-marked, so gc_decref can never bring the cell to zero, gc_scan restores the state through
+       it, and EVERY coroutine with a captured local becomes immortal — a leak the runtime's own gc_obj_list
+       walk would report with nothing naming the cause. One edge per non-NULL slot, which is exactly the one
+       reference this frame holds per slot. */
+    for (i = 0; i < sf->var_ref_count; i++) {
+        JSVarRef *vr = sf->var_refs[i];
+        if (vr && (vr->is_detached || vr->is_coro))
+            mark_func(rt, &vr->header);
+    }
     if (sf->cur_sp) {
         /* if the function is running, cur_sp is not known so we
            cannot mark the stack. Marking the variables is not needed
@@ -45550,7 +45762,14 @@ static int clone_susp_frame(JSContext *ctx, JSAsyncFunctionState *cs, const JSAs
     DCHECK(of->is_call_root || of->var_ref_count == b->var_ref_count,
            "clone_susp_frame: the frame's var-ref count disagrees with its bytecode's — the clone reserves the "
            "bytecode's count, so a larger frame count writes and reads past the allocation");
-    cf->var_ref_count = of->var_ref_count;   /* share the frame's closed cells + take a ref */
+    /* SHARE THE SOURCE FRAME'S CELLS AND TAKE A REFERENCE ON EACH. A shared cell keeps naming the SOURCE frame
+       — its pvalue is a slot in the source's buffer and its stack_frame is the source — so the clone's array
+       and the cell disagree about which frame the cell belongs to, and every question asked of a cell must be
+       asked of the cell's own field rather than of the array it was found in. The owner field is the worked
+       example: it is NOT written here, because a cell taken from the source roots the SOURCE's owner and that
+       is what keeps the storage it aliases alive. The CLONE's own owner is written by whoever minted the clone
+       (flow_clone_state_alloc, js_async_frame_clone), before this function fills the frame. */
+    cf->var_ref_count = of->var_ref_count;
     for (int vi = 0; vi < of->var_ref_count; vi++) { cf->var_refs[vi] = of->var_refs[vi]; if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++; }
     cf->cur_pc = of->cur_pc;
     cf->prev_frame = NULL;
@@ -45625,6 +45844,13 @@ static JSAsyncFunctionState *flow_clone_state_alloc(JSContext *ctx, JSAsyncFunct
         d->resolving_funcs[1] = js_dup(sd->resolving_funcs[1]);
         d->is_active = true;   /* the frame is filled in by the caller; a failure path releases it through here */
         c = &d->func_state;
+        /* THE CLONE'S FRAME IS OWNED BY THE CLONE, and it is written here because here is where the owner is
+           minted — a clone built field by field from a source is exactly where an owner-shaped field gets
+           carried over from the wrong object or left at zero, and either answer makes every cell the clone
+           later mints root something that does not hold its storage. Set directly rather than through
+           async_func_set_owner: the frame is empty at this point (clone_susp_frame fills it next), and the
+           cells it will then take from the source alias the SOURCE's slots and root the SOURCE's owner. */
+        c->frame.cur_gc_obj = &d->header;
     } else if (src->base_kind == FLOW_BASE_STEP_ROOT) {
         c = flow_reaction_clone_alloc(ctx, src);
         if (!c) return NULL;
@@ -45969,6 +46195,8 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             JS_REF_COUNT(as2) = 1;
             add_gc_object(ctx->rt, &as2->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
             as2->is_active = true;
+            /* the sibling's activation owns the sibling's frame — see flow_clone_state_alloc */
+            as2->func_state.frame.cur_gc_obj = &as2->header;
             as2->resolving_funcs[0] = JS_UNDEFINED; as2->resolving_funcs[1] = JS_UNDEFINED;
             JSValue aprom2 = JS_NewPromiseCapability(ctx, as2->resolving_funcs);
             if (JS_IsException(aprom2)) { js_async_function_free(ctx->rt, as2); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
@@ -46022,6 +46250,14 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             if (!g1) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
             g1->state = g0->state;
             g1->cow_ref = 1;   /* the sibling delta's gendata entry owns this clone (creation ref transfers there) */
+            /* AND ITS FRAME IS OWNED BY THAT DELTA, WHICH NO COLLECTION CAN FREE — so this clone's frame names
+               no collectable owner and a cell minted in it roots nothing (js_mallocz already wrote the NULL;
+               this says it is the answer rather than an omission). The generator OBJECT is shared and is NOT
+               the owner here: it owns the ORIGINAL gen_data, and a cell rooting it would keep the wrong state
+               alive while the slot it aliases lives in this one. See JSStackFrame.cur_gc_obj. */
+            DCHECK(g1->func_state.frame.cur_gc_obj == NULL,
+                   "a per-flow generator-data clone named a collectable owner — its frame belongs to the COW "
+                   "delta's counted reference, and any object named here is one that does not hold this frame");
             if (clone_susp_frame(ctx, &g1->func_state, &g0->func_state, live_end - gof->arg_buf) < 0) {
                 js_free(ctx, g1); js_free(ctx, oa); js_free(ctx, ca); return NULL;
             }
@@ -46173,8 +46409,16 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             DCHECK(otf->sf.var_ref_count == wb->var_ref_count,
                    "clone_deep_flow: the frame's var-ref count disagrees with its bytecode's — the clone reserves "
                    "the bytecode's count, so a larger frame count writes and reads past the allocation");
-            ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's closed cells + take a ref */
+            ct->sf.var_ref_count = otf->sf.var_ref_count;   /* share this frame's cells + take a ref */
             for (int vi = 0; vi < otf->sf.var_ref_count; vi++) { ct->sf.var_refs[vi] = otf->sf.var_refs[vi]; if (ct->sf.var_refs[vi]) JS_REF_COUNT(ct->sf.var_refs[vi])++; }
+            /* AN ORDINARY ACTIVATION NAMES NO COLLECTABLE OWNER, so the `*ct = *otf` above carried the right
+               answer for this field rather than a stale one — which is a fact about ordinary frames and not a
+               property of the copy, so it is asserted here instead of assumed. The async and generator arms
+               above do NOT rely on the copy: each replaces the whole func_state and writes the owner itself. */
+            DCHECK(ct->sf.cur_gc_obj == NULL,
+                   "an ordinary bytecode frame on a forked chain names a collectable owner — its storage is the "
+                   "flow's own heap stack, so any object named here is one that does not hold this frame and a "
+                   "cell minted in it would root the wrong thing");
             if (otf->cont_kind == CONT_PROMISE_EXEC) {
                 /* the Promise EXECUTOR body forked: each arm must settle its own timeline, so the sibling gets its
                    own state. The promise object and its resolving functions are SHARED (created pre-fork, js_dup)
@@ -46805,6 +47049,13 @@ static JSAsyncFunctionData *js_async_frame_clone(JSContext *ctx, JSAsyncFunction
     d->resolving_funcs[0] = js_dup(s->resolving_funcs[0]);
     d->resolving_funcs[1] = js_dup(s->resolving_funcs[1]);
     cf = &d->func_state.frame;
+    /* THE CLONE'S FRAME BELONGS TO THE CLONE. This function builds a JSAsyncFunctionData field by field rather
+       than through async_func_init, which is exactly where a field added to the frame gets missed — and missing
+       it here is silent: every cell this arm later mints would root nothing, so the sibling activation could be
+       collected while a closure it created still aliases its slots. The cells COPIED from the source below are
+       a different matter: they alias the source's slots and root the source's owner, which is why this is a
+       direct write and not async_func_set_owner's adoption. */
+    cf->cur_gc_obj = &d->header;
     cf->arg_buf = js_malloc(ctx, sizeof(JSValue) * (lc > 0 ? lc : 1) + sizeof(JSVarRef *) * b->var_ref_count);
     if (!cf->arg_buf) {
         d->is_active = false;
@@ -46954,6 +47205,11 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
     if (JS_IsException(obj))
         goto fail;
     JS_SetOpaqueInternal(obj, s);
+    /* THE OBJECT OWNS THE STATE, SO IT OWNS THE FRAME — recorded the instant it exists, and not before, because
+       until this line there was no owner to name. The prologue above already ran (the resume to
+       OP_initial_yield, which in this engine covers parameter destructuring and default-value expressions, all
+       of it user code that can escape a closure), so any cell it minted is adopted here. */
+    async_func_set_owner(ctx->rt, &s->func_state, &JS_VALUE_GET_OBJ(obj)->header);
     return obj;
  fail:
     free_generator_stack_rt(ctx->rt, s);
@@ -46966,23 +47222,54 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
 static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
 {
     if (s->is_active) {
-        async_func_free(rt, &s->func_state);
+        /* DEAD BEFORE THE TEARDOWN RUNS, NOT AFTER IT. This flag is what every other path asks before touching
+           the frame, and the teardown below can RE-ENTER: closing the frame's cells gives back the references
+           they hold on this very activation (an open cell roots the object owning the frame it aliases), so a
+           release lands here while `async_func_free` is halfway through the frame. Clearing first is what makes
+           the second entry a no-op rather than a second walk of a frame whose values are already gone. */
         s->is_active = false;
+        async_func_free(rt, &s->func_state);
     }
 }
 
+/* THE COLLECTOR'S OWN TEARDOWN OF AN ASYNC ACTIVATION, split by phase exactly as free_object is and for the
+   identical reason (see the realm teardown's comment): a teardown running under JS_GC_PHASE_REMOVE_CYCLES may
+   RELEASE references — that is what the phase absorbs — but must not free memory the collector's walk still
+   owns, because other members of the cycle still hold counted references and will decrement them.
+   IT IS REACHED FROM THE COLLECTOR NOW, WHICH IT WAS NOT BEFORE. An async activation and a cell that aliases
+   its frame reference each other: the frame holds the cell, the cell roots the activation. Both are GC objects
+   and NEITHER is a JSObject, so the collector's "free the JS objects and the rest follow from their teardown"
+   assumption — true while an activation was reachable only through its resolving functions — no longer holds
+   for this pair, and gc_free_cycles now starts the teardown here instead of moving an activation to the
+   zero-refcount list for a holder that does not exist. The XXX above JSAsyncFunctionData names the same oddity
+   from the other end. */
 static void js_async_function_free0(JSRuntime *rt, JSAsyncFunctionData *s)
 {
     js_async_function_terminate(rt, s);
     JS_FreeValueRT(rt, s->resolving_funcs[0]);
     JS_FreeValueRT(rt, s->resolving_funcs[1]);
+    s->resolving_funcs[0] = JS_UNDEFINED;
+    s->resolving_funcs[1] = JS_UNDEFINED;
     remove_gc_object(&s->header);
-    js_free_rt(rt, s);
+    if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && JS_REF_COUNT(s) != 0) {
+        /* still named by a cycle member the walk has not reached; it will decrement this header, so the memory
+           outlives the phase and the sweep at the end of gc_free_cycles releases it */
+        list_add_tail(&s->header.link, &rt->gc_zero_ref_count_list);
+    } else {
+        js_free_rt(rt, s);
+    }
 }
 
 static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s)
 {
     if (--JS_REF_COUNT(s) == 0) {
+        /* IN THE COLLECTOR'S REMOVE-CYCLES PHASE THE WALK OWNS THIS ALLOCATION, and a release that reached zero
+           here is a release the walk expects to absorb — the same answer js_free_value_rt gives for a JSObject
+           in that phase, and it is now reachable for this kind too: the collector tears an activation down
+           directly, and that teardown closes the frame's cells, each of which gives back the reference it held
+           on this activation. Freeing here would free the frame the caller is still walking. */
+        if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES)
+            return;
         js_async_function_free0(rt, s);
     }
 }
@@ -47450,6 +47737,10 @@ static JSValue js_async_function_start(JSContext *ctx, JSValueConst func_obj,
     }
     s->is_active = true;
     s->func_state.base_kind = FLOW_BASE_ASYNC_CALL;   /* this state belongs to `s`, and a fork must say so */
+    /* AND SO DOES THE FRAME — recorded BEFORE the body runs, which is the one coroutine kind where that is
+       possible: an async function's activation exists before its first opcode, so there is no window in which a
+       cell can be minted with no owner to root, and the adoption loop finds nothing. */
+    async_func_set_owner(ctx->rt, &s->func_state, &s->header);
     *pdata = s;
     return promise;
 }
@@ -48181,6 +48472,9 @@ static JSValue js_async_generator_function_call(JSContext *ctx,
         goto fail;
     s->generator = JS_VALUE_GET_OBJ(obj);
     JS_SetOpaqueInternal(obj, s);
+    /* the async generator object owns the state and so the frame — adopting the prologue's cells, exactly as
+       js_call_generator_function does and for the same reason */
+    async_func_set_owner(ctx->rt, &s->func_state, &s->generator->header);
     return obj;
  fail:
     js_async_generator_free(ctx->rt, s);
@@ -59792,6 +60086,7 @@ static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical)
         var_ref->value = JS_UNDEFINED;
     var_ref->pvalue = &var_ref->value;
     var_ref->is_detached = true;
+    var_ref->is_coro = false;   /* a module binding aliases no frame, so there is no owner to root */
     add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
     return var_ref;
 }
@@ -100557,6 +100852,12 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     sf->is_strict_mode = false;
     sf->is_constructor = false;
     sf->is_call_root = true;   /* no bytecode of its own runs here: the handler's activation is a frame ON TOP */
+    /* NO COLLECTABLE OWNER, AND THIS IS THE ONE BASE THAT MUST SAY SO OUT LOUD: its memory is genuinely not
+       zeroed (js_call_flow_complete's base lives on the C STACK) and it is re-initialised over a used one, so an
+       unwritten field here is whatever the last flow left. A call root runs no bytecode of its own and declares
+       var_ref_count 0, so it mints no cells either way — but a frame whose owner is garbage is a frame that
+       would hand the next mint a pointer to nothing. See JSStackFrame.cur_gc_obj. */
+    sf->cur_gc_obj = NULL;
     sf->step_func = sf->step_this = JS_UNDEFINED;
     sf->this_val = JS_UNDEFINED;
     sf->cur_func = js_dup(handler);
