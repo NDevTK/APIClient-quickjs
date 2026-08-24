@@ -23706,6 +23706,27 @@ static TrampFrame *tramp_frame_new(JSRuntime *rt)
            what makes that state nameable, and the DCHECKs at the resume are what make it fatal. */
         tf->this_val = JS_UNINITIALIZED;
         tf->new_target = JS_UNINITIALIZED;
+        /* AND THE EMBEDDED FRAME IS BORN OWNED BY NOBODY, WHICH IS THE SAME SENTENCE ONE FIELD FURTHER ON — the
+           paragraph above is about a field the ordinary sites DO write and the coroutine sites do not, and this
+           is the field NO site writes at all. Nine pushes build a JSStackFrame here (do_tramp_call,
+           do_construct_have_proto, do_apply_tramp, do_async_tramp_call, do_generator_tramp,
+           do_generator_create_tramp, do_agen_create_tramp, do_agen_drive_enter, and the construct macro); each
+           assigns every other member of it explicitly and not one assigns cur_gc_obj, so an ordinary activation
+           on the heap call stack named whatever the recycled block held at that offset.
+           IT IS NOT AN ASSERT THAT WAS MISSING, IT IS A WILD POINTER: get_captured_cell reads this field to
+           decide `vr->is_coro`, and a non-NULL answer makes it INCREMENT the refcount through that pointer and
+           put the cell on the GC list; free_var_ref then hands the same pointer to js_release_coro, which
+           switches on JS_GC_TYPE(it) and frees it as an async activation or a generator object. Every closure
+           captured inside any trampolined call was one recycled block away from that, and both DCHECKs guarding
+           it compile out in release — so the shipped build did the increment and the free in silence.
+           NULL IS THE FIELD'S OWN WORD FOR "no owner yet" (async_func_init writes exactly this, for exactly this
+           reason), and a heap-stack activation's storage genuinely has none: it is torn down by a return or an
+           unwind, never by the collector, which is what JS_CallInternal's own C-stack frame says at its
+           `sf->cur_gc_obj = NULL`. Whoever later mints an owner records it through async_func_set_owner — whose
+           "a base's frame was given a second owner" DCHECK could not fire while this field arrived as garbage.
+           It is written HERE, at the one point every heap frame is born, and not at the nine pushes: a per-site
+           assignment is a line each new call opcode must remember, and this defect is what forgetting it costs. */
+        tf->sf.cur_gc_obj = NULL;
         g_tramp_frames_live++;
     }
     return tf;
