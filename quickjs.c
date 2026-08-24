@@ -28886,10 +28886,9 @@ static int js_async_generator_post(JSContext *ctx, struct JSAsyncGeneratorData *
                                    JSAsyncPost *out);
 /* An ASYNC generator .next()/.throw()/.return() — the same question as tramp_gen_method_magic, for the async
    class. Asked in exactly ONE place (do_generic_callee), which every call shape converges on, so a bound /
-   proxied / applied / spread `ag.next()` cannot answer differently from a plain one. Off the tramp the drive
-   declares ITSELF a flow base (js_async_generator_resume_next), which is right only when the resume IS the
-   running flow — a promise reaction. Called synchronously from a running flow it is a NESTED activation, and its
-   first back-edge then parks a flow the caller's scheduler never asked for. */
+   proxied / applied / spread `ag.next()` cannot answer differently from a plain one. ECMA-262 §27.9.3.6
+   AsyncGeneratorResume ( gen, completion ) step 4 is "Perform ! RunSuspendedContext(genContext, completion)",
+   so the body it enters belongs on the chain of whatever is running — which is what do_agen_drive_tramp does. */
 static inline int tramp_agen_method_magic(JSValueConst method, JSValueConst this_val) {
     JSObject *mp, *tp;
     if (JS_VALUE_GET_TAG(method) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT) return -1;
@@ -28899,6 +28898,36 @@ static inline int tramp_agen_method_magic(JSValueConst method, JSValueConst this
     tp = JS_VALUE_GET_OBJ(this_val);
     if (tp->class_id != JS_CLASS_ASYNC_GENERATOR || !tp->u.async_generator_data) return -1;
     return mp->u.cfunc.magic;
+}
+
+static JSValue js_async_generator_resolve_function(JSContext *ctx, JSValueConst this_obj,
+                                                   int argc, JSValueConst *argv,
+                                                   int magic, JSValueConst *func_data);
+/* …AND RESUMING AN ASYNC GENERATOR BODY AFTER ITS OWN `await` IS THE SAME QUESTION, asked in the same place.
+   ECMA-262 §27.10.5.3 Await ( arg ) is not an async FUNCTION's operation: step 1 is "Let asyncContext be the
+   running execution context", so an `await` written in an async generator body builds steps 3's and 5's
+   fulfilledClosure/rejectedClosure over the GENERATOR's context, and each performs
+   §9.4.7 RunSuspendedContext ( context, completionRecord ) — "Suspend callerContext. Push context onto the
+   execution context stack; context is now the running execution context." One stack, the caller underneath and
+   NOT running. That is a frame on the running flow's chain, exactly as tramp_body_is_async_resume says it is
+   for an async function; it is asked HERE rather than at tramp_body_entry only because these two closures are
+   JS_CLASS_C_FUNCTION_DATA and so carry no bytecode body of their own — the body they enter is the
+   generator's, and this is where a callee with no body of its own converges.
+   MAGIC IS THE ALGORITHM, NOT A NARROWING. The same C entry serves §27.9.3.9 AsyncGeneratorAwaitReturn ( gen )
+   steps 11's and 13's closures (magic 2/3), and those enter NO body at all — AsyncGeneratorCompleteStep and
+   AsyncGeneratorDrainQueue is the whole of what each of them performs. Two different algorithms behind one
+   creation site, so this picks which one runs; deleting either would not make the question unnecessary, which
+   is this project's test for routing against a selector.
+   Returns 0 for onFulfilled and 1 for onRejected, -1 for "not a body resume". */
+static inline int tramp_agen_resume_kind(JSValueConst func) {
+    JSObject *fp;
+    JSCFunctionDataRecord *rec;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return -1;
+    fp = JS_VALUE_GET_OBJ(func);
+    if (fp->class_id != JS_CLASS_C_FUNCTION_DATA) return -1;
+    rec = fp->u.c_function_data_record;   /* NULL once the closure has been finalized */
+    if (!rec || rec->func != js_async_generator_resolve_function || rec->magic >= 2) return -1;
+    return (int)(rec->magic & 1);
 }
 
 static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
@@ -29668,6 +29697,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        those labels and the frame push that follows it — the frame is what holds the drive while the body runs, so
        a nested `ag.next()` inside the body cannot observe them. */
     int tramp_agen_magic = 0;
+    /* §27.10.5.3 Await's completion KIND, read by the async-generator await resume — 0 = onFulfilled,
+       1 = onRejected. Set before the goto, like tramp_agen_magic, and read+reset once at the label. */
+    uint8_t tramp_agen_reject = 0;
     void *agen_cont = NULL; uint8_t agen_ck = CONT_NONE;  /* where the drive's settlement promise is delivered */
     JSAsyncGeneratorData *agen_s = NULL;                /* the machine being driven */
     JSValue agen_prom = JS_UNDEFINED;                   /* its settlement promise: the drive's synchronous result */
@@ -32266,6 +32298,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        its rewrite, so every spelling reaches the same driver. */
                     int agmag = tramp_agen_method_magic(call_argv[-1], gthis);
                     if (agmag >= 0) { tramp_agen_magic = agmag; goto do_agen_drive_tramp; }
+                }
+                {   /* §27.10.5.3 Await's continuation for an async generator BODY: re-enter the SUSPENDED body
+                       on THIS chain, so a loop after the await is an ordinary deep park of the running flow.
+                       Asked here and nowhere else, for the same reason the drive above is — the question is
+                       about the CALLEE, and every spelling of a call converges here. */
+                    int agres = tramp_agen_resume_kind(call_argv[-1]);
+                    if (agres >= 0) { tramp_agen_reject = (uint8_t)agres; goto do_agen_resume_tramp; }
                 }
                 {   /* the SYNC generator's .next()/.throw()/.return(), for the same reason and in the same place.
                        Two per-call-site copies used to answer it (OP_call_method and the forward reshape), so
@@ -38901,11 +38940,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         do_agen_drive_tramp:
             /* ag.next() / .throw() / .return() called from bytecode. The request is enqueued and then the BODY RUNS
                HERE, on the caller's chain, so a loop anywhere in it preempts the caller's flow at any depth.
-               Driven from C instead (js_async_generator_resume_next) the body declares ITSELF a flow base, which is
-               right only when the resume IS the running flow — a promise reaction. Reached synchronously from a
-               running flow it is a NESTED activation, and its first back-edge parks a flow the caller's scheduler
-               never asked for: the park slot then holds the generator, its frame, its bytecode and that bytecode's
-               realm until something drains the pump, which for a script that never awaits is never. */
+               §27.9.3.6 AsyncGeneratorResume ( gen, completion ) step 4 says so in the spec's own words —
+               "Perform ! RunSuspendedContext(genContext, completion)" — and §9.4.7 RunSuspendedContext suspends
+               the caller context and pushes the generator's on top of it, which is this chain. There is one
+               other way into this body, an `await` inside it settling (do_agen_resume_tramp), and it enters the
+               same way for the same reason. */
             {
                 /* ONE operand shape: the drive is reached only through the call convergence point, so its
                    receiver and argument are where every other call's are. The three protocol shapes that used to
@@ -39123,6 +39162,112 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 js_free_rt(rt, ars);
             }
             goto do_agen_drive_finish;
+
+        do_agen_resume_tramp:
+            /* AN ASYNC GENERATOR'S AWAIT CONTINUATION: re-enter the SUSPENDED body HERE, on the chain of
+               whatever flow is running. ECMA-262 §27.10.5.3 Await ( arg ) steps 3 and 5 each perform
+               §9.4.7 RunSuspendedContext ( context, completionRecord ), whose steps 2-3 are "Suspend
+               callerContext. Push context onto the execution context stack" — one stack, the caller underneath
+               and not running. A loop after the await is then an ORDINARY DEEP PARK of the running flow
+               (do_preempt stashes the whole chain into the base and the flow's own driver parks it), which is
+               the only shape in which the park is transparent.
+               WHAT THIS REPLACES, in the same diff and with nothing left to fall back to:
+               js_async_generator_resume_next installed the generator's own state as a SECOND flow base under
+               the live one, and ITS CALLERS DO NOT DRAIN — the promise reaction that resumed it returned
+               `undefined` and went on executing bytecode over a park nothing was going to resume until the
+               pump next ran. The `caller_resumes_park` declaration an async body's own-base resume takes is not
+               available to it for exactly that reason, so the answer was never a declaration, it was this
+               route. That driver, the pump park it created and the park's resume/free/clone callbacks are
+               DELETED; the C entry is a DFAIL backstop.
+               THE BODY RUN IS THE DRIVE'S, not a second one. js_async_generator_pre already answers the
+               EXECUTING state with "the settled value is in place, run the body", so this entry only has to
+               deliver the completion, set up the drive, and jump into it. The drive differs in exactly one
+               thing: §27.10.5.3 steps 3.c and 5.c are "Return NormalCompletion(undefined)" — the NOTE beside
+               them says RunSuspendedContext's own Completion Record is intentionally ignored — so agen_prom is
+               UNDEFINED where a `.next()` would have left its settlement promise, and do_agen_drive_finish
+               places that as this call's value. */
+            {
+                JSObject *rfp = JS_VALUE_GET_OBJ(call_argv[-1]);
+                JSCFunctionDataRecord *rrec = rfp->u.c_function_data_record;
+                JSValueConst rgobj = rrec->data[0];   /* the generator the closure captured */
+                bool r_reject = (tramp_agen_reject != 0);
+                /* the resumption value, taken BEFORE the operands that hold it are released */
+                JSValue rarg = (call_argc >= 1) ? js_dup(call_argv[0]) : JS_UNDEFINED;
+                JSValue *rcargv;
+
+                tramp_agen_reject = 0;
+                agen_s = JS_GetOpaque(rgobj, JS_CLASS_ASYNC_GENERATOR);
+                DCHECK(agen_s != NULL,
+                       "an async generator's await continuation carries no machine — §27.10.5.3's closures "
+                       "capture asyncContext at creation, and the closure holds a reference to the generator "
+                       "object, so an opaque-less one here was built by something other than "
+                       "js_async_generator_resolve_function_create");
+                /* held across the body run, exactly as the drive holds its receiver: the callee operand below
+                   is this generator's only reference on this stack and it is about to be freed. */
+                agen_hold = js_dup(rgobj);
+                DCHECK(agen_s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING,
+                       "an async generator's await continuation fired on a machine that is not EXECUTING — the "
+                       "state is set to EXECUTING before the body runs and only the body's own suspend changes "
+                       "it, so a resume arriving at any other state means something completed this generator "
+                       "while one of its awaits was still registered");
+                DCHECK(!list_empty(&agen_s->queue),
+                       "an async generator's await continuation fired with an EMPTY request queue — the request "
+                       "that started this body run is settled by AsyncGeneratorCompleteStep when the body "
+                       "YIELDS or completes, so an await inside the body always has its own request at the "
+                       "head; an empty queue means js_async_generator_pre will answer 'nothing to drive' and "
+                       "the suspended body would never be re-entered");
+                DCHECK(agen_s->func_state.frame.cur_sp != NULL,
+                       "an await continuation was asked to resume an async generator with no suspended frame — "
+                       "§9.4.7 RunSuspendedContext pushes a SUSPENDED context, and this one has no execution "
+                       "context to make running");
+                DCHECK(agen_s->func_state.tramp_top == NULL,
+                       "an await continuation was asked to resume an async generator that is holding a heap-"
+                       "frame chain — a body suspended at OP_await is its own top frame, so a chain here means "
+                       "this state is parked mid-call and its driver, not this entry, owns it");
+                /* THE FRAME NAMES THE OBJECT THAT OWNS IT, asserted at the one entry that re-enters a frame it
+                   did not create. Nothing here MINTS an activation, so this route owes no async_func_set_owner
+                   of its own — the two async-generator constructors (do_agen_create_settle and
+                   js_async_generator_function_call) already record theirs. That is exactly why a NULL here
+                   would be someone else's omission arriving at this label, and it would surface as a captured
+                   cell rooting nothing rather than as anything naming this. */
+                DCHECK(agen_s->func_state.frame.cur_gc_obj == &agen_s->generator->header,
+                       "an async generator's suspended frame does not name its generator object as owner — a "
+                       "cell captured in this body roots whatever cur_gc_obj says, so a frame that names "
+                       "nothing (or names something else) hands the collector a live coroutine it may free");
+                /* the operands go now, in whatever shape the call was written in: §27.10.5.3 steps 3.c/5.c make
+                   this call's value UNDEFINED no matter what the body does, so nothing below needs them. */
+                TAKE_CALL_SHAPE();
+                CREATE_RELEASE_OPERANDS();
+                rcargv = sp - call_pop;
+                for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, rcargv[i]);
+                sp = rcargv + call_first_r;
+                agen_prom = JS_UNDEFINED;   /* "Return NormalCompletion(undefined)" — the drive's placed value */
+                agen_cont = tramp_cont_state; agen_ck = tramp_cont_kind;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                agen_tail = tramp_is_tail;
+                DCHECK(agen_ck == CONT_NONE || !agen_tail,
+                       "an async-generator await resume is both a tail call and a continuation's callee");
+                agen_caller_sp = sp;
+                /* THE COMPLETION, delivered the way the drive's own `.throw()` delivers one — through
+                   throw_flag plus a live throw, which is the coroutine-resume protocol js_async_generator_pre
+                   and the body entry below both already speak. Last, because it is the only thing here that
+                   must survive to the entry. */
+                agen_s->func_state.throw_flag = r_reject;
+                if (r_reject) {
+                    JS_Throw(ctx, rarg);   /* §27.10.5.3 step 5.a: ThrowCompletion(reason) into the context */
+                } else {
+                    /* step 3.a: NormalCompletion(v), landing where the awaited operand stood —
+                       js_async_generator_post TOOK that operand when the body suspended and left UNDEFINED
+                       behind, which is the whole reason this store leaks nothing. */
+                    DCHECK(JS_IsUndefined(agen_s->func_state.frame.cur_sp[-1]),
+                           "an await continuation is about to overwrite a LIVE operand with the awaited result "
+                           "— the suspend that registered this continuation is the one that empties that slot, "
+                           "so a value standing in it means this body suspended somewhere else and its operand "
+                           "is being lost");
+                    agen_s->func_state.frame.cur_sp[-1] = rarg;
+                }
+                goto do_agen_drive_enter;
+            }
 
         /* DELETED: do_agen_settled and the whole CONT_AGEN_SETTLE path. It existed to place Await's RESOLVE
            call and then call js_async_generator_await_finish — half of 27.6.3.8, with the `constructor` READ
@@ -48528,83 +48673,27 @@ static JSValue js_new_agen_await_ret(JSContext *ctx, JSValueConst generator, boo
                                1, 0, 1, &generator);
 }
 
-static void js_async_generator_resume_next(JSContext *ctx, JSAsyncGeneratorData *s);
-/* The pump resumes a parked async-generator body: re-enter the drive at its saved point (state == EXECUTING).
-   The park HOLDS A REF to the generator object — a suspended body is live state, and without the ref the object
-   could be collected while parked, freeing the frame mid-suspension (async_func_free would see a RUNNING frame). */
-static void js_async_gen_park_resume(JSContext *ctx, void *opaque)
-{
-    JSValue gobj = JS_MKPTR(JS_TAG_OBJECT, (JSObject *)opaque);
-    JSAsyncGeneratorData *s = JS_GetOpaque(gobj, JS_CLASS_ASYNC_GENERATOR);
-    if (s)
-        js_async_generator_resume_next(ctx, s);
-    JS_FreeValue(ctx, gobj);   /* release the ref taken at park */
-}
+/* DELETED: js_async_gen_park_resume / _clone / _free, the async generator's own pump park. They existed only
+   because js_async_generator_resume_next made the body its OWN flow base and had to park it there; the body's
+   resume is now a frame on the running flow's chain (do_agen_resume_tramp), so a back-edge inside it is an
+   ordinary deep park of that whole flow and the flow's own driver owns it. The FORK the clone callback refused
+   is still refused, and by the mechanism the fork now actually reaches: clone_deep_flow's CONT_AGEN_DRIVE
+   DCHECK, which names the same missing capability (a sibling needs its OWN JSAsyncGeneratorData — cloned body
+   frame, fresh queue, fresh settlement capability) at the site a fork inside an async generator body arrives
+   at. free_tramp_chain refuses the same frame for the same reason. */
 
-/* …AND THE FORK, WHICH IS THE ONE OF THE THREE THIS ENGINE CANNOT YET BUILD, said where it would be built.
-   The handle this site's resume and disposer take is the GENERATOR OBJECT — the park record keeps it apart
-   from the base precisely because they are not the same thing — and it is reached through the object's opaque,
-   so an arm's continuation has to be a state some generator object resolves to. JS_FlowClone answers a BARE
-   activation: flow_clone_state_alloc has arms for an async call and for a call root and none that builds a
-   JSAsyncGeneratorData, so the clone is reachable from no generator object at all and returning the source's
-   object here would hand two records ONE activation — the exact double-resume the entry above asserts against.
-   WHAT TO BUILD, and the tree already has both halves one function apart: an arm of flow_clone_state_alloc
-   that mints the clone INSIDE a JSAsyncGeneratorData, and the (object, original, clone) swap recorded on the
-   forking arm's delta the way clone_deep_flow's generator arm already records one — the generator OBJECT stays
-   shared and only its state pointer is per-flow, which is what makes the arm's resume re-enter its own body
-   rather than its parent's. */
-static void *js_async_gen_park_clone(JSContext *ctx, void *opaque, JSAsyncFunctionState *clone)
-{
-    (void)ctx; (void)opaque; (void)clone;
-    DFAIL("a flow parked inside an ASYNC GENERATOR body was forked, and this site's continuation cannot yet be "
-          "cloned: its handle is the generator OBJECT, and a cloned base lives in no JSAsyncGeneratorData for "
-          "an object to resolve to. Build flow_clone_state_alloc's async-generator arm and record the "
-          "(object, original, clone) gendata swap on the arm's delta, as clone_deep_flow's generator arm does");
-    return NULL;
-}
-
-/* …AND THE SAME RELEASE FOR A PARK THAT WILL NEVER RUN, with the same hazard the async continuation has and
-   for the same reason. This hands the GENERATOR OBJECT back to its refcount, so a surviving reference means
-   its finalizer is somebody else's to run and the chain is theirs to unwind. If the park held the LAST one,
-   js_async_generator_free reaches async_func_free — which frees the base frame's buffer and never `tramp_top`
-   — and every heap frame under it leaks exactly as the reaction's did before js_reaction_park_free took
-   JS_FlowFree's two steps. Asserted rather than unwound, because unwinding a chain whose state another
-   reference is still using is a use-after-free; the reaction disposer unwinds because it IS the owner, and
-   these two are not. This assert is the one that was missing when the pair went in: it was named as a gap
-   rather than written, on the grounds that this finalizer's ownership had not been read. It has now been read
-   — js_async_generator_free, whose async_func_free is reached for every state that is neither COMPLETED nor
-   AWAITING_RETURN — and this is what it says. */
-static void js_async_gen_park_free(JSContext *ctx, void *opaque)
-{
-    JSValue gobj = JS_MKPTR(JS_TAG_OBJECT, (JSObject *)opaque);
-#if APICLIENT_DEV
-    {
-        JSAsyncGeneratorData *gs = JS_GetOpaque(gobj, JS_CLASS_ASYNC_GENERATOR);
-        DCHECK(JS_REF_COUNT((JSObject *)opaque) > 1 || gs == NULL || gs->func_state.tramp_top == NULL,
-               "a park held the LAST reference to an async generator whose body still has a heap-frame chain — "
-               "its finalizer reaches async_func_free, which frees the base frame and never the chain, so this "
-               "release leaks every frame under it. Unwind it here as js_reaction_park_free does");
-    }
-#endif
-    JS_FreeValue(ctx, gobj);
-}
-
-/* THE ASYNC-GENERATOR STATE MACHINE, split at the ONE seam that has two entries: the BODY RUN.
-   `pre` decides what the head of the queue needs and delivers the resume input, settling every case that needs
-   no body run; `post` consumes one body run's outcome and says whether the queue has more to drive. Between them
-   the body is entered, and THAT is the only thing the two drivers do differently: on the caller's TRAMP CHAIN
-   when `ag.next()` is called from bytecode (do_agen_drive_tramp — the body's loops then preempt the caller's
-   flow, at any depth), or as its OWN flow base when a promise reaction resumes an awaiting body
-   (js_async_generator_resume_next below, which parks).
-   THAT SECOND ENTRY IS THE SAME DEFECT THE ASYNC FUNCTION'S AWAIT RESUME HAD, AND IT IS STILL HERE. This
-   comment used to cite the async function as the model for the split; it is no longer one, because an async
-   function's await continuation is now a BODY ENTRY on the running flow's chain (TBE_ASYNC_RESUME /
-   do_async_resume_tramp) for the reason §9.4.7 RunSuspendedContext gives — the caller context is SUSPENDED and
-   the resumed one pushed on top of it, never run beside it. An async generator resumed by a reaction still
-   becomes a second flow base under the live one, so a loop after its await parks while the reaction's flow goes
-   on executing bytecode, and unlike the async function's park that one has no assert saying so. The work is to
-   give this machine the same body entry; it is deliberately NOT folded into that change, because widening one
-   consumer at a time is what makes the failures name the missing capability instead of producing a count. */
+/* THE ASYNC-GENERATOR STATE MACHINE, split at the ONE seam that has two ENTRANTS but only one entry: the BODY
+   RUN. `pre` decides what the head of the queue needs and delivers the resume input, settling every case that
+   needs no body run; `post` consumes one body run's outcome and says whether the queue has more to drive.
+   Between them the body is entered ON THE RUNNING FLOW'S CHAIN, and that is now true of both ways in — a
+   `ag.next()` written in script (do_agen_drive_tramp, §27.9.3.6 AsyncGeneratorResume step 4's
+   RunSuspendedContext) and an `await` in the body settling (do_agen_resume_tramp, §27.10.5.3 Await steps 3/5's
+   RunSuspendedContext). Same spec operation underneath both, so the same entry: §9.4.7 suspends the caller
+   context and pushes the resumed one on top of it, never beside it.
+   THE SPLIT IS WHAT LETS `pre` BE RE-ENTERED AFTER AN AWAIT: its EXECUTING arm is the await resume's arm, and
+   it is the reason the second entrant needs no second driver. There used to be one — a C
+   js_async_generator_resume_next that installed the body as its own flow base and parked it there while the
+   promise reaction that called it went on executing bytecode — and it is DELETED, not kept behind the route. */
 static int js_async_generator_pre(JSContext *ctx, JSAsyncGeneratorData *s, JSValue *out_value)
 {
     JSAsyncGeneratorRequest *next;
@@ -48714,73 +48803,18 @@ static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSVa
     return 1;
 }
 
-/* The JOB-DRIVEN driver: a promise reaction (an await settling, or the pump resuming a parked body) continues an
-   async generator that IS the running flow, so its body becomes its own flow base and a back-edge PARKS it. A
-   `ag.next()` written in script does NOT come here — that is a nested activation of the caller's flow and runs on
-   the caller's chain (do_agen_drive_tramp), which is why this driver never sees a synchronous drive. */
-static void js_async_generator_resume_next(JSContext *ctx,
-                                           JSAsyncGeneratorData *s)
-{
-    JSValue func_ret;
-    JSAsyncFunctionState *prev_base;
-
-    for(;;) {
-        {
-            JSValue arv = JS_UNDEFINED;
-            int prc = js_async_generator_pre(ctx, s, &arv);
-            if (prc == AGEN_PRE_AWAIT_RETURN) {
-                /* no tramp chain here — this driver IS a promise reaction — so the machine runs as a CALL-ROOT
-                   FLOW, exactly the way this same driver already places Await's resolve call below. */
-                JSValue fn = js_new_agen_await_ret(ctx, JS_MKPTR(JS_TAG_OBJECT, s->generator), false);
-                int cr;
-                if (JS_IsException(fn)) { JS_FreeValue(ctx, arv); return; }
-                cr = js_settle_as_flow(ctx, fn, arv);
-                JS_FreeValue(ctx, fn);
-                JS_FreeValue(ctx, arv);
-                (void)cr;   /* an OOM here has no queue entry left to settle; the throw is the runtime's */
-                return;
-            }
-            JS_FreeValue(ctx, arv);
-            if (!prc)
-                return;
-        }
-        /* the async-generator BODY is a flow: its own base, so a back-edge PARKS it */
-        prev_base = g_flow_base_gen;
-        g_flow_base_gen = &s->func_state;
-        func_ret = async_func_resume(ctx, &s->func_state);
-        g_flow_base_gen = prev_base;
-        if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_PREEMPT &&
-            (s->func_state.frame.cur_sp != NULL || s->func_state.tramp_top != NULL)) {
-            /* PARKED mid-body: park into THE PUMP, never the job FIFO (that reorders microtasks). The state
-               stays EXECUTING, so the pump's resume re-enters here at the saved point. */
-            js_dup(JS_MKPTR(JS_TAG_OBJECT, s->generator));   /* the park keeps the suspended body alive */
-            /* THE BASE IS THE BODY'S STATE; the OPAQUE is the generator object, because that is what this
-               site's resume and disposer take and what the reference above was taken on. The two are not the
-               same thing and the park records both — the record belongs to the state that suspended, the
-               callbacks take the handle that owns it. */
-            flow_park(ctx, &s->func_state, js_async_gen_park_resume, js_async_gen_park_free,
-                      js_async_gen_park_clone, s->generator);
-            return;
-        }
-        {
-            JSAsyncPost apost;
-            int pr = js_async_generator_post(ctx, s, func_ret, &apost);
-            if (pr == AGEN_POST_AWAIT) {
-                /* 27.6.3.8 as a CALL-ROOT FLOW: this context has no tramp chain to route it onto, which is the
-                   same reason the completed-return case above takes this route. */
-                JSValue fn = js_new_agen_await_ret(ctx, JS_MKPTR(JS_TAG_OBJECT, s->generator), true);
-                if (JS_IsException(fn)) { JS_FreeValue(ctx, apost.value); s->func_state.throw_flag = true; continue; }
-                js_settle_as_flow(ctx, fn, apost.value);
-                JS_FreeValue(ctx, fn);
-                JS_FreeValue(ctx, apost.value);
-                return;
-            }
-            if (!pr)
-                return;
-        }
-    }
-}
-
+/* ONE C ENTRY, TWO ALGORITHMS, AND ONLY ONE OF THEM RUNS A BODY.
+   magic 2/3 are §27.9.3.9 AsyncGeneratorAwaitReturn ( gen ) steps 11's and 13's fulfilledClosure/rejectedClosure:
+   AsyncGeneratorCompleteStep on a generator whose state is draining-queue, and no body run at all — so they
+   stay here, where a C activation is the whole of what they are.
+   magic 0/1 are §27.10.5.3 Await ( arg ) steps 3's and 5's, over an async generator body's own context, and
+   each of those performs §9.4.7 RunSuspendedContext — a BODY ENTRY on the running flow's chain. Their
+   implementation is do_agen_resume_tramp and this is the BACKSTOP, in the shape §C-stack prescribes: every call
+   shape converges on do_generic_callee, so an arrival HERE is a route that was never asked, not a slow path.
+   What stood here was the resume itself, through js_async_generator_resume_next, and it is DELETED rather than
+   kept behind the routing: from C the body could only be installed as a second flow base under a live one, so a
+   loop after an await parked it while THIS function returned `undefined` and the promise reaction that called
+   it went on executing bytecode over the park. */
 static JSValue js_async_generator_resolve_function(JSContext *ctx,
                                                    JSValueConst this_obj,
                                                    int argc, JSValueConst *argv,
@@ -48790,29 +48824,34 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
     JSAsyncGeneratorData *s = JS_GetOpaque(func_data[0], JS_CLASS_ASYNC_GENERATOR);
     JSValueConst arg = argv[0];
 
-    /* XXX: what if s == NULL */
+    (void)this_obj; (void)argc;
+    /* NOT "what if s == NULL", which is what stood here: the closure holds a counted reference to the generator
+       OBJECT in func_data[0], and only that object's finalizer clears the opaque — so a NULL here is a closure
+       built by something other than js_async_generator_resolve_function_create, not a lifetime race. */
+    DCHECK(s != NULL,
+           "an async generator's resolving function carries no machine — its captured generator object is the "
+           "reference keeping the state alive, so a cleared opaque means this closure was not built over one");
 
     if (magic >= 2) {
-        /* resume next case in AWAITING_RETURN state */
-        DCHECK(s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN || s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED, "s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN || s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED");
+        DCHECK(s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN ||
+               s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED,
+               "§27.9.3.9 AsyncGeneratorAwaitReturn's closures assert the generator is draining-queue, and this "
+               "one is in neither of the two states this engine spells that with");
         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
         if (is_reject) {
             js_async_generator_reject(ctx, s, arg);
         } else {
             js_async_generator_resolve(ctx, s, arg, true);
         }
-    } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
-        /* restart function execution after await() */
-        s->func_state.throw_flag = is_reject;
-        if (is_reject) {
-            JS_Throw(ctx, js_dup(arg));
-        } else {
-            /* return value of await */
-            s->func_state.frame.cur_sp[-1] = js_dup(arg);
-        }
-        js_async_generator_resume_next(ctx, s);
+        return JS_UNDEFINED;
     }
-    return JS_UNDEFINED;
+    DFAIL("an async generator's await continuation reached its C entry — §27.10.5.3 Await's onFulfilled/"
+          "onRejected perform §9.4.7 RunSuspendedContext, which is a BODY ENTRY on the running flow's chain. "
+          "Route this call shape through the call convergence point (do_generic_callee's tramp_agen_resume_kind "
+          "-> do_agen_resume_tramp) so the resumed body's loops park the whole flow instead of parking under a "
+          "caller that keeps running");
+    /* Release: the capability is not supportable off the chain, so it fails rather than driving to completion. */
+    return JS_ThrowInternalError(ctx, "async generator await continuation reached its C entry (route it through the call convergence point)");
 }
 
 /* AsyncGeneratorEnqueue (27.6.3.4): one .next()/.throw()/.return() request joins the queue and gets the promise
