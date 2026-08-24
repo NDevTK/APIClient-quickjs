@@ -26369,6 +26369,28 @@ static inline bool tramp_body_is_async(JSValueConst func) {
     fp = JS_VALUE_GET_OBJ(func);
     return fp->class_id == JS_CLASS_ASYNC_FUNCTION;
 }
+/* AND RESUMING ONE IS A BODY ENTRY TOO, WHICH IS THE SPEC'S OWN WORD FOR IT. ECMA-262 §27.10.5.3 Await ( arg )
+   builds two closures (steps 3-6, fulfilledClosure/onFulfilled and rejectedClosure/onRejected) and each does
+   exactly one thing: `Perform Completion(RunSuspendedContext(asyncContext, …))`. And §9.4.7 RunSuspendedContext
+   ( context, completionRecord ) spells out what that is — "Let callerContext be the running execution context.
+   SUSPEND callerContext. PUSH context onto the execution context stack; context is now the running execution
+   context." One stack, the caller underneath and NOT running. That is a frame on the caller's chain, which is
+   the same operation do_async_tramp_call performs on a fresh activation, so it is asked HERE, at the one
+   body-entry question every call shape converges on.
+   IT WAS THE CLASS `.call` SLOT, AND THAT IS WHAT MADE A PARK NON-TRANSPARENT. From C the resumed activation
+   could only become a SECOND flow base underneath the live one running the reaction — the opposite of step 2's
+   suspend — so a loop after an await preempted, parked ITSELF, and handed control back to a caller that went on
+   executing bytecode over the live park. Nothing about that was a missing assert: there was no shape in which
+   the C entry could park the whole flow, because the whole flow was not what it was driving.
+   (The rest of this file writes Await as 27.7.5.3, which is an older edition's number for the same section; the
+   pair above was read out of the current spec text rather than recalled, and the TITLE is what survives both.) */
+static inline bool tramp_body_is_async_resume(JSValueConst func) {
+    JSObject *fp;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
+    fp = JS_VALUE_GET_OBJ(func);
+    return fp->class_id == JS_CLASS_ASYNC_FUNCTION_RESOLVE
+        || fp->class_id == JS_CLASS_ASYNC_FUNCTION_REJECT;
+}
 /* Resumable state for js_array_every (forEach/every/some/map/filter). Factored so the per-element callback drive
    becomes a coroutine STEP — the prerequisite for running the callback on the base tramp chain (a callback body
    loop then preempts the base flow) instead of the C-recursive JS_Call. `pending_k` = the index whose callback
@@ -28727,6 +28749,10 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, 
                                        JSValueConst this_obj, int argc, JSValueConst *argv);
 static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret,
                                           JSAsyncPost *out);
+/* Which suspended async activation THIS flow resumes when it runs one of §27.10.5.3's two closures — the
+   per-flow COW isolation of shared async state, defined beside the rest of the async machinery and needed here
+   by do_async_resume_tramp. NULL only on an allocation failure (with the throw already pending). */
+static JSAsyncFunctionData *js_async_resume_isolate(JSContext *ctx, JSValueConst func_obj);
 /* Await's remaining steps once its resolve call has run: create the continuation's resolving functions and
    PerformPromiseThen on the capability. Consumes `p->await_promise` and the reference `p->st` holds. */
 static int js_async_function_await_finish(JSContext *ctx, JSAsyncPost *p);
@@ -28788,10 +28814,11 @@ static inline bool tramp_body_is_agen(JSValueConst func) {
    the body to completion (Array.fromAsync's `method.call(items)`, which is why built-ins/Array and the whole
    language/ tree aborted). That is the per-spelling drift CLAUDE.md bans, and a fifth body kind would have had to
    be added to N sites correctly. Now a site declares only its OPERAND SHAPE and tail-ness; the list lives here. */
-typedef enum { TBE_NONE = 0, TBE_PLAIN, TBE_ASYNC, TBE_GEN, TBE_AGEN } JSTrampBodyEntry;
+typedef enum { TBE_NONE = 0, TBE_PLAIN, TBE_ASYNC, TBE_ASYNC_RESUME, TBE_GEN, TBE_AGEN } JSTrampBodyEntry;
 static inline JSTrampBodyEntry tramp_body_entry(JSValueConst func) {
-    if (tramp_body_is_plain(func)) return TBE_PLAIN;
-    if (tramp_body_is_async(func)) return TBE_ASYNC;
+    if (tramp_body_is_plain(func))        return TBE_PLAIN;
+    if (tramp_body_is_async(func))        return TBE_ASYNC;
+    if (tramp_body_is_async_resume(func)) return TBE_ASYNC_RESUME;
     if (tramp_body_is_gen(func))   return TBE_GEN;
     if (tramp_body_is_agen(func))  return TBE_AGEN;
     return TBE_NONE;   /* no bytecode body: the caller's own shape decides what to try next */
@@ -28803,6 +28830,8 @@ static inline JSTrampBodyEntry tramp_body_entry(JSValueConst func) {
     case TBE_NONE:  break;                                                                            \
     case TBE_PLAIN: tramp_first = (first); tramp_is_tail = (tail); goto do_tramp_call;                 \
     case TBE_ASYNC: tramp_first = (first); tramp_is_tail = (tail); goto do_async_tramp_call;           \
+    case TBE_ASYNC_RESUME:                                                                            \
+                    tramp_first = (first); tramp_is_tail = (tail); goto do_async_resume_tramp;         \
     case TBE_GEN:   tramp_first = (first); tramp_is_tail = (tail); goto do_generator_create_tramp;     \
     case TBE_AGEN:  tramp_first = (first); tramp_is_tail = (tail); goto do_agen_create_tramp;          \
     }
@@ -31889,6 +31918,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     tramp_apply_func = nfunc; tramp_apply_this = thisArg;
                     call_argv = (JSValueConst *)sp - ap_cargc; call_argc = ap_cargc; tramp_first = ap_cfirst;
                     if (ap_tbe == TBE_ASYNC) goto do_async_tramp_call;
+                    if (ap_tbe == TBE_ASYNC_RESUME) goto do_async_resume_tramp;
                     if (ap_tbe == TBE_GEN)   goto do_generator_create_tramp;
                     DCHECK(ap_tbe == TBE_AGEN, "apply-mode body entry: unhandled coroutine kind");
                     goto do_agen_create_tramp;
@@ -32303,6 +32333,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             call_argv = (JSValueConst *)(sp - call_pop);
                             call_argc = call_pop; tramp_first = call_first_r;
                             if (tbe5 == TBE_ASYNC) goto do_async_tramp_call;
+                            if (tbe5 == TBE_ASYNC_RESUME) goto do_async_resume_tramp;
                             if (tbe5 == TBE_GEN)   goto do_generator_create_tramp;
                             DCHECK(tbe5 == TBE_AGEN, "bound coroutine target: unhandled body-entry kind");
                             goto do_agen_create_tramp;
@@ -37961,6 +37992,158 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 arg_allocated_size = asf->arg_count;
                 sp = asf->cur_sp; pc = asf->cur_pc;
                 asf->cur_sp = NULL;   /* running */
+                goto restart;
+            }
+
+        do_async_resume_tramp:
+            /* AN AWAIT CONTINUATION: re-enter the SUSPENDED async activation HERE, on the chain of whatever flow
+               is running, so the post-await body is a frame under that flow's base exactly as its synchronous
+               prefix was under its caller's. §9.4.7 RunSuspendedContext ( context, completionRecord ) suspends
+               the caller context and pushes the resumed one on top of it — one stack — and this is that stack.
+               A loop in the resumed body is then an ORDINARY DEEP PARK of the running flow (do_preempt stashes
+               the whole chain into the base and the flow's own driver parks it), which is the only shape in
+               which the park is transparent: the caller is suspended under the parked frame, so nothing
+               observable runs between the park and its resume.
+               WHAT THIS REPLACES, in the same diff and with nothing left to fall back to: the class `.call`
+               slot resumed the body from C with the async state installed as a SECOND flow base under the live
+               one, so the body parked and the caller carried on — the exact ordering violation §Attention
+               forbids, reached by every async function with a back-edge after an await (a `for await` loop is
+               enough). The C entry is now a DFAIL backstop; there is no second driver for this. */
+            {
+                /* APPLY MODE IS READ HERE FOR THE REASON ALL THREE COROUTINE ENTRIES READ IT: the arguments of
+                   `f.apply(o,a)` / `Reflect.apply(f,o,a)` / `f(...spread)` and of a BOUND callee are not on the
+                   caller's stack, and a body entry that only knew the stack shape is how one builtin comes to
+                   answer differently depending on how the call was written. These two closures are engine-
+                   internal, so no page can spell them that way today — which is exactly why the arm would rot
+                   unnoticed: without it those reshape sites fall to the async-GENERATOR create, and that arm's
+                   DCHECK compiles out in release. */
+                bool r_apply = (tramp_apply_argv != NULL);
+                JSValueConst rfunc = r_apply ? tramp_apply_func : call_argv[-1];
+                JSObject *rp = JS_VALUE_GET_OBJ(rfunc);
+                /* WHICH COMPLETION IT CARRIES is the closure's identity: §27.10.5.3 steps 3 and 5 build two, one
+                   per completion kind, and js_async_function_resolve_one mints them as the adjacent class pair. */
+                bool r_reject = (rp->class_id != JS_CLASS_ASYNC_FUNCTION_RESOLVE);
+                /* the resumption value, taken BEFORE the vector that may hold it is released */
+                JSValue rarg = r_apply ? ((tramp_apply_argc > 0) ? js_dup(tramp_apply_argv[0]) : JS_UNDEFINED)
+                                       : ((call_argc > 0) ? js_dup(call_argv[0]) : JS_UNDEFINED);
+                JSAsyncFunctionData *as;
+                TrampFrame *atf;
+                JSStackFrame *asf;
+                JSObject *ap;
+                JSFunctionBytecode *ab;
+
+                DCHECK(rp->class_id == JS_CLASS_ASYNC_FUNCTION_RESOLVE || rp->class_id == JS_CLASS_ASYNC_FUNCTION_REJECT,
+                       "the await-continuation entry was reached with a callee that is not one of §27.10.5.3's "
+                       "two closures — the body-entry question routed a shape this entry cannot read a "
+                       "completion kind off");
+                /* THE PER-FLOW ISOLATION FIRST, because resuming CONSUMES the activation. It ran in the C entry
+                   this replaces and it runs at the same point in the sequence here; it executes no page code (a
+                   frame clone and a host hook), which is why it may sit ahead of a body entry at all. */
+                as = js_async_resume_isolate(ctx, rfunc);
+                /* LEAVE APPLY MODE the moment the vector has been read out of, success or failure — the same
+                   line all three coroutine creates keep, and for the same two reasons: a later release leaks
+                   the whole list on a throwing entry, and a missed reset feeds this call's arguments to the
+                   next create. `rfunc` is borrowed from it and is not touched again after this. */
+                if (r_apply) TRAMP_APPLY_RELEASE();
+                if (unlikely(!as)) { JS_FreeValue(ctx, rarg); goto exception; }
+                DCHECK(as->is_active,
+                       "a flow resumed a suspended async continuation that was already consumed — the per-flow "
+                       "activation swap did not isolate it");
+                /* AND ONLY A SUSPENDED ACTIVATION CAN BE RE-ENTERED. §9.4.7 pushes a context that was suspended;
+                   a finished one has no frame to push, and the entry below would read cur_sp/cur_pc off a torn-
+                   down frame and run whatever bytecode those bytes named. */
+                DCHECK(as->func_state.frame.cur_sp != NULL,
+                       "an await continuation was asked to resume an async activation with no suspended frame — "
+                       "§9.4.7 RunSuspendedContext pushes a SUSPENDED context, and this one has already "
+                       "completed, so there is no execution context to make running");
+                DCHECK(as->func_state.tramp_top == NULL,
+                       "an await continuation was asked to resume an async activation that is holding a heap-"
+                       "frame chain — a body suspended at OP_await is its own top frame, so a chain here means "
+                       "this activation is a flow BASE parked mid-call and its driver, not this entry, owns it");
+                JS_REF_COUNT(as)++;   /* the frame on this chain owns a reference; do_async_settle releases it,
+                                         and free_tramp_chain releases it for a chain torn down while parked.
+                                         TAKEN BEFORE THE OPERANDS ARE DROPPED: the callee operand below is the
+                                         closure that holds this activation, and it can be the last one. */
+                atf = tramp_frame_new(rt);
+                if (unlikely(!atf)) {
+                    js_async_function_free(rt, as); JS_FreeValue(ctx, rarg);
+                    JS_ThrowOutOfMemory(ctx); goto exception;
+                }
+                atf->up = tf_top;
+                atf->caller_sf = sf; atf->caller_b = b; atf->caller_ctx = ctx;
+                atf->caller_local_buf = local_buf; atf->caller_stack_buf = stack_buf;
+                atf->caller_var_buf = var_buf; atf->caller_arg_buf = arg_buf;
+                atf->caller_this = this_obj; atf->caller_new_target = new_target;
+                atf->caller_var_refs = var_refs;
+                atf->caller_argc = argc; atf->caller_argv = argv;
+                atf->caller_arg_allocated_size = arg_allocated_size;
+                {
+                    JSValue *acargv;
+                    TAKE_CALL_SHAPE();
+                    CREATE_RELEASE_OPERANDS();
+                    acargv = sp - call_pop;
+                    for (i = call_first_r; i < call_pop; i++) JS_FreeValue(ctx, acargv[i]);
+                    atf->caller_sp = acargv + call_first_r;
+                }
+                atf->call_first = 0; atf->call_argc = 0; atf->is_tail = tramp_is_tail;
+                /* THE CONTINUATION OWES ITS CALLER `undefined`, AND THAT IS A SPEC STEP RATHER THAN AN OMISSION:
+                   §27.10.5.3 steps 3.c and 5.c are "Return NormalCompletion(undefined)", and its NOTE says the
+                   Completion Record RunSuspendedContext returns is intentionally ignored. do_async_settle places
+                   async_promise where the caller's call expects its result, so UNDEFINED here IS that step — and
+                   it is also how every reader downstream tells a RESUME frame from a CREATE frame, whose
+                   async_promise is the promise object the call evaluated to. */
+                atf->async_data = as; atf->async_promise = JS_UNDEFINED; atf->gen_data = NULL;
+                atf->cont_state = tramp_cont_state; atf->cont_kind = tramp_cont_kind;
+                tramp_cont_state = NULL; tramp_cont_kind = CONT_NONE;
+                atf->forof_off = tramp_cont_forof; tramp_cont_forof = 0;
+                atf->b = NULL; atf->local_buf = NULL; atf->local_slots = 0;   /* the state owns the buffers */
+                /* enter the suspended body — byte-identically do_async_tramp_call's entry, because a resume and
+                   a create differ in where cur_pc points and in nothing else. */
+                asf = &as->func_state.frame;
+                /* the async FUNCTION is the frame's own cur_func — async_func_init dup'd it there, and it is
+                   still the state's for as long as the activation is suspended, which is the one thing a
+                   registered await continuation guarantees about it. */
+                ap = JS_VALUE_GET_OBJ(asf->cur_func);
+                DCHECK(js_class_has_bytecode(ap->class_id),
+                       "an await continuation resumed an activation whose cur_func has no bytecode body — an "
+                       "async function's frame carries the function it is an activation OF, so a non-bytecode "
+                       "one here means this state is some other coroutine kind's base wearing an async closure");
+                ab = ap->u.func.function_bytecode;
+                atf->ctx = ab->realm;
+                asf->prev_frame = rt->current_stack_frame;
+                rt->current_stack_frame = asf;
+                tf_top = atf;
+                sf = asf; b = ab; ctx = ab->realm;
+                var_refs = ap->u.func.var_refs;
+                local_buf = arg_buf = asf->arg_buf;
+                var_buf = asf->var_buf;
+                stack_buf = asf->var_buf + ab->var_count;
+                this_obj = as->func_state.this_val; new_target = JS_UNDEFINED;
+                argc = as->func_state.argc; argv = (JSValueConst *)asf->arg_buf;
+                arg_allocated_size = asf->arg_count;
+                sp = asf->cur_sp; pc = asf->cur_pc;
+                asf->cur_sp = NULL;   /* running */
+                /* THE COMPLETION IS DELIVERED BY THIS ENTRY AND NEVER BY THE NEXT ONE. throw_flag is the
+                   coroutine-resume protocol's "re-throw on the way in", read by the GENERATOR branch of this
+                   function; this entry hands the throw straight to `exception` below, so leaving the flag set
+                   would make the flow's own next resume of this frame throw the same rejection a second time.
+                   It also rides js_async_frame_clone and clone_deep_flow, so a stale one forks. */
+                as->func_state.throw_flag = false;
+                if (r_reject) {
+                    /* §27.10.5.3 step 5.a: ThrowCompletion(reason) into the suspended context. Thrown LAST, past
+                       every allocation above, because JS_ThrowOutOfMemory on any of those paths would replace a
+                       rejection that is already standing and the body would catch the wrong one. */
+                    JS_Throw(ctx, rarg);
+                    goto exception;
+                }
+                /* step 3.a: NormalCompletion(v). The await's result lands where the awaited operand stood —
+                   js_async_function_post_prepare TOOK that operand when the body suspended and left UNDEFINED
+                   behind, which is the whole reason this store leaks nothing and the assert that says so. */
+                DCHECK(JS_IsUndefined(sp[-1]),
+                       "an await continuation is about to overwrite a LIVE operand with the awaited result — the "
+                       "suspend that registered this continuation is the one that empties that slot, so a value "
+                       "standing in it means this frame suspended somewhere else and its operand is being lost");
+                sp[-1] = rarg;
                 goto restart;
             }
 
@@ -46260,6 +46443,18 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             JSAsyncFunctionData *as = otf->async_data;
             JSStackFrame *aof = &as->func_state.frame;
             JSAsyncFunctionData *as2 = js_mallocz(ctx, sizeof(*as2));
+            /* A CREATE FRAME OR A RESUME FRAME, AND THE CAPABILITY QUESTION IS THE WHOLE DIFFERENCE. A create
+               (do_async_tramp_call) holds the promise the CALL evaluated to, so this frame is where the async
+               call site lives and each arm must await its OWN promise — a fresh capability. A resume
+               (do_async_resume_tramp) evaluates to `undefined` per §27.10.5.3 steps 3.c/5.c, so its
+               async_promise is UNDEFINED and there is no call site on this frame at all: the promise this
+               activation settles was handed to its caller one suspension ago and already carries the
+               reactions the page registered. Minting a fresh one there would settle a promise nothing is
+               waiting on — which is exactly why flow_clone_state_alloc's ASYNC_CALL arm dups the source's
+               resolving functions instead, and the COW delta captures each arm's settlement on its own
+               timeline. Read off async_promise because that field IS "what this frame owes its caller", the
+               same discriminator the generator arm below already uses. */
+            bool a_resume = JS_IsUndefined(otf->async_promise);
             if (!as2) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
             JS_REF_COUNT(as2) = 1;
             add_gc_object(ctx->rt, &as2->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
@@ -46267,8 +46462,18 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             /* the sibling's activation owns the sibling's frame — see flow_clone_state_alloc */
             as2->func_state.frame.cur_gc_obj = &as2->header;
             as2->resolving_funcs[0] = JS_UNDEFINED; as2->resolving_funcs[1] = JS_UNDEFINED;
-            JSValue aprom2 = JS_NewPromiseCapability(ctx, as2->resolving_funcs);
-            if (JS_IsException(aprom2)) { js_async_function_free(ctx->rt, as2); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            JSValue aprom2 = JS_UNDEFINED;
+            if (a_resume) {
+                DCHECK(!JS_IsUndefined(as->resolving_funcs[0]) && !JS_IsUndefined(as->resolving_funcs[1]),
+                       "a RESUMED async body was forked while its activation holds no resolving functions — the "
+                       "capability is what a resume frame shares instead of minting, so a sibling would have no "
+                       "way to settle the promise its caller is already awaiting");
+                as2->resolving_funcs[0] = js_dup(as->resolving_funcs[0]);
+                as2->resolving_funcs[1] = js_dup(as->resolving_funcs[1]);
+            } else {
+                aprom2 = JS_NewPromiseCapability(ctx, as2->resolving_funcs);
+                if (JS_IsException(aprom2)) { js_async_function_free(ctx->rt, as2); js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            }
             if (clone_susp_frame(ctx, &as2->func_state, &as->func_state, live_end - aof->arg_buf) < 0) {
                 JS_FreeValue(ctx, aprom2); js_async_function_free(ctx->rt, as2); js_free(ctx, oa); js_free(ctx, ca); return NULL;
             }
@@ -46277,7 +46482,9 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             as2->func_state.tramp_top = NULL;
             as2->func_state.frame.cur_sp = (i == 0) ? as2->func_state.frame.arg_buf + (osf->cur_sp - aof->arg_buf) : NULL;
             ct->async_data = as2;
-            ct->async_promise = aprom2;        /* fresh capability's promise (owned by this frame) */
+            ct->async_promise = aprom2;        /* the fresh capability's promise (owned by this frame), or
+                                                  UNDEFINED for a resume frame — which is what makes the clone a
+                                                  resume frame too, by the same reading that classified it. */
             ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0; /* async frame owns its buffers via as2->func_state */
             /* AND THE CONTINUATION AN ASYNC FRAME CAN CARRY, which this arm did not clone at all: an async
                function reached AS A CALLBACK — `[1,2].map(async function(){…})`, `str.replace(re, async fn)` —
@@ -47437,12 +47644,16 @@ static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s
             JSValue promise, resolving_funcs[2], resolving_funcs1[2];
             int i, res;
 
-            /* await: the body suspended and it must be an AWAIT (js_int32(FUNC_RET_AWAIT==0)). A PREEMPT/YIELD
-               reaching HERE means a resumed async body was scheduler-preempted mid-run and this reaction path
-               would misfire it as an await (settling the promise with a FUNC_RET code) — that is the not-yet-
-               built "async resume is a scheduler flow" case; fail LOUD at the origin instead of corrupting. */
+            /* await: the body suspended and it must be an AWAIT (js_int32(FUNC_RET_AWAIT==0)). Every OTHER
+               suspend code belongs to a driver, and each of them takes it before this is reached: a preempt on
+               the chain goes to do_preempt and parks the running flow, a preempt of a base goes to
+               js_async_function_resume_as_flow's or JS_FlowResume's own FUNC_RET_PREEMPT arm. So a non-AWAIT
+               code arriving here is a suspension whose driver did not claim it, and settling the promise with a
+               FUNC_RET integer is what this would otherwise do. */
             DCHECK(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT && JS_VALUE_GET_INT(func_ret) == FUNC_RET_AWAIT,
-                   "resumed async body suspended with non-AWAIT code (preempt-in-resumed-async not built as a flow)");
+                   "an async body's settle was handed a suspension that is not an AWAIT — a preempt is the "
+                   "driver's to take (do_preempt on a chain, the FUNC_RET_PREEMPT arm on a base), so this one "
+                   "reached the settle unclaimed and would be resolved INTO the promise as an integer");
             /* await: 27.7.5.3 step 1 is PromiseResolve(%Promise%, value), and its RESOLVE CALL is page code —
                the native resolving function's `Get(resolution, "then")` when the awaited value is a thenable, so
                `await thenable` ran that read from C. The call is handed out like the settle and the rest of Await
@@ -47581,15 +47792,17 @@ static JSValue js_new_async_await(JSContext *ctx, JSAsyncFunctionData *s)
     return f;
 }
 
-/* Resume an async body one step, then post-process (settle the promise / register the await continuation). The
-   body's own calls trampoline (do_tramp_call), and the frame is the heap-allocated JSAsyncFunctionState (off the
-   C stack). NOTE: async runs to its natural yield — sync-prefix mid-loop INTERLEAVING (preempt/park a nested
-   activation as a per-flow continuation) is NOT built yet; it depends on async/promise/microtask state being
-   per-flow COW (CLAUDE.md), which is the foundation to build first. Building the interleaving before that was an
-   out-of-order step that corrupted the heap; it was removed. */
-/* js_async_function_resume — the DRIVE-TO-COMPLETION async resume — is DELETED. An async/module body is only ever
-   resumed AS A FLOW (js_async_function_resume_as_flow): a loop/await PARKS at a back-edge and re-enters via the job
-   pump, never self-resumed to completion. There is no drive-to-completion resume to fall back to. */
+/* Run an async body one step AS ITS OWN FLOW BASE, then post-process (settle the promise / register the await
+   continuation). The body's own calls trampoline (do_tramp_call), and the frame is the heap-allocated
+   JSAsyncFunctionState (off the C stack).
+   THIS IS THE ENTRY FOR A BODY THAT HAS NO FLOW OVER IT, and after the routing of the await continuation onto
+   the chain it is the only thing it is for: the pump's own resume of a parked continuation, and an async call
+   made from C with no flow live (a module body). A body entered while a flow IS running is a frame on THAT
+   flow's chain — do_async_tramp_call for a fresh activation, do_async_resume_tramp for a suspended one — which
+   is what makes its preempt an ordinary deep park of the running flow rather than a park underneath a caller
+   that keeps going. The assert below is the line between the two.
+   js_async_function_resume — the DRIVE-TO-COMPLETION async resume — is DELETED. There is no drive-to-completion
+   resume to fall back to. */
 
 static void js_async_resume_park(JSContext *ctx, void *opaque);
 static void js_async_resume_park_free(JSContext *ctx, void *opaque);
@@ -47625,16 +47838,28 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
            executing bytecode, and that bytecode runs BETWEEN the park and its resume — which the assert at the
            bytecode dispatch would then report at a site with no relationship to the producer. This assert moves
            that report to where the state is created.
-           WHAT TO BUILD when it fires, and the tree already argues it one function away: JS_FlowResume's
-           FLOW_BASE_ASYNC_CALL arm reports suspension to the SCHEDULER rather than parking it here, precisely
-           because "two drivers for one state is how a flow gets resumed twice". A nested async call's prefix
-           preempt needs the same answer — the continuation riding the CALLER's flow — or the preempt must be
-           declined here so the outer frame takes it at its own next suspend point, which the scheduler owns.
-           Declining is lossless: the yield request stays raised, so no work item is dropped. */
+           WHAT TO BUILD when it fires is ROUTING, and it is built: a body entered while a flow is running goes
+           on THAT flow's chain (do_async_tramp_call for a fresh activation, do_async_resume_tramp for a
+           suspended one), where a preempt is an ordinary deep park of the whole flow and the caller is
+           suspended under it, exactly as §9.4.7 RunSuspendedContext describes. So an arrival here with a live
+           base names a call shape that still creates an async activation from C below a running flow — the
+           g_sync_drive_to_completion class one level up — and the fix is to route THAT shape, never to soften
+           this park.
+           DECLINING THE PREEMPT IS NOT THE OTHER OPTION, and an earlier version of this comment offered it as
+           one. There is nothing to decline HERE: async_func_resume has already returned, so the body is
+           suspended at its back-edge and un-suspending it means re-resuming in a loop, which is the
+           drive-to-completion this file deleted. Declined at the only place it could be — the yield poll — it
+           is worse: the poll CONSUMES the request before it asks, so a decline must re-raise, the next opcode
+           asks the same hook and gets the same answer, and the body runs on with the request permanently
+           standing. The "next suspend point the outer frame takes" does not exist for the case that matters,
+           because a body that never returns never reaches one. That is not a lossless yield, it is a
+           non-parkable structure, which is the one thing §scheduler will not have at any depth. */
         DCHECK(prev_base == NULL,
-               "an async function's synchronous prefix preempted and parked while its CALLER's activation is "
-               "still live — a park is transparent only if nothing observable runs before its resume, and a "
-               "caller that goes on executing bytecode over a live park is exactly that");
+               "an async body was resumed as its OWN flow base while another flow's activation is still live, "
+               "and it preempted — a park is transparent only if nothing observable runs before its resume, and "
+               "a caller that goes on executing bytecode over a live park is exactly that. Route the call shape "
+               "that created this activation onto the running flow's chain (do_async_tramp_call / "
+               "do_async_resume_tramp) instead of driving it from C");
         JS_REF_COUNT(s)++;   /* the park holds a reference until the resume releases it */
         flow_park(ctx, &s->func_state, js_async_resume_park, js_async_resume_park_free,
                   js_async_resume_park_clone, s);
@@ -47723,53 +47948,56 @@ static void js_async_resume_park_free(JSContext *ctx, void *opaque)
     js_async_function_free(ctx->rt, s);
 }
 
-static JSValue js_async_function_resolve_call(JSContext *ctx,
-                                              JSValueConst func_obj,
-                                              JSValueConst this_obj,
-                                              int argc, JSValueConst *argv,
-                                              int flags)
+/* A SUSPENDED ASYNC ACTIVATION IS PER-FLOW STATE, and this is where it diverges. Resuming it CONSUMES it —
+   the completion tears the frame down — so a flow about to resume a SHARED one takes its own clone first and
+   leaves the original as the baseline every other arm still finds. Two arms settle one promise as a matter
+   of course now: a fork inherits the replies still in flight, so both deliver the same fetch on their own
+   timelines. Without this the first arm's completion freed the frame under the second.
+   The generational test is the same one every other capture uses: an activation created after this flow's
+   last fork is private and needs no clone.
+   IT IS A FUNCTION RATHER THAN A BLOCK because its one caller moved: the resume it guards is now the
+   interpreter's body entry (do_async_resume_tramp) and not a C activation, and this half runs no page code, so
+   it is the half that could travel. */
+static JSAsyncFunctionData *js_async_resume_isolate(JSContext *ctx, JSValueConst func_obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(func_obj);
     JSAsyncFunctionData *s = p->u.async_function_data;
-    bool is_reject = p->class_id - JS_CLASS_ASYNC_FUNCTION_RESOLVE;
-    JSValueConst arg;
 
-    /* A SUSPENDED ASYNC ACTIVATION IS PER-FLOW STATE, and this is where it diverges. Resuming it CONSUMES it —
-       the completion tears the frame down — so a flow about to resume a SHARED one takes its own clone first and
-       leaves the original as the baseline every other arm still finds. Two arms settle one promise as a matter
-       of course now: a fork inherits the replies still in flight, so both deliver the same fetch on their own
-       timelines. Without this the first arm's completion freed the frame under the second.
-       The generational test is the same one every other capture uses: an activation created after this flow's
-       last fork is private and needs no clone. */
-    if (g_time_travel.async_fork && s && s->is_active && JS_IsFlowShared(func_obj)) {
+    DCHECK(s != NULL,
+           "an await continuation carries no async activation — §27.10.5.3's closures capture asyncContext at "
+           "creation, so a closure with none was built by something other than js_async_function_resolve_one");
+    if (g_time_travel.async_fork && s->is_active && JS_IsFlowShared(func_obj)) {
         JSAsyncFunctionData *c = js_async_frame_clone(ctx, s);
         if (unlikely(!c))
-            return JS_EXCEPTION;
+            return NULL;
         /* The host installs `c` and keeps `s` as the baseline — or DECLINES (no delta owns the swap, so there
            is no sibling to isolate from and nothing to undo it). Either way the closure is the authority on
            which activation this flow resumes, so it is re-read rather than assumed. */
         g_time_travel.async_fork(ctx, func_obj, s, c);
         s = p->u.async_function_data;
     }
-    DCHECK(s->is_active,
-           "a flow resumed a suspended async continuation that was already consumed — the per-flow activation "
-           "swap did not isolate it");
+    return s;
+}
 
-    if (argc > 0)
-        arg = argv[0];
-    else
-        arg = JS_UNDEFINED;
-    s->func_state.throw_flag = is_reject;
-    if (is_reject) {
-        JS_Throw(ctx, js_dup(arg));
-    } else {
-        /* return value of await */
-        s->func_state.frame.cur_sp[-1] = js_dup(arg);
-    }
-    /* the post-await body is a FLOW the scheduler drives, not a C job run to completion */
-    if (!js_async_function_resume_as_flow(ctx, s))
-        return JS_EXCEPTION;
-    return JS_UNDEFINED;
+/* THE AWAIT CONTINUATION HAS ONE IMPLEMENTATION AND IT IS ON THE CHAIN — see tramp_body_is_async_resume and
+   do_async_resume_tramp. This entry is the BACKSTOP, in the shape §C-stack prescribes: every call shape
+   converges on the body-entry question, so an arrival HERE is a route that was never asked, not a slow path.
+   What stood here was the resume itself, and it is DELETED rather than kept behind the routing: from C the
+   activation could only be installed as a second flow base under a live one, so its loops parked a flow while
+   the caller went on executing bytecode. A second driver for one activation is how a flow gets resumed twice. */
+static JSValue js_async_function_resolve_call(JSContext *ctx,
+                                              JSValueConst func_obj,
+                                              JSValueConst this_obj,
+                                              int argc, JSValueConst *argv,
+                                              int flags)
+{
+    (void)func_obj; (void)this_obj; (void)argc; (void)argv; (void)flags;
+    DFAIL("an async function's await continuation reached its C entry — §27.10.5.3 Await's onFulfilled/"
+          "onRejected perform §9.4.7 RunSuspendedContext, which is a BODY ENTRY on the running flow's chain. "
+          "Route this call shape through tramp_body_entry (TBE_ASYNC_RESUME) so the resumed body's loops park "
+          "the whole flow instead of parking under a caller that keeps running");
+    /* Release: the capability is not supportable off the chain, so it fails rather than driving to completion. */
+    return JS_ThrowInternalError(ctx, "await continuation reached its C entry (route it through the body-entry dispatch)");
 }
 
 /* START an async call: create the JSAsyncFunctionData and its capability, WITHOUT running the body. Split out
