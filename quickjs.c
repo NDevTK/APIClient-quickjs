@@ -24052,6 +24052,25 @@ static void js_desc_facts_free(JSContext *ctx, JSDescFacts *f)
     js_desc_facts_init(f);
 }
 
+/* THE ANSWER SHAPE IS THE ONE OPERAND A FORK CANNOT COPY, and the refusal is written ONCE because it is one
+   fact about a JSDescFacts and not a separate fact about each record that carries a keyed operation across a
+   suspension. It points INTO the requester's own state (a machine's `&s->facts`), and the walk that relinks
+   `outer` gives the sibling a DIFFERENT requester at a different address — so carrying the pointer over would
+   aim the sibling's answer at the parent's record, and allocating a new one would aim it at a record nobody
+   reads. Neither is expressible from a record that merely CARRIES the operation, because the offset of a field
+   inside a requester is the requester's fact. What closes it is a relink the answer shape travels on, the way
+   `outer` does; until then the fork aborts here rather than answering with something that is not the answer —
+   and it aborts in ONE place, so building that relink deletes one refusal rather than leaving a second behind
+   to fire on the case it was not thought about. */
+static void js_desc_out_fork_refuse(const JSDescFacts *desc_out)
+{
+    if (desc_out != NULL)
+        DFAIL("a keyed property operation carrying a DESCRIPTOR-RECORD answer shape was forked — desc_out "
+              "points inside the requester's own state, and the sibling's requester is a different allocation, "
+              "so the copy would write this arm's answer into the other arm's record. Give the answer shape a "
+              "relink of its own (cont_outer_set's pair, one field further in) before this fork is allowed");
+}
+
 typedef struct JSGetProp {
     JSValue target;      /* the proxy's [[Target]], for the invariant (owned); UNDEFINED for an accessor */
     JSAtom atom;         /* the key (owned) */
@@ -24431,22 +24450,13 @@ static void js_trapget_free(JSContext *ctx, JSTrapGet *tg)
    clone_deep_flow takes a second), and a field present in only one of them is the drift that pairing exists
    to stop: `dflags` and `desc_out` were each missed once on the way IN to this record, and a missed dup here
    is the same mistake with two flows sharing one operand instead of one flow losing it.
-   `desc_out` IS THE ONE FIELD THIS CANNOT COPY, and it says so instead of copying it wrong. It points INTO
-   the requester's own state (a machine's `&s->facts`), and the walk that relinks `outer` gives the sibling a
-   DIFFERENT requester at a different address — so carrying the pointer over would aim the sibling's answer at
-   the parent's record, and allocating a new one would aim it at a record nobody reads. Neither is expressible
-   from here, because the offset of a field inside a requester is the requester's fact and not this record's.
-   What closes it is a relink the answer-shape travels on, the way `outer` does; until then the fork aborts
-   here rather than answering with something that is not the answer. */
+   `desc_out` IS THE ONE FIELD THIS CANNOT COPY, and js_desc_out_fork_refuse says so for every record that
+   carries one. */
 static JSTrapGet *js_trapget_clone(JSContext *ctx, const JSTrapGet *tg)
 {
     JSTrapGet *n;
 
-    if (tg->desc_out != NULL)
-        DFAIL("a parked keyed operation carrying a DESCRIPTOR-RECORD answer shape was forked — desc_out points "
-              "inside the requester's own state, and the sibling's requester is a different allocation, so the "
-              "copy would write this arm's answer into the other arm's record. Give the answer shape a relink "
-              "of its own (cont_outer_set's pair, one field further in) before this fork is allowed");
+    js_desc_out_fork_refuse(tg->desc_out);
     n = js_mallocz(ctx, sizeof(*n));
     if (unlikely(!n))
         return NULL;
@@ -24503,18 +24513,55 @@ static JSTrapGet *js_trapget_clone(JSContext *ctx, const JSTrapGet *tg)
  * copies of one cursor. */
 #define CONT_ARRAY_LEN_YIELD 78
 
+/* EVERY REFERENCE THIS RECORD OWNS, NAMED ONCE — the list js_getprop_free releases and the list
+   js_getprop_clone re-takes, written as ONE macro rather than as two walks that have to agree. A record that
+   can ride a PARKED chain is read by both (free_tramp_chain releases the first reference, clone_deep_flow takes
+   a second), and a field named in only one of them is the drift the pairing exists to stop — a reference the
+   fork shares is a double free, a reference the fork does not take is a use-after-free in whichever arm
+   finishes second. Two loops cannot go out of step with each other when there is one loop; a field added to the
+   struct and not to this macro is neither freed nor duped, which is the one failure left and the one place to
+   look for it.
+   `recv` is JS_UNINITIALIZED — the engine's own empty slot — when the receiver IS the object, which is a
+   statement the record makes about itself rather than a hole, so it is TESTED and never defaulted.
+   The cb tail is `2 + nargs` because that is what the request WROTE there ([this, fn, args…]); the slots past
+   it are the JS_UNDEFINED js_mallocz left, since no op writes an operand it does not count. */
+#define JS_GETPROP_OWNED(gp_, F)                                                            \
+    do {                                                                                    \
+        int gpi_;                                                                           \
+        F((gp_)->target); F((gp_)->value); F((gp_)->getter); F((gp_)->setter);               \
+        if (!JS_IsUninitialized((gp_)->recv)) F((gp_)->recv);                                \
+        for (gpi_ = 0; gpi_ < 2 + (gp_)->nargs; gpi_++) F((gp_)->cb[gpi_]);                  \
+    } while (0)
+
 static void js_getprop_free(JSContext *ctx, JSGetProp *gp)
 {
-    if (!JS_IsUninitialized(gp->recv)) JS_FreeValue(ctx, gp->recv);
-    int i;
-    JS_FreeValue(ctx, gp->target);
-    JS_FreeValue(ctx, gp->value);
-    JS_FreeValue(ctx, gp->getter);
-    JS_FreeValue(ctx, gp->setter);
+#define GP_RELEASE(v) JS_FreeValue(ctx, v)
+    JS_GETPROP_OWNED(gp, GP_RELEASE);
+#undef GP_RELEASE
     JS_FreeAtom(ctx, gp->atom);
-    for (i = 0; i < 2 + gp->nargs; i++)
-        JS_FreeValue(ctx, gp->cb[i]);
     js_free_rt(ctx->rt, gp);
+}
+
+/* THE OTHER DIRECTION OF THAT ONE LIST — the fork's copy, and it is a BYTE COPY plus a re-take rather than a
+   field-by-field rebuild for the reason tramp_step_state_clone is: the scalars, the answer shape and the link
+   then cannot be forgotten at all (there is no line to omit), and the only thing left to state is which
+   references the sibling must take its OWN, which is exactly what the macro above says once.
+   `outer` is left naming the ORIGINAL requester and is BOUND by tramp_cont_relink_outer a moment later — the
+   same contract every other cloned continuation is under. */
+static JSGetProp *js_getprop_clone(JSContext *ctx, const JSGetProp *gp)
+{
+    JSGetProp *n;
+
+    js_desc_out_fork_refuse(gp->desc_out);
+    n = js_malloc(ctx, sizeof(*n));
+    if (unlikely(!n))
+        return NULL;
+    *n = *gp;
+#define GP_TAKE(v) ((void)js_dup(v))
+    JS_GETPROP_OWNED(n, GP_TAKE);
+#undef GP_TAKE
+    n->atom = JS_DupAtom(ctx, n->atom);
+    return n;
 }
 #define CONT_PROMISE_EXEC  14  /* cont_state = JSPromiseExec: `new Promise(executor)` (27.2.3.1). The executor is a
                                   CONTINUATION-HOLDING C entry — steps 3-8 create the promise and its resolving
@@ -46530,6 +46577,13 @@ static void *cont_outer_get(void *st, uint8_t kind, uint8_t *out_kind)
            property — a step machine, a coercion sequence, a bytecode operator's own record. */
         *out_kind = ((JSTrapGet *)st)->outer_kind;
         return ((JSTrapGet *)st)->outer;
+    case CONT_GETPROP:
+        /* THE SAME OPERATION WITH ITS CALLEE ON THE CHAIN — the accessor or the trap is RUNNING rather than
+           parked, and the question is identical: what waits on the OPERATION is whoever asked for the
+           property. The record differs from the parked form's (it additionally carries the invocation the
+           request built) but the link does not, which is why both cases stand here. */
+        *out_kind = ((JSGetProp *)st)->outer_kind;
+        return ((JSGetProp *)st)->outer;
     case CONT_ARRAY_LEN: case CONT_ARRAY_LEN_YIELD:
         /* §10.4.2.4's carrier in EITHER role — a link under a coercion sequence, or a frame's own cont_state
            parked at the outcome fork. What waits on it is what asked for the WRITE. */
@@ -46590,6 +46644,8 @@ static void cont_outer_set(void *st, uint8_t kind, void *outer, uint8_t outer_ki
         ((JSStepHdr *)st)->outer = outer; ((JSStepHdr *)st)->outer_kind = outer_kind; return;
     case CONT_GETPROP_YIELD:
         ((JSTrapGet *)st)->outer = outer; ((JSTrapGet *)st)->outer_kind = outer_kind; return;
+    case CONT_GETPROP:
+        ((JSGetProp *)st)->outer = outer; ((JSGetProp *)st)->outer_kind = outer_kind; return;
     case CONT_ARRAY_LEN: case CONT_ARRAY_LEN_YIELD:
         ((JSArrayLen *)st)->outer = outer; ((JSArrayLen *)st)->outer_kind = outer_kind; return;
     case CONT_TOPRIM:
@@ -46607,10 +46663,13 @@ static void cont_outer_set(void *st, uint8_t kind, void *outer, uint8_t outer_ki
           "is cloned and then dropped");
 }
 
-/* Clone ONE link-only record — one that no frame owns, so no frame's arm builds it. The two built here are the
-   two the alternation is made of: a step machine waiting on a coercion, and a coercion sequence waiting on a
-   machine. Everything else CRASHES BY KIND, because a link this cannot copy is a link the sibling would share,
-   and the record it names is what the next agent has to write an arm for. */
+/* Clone ONE link-only record — one that no frame owns, so no frame's arm builds it. The alternation is made of
+   a machine waiting on a request and a request waiting on a machine, and every kind that can stand in either
+   position needs an arm. Everything else CRASHES BY KIND, because a link this cannot copy is a link the
+   sibling would share, and the record it names is what the next agent has to write an arm for.
+   NO CENSUS OF WHAT IT CURRENTLY HAS: this message used to name two arms while the function held four, so the
+   crash told its reader the walk was less finished than it was — a DFAIL that stays true about the OBLIGATION
+   and goes wrong about the tree is the one failure mode this mechanism has, and a list is how it gets there. */
 static void *tramp_cont_clone_one(JSContext *ctx, void *st, uint8_t kind)
 {
     if (kind == CONT_STEP || kind == CONT_STEP_YIELD)
@@ -46621,10 +46680,16 @@ static void *tramp_cont_clone_one(JSContext *ctx, void *st, uint8_t kind)
         return js_array_len_clone(ctx, (const JSArrayLen *)st);
     if (kind == CONT_OP_KEYED)
         return js_op_keyed_clone(ctx, (const JSOpKeyed *)st);
+    if (kind == CONT_GETPROP)
+        /* a keyed property OPERATION whose callee turned out to be a step machine — `new Proxy(t, {ownKeys:
+           Object.getOwnPropertyNames})` — so the machine is the frame's continuation and the operation is the
+           LINK under it. The same record is a frame's own cont_state when the callee is a bytecode accessor or
+           trap, which is why one clone serves both walks. */
+        return js_getprop_clone(ctx, (const JSGetProp *)st);
     {
 #define CONT_CLONE_FMT                                                                                       \
     "tramp_cont_clone_one: a REQUESTER of kind %d is waiting on a forked continuation and this walk has no "  \
-    "arm for it — a step machine and a ToPrimitive sequence are the two it has. Give THAT record its arm "    \
+    "arm for it. Give THAT record its arm "                                                                  \
     "here (dup every field its release frees) and in tramp_cont_free together: the sibling must not share a "  \
     "record both flows advance and both free"
         char why[sizeof CONT_CLONE_FMT + 11];
@@ -47129,6 +47194,46 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                    identical repoint the Promise executor's cb_args[2] needs, and for the identical reason. */
                 if (otf->sf.arg_buf == &ots->cb[2])
                     ct->sf.arg_buf = &nts->cb[2];
+            } else if (otf->cont_kind == CONT_GETPROP) {
+                /* A CONCOLIC BRANCH INSIDE A GETTER OR A PROXY TRAP. A keyed property operation runs the page's
+                   code two ways — §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 7's
+                   "Return ? Call(getter, receiver)", and the handler traps, of which §10.5.8 [[Get]] (
+                   propertyKey, receiver ) step 7's "Let trapResult be ? Call(trap, handler, « target,
+                   propertyKey, receiver »)" and §10.5.5 [[GetOwnProperty]] ( propertyKey ) step 7's "Let
+                   trapResultObj be ? Call(trap, handler, « target, propertyKey »)" are two — and a branch
+                   inside any of them forks exactly where a branch in any other callee does.
+                   NONE OF THAT IS EXOTIC BUNDLE SHAPE, which is why this arm is not an edge case: an object
+                   spread performs §7.3.25 CopyDataProperties ( target, source, excludedItems ) step 4, one
+                   [[Get]] per own key, so it reaches EVERY getter the source has; a descriptor walk reaches a
+                   `getOwnPropertyDescriptor` trap once per key the same way. A getter or a trap that reads an
+                   attacker source and branches on it therefore forks with the walk suspended MID-KEY.
+                   THE FIELD LIST LIVES AT js_getprop_clone, beside the release it mirrors, because this is not
+                   its only caller: the requester walk below finds this same record as a LINK whenever the trap
+                   turned out to be a step machine rather than a bytecode body. */
+                JSGetProp *ogp = (JSGetProp *)otf->cont_state;
+                JSGetProp *ngp = js_getprop_clone(ctx, ogp);
+
+                if (!ngp) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+                ct->cont_state = ngp;
+                /* cb[2] IS THE CALL'S ARGUMENT VECTOR (`call_argv = &gp->cb[2]` where the request dispatches),
+                   an EXTERNAL allocation the generic XL relocation leaves pointing at the ORIGINAL record — the
+                   identical repoint the coercion sequence above and the Promise executor need, for the
+                   identical reason. It is reached on the ZERO-ARGUMENT shape, which is the ordinary one: a
+                   `get x(){…}` accessor takes none, so its frame allocates no argument buffer and BORROWS the
+                   request's. */
+                if (otf->sf.arg_buf == &ogp->cb[2])
+                    ct->sf.arg_buf = &ngp->cb[2];
+                /* AND THE SIBLING MUST NOT BE LEFT READING THE PARENT'S — asserted rather than assumed,
+                   because the repoint above is an EQUALITY against one field and the borrow is a fact about
+                   the whole record: an operand vector that ever starts at another slot would pass that test
+                   silently and hand two flows one argument buffer, whose first finisher frees what the other
+                   is still reading. */
+                DCHECK(ct->sf.arg_buf == NULL
+                       || (const uint8_t *)ct->sf.arg_buf < (const uint8_t *)ogp
+                       || (const uint8_t *)ct->sf.arg_buf >= (const uint8_t *)ogp + sizeof(*ogp),
+                       "clone_deep_flow: the sibling's accessor/trap frame still reads its arguments out of the "
+                       "PARENT's property-operation record — the request's argument vector is that record's own "
+                       "buffer, so every borrow of it has to be repointed at the clone's");
             } else {
                 /* The KIND is the one fact needed to act on this, so it is in the message. A DFAIL that says
                    "some other continuation" sends the reader back to a bisection to learn what it already knew. */
@@ -47139,11 +47244,14 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                    that crash lost the half naming what to build, silently, at the one call that existed to
                    deliver it. `sizeof` the literal is what it will actually be, and `%d` is replaced by at most
                    11 characters of `int`. */
+/* NO CENSUS OF THE ARMS THAT EXIST — this named four while a fifth was being written, and a list is the one
+   way a crash that is right about the obligation goes wrong about the tree. The KIND is the fact needed to
+   act, and the instruction does not change as arms are added. */
 #define CLONE_KIND_FMT                                                                                        \
-    "clone_deep_flow: deep-fork of a C-continuation callback frame of kind %d — not a step machine, a "        \
-    "Promise executor, a constructor body or a ToPrimitive sequence, which are the four this has arms for. "   \
-    "Give THAT continuation its own clone arm: the sibling must not share a state both flows advance and "     \
-    "both free"
+    "clone_deep_flow: deep-fork of a C-continuation callback frame of kind %d, which this walk has no arm "    \
+    "for. Give THAT continuation its own clone arm (dup every reference its release frees, and repoint any "   \
+    "argument vector the callee borrows out of the record) and its arm in tramp_cont_free: the sibling must "  \
+    "not share a state both flows advance and both free"
                 char why[sizeof CLONE_KIND_FMT + 11];
 
                 snprintf(why, sizeof why, CLONE_KIND_FMT, (int)otf->cont_kind);
@@ -47362,6 +47470,22 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
         uint8_t ck = tg->outer_kind;
         js_trapget_free(ctx, tg);
         tramp_cont_free(ctx, co, ck);
+        return;
+    }
+    if (kind == CONT_GETPROP) {
+        /* A KEYED PROPERTY OPERATION WHOSE ACCESSOR OR TRAP WAS STILL RUNNING, released with nobody to answer
+           to — a cold-tier tail dropped, a flow destroyed under a throw. The operation can never finish, so
+           whatever asked for the property can never be answered either and goes with it, which is what every
+           other arm in this walk does with its requester. Taken BEFORE the free, because the free is what makes
+           the record unreadable.
+           THE OTHER DIRECTION OF js_getprop_clone, and it lands in the SAME diff for the reason this walk's own
+           DFAIL states: a kind present in only one of the two is a flow that can be forked and cannot be
+           evicted, paged or freed — which is precisely the shape a parked getter has. */
+        JSGetProp *gp = st;
+        void *go = gp->outer;
+        uint8_t gk = gp->outer_kind;
+        js_getprop_free(ctx, gp);
+        tramp_cont_free(ctx, go, gk);
         return;
     }
     if (kind == CONT_ARRAY_LEN || kind == CONT_ARRAY_LEN_YIELD) {
