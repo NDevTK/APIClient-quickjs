@@ -28804,15 +28804,17 @@ static inline bool tramp_body_is_agen(JSValueConst func) {
     return fp->class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION;
 }
 
-/* THE body-entry question, asked in exactly ONE place. These four are ROUTING, not recognizers, and they are
-   named for it: each answers WHICH of four different body-entry ALGORITHMS a callee has, and deleting any other
-   code would not make TBE_GEN unnecessary — which is this project's test for the difference. They were called
-   tramp_can_call_* and so were counted by the recognizer ratchet, which is a claim the name made and the code
-   did not; engine/check_recognizers.mjs now PINS their use sites so a future selector cannot hide among them.
-   THE body-entry question, asked in exactly ONE place. A callee that HAS a bytecode body has exactly four ways in
-   (plain frame / async frame / generator create / async-generator create); which one is a property of the CALLEE,
-   never of the call spelling. It was written out per call shape instead, and the copies drifted: OP_call and
-   OP_call_method asked all four, do_forward_dispatch asked three — so `ag()` created its coroutine on the tramp
+/* THE body-entry question, asked in exactly ONE place. These predicates are ROUTING, not recognizers, and they
+   are named for it: each answers WHICH body-entry ALGORITHM a callee has, and deleting any other code would not
+   make TBE_GEN unnecessary — which is this project's test for the difference.
+   A callee that HAS a bytecode body has exactly five ways in (plain frame / async frame / await-continuation
+   RESUME of a suspended async frame / generator create / async-generator create); which one is a property of
+   the CALLEE, never of the call spelling. THE COUNT IS NOT DECORATION and this sentence is written after
+   correcting it: the prose said four for as long as the list held five, and a count is exactly the kind of
+   claim a reader trusts and a reviewer cannot see through — the stale-DFAIL failure mode in a place with no
+   crash to correct it. The list is therefore written out rather than counted.
+   It was written out per call shape instead, and the copies drifted: OP_call and
+   OP_call_method asked all four they then knew, do_forward_dispatch asked three — so `ag()` created its coroutine on the tramp
    while `method.call(obj)` on the SAME async generator fell through to js_async_generator_function_call and drove
    the body to completion (Array.fromAsync's `method.call(items)`, which is why built-ins/Array and the whole
    language/ tree aborted). That is the per-spelling drift CLAUDE.md bans, and a fifth body kind would have had to
