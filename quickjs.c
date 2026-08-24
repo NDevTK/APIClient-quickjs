@@ -37922,12 +37922,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (ainit) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); goto exception; }
                 }
                 as->is_active = true;
-                /* THE STATE BELONGS TO `as`, whoever ends up driving it. While the body runs here it is a frame
-                   on the caller's chain and this says nothing; the moment an await settles, the continuation is
-                   resumed with THIS state as the flow base (js_async_function_resolve_call), and a fork after
-                   that await clones a base whose completion has to settle `as`'s promise. Unmarked, the clone
-                   looked like a plain script base: the scheduler resumed it, read a done_generator suspend as a
-                   completion code, and walked off the end of the body's bytecode. */
+                /* THE STATE BELONGS TO `as`, whoever ends up driving it — and after an await that is normally
+                   another frame on another flow's chain (do_async_resume_tramp), not a base at all. What still
+                   needs the mark is the case where nothing is running above the resume and the SCHEDULER drives
+                   the activation directly: the pump's own resume of a parked continuation, and a module body.
+                   A fork inside one of those clones a base whose completion has to settle `as`'s promise, and
+                   unmarked the clone looked like a plain script base — the scheduler resumed it, read a
+                   done_generator suspend as a completion code, and walked off the end of the body's bytecode. */
                 as->func_state.base_kind = FLOW_BASE_ASYNC_CALL;
                 atf = tramp_frame_new(rt);
                 if (unlikely(!atf)) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -48468,8 +48469,16 @@ static void js_async_gen_park_free(JSContext *ctx, void *opaque)
    the body is entered, and THAT is the only thing the two drivers do differently: on the caller's TRAMP CHAIN
    when `ag.next()` is called from bytecode (do_agen_drive_tramp — the body's loops then preempt the caller's
    flow, at any depth), or as its OWN flow base when a promise reaction resumes an awaiting body
-   (js_async_generator_resume_next below, which parks). That is exactly the split an async FUNCTION already has
-   between its tramp entry and js_async_function_resume_as_flow; the machine itself has one implementation. */
+   (js_async_generator_resume_next below, which parks).
+   THAT SECOND ENTRY IS THE SAME DEFECT THE ASYNC FUNCTION'S AWAIT RESUME HAD, AND IT IS STILL HERE. This
+   comment used to cite the async function as the model for the split; it is no longer one, because an async
+   function's await continuation is now a BODY ENTRY on the running flow's chain (TBE_ASYNC_RESUME /
+   do_async_resume_tramp) for the reason §9.4.7 RunSuspendedContext gives — the caller context is SUSPENDED and
+   the resumed one pushed on top of it, never run beside it. An async generator resumed by a reaction still
+   becomes a second flow base under the live one, so a loop after its await parks while the reaction's flow goes
+   on executing bytecode, and unlike the async function's park that one has no assert saying so. The work is to
+   give this machine the same body entry; it is deliberately NOT folded into that change, because widening one
+   consumer at a time is what makes the failures name the missing capability instead of producing a count. */
 static int js_async_generator_pre(JSContext *ctx, JSAsyncGeneratorData *s, JSValue *out_value)
 {
     JSAsyncGeneratorRequest *next;
