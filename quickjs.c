@@ -29096,10 +29096,10 @@ void JS_RequestFlowYield(void) { FLOW_YIELD_REQUEST(JS_PREEMPT_HOST); }
    at "the clone sites" would be a list that is ALREADY incomplete and harmlessly so, and a list that reads as
    complete while it is not is worse than no list at all.
    So it is called from the two functions that turn memory into a base and initialise every OTHER field of it
-   for the same reason: async_func_init, and reaction_call_flow_init — which is also the one place the memory
-   is genuinely not zeroed (js_call_flow_complete's base lives on the C STACK) and the one place a base is
-   re-initialised over a used one (a reaction's phase 1). A constructor that somehow reaches neither and does
-   not zero fails LOUD at flow_park's `park_fn == NULL` or at its own teardown's, because garbage is not NULL.
+   for the same reason: async_func_init, and reaction_call_flow_init — which is the one place a base is
+   RE-INITIALISED OVER A USED ONE (a reaction's phase 1), so its every field is whatever the last flow left
+   rather than a zero. A constructor that somehow reaches neither and does not zero fails LOUD at flow_park's
+   `park_fn == NULL` or at its own teardown's, because garbage is not NULL.
    It detaches the link the way list_del does — {NULL,NULL}, not self-linked — so a zeroed base, a
    just-resumed one and a deliberately-cleared one are ONE state under one convention. */
 static void flow_park_init(JSAsyncFunctionState *s) {
@@ -60616,7 +60616,7 @@ static int js_create_module_bytecode_function(JSContext *ctx, JSModuleDef *m)
     return -1;
 }
 
-/* must be done before js_link_module() because of cyclic references */
+/* must be done before 16.2.1.6.1.2 Link ( ) because of cyclic references */
 /* Create ONE module's function and exported variable slots. The walk over the dependency graph is
    js_create_module_function below; this half creates nothing recursively and runs no user code. */
 static int js_create_module_function_one(JSContext *ctx, JSModuleDef *m)
@@ -60691,42 +60691,13 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
 }
 
 
-/* Prepare a module to be executed by resolving all the imported
-   variables. */
-static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSValueConst this_val,
-                                   JSValueConst handler, int argc, JSValueConst *argv);
-
-/* `func.call(this_val, ...argv)` as a CALL-ROOT FLOW that must COMPLETE. The call-root base is the same one a
-   promise reaction runs on, so the callee enters through the convergence point and anything that loops inside it
-   PARKS instead of driving to completion — which is what a plain JS_Call from C could not do. The difference
-   from the reaction driver is the contract, not the mechanism: this is for a callee the COMPILER emits with no
-   back-edge, so a park is a should-never-happen and `parked_msg` names the machinery that would have to exist
-   for that callee to suspend. Returns the completion value (JS_EXCEPTION with the throw in flight). */
-static JSValue js_call_flow_complete(JSContext *ctx, JSValueConst func, JSValueConst this_val,
-                                     int argc, JSValueConst *argv, const char *parked_msg)
-{
-    JSAsyncFunctionState fs, *prev_base = g_flow_base_gen;
-    JSValue res;
-
-    if (reaction_call_flow_init(ctx, &fs, this_val, func, argc, argv) < 0)
-        return JS_EXCEPTION;
-    fs.throw_flag = false;
-    g_flow_base_gen = &fs;
-    res = async_func_resume(ctx, &fs);
-    g_flow_base_gen = prev_base;
-    if (fs.frame.cur_sp != NULL || fs.tramp_top != NULL)
-        DFAIL(parked_msg);
-    /* completed via `done:`, which frees the stack + var_refs inline but not the frame block or its cur_func */
-    js_free_rt(ctx->rt, fs.frame.arg_buf);
-    JS_FreeValue(ctx, fs.frame.cur_func);
-    JS_FreeValue(ctx, fs.this_val);
-    return res;
-}
-
-/* THE POST-ORDER half of InnerModuleLinking (16.2.1.6.1.2.1 steps 9-11): the indirect-export check, the import
-   resolution, and the `initialize the global variables` call. It is its own function because the WALK around it is
-   no longer C recursion — see js_inner_module_linking below. */
-static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef **pstack_top)
+/* 16.2.1.6.1.2.1 InnerModuleLinking steps 9-10 for ONE module: the indirect-export check and the import
+   resolution — everything 16.2.1.7.3.1 InitializeEnvironment performs BEFORE its declaration instantiation.
+   Nothing here runs the page's code: every operation the clause names is `!` or a walk over the module graph,
+   which is what makes this half a plain C function while its successor is a CALL.
+   It is its own function because the WALK around it is no longer C recursion, and because the caller has to be
+   able to STOP between it and the prologue — see js_module_link_advance below. */
+static int js_module_linking_bindings(JSContext *ctx, JSModuleDef *m)
 {
     int i;
     JSImportEntry *mi;
@@ -60734,7 +60705,6 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
     JSVarRef **var_refs, *var_ref;
     JSObject *p;
     bool is_c_module;
-    JSValue ret_val;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
     if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
@@ -60862,56 +60832,62 @@ static int js_module_linking_finish(JSContext *ctx, JSModuleDef *m, JSModuleDef 
             }
         }
 
-        /* 16.2.1.7.3.1 InitializeEnvironment's tail: run the module body's `OP_push_this; OP_if_false <body>`
-           prologue, which with `this === true` performs the hoisted-definition pass and returns. AS A FLOW —
-           the same entry module EVALUATION uses — because a bytecode body entered by plain JS_Call from C
-           cannot suspend, and this was the last such entry in the module machinery (the walk around it is
-           already an explicit worklist). The prologue has no back-edge, so nothing in it can park; that is an
-           invariant of the shape the compiler emits, and the DFAIL below is what makes it one rather than an
-           assumption. */
-        ret_val = js_call_flow_complete(ctx, m->func_obj, JS_TRUE, 0, NULL,
-                                        "a module's hoisted-definition prologue PARKED — it is compiled with no "
-                                        "back-edge, so nothing in it can preempt. A prologue that does park "
-                                        "makes LINKING asynchronous: the link worklist must hold its frame "
-                                        "across the suspension and resume on the parked flow");
-        if (JS_IsException(ret_val))
-            goto fail;
-        JS_FreeValue(ctx, ret_val);
     }
-
-    DCHECK(m->dfs_ancestor_index <= m->dfs_index, "m->dfs_ancestor_index <= m->dfs_index");
-    if (m->dfs_index == m->dfs_ancestor_index) {
-        for(;;) {
-            /* pop m1 from stack */
-            m1 = *pstack_top;
-            *pstack_top = m1->stack_prev;
-            m1->status = JS_MODULE_STATUS_LINKED;
-            if (m1 == m)
-                break;
-        }
-    }
-
-#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
-    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
-        printf("js_inner_module_linking done\n");
-    }
-#endif
+    /* THE PROLOGUE IS NOT HERE, and its absence is the whole of this split. 16.2.1.7.3.1 InitializeEnvironment's
+       steps 32-37 — the var and lexical declaration instantiation, and the InstantiateFunctionObject each
+       function declaration needs — are compiled into the module body's own `OP_push_this; OP_if_false <body>`
+       prologue, so performing them is ENTERING A BYTECODE BODY. That is a call, and in this engine a call the
+       page's flow may be parked inside; the caller issues it (js_module_link_advance's MODLINK_PROLOGUE) so
+       that the frame it pushes lands on the RUNNING flow's chain rather than on a second base of its own. */
     return 0;
  fail:
     return -1;
 }
 
-/* 16.2.1.6.1.2.1 InnerModuleLinking, as an EXPLICIT WORKLIST rather than C recursion. Two things were wrong with the
-   recursive form and only one of them is about depth.
-     The DEPTH: it opened with js_check_stack_overflow and a JS_ThrowStackOverflow, so a module graph deeper than
-   the C stack failed with a synthetic error. That is a BOUND on the input, which this engine does not have — the
-   whole point of the heap trampoline is that nesting is not the C stack's business — and a graph is data, so its
-   depth is the page's to choose. The frame array grows; nothing caps it.
-     The SUSPENSION: step 9's InitializeEnvironment ends in `JS_Call(m->func_obj, JS_TRUE)`, which runs the module
-   body's `OP_push_this; OP_if_false` prologue — a BYTECODE BODY entered by C recursion below a live flow, and the
-   largest single contributor to SyncDriveToCompletion. A C-recursive walk can never park, so it could not be
-   routed at all while the recursion stood; flattening it is that conversion's prerequisite and not a substitute
-   for it. The call is still made from C here, and still counted.
+/* 16.2.1.6.1.2.1 InnerModuleLinking step 11: the SCC pop. `m` is the root of a strongly connected component
+   exactly when its ancestor index never moved, and every module above it on `stack` linked with it. */
+static void js_module_linking_scc_pop(JSModuleDef *m, JSModuleDef **pstack_top)
+{
+    JSModuleDef *m1;
+
+    DCHECK(m->dfs_ancestor_index <= m->dfs_index, "m->dfs_ancestor_index <= m->dfs_index");
+    if (m->dfs_index != m->dfs_ancestor_index)
+        return;
+    for(;;) {
+        /* pop m1 from stack */
+        m1 = *pstack_top;
+        DCHECK(m1 != NULL,
+               "16.2.1.6.1.2.1 step 11.b: the SCC stack ran out before its own root — the walk popped a "
+               "component whose members are no longer the ones step 8 appended");
+        *pstack_top = m1->stack_prev;
+        m1->status = JS_MODULE_STATUS_LINKED;
+        if (m1 == m)
+            break;
+    }
+}
+
+/* 16.2.1.6.1.2 Link ( ) AS A RECORD A FLOW CAN BE PARKED INSIDE — 16.2.1.6.1.2.1 InnerModuleLinking's depth-first
+   traversal with its cursor on the HEAP, and step 2's `stack` beside it, so that neither lives on the C stack.
+     THE DEPTH came first and is the smaller half. The recursion opened with js_check_stack_overflow and a
+   JS_ThrowStackOverflow, so a module graph deeper than the C stack failed with a synthetic error — a BOUND on
+   the input, which this engine does not have, and a graph is data, so its depth is the page's to choose. The
+   frame array grows; nothing caps it.
+     THE SUSPENSION is the reason the cursor is a record rather than a local. Step 9's InitializeEnvironment ends
+   in the module body's `OP_push_this; OP_if_false` prologue, and entering a bytecode body is entering the
+   INTERPRETER, whose yield poll runs at EVERY opcode dispatch — so a flow can be asked for the thread inside a
+   prologue exactly as it can inside any other body. It has nothing to do with the prologue's SHAPE: a comment
+   here used to argue that the prologue is compiled with no back-edge and therefore "nothing in it can preempt",
+   and that was never true of this interpreter. A back-edge is one of the places a request is RAISED; the request
+   is also raised from outside the flow's instruction stream entirely (solver/quantum.c's CPU-time edge,
+   frontier_rank_changed), and it is ANSWERED wherever the next opcode is fetched. Straight-line code parks.
+     WHICH IS NOT LINKING BECOMING ASYNCHRONOUS, and the standard is what settles that. 16.2.1.6.1.2 Link ( )
+   returns a normal completion containing unused or a throw completion — synchronously, unlike 16.2.1.6.1.3
+   Evaluate ( ), which returns a Promise — and every operation 16.2.1.7.3.1 InitializeEnvironment performs is `!`
+   or a walk of the module graph: ResolveExport, NewModuleEnvironment, CreateImmutableBinding,
+   CreateImportBinding, InstantiateFunctionObject. Not one of them runs the page's code, so NOTHING OBSERVABLE
+   may happen between the steps of a link, and nothing does: a scheduler park runs no page code in this
+   timeline — a sibling flow is a sibling WORLD, isolated by its own COW delta — and the resume is byte-identical.
+   Parkable and asynchronous are different properties, and only the second one the standard forbids.
      The traversal is Tarjan's, unchanged: `index` and the dfs/ancestor indices are threaded exactly as the
    recursion threaded them, and the parent's ancestor-index minimum is taken after a child is entered (the
    already-visited case) or finished (the recursed case), which is where the recursive form took it. */
@@ -60919,6 +60895,25 @@ typedef struct JSModuleLinkFrame {
     JSModuleDef *m;
     int i;              /* cursor over m->req_module_entries: which child comes next */
 } JSModuleLinkFrame;
+
+/* WHERE THE NEXT ADVANCE CONTINUES. A resume point, not a phase counter: each names a place the walk STOPPED,
+   and a walk that stopped nowhere else can be entered at no other. */
+enum { MLW_DESCEND,    /* inside frames[depth-1]'s child loop (step 9's `For each ModuleRequest Record request`) */
+       MLW_POP,        /* frames[depth-1]'s steps 9-10 are done, including its prologue: step 11 comes next */
+       MLW_DONE };     /* step 12: the root has finished, or never needed a visit */
+
+typedef struct JSModuleLinkWalk {
+    JSModuleLinkFrame *frames;   /* OWNED, and declared to the step teardown by the machine's `visit` */
+    int depth, cap;
+    int index;                   /* 16.2.1.6.1.2.1's `index` */
+    JSModuleDef *stack_top;      /* 16.2.1.6.1.2 step 2's `stack`, threaded through JSModuleDef.stack_prev */
+    uint8_t resume;
+} JSModuleLinkWalk;
+
+/* what js_module_link_advance answers */
+enum { MODLINK_DONE = 0,      /* 16.2.1.6.1.2 step 5: the graph is linked */
+       MODLINK_MORE,          /* a rest point with nothing to run: advance again when the scheduler says so */
+       MODLINK_PROLOGUE };    /* *pm's hoisted-definition prologue must be CALLED, then advance again */
 
 /* the PRE-ORDER half (steps 3-7): claim the module, number it, push it on the SCC stack. Returns the new index, or
    -1 when the module needs no visit at all — which is the recursive form's early `return index`. */
@@ -60939,88 +60934,32 @@ static int js_module_linking_enter(JSModuleDef *m, JSModuleDef **pstack_top, int
     return index + 1;
 }
 
-static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
-                                   JSModuleDef **pstack_top, int index)
+static int js_module_link_push(JSContext *ctx, JSModuleLinkWalk *w, JSModuleDef *m)
 {
-    JSModuleLinkFrame *frames = NULL;
-    int depth = 0, cap = 0, ret = -1, nindex;
-
-#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
-    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
-        char buf1[ATOM_GET_STR_BUF_SIZE];
-        printf("js_inner_module_linking '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
+    if (w->depth == w->cap) {
+        int ncap = w->cap ? w->cap * 2 : 8;
+        JSModuleLinkFrame *nf = js_realloc(ctx, w->frames, sizeof(*nf) * (size_t)ncap);
+        if (unlikely(!nf))
+            return -1;
+        w->frames = nf;
+        w->cap = ncap;
     }
-#endif
-
-    nindex = js_module_linking_enter(m, pstack_top, index);
-    if (nindex < 0)
-        return index;                      /* already linking or linked: nothing to walk */
-    index = nindex;
-    for (;;) {
-        JSModuleLinkFrame *f;
-        if (depth == cap) {
-            int ncap = cap ? cap * 2 : 8;
-            JSModuleLinkFrame *nf = js_realloc(ctx, frames, sizeof(*nf) * (size_t)ncap);
-            if (unlikely(!nf))
-                goto done;
-            frames = nf;
-            cap = ncap;
-        }
-        frames[depth].m = m;
-        frames[depth].i = 0;
-        depth++;
-    descend:
-        f = &frames[depth - 1];
-        while (f->i < f->m->req_module_entries_count) {
-            JSModuleDef *m1 = f->m->req_module_entries[f->i].module;
-            f->i++;
-            /* 16.2.1.9 GetImportedModule, whose whole body is `Assert: records has exactly one element, since
-               LoadRequestedModules has completed successfully on referrer prior to invoking this abstract
-               operation`. Linking asks the host for NOTHING; a request with no record is a graph that was
-               linked without being loaded, which is the phase order broken and not a module that is missing. */
-            DCHECK(m1 != NULL,
-                   "16.2.1.9: a module request reached LINKING with no loaded record — Link never loads, so "
-                   "this graph was linked before js_module_load_requested finished on it (or at all)");
-            nindex = js_module_linking_enter(m1, pstack_top, index);
-            if (nindex < 0) {
-                /* already visited: take the minimum the recursive form took on return */
-                if (m1->status == JS_MODULE_STATUS_LINKING)
-                    f->m->dfs_ancestor_index = min_int(f->m->dfs_ancestor_index, m1->dfs_ancestor_index);
-                continue;
-            }
-            index = nindex;
-            m = m1;                        /* descend: a frame for m1 goes on top */
-            goto push;
-        }
-        /* every child is done, so this module's post-order half runs */
-        if (js_module_linking_finish(ctx, f->m, pstack_top) < 0)
-            goto done;
-        depth--;
-        if (depth == 0) {
-            ret = index;                   /* the root finished */
-            goto done;
-        }
-        {
-            JSModuleDef *child = f->m;
-            JSModuleLinkFrame *pf = &frames[depth - 1];
-            DCHECK(child->status == JS_MODULE_STATUS_LINKING || child->status == JS_MODULE_STATUS_LINKED || child->status == JS_MODULE_STATUS_EVALUATING_ASYNC || child->status == JS_MODULE_STATUS_EVALUATED, "child->status == JS_MODULE_STATUS_LINKING || child->status == JS_MODULE_STATUS_LINKED || child->status == JS_MODULE_STATUS_EVALUATING_ASYNC || child->status == JS_MODULE_STATUS_EVALUATED");
-            if (child->status == JS_MODULE_STATUS_LINKING)
-                pf->m->dfs_ancestor_index = min_int(pf->m->dfs_ancestor_index, child->dfs_ancestor_index);
-        }
-        goto descend;
-    push:
-        continue;
-    }
- done:
-    js_free(ctx, frames);
-    return ret;
+    w->frames[w->depth].m = m;
+    w->frames[w->depth].i = 0;
+    w->depth++;
+    return 0;
 }
 
-/* Prepare a module to be executed by resolving all the imported
-   variables. */
-static int js_link_module(JSContext *ctx, JSModuleDef *m)
+/* 16.2.1.6.1.2 Link ( ) steps 1-3's entry: the root's pre-order half, or the early return when it needs none. */
+static int js_module_link_init(JSContext *ctx, JSModuleLinkWalk *w, JSModuleDef *m)
 {
-    JSModuleDef *stack_top, *m1;
+    int nindex;
+
+    w->frames = NULL;
+    w->depth = w->cap = 0;
+    w->index = 0;
+    w->stack_top = NULL;      /* step 2: `stack` is a new empty List */
+    w->resume = MLW_DONE;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
     if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
@@ -61028,20 +60967,132 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
         printf("js_link_module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
     }
 #endif
-    DCHECK(m->status == JS_MODULE_STATUS_UNLINKED || m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED, "m->status == JS_MODULE_STATUS_UNLINKED || m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED");
-    stack_top = NULL;
-    if (js_inner_module_linking(ctx, m, &stack_top, 0) < 0) {
-        while (stack_top != NULL) {
-            m1 = stack_top;
-            DCHECK(m1->status == JS_MODULE_STATUS_LINKING, "m1->status == JS_MODULE_STATUS_LINKING");
-            m1->status = JS_MODULE_STATUS_UNLINKED;
-            stack_top = m1->stack_prev;
-        }
+    /* step 1 */
+    DCHECK(m->status == JS_MODULE_STATUS_UNLINKED || m->status == JS_MODULE_STATUS_LINKED ||
+           m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED,
+           "16.2.1.6.1.2 step 1: Link was entered on a module that is already LINKING — a second link of a "
+           "graph whose first one has not finished, which the module map's memo is what prevents");
+    nindex = js_module_linking_enter(m, &w->stack_top, w->index);
+    if (nindex < 0)
+        return 0;                          /* 16.2.1.6.1.2.1 step 2: already linked, so there is nothing to walk */
+    w->index = nindex;
+    if (js_module_link_push(ctx, w, m) < 0)
         return -1;
-    }
-    DCHECK(stack_top == NULL, "stack_top == NULL");
-    DCHECK(m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED, "m->status == JS_MODULE_STATUS_LINKED || m->status == JS_MODULE_STATUS_EVALUATING_ASYNC || m->status == JS_MODULE_STATUS_EVALUATED");
+    w->resume = MLW_DESCEND;
     return 0;
+}
+
+/* ONE STEP OF THE WALK. It answers MODLINK_PROLOGUE with *pm set when the next thing 16.2.1.7.3.1 owes is the
+   module body's declaration-instantiation entry — which is a CALL, and therefore the caller's to issue on the
+   running flow's chain — and MODLINK_MORE at every other rest point, so a caller that is a step machine can
+   offer the scheduler the thread between any two modules of the graph. -1 = threw. */
+static int js_module_link_advance(JSContext *ctx, JSModuleLinkWalk *w, JSModuleDef **pm)
+{
+    JSModuleLinkFrame *f;
+    int nindex;
+
+    *pm = NULL;
+    if (w->resume == MLW_DONE)
+        return MODLINK_DONE;
+    if (w->resume == MLW_POP)
+        goto pop;
+
+    DCHECK(w->resume == MLW_DESCEND,
+           "a module link walk was advanced at a resume point it never stopped at — MLW_* names the three "
+           "places the walk can be entered, and a fourth value is memory nothing in this file wrote");
+    DCHECK(w->depth > 0,
+           "a module link walk advanced with no frame on its path — js_module_link_init pushes the root's "
+           "frame, and MLW_DONE is how a walk with nothing to do says so");
+    f = &w->frames[w->depth - 1];
+    while (f->i < f->m->req_module_entries_count) {
+        JSModuleDef *m1 = f->m->req_module_entries[f->i].module;
+        f->i++;
+        /* 16.2.1.9 GetImportedModule, whose whole body is `Assert: records has exactly one element, since
+           LoadRequestedModules has completed successfully on referrer prior to invoking this abstract
+           operation`. Linking asks the host for NOTHING; a request with no record is a graph that was
+           linked without being loaded, which is the phase order broken and not a module that is missing. */
+        DCHECK(m1 != NULL,
+               "16.2.1.9: a module request reached LINKING with no loaded record — Link never loads, so "
+               "this graph was linked before js_module_load_requested finished on it (or at all)");
+        nindex = js_module_linking_enter(m1, &w->stack_top, w->index);
+        if (nindex < 0) {
+            /* already visited: take the minimum the recursive form took on return */
+            if (m1->status == JS_MODULE_STATUS_LINKING)
+                f->m->dfs_ancestor_index = min_int(f->m->dfs_ancestor_index, m1->dfs_ancestor_index);
+            continue;
+        }
+        w->index = nindex;
+        if (js_module_link_push(ctx, w, m1) < 0)   /* descend: a frame for m1 goes on top */
+            return -1;
+        return MODLINK_MORE;
+    }
+    /* every child is done, so this module's post-order half runs: steps 9-10 first, and they run no page code */
+    if (js_module_linking_bindings(ctx, f->m) < 0)
+        return -1;
+    w->resume = MLW_POP;
+    /* …and then 16.2.1.7.3.1's declaration instantiation, which for a Source Text Module Record IS its body's
+       hoisted-definition prologue. A module with an init_func is this engine's Synthetic Module Record shape:
+       16.2.1.8.4.4 Link ( ) is `Return unused`, so there is no environment to initialise and no body to enter. */
+    if (f->m->init_func == NULL) {
+        *pm = f->m;
+        return MODLINK_PROLOGUE;
+    }
+ pop:
+    f = &w->frames[w->depth - 1];
+    js_module_linking_scc_pop(f->m, &w->stack_top);      /* step 11 */
+    w->depth--;
+    w->resume = MLW_DESCEND;
+#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
+    if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
+        printf("js_inner_module_linking done\n");
+    }
+#endif
+    if (w->depth == 0) {
+        w->resume = MLW_DONE;
+        /* steps 5-6, and the ROOT is f->m because the last frame popped is the one init pushed */
+        DCHECK(f->m->status == JS_MODULE_STATUS_LINKED ||
+               f->m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
+               f->m->status == JS_MODULE_STATUS_EVALUATED,
+               "16.2.1.6.1.2 step 5: Link returned with its own module not linked — step 11's SCC pop never "
+               "reached the root, so its component is still LINKING and its bindings are half-built");
+        DCHECK(w->stack_top == NULL,
+               "16.2.1.6.1.2 step 6: Link finished with modules still on its stack — every one of them is "
+               "left at LINKING for ever, and the next link of any graph that reaches one silently skips it");
+        return MODLINK_DONE;
+    }
+    {
+        JSModuleDef *child = f->m;
+        JSModuleLinkFrame *pf = &w->frames[w->depth - 1];
+        DCHECK(child->status == JS_MODULE_STATUS_LINKING || child->status == JS_MODULE_STATUS_LINKED ||
+               child->status == JS_MODULE_STATUS_EVALUATING_ASYNC || child->status == JS_MODULE_STATUS_EVALUATED,
+               "16.2.1.6.1.2.1 step 9.c.i: a child came back from its own InnerModuleLinking still UNLINKED");
+        if (child->status == JS_MODULE_STATUS_LINKING)
+            pf->m->dfs_ancestor_index = min_int(pf->m->dfs_ancestor_index, child->dfs_ancestor_index);
+    }
+    return MODLINK_MORE;
+}
+
+/* 16.2.1.6.1.2 Link ( ) step 4 — AND the abandon, which is the same operation and is why this is not written
+   inline at the one failure site it used to serve. A walk can now END three ways: it finished (the loop below
+   runs over an empty stack and does nothing), one of its modules threw, or the FLOW HOLDING IT WAS DROPPED —
+   a forked arm the scheduler released, a cold-tier tail, a runtime torn down while a link was parked. The
+   third one has no C stack to unwind through, so the reset has to belong to the RECORD; without it a dropped
+   flow leaves every module of its path at LINKING for ever, and 16.2.1.6.1.2.1 step 2 then treats each of them
+   as already done — a graph that silently links to nothing at all.
+   It does not free `frames`: the machine's `visit` declares that buffer, and the step teardown owns exactly
+   what `visit` names (see JSTrampStepDef.visit). */
+static void js_module_link_walk_end(JSModuleLinkWalk *w)
+{
+    while (w->stack_top != NULL) {
+        JSModuleDef *m1 = w->stack_top;
+        DCHECK(m1->status == JS_MODULE_STATUS_LINKING,
+               "16.2.1.6.1.2 step 4.a: a module on Link's own stack is not LINKING — step 8 appends only "
+               "modules it has just set to linking, so something else moved this one");
+        m1->status = JS_MODULE_STATUS_UNLINKED;
+        w->stack_top = m1->stack_prev;
+    }
+    w->depth = 0;
+    w->resume = MLW_DONE;
 }
 
 /* return JS_ATOM_NULL if the name cannot be found. Only works with
@@ -61119,9 +61170,9 @@ static JSValue JS_NewModuleValue(JSContext *ctx, JSModuleDef *m)
 /* DELETED: js_load_module_rejected. A module load's rejection is FORWARDED UNCHANGED, so it never needed a
    reaction of its own — the whole body of that C function was `JS_Call(resolving_funcs[1], reason)`, taking the
    reason a promise had just handed it and passing the same value on. Where the import's capability is the
-   PerformPromiseThen's derived one (js_load_module_evaluate) the forwarding is 27.2.5.4.1's missing-onRejected
-   rethrow and there is nothing to register; where it is not (js_load_module_then, whose fulfilment reaction owes
-   the capability nothing) the reaction is resolving_funcs[1] ITSELF.
+   PerformPromiseThen's derived one (13.3.10.3's linkAndEvaluateClosure) the forwarding is 27.2.5.4.1's
+   missing-onRejected rethrow and there is nothing to register; where it is not (js_load_module_then, whose
+   fulfilment reaction owes the capability nothing) the reaction is resolving_funcs[1] ITSELF.
    THE WRAPPER WAS NOT A SLOW PATH, IT WAS A DEAD END. `resolving_funcs[1]` is PAGE CODE whenever the import's
    capability came from a promise SUBCLASS, and the native one is a step machine whose settle reads
    `Get(resolution, "then")` off the value — so a loop or an await in either had no flow base under that JS_Call
@@ -61158,9 +61209,9 @@ static JSValue js_load_module_fulfilled(JSContext *ctx, JSValueConst this_val,
    park into and aborted. Its "XXX: what to do if exception ?" is answered by the same move rather than by a
    policy: the settle's own throw is a COMPLETION now, never a value to drop.
    ITS FIVE CALL SITES DO NOT SHARE ONE ANSWER, because the question is what is UNDER the C activation and that
-   differs. THREE OF THEM ALREADY RUN INSIDE A FLOW: js_load_module_evaluate (reached only from
-   js_module_loaded_import), js_module_source_fulfilled and js_module_loaded_run are promise REACTION HANDLERS,
-   so each is phase 0 of promise_reaction_job's call-root flow and its completion already has somewhere to go.
+   differs. THREE OF THEM ALREADY RUN INSIDE A FLOW: js_module_source_fulfilled and the two load continuations
+   js_load_module_then registers are promise REACTION HANDLERS, so each is phase 0 of promise_reaction_job's
+   call-root flow and its completion already has somewhere to go.
    There the rejection is the handler's OWN THROW — the exception stays in flight, the handler returns
    JS_EXCEPTION, and phase 1 of that same flow delivers it to the capability on the base the handler ran on.
    js_settle_as_flow at those three would be a SECOND flow nested inside the first, which is not a smaller
@@ -61197,83 +61248,250 @@ static void js_load_module_reject_at_entry(JSContext *ctx, JSValueConst *resolvi
    -1 leaves the failure's exception IN FLIGHT for the caller to deliver, because only the caller knows whether
    it is standing in a flow (return it) or at an embedder entry (js_load_module_reject_at_entry). */
 static __exception int js_load_module_then(JSContext *ctx, JSModuleDef *m,
-                                           JSValueConst *resolving_funcs, JSCFunctionData *on_loaded);
+                                           JSValueConst *resolving_funcs,
+                                           const JSTrampStepDef *on_loaded);
 
-/* 13.3.10.2's TAIL, run only once the graph is LOADED (js_load_module_then puts it there): link, evaluate, and
-   settle the import's capability with the module NAMESPACE once evaluation's own promise does — which is what
-   `import()` resolves to, and the one thing that distinguishes it from running a module script. */
 static JSValue js_module_eval_capability(JSContext *ctx, JSModuleDef *m);
 static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m);
 
-/* -1 is a THROW, not a settle: this runs inside js_module_loaded_import, which is a reaction handler, so the
-   failure is that flow's own abrupt completion and phase 1 hands it to the import's reject. */
-static __exception int js_load_module_evaluate(JSContext *ctx, JSModuleDef *m,
-                                               JSValueConst *resolving_funcs)
+/* 16.2.1.6.1.2 Link ( ) AS A REQUEST SUB-SEQUENCE — the shared half of the two continuations that link a
+   loaded graph, in the shape every other sub-sequence in this file has (step_program_run, step_call_run):
+   the caller keeps the cursor in its own state, calls this at one stage, and returns whatever it answers.
+     IT EXISTS BECAUSE LINKING CONTAINS A CALL. 16.2.1.7.3.1 InitializeEnvironment's declaration instantiation
+   is compiled into the module body's own `OP_push_this; OP_if_false <body>` prologue, so performing it means
+   ENTERING A BYTECODE BODY — and a bytecode body entered from C gets an activation with no flow base under it,
+   or (which is what this replaced) one on a SECOND base built on the C stack, which the first preempt parks
+   into and nobody can resume. As a CALL request the prologue's frame lands on the RUNNING flow's chain, so a
+   park there is the flow's own park: the chain holds it, the pump resumes it, and this sub-sequence is
+   re-entered at the module it left off at.
+     0 = the graph is linked; JS_STEP_CALL / JS_STEP_YIELD = the caller must return that code and will be
+   re-entered here; -1 = threw, with 16.2.1.6.1.2 step 4's reset owed to the teardown. */
+typedef struct JSModuleLinkOp {
+    JSModuleLinkWalk walk;
+    JSValue cb[2];        /* the prologue CALL request's operands: [this = true, the module's body] */
+    JSValue res;          /* the prologue's completion — undefined by construction, and discarded */
+    uint8_t phase;        /* step_call_run's own cursor */
+    uint8_t started;      /* the walk has been initialised; NOT derivable from the stage (see JSTrampStepDef.steps) */
+} JSModuleLinkOp;
+
+static int step_module_link_run(JSContext *ctx, JSModuleLinkOp *op, JSModuleDef *m,
+                                JSValue in, JSValue **out_cb, int *out_argc)
 {
-    JSValue cap, ret_val;
-    JSValue func_obj, evaluate_resolving_funcs[2];
+    JSModuleDef *pm;
+    int r;
 
-    /* LINK, then take the capability, THEN evaluate — spelled as the three steps rather than as JS_EvalFunction
-       precisely so the registration below lands between the second and the third. The module body can FORK; a
-       sibling forked mid-body inherits the world as it was at the branch, and this continuation has to already
-       be on the capability in that world or the importing `.then(m => …)` never runs there. Linking runs only
-       the hoisted-definition prologue, which the compiler emits with no back-edge and which therefore cannot
-       fork. */
-    if (js_create_module_function(ctx, m) < 0)
-        return -1;
-    if (js_link_module(ctx, m) < 0)
-        return -1;
-    cap = js_module_eval_capability(ctx, m);
-    if (JS_IsException(cap))
-        return -1;
+    if (!op->started) {
+        /* EVERY OWNED FIELD BEFORE THE FIRST OPERATION THAT CAN FAIL — the teardown releases exactly what the
+           machine's `visit` names, and js_mallocz leaves a JSValue reading as the INTEGER 0. */
+        op->cb[0] = JS_UNDEFINED;
+        op->cb[1] = JS_UNDEFINED;
+        op->res = JS_UNDEFINED;
+        op->phase = 0;
+        op->started = 1;
+        JS_FreeValue(ctx, in);
+        /* must be done before the link because of cyclic references: every module of the graph needs its
+           function object and its exported variable slots to exist before any of them resolves an import. */
+        if (js_create_module_function(ctx, m) < 0)
+            return -1;
+        if (js_module_link_init(ctx, &op->walk, m) < 0)
+            return -1;
+    } else if (op->phase != 0) {
+        /* the prologue this parked on has completed: END the request where it was made, whatever it completed
+           with. A THROW does not come back here at all — this machine does not declare catches_abrupt, so the
+           driver tears it down and 16.2.1.6.1.2 step 4's reset runs from the teardown. */
+        r = step_call_run(ctx, &op->phase, STEP_CB(op->cb), JS_UNDEFINED, JS_UNDEFINED, 0, NULL,
+                          in, &op->res, out_cb, out_argc);
+        DCHECK(r == 0,
+               "a module prologue's CALL request resumed and did not end — step_call_run's second phase always "
+               "completes, so a step code here is a cursor that names a request nobody issued");
+        JS_FreeValue(ctx, op->res);
+        op->res = JS_UNDEFINED;
+    } else {
+        JS_FreeValue(ctx, in);   /* re-entered from a JS_STEP_YIELD: the driver delivers undefined */
+    }
 
-    /* 16.2.1.6.1.3.1: the IMPORT'S CAPABILITY IS THE DERIVED CAPABILITY OF THIS PerformPromiseThen, which is
-       what stops either reaction from having to CALL it. js_promise_then_native made a throwaway capability
-       instead, so both reactions settled the import by JS_Call — and that is the whole reason this pair had a
-       rejection wrapper and a resolve call in it. Handed the real capability, the fulfilment reaction settles by
-       RETURNING (phase 1 of its own flow) and the rejection needs no reaction at all: 27.2.5.4.1 says a missing
-       onRejected RETHROWS, and perform_promise_then's no-handler path forwards the reason to
-       resolving_funcs[1] through js_settle_as_flow — a call root a subclass's reject can park inside.
-       func_data is therefore the MODULE ALONE: the reaction stopped holding the capability when it stopped
-       calling it. */
-    func_obj = JS_NewModuleValue(ctx, m);
-    evaluate_resolving_funcs[0] = JS_NewCFunctionData(ctx, js_load_module_fulfilled, 0, 0, 1, vc(&func_obj));
-    evaluate_resolving_funcs[1] = JS_UNDEFINED;
-    CHECK(!JS_IsException(evaluate_resolving_funcs[0]),
-          "a module evaluation could not build its continuation — the module would evaluate and reach nobody");
-    JS_FreeValue(ctx, func_obj);
-    CHECK(perform_promise_then(ctx, cap, vc(evaluate_resolving_funcs), resolving_funcs) == 0,
-          "a module evaluation's continuation could not be attached — the import would never settle");
-    JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
-    JS_FreeValue(ctx, cap);
-
-    ret_val = js_evaluate_module(ctx, m);
-    /* The capability exists, so the only failure js_evaluate_module can still report is the one that creates it;
-       every evaluation error settles that capability instead, which is what the reactions above are for. */
-    DCHECK(!JS_IsException(ret_val), "module evaluation threw after its capability existed — an evaluation error "
-                                     "settles the capability, it does not throw past it");
-    JS_FreeValue(ctx, ret_val);
-    return 0;
+    r = js_module_link_advance(ctx, &op->walk, &pm);
+    if (r < 0)
+        return -1;
+    if (r == MODLINK_DONE)
+        return 0;
+    if (r == MODLINK_PROLOGUE) {
+        DCHECK(pm != NULL, "the link walk asked for a prologue and named no module to run it for");
+        DCHECK(JS_VALUE_GET_TAG(pm->func_obj) == JS_TAG_OBJECT,
+               "16.2.1.7.3.1: a Source Text Module Record reached its declaration instantiation with no body "
+               "object — js_create_module_function builds one for every module of the graph before the link");
+        /* `this === true` is what selects the prologue: the compiler emits `OP_push_this; OP_if_false <body>`
+           at the head of a module body, so the true arm performs the declaration instantiation and returns
+           while the false arm is the module's own code, which 16.2.1.6.1.3 Evaluate ( ) enters later. */
+        r = step_call_run(ctx, &op->phase, STEP_CB(op->cb), pm->func_obj, JS_TRUE, 0, NULL,
+                          JS_UNDEFINED, &op->res, out_cb, out_argc);
+        DCHECK(r == JS_STEP_CALL,
+               "a module prologue's CALL request answered something other than a call — its cursor was already "
+               "in flight, so the answer to the OLD request is about to be collected as this one's");
+        return r;
+    }
+    DCHECK(r == MODLINK_MORE, "js_module_link_advance answered a code it does not define");
+    /* A REST WITH NOTHING TO RUN, and it is offered rather than skipped: the graph is the PAGE'S SIZE, so a
+       walk that never yields runs to completion inside one opcode however flat its frames are. */
+    return JS_STEP_YIELD;
 }
 
-/* `import()`'s continuation once its graph is loaded. func_data = [resolve, reject, module] — the shape
-   js_load_module_then builds for every on_loaded.
-   A LINK OR CAPABILITY FAILURE IS THIS REACTION'S OWN THROW. It used to be a JS_Call on the import's reject made
-   from inside this C activation; as a completion it becomes phase 1 of the very flow this handler is running on,
-   so a subclass's reject — or the native one's step machine — has a base to park in. The NORMAL return stays
-   JS_UNDEFINED and settles nothing, which is why the derived capability js_load_module_then registers has an
-   UNDEFINED resolve: the import's settlement belongs to the evaluation promise js_load_module_evaluate just
-   attached to, not to the graph having loaded. */
-static JSValue js_module_loaded_import(JSContext *ctx, JSValueConst this_val,
-                                       int argc, JSValueConst *argv, int magic,
-                                       JSValueConst *func_data)
+static void step_module_link_visit(JSContext *ctx, JSModuleLinkOp *op, JSStepVisit *v)
 {
-    DCHECK(JS_VALUE_GET_TAG(func_data[2]) == JS_TAG_MODULE,
-           "a load continuation was handed something that is not the module record it loaded");
-    if (js_load_module_evaluate(ctx, JS_VALUE_GET_PTR(func_data[2]), func_data) < 0)
-        return JS_EXCEPTION;
+    int k;
+    for (k = 0; k < 2; k++)
+        v->val(ctx, &op->cb[k]);
+    v->val(ctx, &op->res);
+    v->buf(ctx, (void **)&op->walk.frames, (size_t)op->walk.cap * sizeof(*op->walk.frames));
+}
+
+/* WHY A HALF-FINISHED LINK MAY NOT BE FORKED (JSTrampStepDef.unforkable). Everything the walk's cursor names is
+   the REALM'S and not this flow's: a Module Record's [[Status]] and [[DFSAncestorIndex]] live in a JSModuleDef,
+   which no COW delta captures, and 16.2.1.6.1.2 step 2's own `stack` is threaded through those same records.
+   Two arms resuming one walk would each run 16.2.1.7.3.1 over the same records — every import binding's var_ref
+   counted twice, every module of the component set to linked twice — and the second arm's frames would name a
+   path the first has already popped. It is not "no page code runs here": a park inside a prologue is exactly
+   what this machine exists to allow, and RAM pressure and a cold-tier resume never ask what the page is doing.
+   The trajectory to zero is a cow_capture_host_record over the module graph, and nothing else. */
+static const char *js_module_loaded_unforkable(const void *state);
+
+typedef struct JSModuleLoaded {
+    JSStepHdr hdr;          /* MUST be first. The closure's data is [resolve, reject, module]. */
+    JSModuleLinkOp op;      /* 16.2.1.6.1.2 Link ( ) */
+    JSValue cap;            /* 16.2.1.6.1.3 Evaluate ( )'s promise, held across the settle that adopts it */
+    JSValue settle_cb[3];   /* the load's own resolve CALL: [this, resolve, cap] */
+    JSValue settle_res;
+    uint8_t settle_phase;
+} JSModuleLoaded;
+_Static_assert(offsetof(JSModuleLoaded, hdr) == 0, "JSStepHdr must be first in JSModuleLoaded");
+
+static const char *js_module_loaded_unforkable(const void *state)
+{
+    const JSModuleLoaded *s = state;
+    if (s->op.walk.depth == 0 && s->op.walk.stack_top == NULL)
+        return NULL;
+    return "a half-finished 16.2.1.6.1.2 Link ( ). Its cursor names Module Records whose [[Status]] and "
+           "[[DFSAncestorIndex]] belong to the REALM, and step 2's own stack is threaded through those "
+           "records, so two arms would each run 16.2.1.7.3.1 InitializeEnvironment over the same graph — "
+           "every import binding's var_ref counted twice. The module records need a cow_capture_host_record";
+}
+
+static void js_module_loaded_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSModuleLoaded *s = st;
+    int k;
+    step_module_link_visit(ctx, &s->op, v);
+    v->val(ctx, &s->cap);
+    v->val(ctx, &s->settle_res);
+    for (k = 0; k < 3; k++)
+        v->val(ctx, &s->settle_cb[k]);
+}
+
+/* THE COMPLETION IS ALWAYS undefined — both continuations settle by REGISTERING on the evaluation promise, never
+   by returning a value — so all this states is 16.2.1.6.1.2 step 4, which now covers the ABANDON as well as the
+   throw: a flow dropped while parked inside a link would otherwise leave every module of its path at LINKING
+   for ever, and 16.2.1.6.1.2.1 step 2 reads that as "already done". */
+static JSValue js_module_loaded_fini(JSContext *ctx, void *st, bool take_result)
+{
+    JSModuleLoaded *s = st;
+    (void)ctx; (void)take_result;
+    js_module_link_walk_end(&s->op.walk);
     return JS_UNDEFINED;
 }
+
+/* 13.3.10.3 ContinueDynamicImport step 8's linkAndEvaluateClosure, run once the graph is LOADED (step 12's
+   PerformPromiseThen puts it there): Link, take the evaluation promise, register step 8.e's onFulfilled on it,
+   and Evaluate. The closure's data is [resolve, reject, module] — the shape js_load_module_then builds.
+   A LINK OR CAPABILITY FAILURE IS THIS MACHINE'S OWN THROW, delivered to the import's reject as phase 1 of the
+   flow it runs on, which is what step 8.b's `Call(promiseCapability.[[Reject]], …)` is here. The NORMAL
+   completion is undefined and settles nothing: the import's settlement belongs to the evaluation promise this
+   just attached to, not to the graph having loaded. */
+#define MODIMP_STAGES(X) \
+    X(MODIMP_LINK,     "13.3.10.3 step 8.a (link is Completion(module.Link())) — 16.2.1.6.1.2 step 3's " \
+                       "InnerModuleLinking, resting once per module of the graph because each one's " \
+                       "16.2.1.7.3.1 declaration instantiation is a CALL of that module's own body") \
+    X(MODIMP_EVALUATE, "13.3.10.3 steps 8.c-8.f (evaluatePromise is module.Evaluate(); " \
+                       "PerformPromiseThen(evaluatePromise, onFulfilled, onRejected))")
+enum { MODIMP_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_module_loaded_import_steps[] = { MODIMP_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
+static int js_module_loaded_import_step(JSContext *ctx, void *st, JSValue cb_result,
+                                        JSValue **out_cb, int *out_argc)
+{
+    JSModuleLoaded *s = st;
+    JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
+    JSModuleDef *m;
+    JSValue cap, ret_val, func_obj, evaluate_resolving_funcs[2];
+    int r;
+
+    DCHECK(JS_VALUE_GET_TAG(rec->data[2]) == JS_TAG_MODULE,
+           "a load continuation was handed something that is not the module record it loaded");
+    m = JS_VALUE_GET_PTR(rec->data[2]);
+
+    STEP_DISPATCH(MODIMP_STAGES, s->hdr.stage, s->hdr.def->algorithm, JS_STEP_ABRUPT);
+
+    STEP_ARM(MODIMP_LINK);
+        if (!s->op.started) {
+            s->cap = JS_UNDEFINED;
+            s->settle_res = JS_UNDEFINED;
+            s->settle_cb[0] = s->settle_cb[1] = s->settle_cb[2] = JS_UNDEFINED;
+            s->settle_phase = 0;
+        }
+        r = step_module_link_run(ctx, &s->op, m, cb_result, out_cb, out_argc);
+        if (r)
+            return r < 0 ? JS_STEP_ABRUPT : r;
+        STEP_GOTO(s->hdr.stage, MODIMP_EVALUATE, &s->op.phase, NULL);
+        return JS_STEP_YIELD;
+
+    STEP_ARM(MODIMP_EVALUATE);
+        JS_FreeValue(ctx, cb_result);
+        /* THE CAPABILITY BEFORE EVALUATING, and step 8.f's PerformPromiseThen before it too — spelled as the
+           three operations rather than as JS_EvalFunction precisely so the registration lands between the
+           second and the third. The module body can FORK; a sibling forked mid-body inherits the world as it
+           was at the branch, and this continuation has to already be on the capability in that world or the
+           importing `.then(m => …)` never runs there. */
+        cap = js_module_eval_capability(ctx, m);
+        if (JS_IsException(cap))
+            return JS_STEP_ABRUPT;
+
+        /* THE IMPORT'S CAPABILITY IS THE DERIVED CAPABILITY OF THIS PerformPromiseThen, which is what stops
+           either reaction from having to CALL it. js_promise_then_native made a throwaway capability instead,
+           so both reactions settled the import by JS_Call — and that is the whole reason this pair had a
+           rejection wrapper and a resolve call in it. Handed the real capability, step 8.e's onFulfilled
+           settles by RETURNING (phase 1 of its own flow) and step 4's onRejected needs no reaction at all:
+           27.5.5.4.1 PerformPromiseThen leaves a missing onRejected's handler EMPTY and 27.5.2.1
+           NewPromiseReactionJob rethrows the reason, and perform_promise_then's no-handler path forwards
+           the reason to rec->data[1] through js_settle_as_flow — a call root a subclass's reject can park
+           inside. func_data is therefore the MODULE ALONE: the reaction stopped holding the capability when it
+           stopped calling it. */
+        func_obj = JS_NewModuleValue(ctx, m);
+        evaluate_resolving_funcs[0] = JS_NewCFunctionData(ctx, js_load_module_fulfilled, 0, 0, 1, vc(&func_obj));
+        evaluate_resolving_funcs[1] = JS_UNDEFINED;
+        CHECK(!JS_IsException(evaluate_resolving_funcs[0]),
+              "a module evaluation could not build its continuation — the module would evaluate and reach nobody");
+        JS_FreeValue(ctx, func_obj);
+        CHECK(perform_promise_then(ctx, cap, vc(evaluate_resolving_funcs), vc(rec->data)) == 0,
+              "a module evaluation's continuation could not be attached — the import would never settle");
+        JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
+        JS_FreeValue(ctx, cap);
+
+        ret_val = js_evaluate_module(ctx, m);
+        /* The capability exists, so the only failure js_evaluate_module can still report is the one that
+           creates it; every evaluation error settles that capability instead, which is what the reactions
+           above are for. */
+        DCHECK(!JS_IsException(ret_val), "module evaluation threw after its capability existed — an evaluation "
+                                         "error settles the capability, it does not throw past it");
+        JS_FreeValue(ctx, ret_val);
+        return JS_STEP_DONE;
+}
+
+static const JSTrampStepDef js_module_loaded_import_def = {
+    sizeof(JSModuleLoaded), js_module_loaded_import_step, js_module_loaded_fini, 0,
+    .visit = js_module_loaded_visit,
+    .algorithm = "13.3.10.3 ContinueDynamicImport step 8 linkAndEvaluateClosure",
+    .steps = js_module_loaded_import_steps,
+    .unforkable = js_module_loaded_unforkable
+};
 
 /* The source arrived. func_data = [resolve, reject, module_name]; argv[0] is the module's SOURCE TEXT. Compiling
    it here registers the record under that name, so a second import of the same specifier finds it loaded and
@@ -61303,7 +61521,7 @@ static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
     m = js_find_loaded_module(ctx, name_atom);
     JS_FreeAtom(ctx, name_atom);
     if (m) {
-        if (js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import) < 0)
+        if (js_load_module_then(ctx, m, resolving_funcs, &js_module_loaded_import_def) < 0)
             return JS_EXCEPTION;
         return JS_UNDEFINED;
     }
@@ -61330,7 +61548,7 @@ static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
     /* COMPILING IS NOT LOADING. The record this just parsed has its own `import`s and an EMPTY [[LoadedModules]]
        (16.2.1.7.1), so what follows the compile is the load of ITS graph — not the link. That is the whole
        difference between the phase order this file used to have and the one the spec states. */
-    if (js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import) < 0)
+    if (js_load_module_then(ctx, m, resolving_funcs, &js_module_loaded_import_def) < 0)
         return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
@@ -61838,8 +62056,15 @@ static JSValue js_module_load_requested(JSContext *ctx, JSModuleDef *m)
                 fire the instant the graph loaded and resolve `import()` with undefined instead of the namespace.
                 27.2.2.1 drops the completion when the half is undefined, which is exactly the old behaviour of
                 the throwaway capability js_promise_then_native used to make — minus the promise nobody held. */
+/* `on_loaded` IS A STEP MACHINE, NEVER A C BODY, and that is a property of what it has to do rather than of
+   how it happens to be written: both continuations LINK the graph, linking enters each module's own body to
+   perform 16.2.1.7.3.1's declaration instantiation, and a flow can be asked for the thread inside one. A C
+   reaction body has nowhere to hold the walk across that suspension; a machine's state is exactly where it
+   goes. js_new_step_closure builds the bodyless closure — captured data plus the machine — that a reaction
+   with work only a machine may do has to be. */
 static __exception int js_load_module_then(JSContext *ctx, JSModuleDef *m,
-                                           JSValueConst *resolving_funcs, JSCFunctionData *on_loaded)
+                                           JSValueConst *resolving_funcs,
+                                           const JSTrampStepDef *on_loaded)
 {
     JSValue loading, mv, reactions[2];
     JSValueConst func_data[3], cap[2];
@@ -61851,7 +62076,7 @@ static __exception int js_load_module_then(JSContext *ctx, JSModuleDef *m,
     func_data[0] = resolving_funcs[0];
     func_data[1] = resolving_funcs[1];
     func_data[2] = mv;
-    reactions[0] = JS_NewCFunctionData(ctx, on_loaded, 0, 0, 3, func_data);
+    reactions[0] = js_new_step_closure(ctx, on_loaded, 0, 0, 3, func_data);
     reactions[1] = JS_UNDEFINED;
     CHECK(!JS_IsException(reactions[0]),
           "a module graph load could not build its continuation — the graph would load and reach nobody");
@@ -61865,43 +62090,104 @@ static __exception int js_load_module_then(JSContext *ctx, JSModuleDef *m,
     return 0;
 }
 
-/* HTML §8.1.3.3 "run a module script", once the graph is loaded: Link it, Evaluate it, and settle this
-   promise exactly as the module's OWN evaluation promise settles — Evaluate() returns a promise for undefined,
-   not for the namespace, which is the whole difference between this tail and `import()`'s.
-   A LINK OR CAPABILITY FAILURE IS THIS REACTION'S OWN THROW, delivered to resolving_funcs[1] as phase 1 of this
-   flow — see the note where js_load_module_reject_pending used to stand. */
-static JSValue js_module_loaded_run(JSContext *ctx, JSValueConst this_val,
-                                    int argc, JSValueConst *argv, int magic,
-                                    JSValueConst *func_data)
-{
-    JSValueConst *resolving_funcs = func_data;
-    JSModuleDef *m;
-    JSValue cap, ret, ev;
+/* THE EMBEDDER'S "run a module script", once the graph is loaded: 16.2.1.6.1.2 Link ( ), then
+   16.2.1.6.1.3 Evaluate ( ), and this load's own capability is settled with the promise Evaluate returns — a
+   promise for undefined, not for the namespace, which is the whole difference between this tail and
+   13.3.10.3's. The closure's data is [resolve, reject, module].
+   ITS CITATION USED TO BE HTML §8.1.3.3 "run a module script" AND WAS WRONG TWICE. That algorithm is in
+   §8.1.4.4 Calling scripts (§8.1.3.3 is a fetch clause), and it does not link at all — it Evaluates a record
+   the graph fetch has already linked. This entry is quickjs's own embedder path, so what it performs is the
+   two ECMAScript concrete methods and it says so.
+   A LINK OR CAPABILITY FAILURE IS THIS MACHINE'S OWN THROW, delivered to the load's reject as phase 1 of the
+   flow it runs on — see the note where js_load_module_reject_pending used to stand. */
+#define MODRUN_STAGES(X) \
+    X(MODRUN_LINK,     "16.2.1.6.1.2 Link ( ) step 3 (InnerModuleLinking), resting once per module of the " \
+                       "graph because each one's 16.2.1.7.3.1 declaration instantiation is a CALL of that " \
+                       "module's own body") \
+    X(MODRUN_SETTLE,   "the embedder's own load capability is RESOLVED with 16.2.1.6.1.3 Evaluate ( )'s " \
+                       "promise. A CALL, because that resolving function is 27.5.1.3 CreateResolvingFunctions " \
+                       "( toResolve )'s for the intrinsic capability and the page's own for a subclassed one") \
+    X(MODRUN_EVALUATE, "16.2.1.6.1.3 Evaluate ( )")
+enum { MODRUN_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_module_loaded_run_steps[] = { MODRUN_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
-    DCHECK(JS_VALUE_GET_TAG(func_data[2]) == JS_TAG_MODULE,
+static int js_module_loaded_run_step(JSContext *ctx, void *st, JSValue cb_result,
+                                     JSValue **out_cb, int *out_argc)
+{
+    JSModuleLoaded *s = st;
+    JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(s->hdr.func_obj)->u.c_function_data_record;
+    JSModuleDef *m;
+    JSValue ev;
+    int r;
+
+    DCHECK(JS_VALUE_GET_TAG(rec->data[2]) == JS_TAG_MODULE,
            "a load continuation was handed something that is not the module record it loaded");
-    m = JS_VALUE_GET_PTR(func_data[2]);
-    if (js_create_module_function(ctx, m) < 0)
-        return JS_EXCEPTION;
-    if (js_link_module(ctx, m) < 0)
-        return JS_EXCEPTION;
-    /* The capability BEFORE evaluating, and this promise adopts it BEFORE evaluating too — same ordering and
-       the same reason as js_load_module_evaluate: the body can FORK, and a sibling forked mid-body has to find
-       this continuation already registered in the world it inherits. */
-    cap = js_module_eval_capability(ctx, m);
-    if (JS_IsException(cap))
-        return JS_EXCEPTION;
-    ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, vc(&cap));
-    JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, cap);
-    ev = js_evaluate_module(ctx, m);
-    /* The capability exists, so the only failure js_evaluate_module can still report is the one that creates it;
-       every evaluation error settles that capability instead. */
-    DCHECK(!JS_IsException(ev), "module evaluation threw after its capability existed — an evaluation error "
-                                "settles the capability, it does not throw past it");
-    JS_FreeValue(ctx, ev);
-    return JS_UNDEFINED;
+    m = JS_VALUE_GET_PTR(rec->data[2]);
+
+    STEP_DISPATCH(MODRUN_STAGES, s->hdr.stage, s->hdr.def->algorithm, JS_STEP_ABRUPT);
+
+    STEP_ARM(MODRUN_LINK);
+        if (!s->op.started) {
+            s->cap = JS_UNDEFINED;
+            s->settle_res = JS_UNDEFINED;
+            s->settle_cb[0] = s->settle_cb[1] = s->settle_cb[2] = JS_UNDEFINED;
+            s->settle_phase = 0;
+        }
+        r = step_module_link_run(ctx, &s->op, m, cb_result, out_cb, out_argc);
+        if (r)
+            return r < 0 ? JS_STEP_ABRUPT : r;
+        /* THE CAPABILITY BEFORE EVALUATING, and this promise adopts it BEFORE evaluating too — the body can
+           FORK, and a sibling forked mid-body has to find this continuation already registered in the world
+           it inherits. */
+        s->cap = js_module_eval_capability(ctx, m);
+        if (JS_IsException(s->cap)) {
+            s->cap = JS_UNDEFINED;
+            return JS_STEP_ABRUPT;
+        }
+        STEP_GOTO(s->hdr.stage, MODRUN_SETTLE, &s->op.phase, NULL);
+        /* NOT A REST POINT: 27.5.1.5 NewPromiseCapability ( ctor ) over the INTRINSIC Promise is one O(1)
+           engine action and runs nothing (js_module_eval_capability passes no constructor). The SETTLE below is
+           a request because `resolve` is the CALLER's, not because the capability is. */
+        cb_result = JS_UNDEFINED;
+        STEP_JUMP(MODRUN_SETTLE);
+
+    STEP_ARM(MODRUN_SETTLE);
+        /* `resolve` IS PAGE CODE whenever this load's capability came from a promise SUBCLASS, and the native
+           one is a step machine — so it is a CALL request, not a JS_Call from C. As a JS_Call it was an
+           activation with no flow base under it, which is the drive-to-completion this engine aborts on the
+           moment anything in that resolving function loops, awaits or reads through a getter. */
+        {
+            JSValueConst arg = s->cap;
+            r = step_call_run(ctx, &s->settle_phase, STEP_CB(s->settle_cb), rec->data[0], JS_UNDEFINED,
+                              1, &arg, cb_result, &s->settle_res, out_cb, out_argc);
+            if (r)
+                return r < 0 ? JS_STEP_ABRUPT : r;
+        }
+        JS_FreeValue(ctx, s->settle_res);
+        s->settle_res = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cap);
+        s->cap = JS_UNDEFINED;
+        STEP_GOTO(s->hdr.stage, MODRUN_EVALUATE, &s->settle_phase, &s->op.phase, NULL);
+        return JS_STEP_YIELD;
+
+    STEP_ARM(MODRUN_EVALUATE);
+        JS_FreeValue(ctx, cb_result);
+        ev = js_evaluate_module(ctx, m);
+        /* The capability exists, so the only failure js_evaluate_module can still report is the one that
+           creates it; every evaluation error settles that capability instead. */
+        DCHECK(!JS_IsException(ev), "module evaluation threw after its capability existed — an evaluation error "
+                                    "settles the capability, it does not throw past it");
+        JS_FreeValue(ctx, ev);
+        return JS_STEP_DONE;
 }
+
+static const JSTrampStepDef js_module_loaded_run_def = {
+    sizeof(JSModuleLoaded), js_module_loaded_run_step, js_module_loaded_fini, 0,
+    .visit = js_module_loaded_visit,
+    .algorithm = "the embedder's run-a-module-script tail: 16.2.1.6.1.2 Link ( ) then 16.2.1.6.1.3 Evaluate ( )",
+    .steps = js_module_loaded_run_steps,
+    .unforkable = js_module_loaded_unforkable
+};
 
 static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
                                   const char *filename,
@@ -61916,7 +62202,7 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     if (m) {
         /* AN EMBEDDER ENTRY, so a failure has no flow to be the completion of: both callers are plain C
            (JS_LoadModule, and js_dynamic_import_job, which is a job the pump runs directly). */
-        if (js_load_module_then(ctx, m, resolving_funcs, js_module_loaded_import) < 0)
+        if (js_load_module_then(ctx, m, resolving_funcs, &js_module_loaded_import_def) < 0)
             js_load_module_reject_at_entry(ctx, resolving_funcs);
         return;
     }
@@ -68145,8 +68431,11 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
         DFAIL("JS_EvalFunctionInternal ran a program body from C — route it onto the tramp chain");
         return JS_ThrowTypeError(ctx, "eval");
     } else if (tag == JS_TAG_MODULE) {
-        /* HTML §8.1.3.3 "run a module script", ALL THREE PHASES IN THE SPEC'S ORDER. This used to link and
-           evaluate directly, which was only ever correct because the compile had already loaded the graph
+        /* THE EMBEDDER'S RUN-A-MODULE-SCRIPT, ALL THREE PHASES IN THE SPEC'S ORDER: 16.2.1.6.1.1
+           LoadRequestedModules, then 16.2.1.6.1.2 Link ( ), then 16.2.1.6.1.3 Evaluate ( ). It used to cite
+           HTML §8.1.3.3 "run a module script" and that was wrong twice — the algorithm is in §8.1.4.4 Calling
+           scripts, and it does not link at all: it Evaluates a record the graph fetch has already linked.
+           This used to link and evaluate directly, which was only ever correct because the compile had already loaded the graph
            behind the parser's back; with 16.2.1.7.1 doing what it says, the graph arrives here EMPTY and the
            load is the first thing that has to happen. Loading is asynchronous, so the result is a PROMISE that
            settles as the module's own evaluation promise settles, and the embedder must pump jobs for it —
@@ -68160,7 +68449,7 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
             return JS_EXCEPTION;
         /* AN EMBEDDER ENTRY: JS_EvalFunction is called from C with nothing under it, so a failure of the load
            has no flow whose completion it could be and the settle has to build its own call root. */
-        if (js_load_module_then(ctx, m, vc(resolving_funcs), js_module_loaded_run) < 0)
+        if (js_load_module_then(ctx, m, vc(resolving_funcs), &js_module_loaded_run_def) < 0)
             js_load_module_reject_at_entry(ctx, vc(resolving_funcs));
         JS_FreeValue(ctx, resolving_funcs[0]);
         JS_FreeValue(ctx, resolving_funcs[1]);
@@ -101330,9 +101619,9 @@ static int reaction_call_flow_init(JSContext *ctx, JSAsyncFunctionState *fs, JSV
     sf->is_strict_mode = false;
     sf->is_constructor = false;
     sf->is_call_root = true;   /* no bytecode of its own runs here: the handler's activation is a frame ON TOP */
-    /* NO COLLECTABLE OWNER, AND THIS IS THE ONE BASE THAT MUST SAY SO OUT LOUD: its memory is genuinely not
-       zeroed (js_call_flow_complete's base lives on the C STACK) and it is re-initialised over a used one, so an
-       unwritten field here is whatever the last flow left. A call root runs no bytecode of its own and declares
+    /* NO COLLECTABLE OWNER, AND THIS IS THE ONE BASE THAT MUST SAY SO OUT LOUD: it is RE-INITIALISED OVER A
+       USED ONE (a reaction's phase 1), so an unwritten field here is whatever the last flow left rather than an
+       allocator's zero. A call root runs no bytecode of its own and declares
        var_ref_count 0, so it mints no cells either way — but a frame whose owner is garbage is a frame that
        would hand the next mint a pointer to nothing. See JSStackFrame.cur_gc_obj. */
     sf->cur_gc_obj = NULL;
