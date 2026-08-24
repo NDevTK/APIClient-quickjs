@@ -6351,12 +6351,30 @@ JSValue JS_NewAtomString(JSContext *ctx, const char *str)
     return val;
 }
 
+#if APICLIENT_DEV
+/* THE PAGE'S FRAMES, RENDERED — defined with the other `@WHY` helpers beside JS_ToPrimitiveFree and DECLARED
+   HERE because this is the FIRST boundary that needs them. An arrival this boundary cannot answer is
+   identified by exactly two facts and neither substitutes for the other: the CONSUMER's own file:line, which
+   only this function has (the macro captured it), and the PAGE's call into that consumer, which only a
+   backtrace has. */
+static void js_why_backtrace(JSContext *ctx, char *dst, size_t n);
+#endif
+
 /* THE ONE CONVERGENCE POINT OF EVERY BYTE CONSUMER IN THE ENGINE AND THE HOST — JS_ToCStringLen2At and
    JS_ToCStringLenUTF16At are the only two callers, and every spelling a call site can write (JS_ToCString,
    JS_ToCStringLen, JS_ToCStringLen2, JS_ToCStringUTF16, JS_ToCStringLenUTF16) is a macro over one of them.
    That is why the UNKNOWN-EXTERNAL-INPUT assertion belongs HERE rather than at the call sites: it is asked
    once, no per-site `if` exists to be forgotten by the next edge that needs bytes, and a new byte consumer
    cannot be written that skips it.
+   THERE ARE TWO ARRIVALS THIS BOUNDARY CANNOT ANSWER, NOT ONE, AND THEY ARE THE SAME DEFECT WEARING TWO
+   VALUES. ECMAScript §7.1.19 ToString ( arg ) step 9 asserts what is left is an Object and step 10 hands it to
+   §7.1.1 ToPrimitive ( input [ , preferredType ] ), which for a CONCOLIC returns it unchanged and for a REAL
+   object runs the page's own code — so neither can produce the `const char *` this function owes C. Only the
+   concolic one was asserted here, and the object one therefore died one frame LATER, in JS_ToPrimitiveFree,
+   which can name the value's CLASS and the page's frame and cannot name the EDGE that asked: the reader is
+   then standing at a conversion with no way to tell a DOM member that skipped its own IDL conversion from a
+   solver observer asking for bytes an algorithm never produced. Both arrivals are asserted here now, and both
+   messages carry the consumer's file:line in their FIRST sentence for the reason the concolic one already did.
    `file`/`line` are the CONSUMER's, captured by the macro — see the contract above the declarations in
    quickjs.h for why the operand cannot supply them. */
 static JSValue js_force_tostring(JSContext *ctx, JSValueConst val1, const char *file, int line)
@@ -6414,6 +6432,49 @@ static JSValue js_force_tostring(JSContext *ctx, JSValueConst val1, const char *
                  shape ? shape : "(a shape this engine could not spell)", file ? file : "(no call site)", line);
         if (shape) JS_FreeCString(ctx, shape);
         JS_FreeValue(ctx, sv);
+        DFAIL(why);
+    }
+    /* THE OTHER ARRIVAL, ASSERTED AT THE SAME ORIGIN. A REAL object here reaches §7.1.19 ToString ( arg ) step
+       10's §7.1.1 ToPrimitive ( input [ , preferredType ] ), whose step 1.a is GetMethod(input,
+       %Symbol.toPrimitive%) and whose §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3 does Get(obj, name)
+       then Call(method, obj) — the PAGE's code, from a C activation with no flow base under it. That is the
+       arrival JS_ToPrimitiveFree already refuses, so this changes NOTHING about which programs abort: it moves
+       the abort one frame earlier, to the only frame that knows WHICH EDGE asked. The class is carried too,
+       because it is what tells a Date reaching an unconverted operator from a plain object handed to a DOM
+       member, and the page's frames are carried because the consuming C line and the page line that reached it
+       are two different addresses and a fix needs both.
+       THE ORDER MATTERS: a concolic IS an object, so its own arm above answers first — the two are different
+       defects with different fixes and collapsing them would send every unknown-input report to this text. */
+    if (unlikely(JS_VALUE_GET_TAG(val1) == JS_TAG_OBJECT)) {
+        /* SIZED FOR THE WHOLE MESSAGE — the prose is ~1150 bytes, the class name is capped by
+           ATOM_GET_STR_BUF_SIZE, and the rest is the CONSUMER'S PATH and the PAGE'S FRAMES, the two fields
+           whose length this file does not control. */
+        char why[4096];
+        char frames[2048];
+        char cbuf[ATOM_GET_STR_BUF_SIZE];
+        const char *cname;
+
+        cname = JS_AtomGetStr(ctx, cbuf, sizeof(cbuf),
+                              ctx->rt->class_array[JS_VALUE_GET_OBJ(val1)->class_id].class_name);
+        js_why_backtrace(ctx, frames, sizeof frames);
+        snprintf(why, sizeof why,
+                 "ToString over a REAL OBJECT (class `%.40s`), asked for by the BYTE CONSUMER at %s:%d. That "
+                 "call wants BYTES, and §7.1.19 ToString ( arg ) steps 9-10 send an Object to §7.1.1 "
+                 "ToPrimitive ( input [ , preferredType ] ), whose step 1.a is GetMethod(input, "
+                 "%%Symbol.toPrimitive%%) and whose §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3 CALLS the "
+                 "page's valueOf/toString — page code from a C activation with no flow base under it, which is "
+                 "a capability this engine does not have rather than a case to handle. FIX IT AT THAT "
+                 "FILE:LINE, not here. ASK FIRST WHETHER THE SITE SHOULD BE ASKING AT ALL: a DOM member's "
+                 "argument is already a DOMString by its own IDL declaration (the declaration converts it on "
+                 "the trampoline, and the body reads a String), and an algorithm whose own step returns a "
+                 "non-String unevaluated has produced no bytes for anyone to observe — in both shapes the "
+                 "conversion is not owed and the site states the positive fact instead. If the site GENUINELY "
+                 "needs the primitive, ROUTE IT: a builtin declares PRIMARGS(mask, hint, nargs) at its "
+                 "JSTrampStepDef so js_primargs_step coerces the argument as a TOPRIMITIVE step; an operator "
+                 "asks js_toprim_operand and goes to do_toprim_tramp with a tp_resume_at of its own; a step "
+                 "machine already on the chain sets tp_outer/tp_value and takes the primitive as its next "
+                 "step's result. The page's call into this consumer: %s",
+                 cname ? cname : "(unnamed class)", file ? file : "(no call site)", line, frames);
         DFAIL(why);
     }
 #endif
@@ -15262,7 +15323,16 @@ static void js_why_backtrace(JSContext *ctx, char *dst, size_t n)
    reading @@toPrimitive off it would get a DERIVED concolic back and call it, throwing "toPrimitive is not a
    function" inside an expression the page never wrote.
    A real object reaching here is a call site that runs user code from C with no flow base under it, which is a
-   capability that does not exist rather than a case to handle: route it to the trampoline. */
+   capability that does not exist rather than a case to handle: route it to the trampoline.
+   A BYTE CONSUMER CANNOT REACH THIS LINE ANY MORE, and that is why the message below no longer offers "a host
+   component that only wants BYTES asks for them at its own edge" as one of its remedies. js_force_tostring —
+   the single point JS_ToCStringLen2At and JS_ToCStringLenUTF16At both converge on, and therefore the point
+   every JS_ToCString spelling in the engine and the host converges on — asserts the object arrival one frame
+   EARLIER and names the consumer's own file:line, which it can do because the macro captured it and this
+   function cannot. The reader has no stack (a real page reports the message and nothing else), so a boundary
+   that can only name the VALUE sends them to search every edge that could have taken it. What still arrives
+   HERE is the other half: a JS_ToString, a JS_ToPropertyKey or a JS_ValueToAtom called straight from C by an
+   OPERATOR or a builtin that has not been routed. */
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
 {
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
@@ -15289,15 +15359,18 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
                               ctx->rt->class_array[JS_VALUE_GET_OBJ(val)->class_id].class_name);
         js_why_backtrace(ctx, frames, sizeof frames);
         snprintf(why, sizeof why,
-                 "7.1.1 ToPrimitive reached with a REAL object (class `%.40s`, hint %s) from a C activation "
-                 "with no flow base under it. 7.1.1 step 2.a is GetMethod(input, @@toPrimitive) and 7.1.1.1 "
-                 "OrdinaryToPrimitive step 3 CALLS the page's valueOf/toString, so this is not a conversion "
-                 "the boundary can perform — the C-drives-JS body was DELETED, not left behind an assert. "
-                 "ROUTE THE CALL SITE to the trampoline: a builtin declares PRIMARGS(mask, hint, nargs) at its "
-                 "JSTrampStepDef so js_primargs_step coerces the argument as a TOPRIMITIVE step; an operator "
-                 "asks js_toprim_operand and goes to do_toprim_tramp with a tp_resume_at of its own; a step "
-                 "machine already on the chain sets tp_outer/tp_value and delivers the primitive as its next "
-                 "step's result. A host component that only wants BYTES asks for them at its own edge instead. "
+                 "§7.1.1 ToPrimitive ( input [ , preferredType ] ) reached with a REAL object (class `%.40s`, "
+                 "hint %s) from a C activation with no flow base under it. Its step 1.a is GetMethod(input, "
+                 "%%Symbol.toPrimitive%%) and §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3 CALLS the "
+                 "page's valueOf/toString, so this is not a conversion the boundary can perform — the "
+                 "C-drives-JS body was DELETED, not left behind an assert. ROUTE THE CALL SITE to the "
+                 "trampoline: a builtin declares PRIMARGS(mask, hint, nargs) at its JSTrampStepDef so "
+                 "js_primargs_step coerces the argument as a TOPRIMITIVE step; an operator asks "
+                 "js_toprim_operand and goes to do_toprim_tramp with a tp_resume_at of its own; a step machine "
+                 "already on the chain sets tp_outer/tp_value and delivers the primitive as its next step's "
+                 "result. A BYTE CONSUMER cannot be the culprit — every JS_ToCString spelling asserts one frame "
+                 "earlier at js_force_tostring, which names its file:line — so this is a JS_ToString, a "
+                 "JS_ToPropertyKey or a JS_ValueToAtom called straight from C. "
                  "The innermost frame here is the page's call into the site that has not been routed: %s",
                  cname ? cname : "(unnamed class)",
                  th == HINT_STRING ? "string" : th == HINT_NUMBER ? "number" : "default",
