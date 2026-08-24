@@ -45862,10 +45862,15 @@ static JSAsyncFunctionState *flow_clone_state_alloc(JSContext *ctx, JSAsyncFunct
     /* A CLONE IS BORN UNPARKED, and that is an absence with a reason rather than an oversight: the park record
        is NOT among the fields taken from `src`. The source may be parked — a fork at a branch inside a body
        whose continuation is already on the pump's queue is ordinary — and a park is one activation's one
-       resume point: run it twice and the second resume rebuilds a frame the first already freed. The sibling
-       reaches its own suspend point and parks then, on its own record. Every arm above allocates with
-       js_mallocz and an unparked base IS `park_fn == NULL` (see JSAsyncFunctionState), so there is nothing to
-       clear here. */
+       resume point: run it twice and the second resume rebuilds a frame the first already freed. Every arm
+       above allocates with js_mallocz and an unparked base IS `park_fn == NULL` (see JSAsyncFunctionState), so
+       there is nothing to clear here.
+       WHAT THE SIBLING DOES INSTEAD DEPENDS ON WHY IT WAS FORKED, and both answers are the same rule. A fork
+       of a RUNNING body reaches its own suspend point and parks then, on its own record. A fork of a flow that
+       is ALREADY suspended AT a park — the arm per answer of a cross-instance read a job made — has no later
+       suspend point to reach, so JS_CloneParkedFlows re-parks the clone on a record it writes from the
+       source's, through the site's own fork. Neither shares one record, which is the whole content of the
+       paragraph above; "a clone is never parked" is not, and reading it that way would delete that re-park. */
     return c;
 }
 
