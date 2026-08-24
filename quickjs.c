@@ -30039,11 +30039,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                               ? &((JSAsyncGeneratorData *)dtf->cont_state)->func_state
                                           : NULL;
                 JSStackFrame *dsf = dfs ? &dfs->frame : &dtf->sf;
-                JSObject *dp = JS_VALUE_GET_OBJ(dsf->cur_func);
+                JSObject *dp;
+                /* THE FRAME THIS RESUME IS ABOUT TO RUN IS THE FRAME IT SAYS IT IS — asked here because the
+                   arm fifteen lines below, which resumes the BASE's own body, already asks it, and the two are
+                   the same question about the same thing. This one reaches three levels deep (cur_func's
+                   object, that object's bytecode, that bytecode's realm) and then jumps to `restart:`, whose
+                   first act is `*pc++`, so everything wrong here surfaces as a fault inside the dispatch with
+                   nothing left to say which of the three was bad.
+                   A COROUTINE FRAME ON A PARKED CHAIN IS THE ONE THAT CAN GO STALE UNDER US: its storage
+                   belongs to a collectable activation, and the chain's reference to that activation is held by
+                   a TrampFrame, which no mark function walks. So the liveness of the activation is asserted
+                   FIRST and by its own flag, before anything reads through the frame embedded in it. */
+                DCHECK(dtf->async_data == NULL || dtf->async_data->is_active,
+                       "a parked chain is resuming an async activation that has already been torn down — its "
+                       "frame's buffers are freed and every interpreter register below is about to be built "
+                       "out of them, so the fault will land in the dispatch with nothing naming this");
+                DCHECK(JS_VALUE_GET_TAG(dsf->cur_func) == JS_TAG_OBJECT,
+                       "a parked chain's frame names no function object to resume into — cur_func is the one "
+                       "thing that says WHICH body this frame is an activation of, and a non-object there "
+                       "means the frame is not a frame any more");
+                dp = JS_VALUE_GET_OBJ(dsf->cur_func);
+                DCHECK(js_class_has_bytecode(dp->class_id),
+                       "a parked chain's frame resumed into a cur_func with no bytecode body — the same "
+                       "question the base-body arm below asks, and the answer is read three levels deep here "
+                       "before the first opcode dispatches");
                 s->tramp_top = NULL;
                 tf_top = dtf;
                 rt->current_stack_frame = dsf;
                 b = dp->u.func.function_bytecode; ctx = b->realm;
+                /* AND THE RESUME POINT IS INSIDE THE BODY IT NAMES. `restart:` dereferences pc immediately, so
+                   a pc from a stale or recycled frame is an indirect jump through whatever byte it lands on —
+                   the one corruption this function cannot report on its own behalf. The live end is bounded
+                   the same way and for the same reason: every register below is derived from it. */
+                DCHECK(dsf->cur_pc >= b->byte_code_buf && dsf->cur_pc < b->byte_code_buf + b->byte_code_len,
+                       "a parked chain's frame resumed at a pc outside the bytecode of the body it names — the "
+                       "dispatch is about to jump through it");
+                DCHECK(dfs == NULL || (dsf->cur_sp >= dsf->arg_buf && dsf->cur_sp <= TRAMP_SP_LIMIT(dsf)),
+                       "a parked coroutine frame's saved stack position is outside its own frame block — the "
+                       "operand stack the resumed body runs on would start outside the allocation that holds "
+                       "it, and async_func_free would later walk that range to free values");
                 local_buf = dfs ? dsf->arg_buf : dtf->local_buf;
                 arg_buf = dsf->arg_buf; var_buf = dsf->var_buf;
                 stack_buf = dsf->var_buf + b->var_count;
@@ -38839,6 +38873,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(JS_IsException(obj))) { js_async_generator_free(rt, s); goto exception; }
                 s->generator = JS_VALUE_GET_OBJ(obj);
                 JS_SetOpaqueInternal(obj, s);
+                /* …AND THE FRAME WITH IT — the same line js_async_generator_function_call carries and the same
+                   one the generator create above was missing, for the same reason and with the same cost. An
+                   async generator's prologue has run by OP_initial_yield too, so the adoption walk inside is
+                   load-bearing rather than defensive. This is the third and last of the coroutine creates that
+                   moved onto the chain; with it, every constructor of every coroutine kind records its owner
+                   and get_captured_cell's is_coro answer is a property of the coroutine rather than of which
+                   spelling created it. */
+                async_func_set_owner(rt, &s->func_state, &s->generator->header);
                 if (aseq_kind != CONT_NONE) {
                     /* requested BY A CALL: the async generator is that call's RESULT, so it goes to the ONE
                        delivery a returning bytecode callback uses — empty operand shape, because the create
@@ -39218,6 +39260,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JS_FreeValue(ctx, gfunc);
                 if (unlikely(JS_IsException(obj))) { free_generator_stack_rt(rt, s); js_free_rt(rt, s); goto exception; }
                 JS_SetOpaqueInternal(obj, s);   /* the object now owns the suspended generator state */
+                /* …AND THE FRAME WITH IT, RECORDED THE INSTANT THE OWNER EXISTS. The C entry this create
+                   replaced (js_call_generator_function) carries this same line with the same reasoning, and the
+                   on-chain create dropped it: a generator called from BYTECODE therefore ran its whole life
+                   with cur_gc_obj NULL, so every local it captured minted a cell that rooted nothing.
+                   get_captured_cell states the cost — an open cell's storage IS a slot in this frame, so
+                   without the root "the collector sees a cycle where there is a live coroutine, frees it, and
+                   the closure is left aliasing released memory", and the generator OBJECT is exactly such a
+                   collectable owner. The adoption walk inside is why this is not merely "the next mint will be
+                   right": a generator's PROLOGUE has already run by OP_initial_yield — parameter destructuring
+                   and default-value expressions are user code that can escape a closure — so cells predating
+                   this line exist and are adopted here. */
+                async_func_set_owner(rt, &s->func_state, &JS_VALUE_GET_OBJ(obj)->header);
                 if (gcall_cont_kind != CONT_NONE) {
                     /* requested BY A CALL: the generator is that call's RESULT, so it goes to the ONE delivery a
                        returning bytecode callback uses. The operand shape is EMPTY because the create already
