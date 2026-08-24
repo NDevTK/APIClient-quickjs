@@ -47909,7 +47909,11 @@ static void *js_async_resume_park_clone(JSContext *ctx, void *opaque, JSAsyncFun
    PUMP via a resume job, so the flow is suspended and resumed BY THE SCHEDULER — never self-resumed to
    completion (that would be the forbidden drive-to-completion). This is the first step of "every runtime job is
    a scheduler flow": the job queue drives the continuation, parking between slices. */
-static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData *s)
+/* `caller_resumes_park` is the CALLER'S PROMISE that if this body parks, the caller resumes it before anything
+   observable runs — see the assert below, which is the only thing that reads it. The pump makes that promise
+   because it IS the drain; module evaluation makes it because §16.2.1.6.1.3.4's walk drains on its next line.
+   A caller that cannot make it passes false and gets the crash naming what to route. */
+static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData *s, bool caller_resumes_park)
 {
     JSAsyncFunctionState *prev_base = g_flow_base_gen;
     JSValue func_ret, jv;
@@ -47949,12 +47953,33 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
            standing. The "next suspend point the outer frame takes" does not exist for the case that matters,
            because a body that never returns never reaches one. That is not a lossless yield, it is a
            non-parkable structure, which is the one thing §scheduler will not have at any depth. */
-        DCHECK(prev_base == NULL,
+        /* WHAT THE CONDITION IS, CORRECTED: it is not "is another activation live", it is "will anything
+           observable run before this park is resumed". Those are different questions and only the SECOND is
+           the invariant. `prev_base != NULL` was a proxy for it, and the proxy is wrong in the direction that
+           costs most — it fires on a sound path.
+           THE FILE HAS ALREADY LEARNED THIS ONCE, for this very invariant. JS_CallInternal's
+           `list_empty(&rt->parked_flows)` check used to sit at that function's door and was NARROWED to the
+           bytecode dispatch, because at the door "its condition is broader than the invariant": a JS_Call on a
+           C-function callee arrives there having run no page code and reordered nothing, and aborted anyway.
+           This assert re-introduced the broad form at a different site, and §16.2.1.6.1.3.4
+           AsyncModuleExecutionFulfilled is where it came back: that operation IS a promise reaction, it walks
+           GatherAvailableAncestors and executes each available module body inside itself, and the spec does not
+           continue the reaction until that body completes or reaches its own suspend. js_execute_async_module
+           reproduces exactly that — it runs the body and the VERY NEXT STATEMENT drains the pump — so nothing
+           observable runs between this park and its resume and the transparency the assert protects is intact.
+           SO THE CALLER DECLARES IT, because the caller is the only thing that can know. This is a contract
+           declaration and not a fallback selector: it chooses no code — both answers park, through this one
+           flow_park — and a caller that cannot make the promise gets the crash. The pump makes it because it
+           IS the drain; module evaluation makes it because the drain is its next line; a bare C JS_Call of an
+           async function makes it for nothing, which is the shape that must still be routed onto the running
+           flow's chain. */
+        DCHECK(prev_base == NULL || caller_resumes_park,
                "an async body was resumed as its OWN flow base while another flow's activation is still live, "
-               "and it preempted — a park is transparent only if nothing observable runs before its resume, and "
-               "a caller that goes on executing bytecode over a live park is exactly that. Route the call shape "
-               "that created this activation onto the running flow's chain (do_async_tramp_call / "
-               "do_async_resume_tramp) instead of driving it from C");
+               "and it preempted, and the caller did not promise to resume the park before anything else runs "
+               "— a park is transparent only if nothing observable runs before its resume, and a caller that "
+               "goes on executing bytecode over a live park is exactly that. Either route the call shape that "
+               "created this activation onto the running flow's chain (do_async_tramp_call / "
+               "do_async_resume_tramp), or drain the pump on the statement after this call and say so");
         JS_REF_COUNT(s)++;   /* the park holds a reference until the resume releases it */
         flow_park(ctx, &s->func_state, js_async_resume_park, js_async_resume_park_free,
                   js_async_resume_park_clone, s);
@@ -48000,7 +48025,10 @@ static void js_async_resume_park(JSContext *ctx, void *opaque)
     JSAsyncFunctionData *s = opaque;
     /* a preempt-resume is a CONTINUATION, never a re-throw: the throw (if any) was consumed on the first resume */
     s->func_state.throw_flag = false;
-    js_async_function_resume_as_flow(ctx, s);
+    /* TRUE because this IS the drain: JS_ResumeParkedFlow called us, and every one of its callers loops until
+       the queue is empty before it runs anything else. A body that parks again here goes back on the same
+       queue the same loop is still draining. */
+    js_async_function_resume_as_flow(ctx, s, true);
     js_async_function_free(ctx->rt, s);   /* release the ref taken at park */
 }
 
@@ -48142,9 +48170,9 @@ static JSValue js_async_function_start(JSContext *ctx, JSValueConst func_obj,
    (js_execute_sync_module / js_execute_async_module), so module evaluation suspend/resumes on the flow
    machinery; a parked body leaves its promise PENDING, which js_execute_sync_module treats as async evaluation.
    Consumes the reference `js_async_function_start` handed out. */
-static bool js_async_function_run(JSContext *ctx, JSAsyncFunctionData *s)
+static bool js_async_function_run(JSContext *ctx, JSAsyncFunctionData *s, bool caller_resumes_park)
 {
-    if (!js_async_function_resume_as_flow(ctx, s))
+    if (!js_async_function_resume_as_flow(ctx, s, caller_resumes_park))
         return false;
     js_async_function_free(ctx->rt, s);
     return true;
@@ -48161,7 +48189,11 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
     promise = js_async_function_start(ctx, func_obj, this_obj, argc, argv, &s);
     if (JS_IsException(promise))
         return promise;
-    if (!js_async_function_run(ctx, s)) {
+    /* FALSE, and it is the honest answer rather than a gap: this is the class `.call` slot, reached only by a
+       C JS_Call of an async function (every bytecode call shape goes to do_async_tramp_call), and a C caller
+       gets a pending promise back and carries on. There is no drain on the next line and nothing here can put
+       one there — the fix, when this fires, is to route that call site onto the running flow's chain. */
+    if (!js_async_function_run(ctx, s, false)) {
         JS_FreeValue(ctx, promise);
         return JS_EXCEPTION;
     }
@@ -62414,7 +62446,12 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
     JS_FreeValue(ctx, resolve_funcs[0]);
     JS_FreeValue(ctx, resolve_funcs[1]);
     JS_FreeValue(ctx, promise);
-    if (!js_async_function_run(ctx, s))
+    /* TRUE, and the loop immediately below is the promise being kept — the two lines are one statement about
+       ordering and must not drift apart. §16.2.1.6.1.3.4 AsyncModuleExecutionFulfilled runs this walk INSIDE a
+       promise reaction and does not continue it until the body it started has completed or reached its own
+       suspend, so a park here is resumed before anything observable runs and the preempt stays transparent.
+       That is what the flag says, and it is the only reason this call is not the crash the C entry gets. */
+    if (!js_async_function_run(ctx, s, true))
         return -1;
     /* A PARKED BODY IS STILL EVALUATING, so finish it before this returns and the walk starts the next module.
        §16.2.1.6.1.3.1 evaluates [[RequestedModules]] in source order, and a module with no top-level await must be
