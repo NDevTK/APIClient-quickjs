@@ -28747,6 +28747,9 @@ static inline bool tramp_is_reflect_apply(JSValueConst method) {
 /* Helpers defined later — needed by the heap-resident async call path inside JS_CallInternal. */
 static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s, JSValueConst func_obj,
                                        JSValueConst this_obj, int argc, JSValueConst *argv);
+/* …and the owner of the frame async_func_init just built, recorded by whoever mints it — needed here because
+   do_async_tramp_call mints an async activation's owner at the same instant it creates the activation. */
+static void async_func_set_owner(JSRuntime *rt, JSAsyncFunctionState *s, JSGCObjectHeader *owner);
 static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s, JSValue func_ret,
                                           JSAsyncPost *out);
 /* Which suspended async activation THIS flow resumes when it runs one of §27.10.5.3's two closures — the
@@ -37930,6 +37933,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    unmarked the clone looked like a plain script base — the scheduler resumed it, read a
                    done_generator suspend as a completion code, and walked off the end of the body's bytecode. */
                 as->func_state.base_kind = FLOW_BASE_ASYNC_CALL;
+                /* AND THE FRAME NAMES THE OBJECT THAT OWNS IT — the line this create was missing, and the ONE
+                   async-activation constructor of the five that did not have it (js_async_function_start,
+                   flow_clone_state_alloc, clone_deep_flow and js_async_frame_clone all record theirs, the
+                   latter three by direct write). It is a hand-copied list with one member missed, and the miss
+                   is silent by construction: nothing reads cur_gc_obj until the body CAPTURES A LOCAL.
+                   WHAT IT COSTS, in get_captured_cell's own words: an open cell aliases a slot in this frame,
+                   so when something the COLLECTOR can free owns the frame, the cell takes a counted reference
+                   on that owner — "without it the collector sees a cycle where there is a live coroutine, frees
+                   it, and the closure is left aliasing released memory". With cur_gc_obj NULL every cell minted
+                   in an async body called from BYTECODE answered is_coro=false and rooted nothing. That was
+                   harmless only while the activation was held by this frame alone, which the collector cannot
+                   see and therefore never decrements; the moment the body AWAITS, its two continuation closures
+                   become its only holders and they ARE marked, so gc_decref can take it to zero inside a cycle
+                   and free the frame out from under live cells. The fault then lands wherever the closure's
+                   value is next released, with nothing at that site to say what happened.
+                   An async function is the one coroutine kind whose activation exists before its first opcode
+                   (a generator and an async generator run a prologue that can mint cells before
+                   js_create_from_ctor makes the object), so this is recorded BEFORE the body runs and the
+                   adoption loop inside finds nothing — exactly as js_async_function_start records it. */
+                async_func_set_owner(rt, &as->func_state, &as->header);
                 atf = tramp_frame_new(rt);
                 if (unlikely(!atf)) { JS_FreeValue(ctx, aprom); js_async_function_free(rt, as); JS_ThrowOutOfMemory(ctx); goto exception; }
                 atf->up = tf_top;
@@ -47579,6 +47602,23 @@ static JSValue js_async_function_resolve_one(JSContext *ctx, JSAsyncFunctionData
     JSValue f = JS_NewObjectProtoClass(ctx, ctx->function_proto, JS_CLASS_ASYNC_FUNCTION_RESOLVE + i);
     if (JS_IsException(f))
         return f;
+    /* THIS IS WHERE AN ACTIVATION BECOMES VISIBLE TO THE COLLECTOR, AND THEREFORE WHERE A FRAME THAT NAMES NO
+       OWNER STOPS BEING SURVIVABLE. Until now the only reference to it is the heap CALL FRAME's, which no mark
+       function walks, so gc_decref never touches its count and it cannot be collected however wrong the frame
+       is. The object minted below is marked (js_async_function_resolve_mark), so from here the collector both
+       sees the activation and can bring it to zero — and any open cell aliasing a slot in its frame must
+       already be rooting it, which get_captured_cell decides from cur_gc_obj at the instant the cell is born.
+       A frame with no owner therefore hands the collector a live coroutine it is free to release with closures
+       still pointing into its buffer, and the fault lands wherever one of those values is next released, at a
+       site with nothing to say what happened. do_async_tramp_call — the create every `async function` called
+       from bytecode goes through — was missing that record while the four other constructors had it.
+       ASKED FOR THE EXACT OWNER, not merely for a non-NULL one: recording the WRONG object is the same mistake
+       with the same outcome, and all five constructors name the JSAsyncFunctionData the state is embedded in. */
+    DCHECK(s->func_state.frame.cur_gc_obj == &s->header,
+           "an async activation is being handed to the collector through one of its continuation closures while "
+           "its frame names no owner (or the wrong one) — a captured local minted in that frame roots whatever "
+           "cur_gc_obj said at its birth, so the activation can now be collected out from under a live closure "
+           "that still aliases its slots. Record the owner where the activation is created");
     JS_REF_COUNT(s)++;
     JS_VALUE_GET_OBJ(f)->u.async_function_data = s;
     return f;
