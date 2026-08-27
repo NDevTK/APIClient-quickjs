@@ -27320,6 +27320,21 @@ typedef struct JSAsyncFromSync {
 /* ITERCALL: OP_iterator_call — `for await`/yield* delegating .return(v)/.throw(v) onto the wrapper. Delivers
    like ITERNEXT and then pushes the opcode's `false` ret_flag (the method WAS present). */
 enum { AFS_DELIVER_CALL = 0, AFS_DELIVER_CLOSE, AFS_DELIVER_ITERNEXT, AFS_DELIVER_ITERCALL };
+/* THE DELIVERY MODE AND THE OPERAND SHAPE ARE ONE DECLARATION, ASSERTED WHERE THE SHAPE IS SPENT. A CALL entry
+   takes the caller's operands through TAKE_CALL_SHAPE, so its `first` is the call's own: -2 for the method
+   spelling, -1 for the plain one — NEVER 0, which is what the three opcode entries declare because their
+   operands are the opcode's and are not popped here at all. The two are set in the same breath at the entry and
+   read in the same breath at the settle, and between them lies the whole drive, a suspension and possibly a
+   fork; a settle that pops (0, 0) while delivering a CALL frees nothing, leaves sp where it was and pushes the
+   promise on top of the live receiver and callee. Nothing reports that: the frame simply stands two slots high
+   until the NEXT opcode's height check names a byte that is innocent. Asked here, the crash is one opcode
+   earlier and names the pair that disagreed. */
+#define AFS_SETTLE_SHAPE_AGREES(deliver_, first_, argc_)                                                 \
+    DCHECK((deliver_) != AFS_DELIVER_CALL || (first_) < 0,                                               \
+           "an async-from-sync settle is delivering a CALL result while holding an OPCODE entry's operand "\
+           "shape — a call's `first` is -2 or -1, never 0, so this pop frees nothing and the promise is "  \
+           "pushed above a live receiver and callee. The mode and the shape are set together at the entry: "\
+           "find the entry whose two halves disagree")
 static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor, int argc, JSValueConst *argv, int magic);
 static __exception int perform_promise_then(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject, JSValueConst *cap_resolving_funcs);
 static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx, bool done);
@@ -32905,6 +32920,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            close is performed as 7.4.9 rather than by the loop opcode — GetMethod(wrapper,
                            "return") then Call — which is every exception unwind past a `for await`. Narrowed to
                            .next, that call landed on the C entry. */
+                        /* THIS ENTRY DECLARES A MODE BY SAYING NOTHING, so it asserts what it is relying on.
+                           tramp_afs_mode selects where the wrapper's promise goes AND what the settle pops:
+                           AFS_DELIVER_CALL takes the caller's operand shape (TAKE_CALL_SHAPE, [-2, argc] for a
+                           method call), the two opcode modes declare (0, 0) and write into an operand slot
+                           instead. A CALL that reached here with an opcode mode standing therefore pops
+                           NOTHING and pushes its promise — the receiver and the callee stay live under it and
+                           the frame stands two slots high, which is the shifted stack the height check reports
+                           at the NEXT opcode, one opcode too late to attribute.
+                           The opcode-boundary idle check cannot see this one: every site that sets the mode
+                           jumps straight to the tramp, so a mode set and misconsumed WITHIN one opcode never
+                           crosses a boundary for that check to test. It is asked here instead, at the entry
+                           that depends on it — the same medicine the construct shape's five silent entries
+                           needed, applied where the silence is. */
+                        DCHECK(tramp_afs_mode == AFS_DELIVER_CALL,
+                               "a plain CALL of an async-from-sync wrapper method reached the drive with an "
+                               "OPCODE entry's delivery mode still standing — this entry sets no mode and "
+                               "takes the caller's operand shape, so the settle will pop the shape the other "
+                               "entry declared, which is nothing. FIX THE SITE THAT LEFT THE MODE");
+                        DCHECK(tramp_afs_magic == GEN_MAGIC_NEXT,
+                               "an async-from-sync CALL entry found a method magic already standing — it is "
+                               "about to overwrite it, so the site that set it never reached its own drive");
+                        DCHECK(tramp_afs_noarg == 0,
+                               "an async-from-sync CALL entry found the no-argument flag already standing — "
+                               "it is about to overwrite it, so the site that set it never reached its drive");
                         tramp_afs_magic = mp->u.cfunc.magic;
                         tramp_afs_noarg = (call_argc == 0);
                         goto do_async_from_sync_tramp;
@@ -38270,6 +38309,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue *cargv;
                     js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
                     if (cok != CONT_NONE) goto do_afs_call_outer;
+                    AFS_SETTLE_SHAPE_AGREES(deliver, cfirst, cargc);
                     cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
@@ -38364,6 +38404,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           "does not route — add its arm here");
                     goto exception;
                 }
+                AFS_SETTLE_SHAPE_AGREES(deliver, cfirst, cargc);
                 cargv = sp - cargc;
                 for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += cfirst - cargc;
