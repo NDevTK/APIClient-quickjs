@@ -30055,8 +30055,62 @@ static void js_sp_level_fail(JSContext *ctx, JSFunctionBytecode *b, uint32_t pos
             }                                                                                   \
         }                                                                                       \
     } while (0)
+
+/* THE PENDING-CALL REGISTERS ARE IDLE AT EVERY OPCODE BOUNDARY — the other half of the height assert above, and
+   the mechanism that MAKES the height it reports.
+   A call site declares three things a later arm must consume: the OPERAND SHAPE it overrides (call_cfirst /
+   call_cargc, taken by TAKE_CALL_SHAPE), an OWNED invocation list (call_args_owned), and the REQUESTER waiting
+   on the result (tramp_cont_state / _kind). All three are set in the same statement as the `goto` that hands
+   them over, and every arm that takes over consumes them — so none of them can legally survive to the next
+   fetch. `exception:` clears the first two for the same reason: a catch resumes in this frame and the next call
+   it makes would read them.
+   WHY THIS IS THE PAIR TO THE HEIGHT CHECK. A shape left standing is read by the NEXT call this frame makes,
+   which is a call whose operands ARE on the stack — so a `[-2, argc]` method call is delivered as `[0, 0]`: the
+   delivery frees nothing, sp does not come down, and the result is pushed on top. The receiver and the callee
+   stay live under it (a leak nothing reports) and the stack stands exactly TWO slots high, which is what the
+   height check then names one opcode later and cannot attribute. Asked here, the crash names the opcode that
+   RAN with the shape standing — the arm that failed to consume it.
+   ONE TEST, THREE FACTS. The three registers are interpreter locals already in registers, so the fast path is a
+   single fused compare and a branch the predictor gets right forever — the same trade the height check and the
+   yield poll take — and the cold reporter says which of the three it was. Compiled out in release with them. */
+static void js_call_shape_idle_fail(JSContext *ctx, JSFunctionBytecode *b, uint32_t pos,
+                                    int cargc, int cfirst, int owned_n, int cont_kind)
+{
+    char why[2560];
+    char frames[1536];
+    char nbuf[ATOM_GET_STR_BUF_SIZE], fbuf[ATOM_GET_STR_BUF_SIZE];
+    const char *fname = b ? JS_AtomGetStr(ctx, nbuf, sizeof(nbuf), b->func_name) : NULL;
+    const char *file = b ? JS_AtomGetStr(ctx, fbuf, sizeof(fbuf), b->filename) : NULL;
+
+    js_why_backtrace(ctx, frames, sizeof frames);
+    snprintf(why, sizeof why,
+             "A PENDING-CALL REGISTER SURVIVED AN OPCODE BOUNDARY: at byte %u of `%.60s` (%.120s), "
+             "call_cargc=%d call_cfirst=%d call_args_owned_n=%d tramp_cont_kind=%d — the neutral state is "
+             "(-1, *, 0, 0). Each of the three is declared in the SAME statement as the `goto` that hands it "
+             "over and is consumed by whichever arm takes the call (TAKE_CALL_SHAPE for the shape, the arm's "
+             "own free for the owned list, the frame push or the in-place delivery for the requester), so one "
+             "standing HERE means the arm that just ran did not consume it. FIX THAT ARM, not this check. "
+             "What it costs if left: the next call this frame makes reads the stale shape instead of its own, "
+             "so a [-2, argc] method call is delivered as [0, 0] — nothing is freed, sp does not come down, "
+             "and the result is pushed above the receiver and the callee, leaving the operand stack two slots "
+             "high with two values leaked. A stale requester delivers this frame's next call result into a "
+             "machine that was never waiting for it. The page's frame: %s",
+             pos, fname ? fname : "(anonymous)", file ? file : "(no file)",
+             cargc, cfirst, owned_n, cont_kind, frames);
+    DFAIL(why);
+}
+/* A statement, never an expression — see SP_LEVEL_CHECK above for the defect that rule exists for. */
+#define CALL_SHAPE_IDLE_CHECK() do {                                                            \
+        if (unlikely(call_cargc != -1 || call_args_owned != NULL                                 \
+                     || tramp_cont_kind != CONT_NONE))                                           \
+            js_call_shape_idle_fail(ctx, b,                                                      \
+                                    (uint32_t)(b ? (pc - b->byte_code_buf) : 0),                 \
+                                    call_cargc, call_cfirst, call_args_owned_n,                  \
+                                    (int)tramp_cont_kind);                                       \
+    } while (0)
 #else
 #define SP_LEVEL_CHECK() do { } while (0)
+#define CALL_SHAPE_IDLE_CHECK() do { } while (0)
 #endif
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
@@ -30344,6 +30398,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #if !DIRECT_DISPATCH
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) \
                         SP_LEVEL_CHECK(); \
+                        CALL_SHAPE_IDLE_CHECK(); \
                         if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll; \
                         switch (opcode = *pc++)
 #define CASE(op)        case op
@@ -30369,6 +30424,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    said nothing about it. Wrapping the dispatch in do/while is what makes the macro a statement. */
 #define DISPATCH()      do { DUMP_BYTECODE_OR_DONT(pc)                              \
                              SP_LEVEL_CHECK();                                       \
+                             CALL_SHAPE_IDLE_CHECK();                                \
                              if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll;    \
                              goto *dispatch_table[opcode = *pc++]; } while (0)
 #define SWITCH(pc)      DISPATCH();
