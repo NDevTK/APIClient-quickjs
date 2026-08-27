@@ -31478,9 +31478,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
                     nsf->arg_count = narg_alloc;
                 } else {
-                    /* zero arguments either way: an OWNED vector has nothing in it to point at, and pointing at
-                       one that is about to be freed is a dangling arg_buf even when nothing reads it. */
-                    narg_buf = call_args_owned ? NULL : (JSValue *)call_argv;   /* else: the caller stack (borrowed) */
+                    /* ZERO ARGUMENTS, and the borrow rule decides the pointer rather than the count. narg_alloc
+                       is 0 here only when eff_argc is 0 (the clause above raises it to eff_argc for an owned
+                       list or a callback), so there is nothing to point AT — and what may be pointed at is the
+                       question, not how much. The borrow is sound for exactly one producer of these slots: the
+                       CALLER'S OPERAND STACK, which the caller frees and which outlives this frame. An owned
+                       vector is freed a few lines below, and a C-builtin CALLBACK's `call_argv` is
+                       `&record->cb[2]` — the step/coercion/getprop request's OWN buffer, which the frame
+                       neither owns nor outlives. Both left a live frame naming storage belonging to something
+                       else, and only the zero-length made it a latent pointer instead of a crash: it survived
+                       because nothing indexes it, and it cost three hand-written per-record repoints in the
+                       flow clone to keep a forked sibling from reading its parent's record.
+                       A callback frame OWNS its arguments, so a frame with none has no argument buffer. */
+                    narg_buf = NULL;
                 }
                 /* the RECEIVER is read out of the operands BEFORE the list is released. For an OWNED invocation
                    call_argv points INTO that list (the bound arm's [this, f, args...]), so reading call_argv[-2]
@@ -32396,9 +32406,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
                     nsf->arg_count = narg_alloc;
                 } else {
-                    /* zero arguments either way: an OWNED vector has nothing in it to point at, and pointing at
-                       one that is about to be freed is a dangling arg_buf even when nothing reads it. */
-                    narg_buf = con_args_owned ? NULL : (JSValue *)con_args;
+                    /* ZERO ARGUMENTS — the same borrow rule as do_tramp_call's, and the same two producers this
+                       shape must not name: an owned vector freed on the next line, and a step machine's own cb
+                       buffer (cs->outer non-NULL, the construct the machine REQUESTED). A constructor frame
+                       owns its arguments exactly as a callback frame does, so with none it has no buffer. */
+                    narg_buf = NULL;
                 }
                 if (con_args_owned) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL; }
                 nvar_buf = nlb + narg_alloc;
@@ -47177,6 +47189,23 @@ static int tramp_cont_relink_outer(JSContext *ctx, void *clone, uint8_t kind)
     return 0;
 }
 
+/* A CLONED FRAME NEVER READS ITS ARGUMENTS OUT OF A CONTINUATION RECORD — and this is an ASSERT rather than a
+   repoint because the borrow it used to correct no longer happens. Three kinds carried a hand-written
+   `if (otf->sf.arg_buf == &record->cb[2]) ct->sf.arg_buf = &clone->cb[2];`, one per record layout, each of them
+   an EQUALITY against a single field standing in for a fact about the WHOLE record: a vector that ever started
+   at another slot passed the test and handed two flows one buffer, whose first finisher frees what the other is
+   still reading. The borrow existed because a zero-argument callback frame BORROWED the request's cb buffer
+   instead of owning its arguments; the call and construct frame entries now hand such a frame no buffer at all,
+   so there is nothing left to relocate and a fourth record kind cannot arrive needing a fourth copy of the
+   repoint. What remains is the statement that made the repoints necessary, checked over the whole record. */
+#define CLONE_ARG_BUF_NOT_IN_RECORD(ct_, rec_)                                                           \
+    DCHECK((ct_)->sf.arg_buf == NULL                                                                     \
+           || (const uint8_t *)(ct_)->sf.arg_buf <  (const uint8_t *)(rec_)                               \
+           || (const uint8_t *)(ct_)->sf.arg_buf >= (const uint8_t *)(rec_) + sizeof(*(rec_)),            \
+           "clone_deep_flow: a forked frame reads its arguments out of the PARENT's continuation record — "  \
+           "a callback/accessor frame OWNS its arguments, and one with none has no argument buffer, so a "   \
+           "pointer INTO the request's own storage means some call entry started borrowing it again")
+
 static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     JSStackFrame *ob = &s->frame;
     /* Collect the chain deepest(tramp_top)-first .. bottom-last. arr[i].up == arr[i+1]; bottom.up == NULL. */
@@ -47589,8 +47618,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                 ns->cb_args[2] = ns->resolving_funcs[0];
                 ns->cb_args[3] = ns->resolving_funcs[1];
                 ct->cont_state = ns;
-                if (otf->sf.arg_buf == &os->cb_args[2])
-                    ct->sf.arg_buf = &ns->cb_args[2];
+                CLONE_ARG_BUF_NOT_IN_RECORD(ct, os);
             } else if (otf->cont_kind == CONT_STEP) {
                 /* A STEP MACHINE drove this callback, and the sibling needs its own — two arms of the same
                    `[1,2].forEach(e => cfg.admin ? …)` must not share one cursor and one result array. The state
@@ -47642,11 +47670,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
 
                 if (!nts) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
                 ct->cont_state = nts;
-                /* cb[2] IS THE CALL'S ARGUMENT VECTOR (`call_argv = &tp->cb[2]` at toprim_dispatch), an
-                   EXTERNAL allocation the generic XL relocation leaves pointing at the ORIGINAL record — the
-                   identical repoint the Promise executor's cb_args[2] needs, and for the identical reason. */
-                if (otf->sf.arg_buf == &ots->cb[2])
-                    ct->sf.arg_buf = &nts->cb[2];
+                CLONE_ARG_BUF_NOT_IN_RECORD(ct, ots);
             } else if (otf->cont_kind == CONT_GETPROP) {
                 /* A CONCOLIC BRANCH INSIDE A GETTER OR A PROXY TRAP. A keyed property operation runs the page's
                    code two ways — §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 7's
@@ -47668,25 +47692,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
 
                 if (!ngp) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
                 ct->cont_state = ngp;
-                /* cb[2] IS THE CALL'S ARGUMENT VECTOR (`call_argv = &gp->cb[2]` where the request dispatches),
-                   an EXTERNAL allocation the generic XL relocation leaves pointing at the ORIGINAL record — the
-                   identical repoint the coercion sequence above and the Promise executor need, for the
-                   identical reason. It is reached on the ZERO-ARGUMENT shape, which is the ordinary one: a
-                   `get x(){…}` accessor takes none, so its frame allocates no argument buffer and BORROWS the
-                   request's. */
-                if (otf->sf.arg_buf == &ogp->cb[2])
-                    ct->sf.arg_buf = &ngp->cb[2];
-                /* AND THE SIBLING MUST NOT BE LEFT READING THE PARENT'S — asserted rather than assumed,
-                   because the repoint above is an EQUALITY against one field and the borrow is a fact about
-                   the whole record: an operand vector that ever starts at another slot would pass that test
-                   silently and hand two flows one argument buffer, whose first finisher frees what the other
-                   is still reading. */
-                DCHECK(ct->sf.arg_buf == NULL
-                       || (const uint8_t *)ct->sf.arg_buf < (const uint8_t *)ogp
-                       || (const uint8_t *)ct->sf.arg_buf >= (const uint8_t *)ogp + sizeof(*ogp),
-                       "clone_deep_flow: the sibling's accessor/trap frame still reads its arguments out of the "
-                       "PARENT's property-operation record — the request's argument vector is that record's own "
-                       "buffer, so every borrow of it has to be repointed at the clone's");
+                CLONE_ARG_BUF_NOT_IN_RECORD(ct, ogp);
             } else {
                 /* The KIND is the one fact needed to act on this, so it is in the message. A DFAIL that says
                    "some other continuation" sends the reader back to a bisection to learn what it already knew. */
