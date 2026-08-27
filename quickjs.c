@@ -57694,18 +57694,35 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
             emit_op(s, OP_drop);
             emit_op(s, OP_call_method);
             emit_u16(s, 0);
+            /* A CATCH OFFSET MUST STAY IN THE SLOT IT WAS PUSHED INTO, because that slot IS the handler's
+               operand depth. The unwind pops down to the offset, consumes it, and pushes the exception into
+               the slot it vacated, so the handler runs at (the offset's index + 1); compute_stack_size records
+               the handler at the depth AT the OP_catch, which is the depth the PUSH produced. The two agree
+               only while nothing moves the offset afterwards.
+               THE SWAP THAT USED TO BE HERE MOVED IT. `OP_catch` lands above the promise, `OP_await` wants the
+               promise on top, and a swap put the offset one slot lower — so the handler was entered one slot
+               below the table's answer for it and the interpreter's own height assert reported the mismatch as
+               a defect in the FIRST instruction of the handler. Its `nip nip nip` was written for the runtime
+               depth and is right; the table was describing a stack that never existed. Only a REJECTED head
+               reaches the handler, which is why a fixture whose head always resolves never showed it.
+               So the promise is COPIED above the offset instead (dup2 drops the offset's copy), the offset
+               stays where it was pushed, and the copy is the slot the second `nip` removes once the head has
+               settled. The handler drops one more thing than it used to for the same reason. */
             emit_goto(s, OP_catch, label_head_abrupt);
-            emit_op(s, OP_swap);        /* stack: … catch_offset(head) promise */
+            emit_op(s, OP_dup2);        /* stack: … promise catch_offset promise catch_offset */
+            emit_op(s, OP_drop);        /* stack: … promise catch_offset(head) promise */
             /* get the result of the promise */
             emit_op(s, OP_await);
-            emit_op(s, OP_swap);
-            emit_op(s, OP_drop);        /* the head settled: its catch offset is done with */
+            emit_op(s, OP_nip);         /* the head settled: its catch offset is done with */
+            emit_op(s, OP_nip);         /* and the promise the offset was kept above */
             /* unwrap the value and done values */
             emit_op(s, OP_iterator_get_value_done);
             label_head_ok = emit_goto(s, OP_goto, -1);
             emit_label(s, label_head_abrupt);
-            /* stack: iter_obj next catch_offset(loop) exception — drop the whole enum_rec so the unwind finds no
-               catch offset 0 for this loop, then rethrow into whatever encloses it. */
+            /* stack: iter_obj next catch_offset(loop) promise exception — drop the whole enum_rec (and the
+               promise the offset sat above) so the unwind finds no catch offset 0 for this loop, then rethrow
+               into whatever encloses it. */
+            emit_op(s, OP_nip);
             emit_op(s, OP_nip);
             emit_op(s, OP_nip);
             emit_op(s, OP_nip);
