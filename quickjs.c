@@ -38324,42 +38324,73 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNDEFINED;
                     goto do_step_step;
                 }
-            do_afs_cont_done:
-                {
-                    JSValue r = js_dup(s->promise);
-                    int cfirst = s->orig_cfirst, cargc = s->orig_cargc; uint8_t itail = s->orig_is_tail, deliver = s->deliver;
-                    void *couter = s->call_outer; uint8_t cok = s->call_outer_kind;
-                    JSValue *cargv;
-                    js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
-                    if (cok != CONT_NONE) goto do_afs_call_outer;
-                    AFS_SETTLE_SHAPE_AGREES(sp, stack_buf, cfirst, cargc);
-                    cargv = sp - cargc;
-                    for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
-                    sp += cfirst - cargc;
-                    if (deliver == AFS_DELIVER_CLOSE) { JS_FreeValue(ctx, r); BREAK; }   /* the promise is never awaited */
-                    if (deliver == AFS_DELIVER_ITERNEXT) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; BREAK; }   /* replaces the resume arg; OP_await takes it from there */
-                    if (deliver == AFS_DELIVER_ITERCALL) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; *sp++ = js_bool(false); BREAK; }   /* + the opcode's ret_flag */
-                    if (itail) { ret_val = r; goto do_return; }
-                    *sp++ = r;
-                    BREAK;
-                do_afs_call_outer:
-                    /* the wrapper's method was called BY a machine or sequence: its promise is that call's result
-                       and the operand drop belongs to that delivery, exactly as a returned heap frame's does. */
-                    call_first_r = cfirst; call_pop = cargc;
-                    cont_st = couter; ret_val = r;
-                    if (cok == CONT_ITER_CLOSE_CALL) goto do_iter_close_deliver;
-                    /* a STEP MACHINE called the wrapper's method — Array.fromAsync drives the async-from-sync
-                       record's `next` exactly as the spec's loop does, so the wrapper's promise is that CALL
-                       request's result like any other callee's. Both deliveries need the arm: the promise is
-                       the result whether it settles or rejects, because the wrapper never throws to its caller. */
-                    if (cok == CONT_STEP) goto do_step_step;
-                    DFAIL("an async-from-sync wrapper method was called with a continuation kind this delivery "
-                          "does not route — add its arm here");
-                    goto exception;
-                }
             async_from_sync_reject:
                 cont_st = s;
                 goto do_async_from_sync_abrupt;
+            }
+
+        do_afs_cont_done:
+            /* §27.1.5.4 AsyncFromSyncIteratorContinuation has finished, so the wrapper's promise is this
+               operation's result. THE STATE COMES FROM cont_st, WHICH IS THE ONLY THING A RESUME CARRIES.
+               This label used to sit INSIDE the block above and read that block's `s` — a C local of whichever
+               JS_CallInternal invocation last ran the unpack. Between the machine being built and this label
+               the step driver offers its suspend point, so a park, a preempt, a fork's sibling resume or a
+               second async-from-sync operation reaching the unpack all reach here with that local naming a
+               DIFFERENT state, and the settle then pops the shape THAT operation's entry declared. The one
+               that hurts is the (0, 0) an owned-list call and the two opcode entries declare: the delivery
+               frees nothing, sp does not come down, and the wrapper's promise is pushed above the receiver and
+               the callee — the operand stack two slots high with two values leaked, reported by the height
+               check at the NEXT opcode with nothing to attribute it to. The block is CLOSED above this label
+               now, so `s` is out of scope and reading it again is a compile error rather than a wrong answer;
+               every sibling continuation of this machine (the park-close, the abrupt, the read-throw, the
+               itercall resume) already derived its state exactly this way, and the site that jumps here sets
+               cont_st for that purpose in the same statement. */
+            {
+                JSAsyncFromSync *s = (JSAsyncFromSync *)cont_st;
+                JSValue r;
+                int cfirst, cargc; uint8_t itail, deliver;
+                void *couter; uint8_t cok;
+                JSValue *cargv;
+                /* The unpack is what puts a state in the settle phase: it zeroes res_ph and releases res_obj in
+                   the same statement that builds the machine whose completion arrives here. A state that is
+                   still mid-unpack is therefore one this delivery was never handed — the shape a stale read
+                   produces — and it is worth naming here rather than letting its operand shape be popped. */
+                DCHECK(s != NULL && s->res_ph == 0 && JS_IsUndefined(s->res_obj),
+                       "the async-from-sync settle was handed a state that has not finished unpacking its "
+                       "sync result — the continuation that finished named its own state in cont_st, so a "
+                       "state in another phase means this delivery is settling somebody else's operation");
+                DCHECK(s->deliver <= AFS_DELIVER_ITERCALL,
+                       "the async-from-sync settle was handed a state whose delivery mode is not one of the "
+                       "four entries declare");
+                r = js_dup(s->promise);
+                cfirst = s->orig_cfirst; cargc = s->orig_cargc; itail = s->orig_is_tail; deliver = s->deliver;
+                couter = s->call_outer; cok = s->call_outer_kind;
+                js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
+                if (cok != CONT_NONE) goto do_afs_call_outer;
+                AFS_SETTLE_SHAPE_AGREES(sp, stack_buf, cfirst, cargc);
+                cargv = sp - cargc;
+                for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
+                sp += cfirst - cargc;
+                if (deliver == AFS_DELIVER_CLOSE) { JS_FreeValue(ctx, r); BREAK; }   /* the promise is never awaited */
+                if (deliver == AFS_DELIVER_ITERNEXT) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; BREAK; }   /* replaces the resume arg; OP_await takes it from there */
+                if (deliver == AFS_DELIVER_ITERCALL) { JS_FreeValue(ctx, sp[-1]); sp[-1] = r; *sp++ = js_bool(false); BREAK; }   /* + the opcode's ret_flag */
+                if (itail) { ret_val = r; goto do_return; }
+                *sp++ = r;
+                BREAK;
+            do_afs_call_outer:
+                /* the wrapper's method was called BY a machine or sequence: its promise is that call's result
+                   and the operand drop belongs to that delivery, exactly as a returned heap frame's does. */
+                call_first_r = cfirst; call_pop = cargc;
+                cont_st = couter; ret_val = r;
+                if (cok == CONT_ITER_CLOSE_CALL) goto do_iter_close_deliver;
+                /* a STEP MACHINE called the wrapper's method — Array.fromAsync drives the async-from-sync
+                   record's `next` exactly as the spec's loop does, so the wrapper's promise is that CALL
+                   request's result like any other callee's. Both deliveries need the arm: the promise is
+                   the result whether it settles or rejects, because the wrapper never throws to its caller. */
+                if (cok == CONT_STEP) goto do_step_step;
+                DFAIL("an async-from-sync wrapper method was called with a continuation kind this delivery "
+                      "does not route — add its arm here");
+                goto exception;
             }
 
         do_afs_read_throw:
@@ -104907,13 +104938,13 @@ static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx,
                                1, 0, 1, func_data);
 }
 
-/* 27.1.6.4 step 13.a `closeIterator`: IteratorClose(syncIteratorRecord, ThrowCompletion(error)), as a STEP
+/* 27.1.5.4 step 13.a `closeIterator`: IteratorClose(syncIteratorRecord, ThrowCompletion(error)), as a STEP
    MACHINE. It has to be one: the sync iterator's `return` is often a GENERATOR body — `try { yield p } finally
    { … }` — and a coroutine body must suspend on the tramp, which a JS_Call out of a C reaction body cannot do.
    This machine NEVER completes normally: 7.4.11 step 5 says a throw completion is the result whatever the close
    did, so every exit is the stored error, re-thrown by fini over anything the close itself raised.
    The prose said 27.1.4.4 step 11; 27.1.4.4 is Iterator.prototype.filter, and AsyncFromSyncIteratorContinuation
-   is 27.1.6.4 with the closure at step 13.a. Its 7.4.11 step numbers were one low throughout, for the same
+   is 27.1.5.4 with the closure at step 13.a. Its 7.4.11 step numbers were one low throughout, for the same
    reason every other unchecked comment in this file was. */
 typedef struct JSIterCloseThrow {
     JSStepHdr hdr;       /* MUST be first: the driver casts state -> JSStepHdr * */
@@ -104929,9 +104960,9 @@ _Static_assert(offsetof(JSIterCloseThrow, hdr) == 0, "JSStepHdr must be first in
    inside the sync iterator's `return` — the generator body this machine exists for — reported the stage that
    discards its answer. */
 #define ICT_STAGES(X) \
-    X(ICT_METHOD, "27.1.6.4 step 13.a -> 7.4.11 IteratorClose step 3 (innerResult is GetMethod(iterator, " \
+    X(ICT_METHOD, "27.1.5.4 step 13.a -> 7.4.11 IteratorClose step 3 (innerResult is GetMethod(iterator, " \
                   "\"return\"))") \
-    X(ICT_CALL,   "27.1.6.4 step 13.a -> 7.4.11 IteratorClose step 4.c (innerResult is Call(return, iterator))")
+    X(ICT_CALL,   "27.1.5.4 step 13.a -> 7.4.11 IteratorClose step 4.c (innerResult is Call(return, iterator))")
 enum { ICT_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_iter_close_throw_steps[] = { ICT_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -104997,7 +105028,7 @@ static JSValue js_iter_close_throw_fini(JSContext *ctx, void *st, bool take_resu
 
 static const JSTrampStepDef js_iter_close_throw_def = {
     sizeof(JSIterCloseThrow), js_iter_close_throw_step, js_iter_close_throw_fini, 0, .visit = js_iter_close_throw_visit,
-    .algorithm = "27.1.6.4 step 13.a closeIterator", .steps = js_iter_close_throw_steps
+    .algorithm = "27.1.5.4 step 13.a closeIterator", .steps = js_iter_close_throw_steps
 };
 
 /* The closure has no C body: its only dispatch is as a Promise reaction, and promise_reaction_job routes a
@@ -105026,14 +105057,14 @@ typedef struct JSAfsCont {
 } JSAfsCont;
 _Static_assert(offsetof(JSAfsCont, hdr) == 0, "JSStepHdr must be first in JSAfsCont");
 
-/* WHICH STEP OF 27.1.6.4 THIS MACHINE RESTS AT. Steps 2-5 are already done when it is entered — the caller that
+/* WHICH STEP OF 27.1.5.4 THIS MACHINE RESTS AT. Steps 2-5 are already done when it is entered — the caller that
    built this closure has `done` and `value` — so what it performs is one span, and ONE stage is the honest
    count: it rests inside step 6's PromiseResolve, which is the only page-visible operation left, and steps 7-15
    invoke nothing (the close is ENQUEUED as a reaction, and PerformPromiseThen calls no one).
    The step numbers in this machine were all one low — 5, 6, 7, 8-9 and 11-14 for what ES2025 numbers 6, 7, 8,
    9-10 and 12-14 — and the stage it used to carry was a private 0/1 pair with no step in it at all. */
 #define AFS_STAGES(X) \
-    X(AFS_RESOLVE, "27.1.6.4 steps 6-15 (valueWrapper is PromiseResolve(%Promise%, value); an abrupt one closes " \
+    X(AFS_RESOLVE, "27.1.5.4 steps 6-15 (valueWrapper is PromiseResolve(%Promise%, value); an abrupt one closes " \
                    "the sync iterator; PerformPromiseThen attaches unwrap and closeIterator)")
 enum { AFS_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_afs_cont_steps[] = { AFS_STAGES(JS_STEP_STAGE_LABEL) NULL };
@@ -105116,7 +105147,7 @@ static const JSTrampStepDef js_afs_cont_def = {
     sizeof(JSAfsCont), js_afs_cont_step, js_afs_cont_fini, 0,
     .catches_abrupt = 1,  /* step 6's abrupt is a VALUE here: it selects between the close and the reject */
     .visit = js_afs_cont_visit,
-    .algorithm = "27.1.6.4 AsyncFromSyncIteratorContinuation", .steps = js_afs_cont_steps
+    .algorithm = "27.1.5.4 AsyncFromSyncIteratorContinuation", .steps = js_afs_cont_steps
 };
 
 static JSValue js_new_afs_cont(JSContext *ctx, JSValueConst sync_iter, JSValueConst resolve,
