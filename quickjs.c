@@ -31502,19 +31502,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
                     nsf->arg_count = narg_alloc;
                 } else {
-                    /* ZERO ARGUMENTS, and the borrow rule decides the pointer rather than the count. narg_alloc
-                       is 0 here only when eff_argc is 0 (the clause above raises it to eff_argc for an owned
-                       list or a callback), so there is nothing to point AT — and what may be pointed at is the
-                       question, not how much. The borrow is sound for exactly one producer of these slots: the
-                       CALLER'S OPERAND STACK, which the caller frees and which outlives this frame. An owned
-                       vector is freed a few lines below, and a C-builtin CALLBACK's `call_argv` is
-                       `&record->cb[2]` — the step/coercion/getprop request's OWN buffer, which the frame
-                       neither owns nor outlives. Both left a live frame naming storage belonging to something
-                       else, and only the zero-length made it a latent pointer instead of a crash: it survived
-                       because nothing indexes it, and it cost three hand-written per-record repoints in the
-                       flow clone to keep a forked sibling from reading its parent's record.
-                       A callback frame OWNS its arguments, so a frame with none has no argument buffer. */
-                    narg_buf = NULL;
+                    /* BORROW — and WHO OWNS THE SLOTS decides the pointer, not how many there are. This is the
+                       ORDINARY path, not a zero-argument one: narg_alloc is 0 whenever the caller supplied at
+                       least as many arguments as the callee declares, which is every `f(a,b)` calling a
+                       two-parameter `f`. Those slots are the CALLER'S OPERAND STACK, which the caller frees and
+                       which outlives this frame, and borrowing them in place is the whole point of the fast
+                       path.
+                       The two producers that are NOT the caller's stack take no buffer at all. An owned vector
+                       is freed a few lines below, and a C-builtin CALLBACK's `call_argv` is `&record->cb[2]` —
+                       the step/coercion/getprop request's own storage, which the frame neither owns nor
+                       outlives. Both left a live frame naming somebody else's memory, and only the zero length
+                       made it a latent pointer instead of a crash; it cost three hand-written per-record
+                       repoints in the flow clone to keep a forked sibling off its parent's record.
+                       Those two are exactly the cases the clause above raises narg_alloc to eff_argc for, so
+                       reaching here with either one means eff_argc IS 0 and there is nothing to point at. That
+                       implication is the whole licence for the NULL, it is one-directional, and reading it the
+                       other way — "narg_alloc 0, therefore no arguments" — is what handed every ordinary call a
+                       NULL arg_buf and segfaulted the engine. It is asserted below rather than reasoned about
+                       again. */
+                    narg_buf = (call_args_owned || tramp_cont_kind != CONT_NONE)
+                             ? NULL : (JSValue *)call_argv;   /* else: the caller's stack (borrowed) */
+                    DCHECK(narg_buf != NULL || eff_argc == 0,
+                           "a frame was given NO argument buffer while its call supplied arguments to read — "
+                           "the buffer is dropped only for a callback or an owned list, and the clause above "
+                           "allocates for those the moment there is one argument, so this frame is about to "
+                           "index through NULL for every parameter its body reads");
                 }
                 /* the RECEIVER is read out of the operands BEFORE the list is released. For an OWNED invocation
                    call_argv points INTO that list (the bound arm's [this, f, args...]), so reading call_argv[-2]
@@ -32430,11 +32442,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     for (; k < narg_alloc; k++) narg_buf[k] = JS_UNDEFINED;
                     nsf->arg_count = narg_alloc;
                 } else {
-                    /* ZERO ARGUMENTS — the same borrow rule as do_tramp_call's, and the same two producers this
-                       shape must not name: an owned vector freed on the next line, and a step machine's own cb
-                       buffer (cs->outer non-NULL, the construct the machine REQUESTED). A constructor frame
-                       owns its arguments exactly as a callback frame does, so with none it has no buffer. */
-                    narg_buf = NULL;
+                    /* BORROW — the same rule as do_tramp_call's, and the same two producers this shape must not
+                       name: an owned vector freed on the next line, and a step machine's own cb buffer
+                       (cs->outer non-NULL — con_outer has already moved onto the construct by here). Every
+                       other construct borrows the caller's operand stack or the derived frame's argv, which is
+                       the ordinary `new C(a,b)` and must keep its buffer. */
+                    narg_buf = (con_args_owned || cs->outer) ? NULL : (JSValue *)con_args;
+                    DCHECK(narg_buf != NULL || eff_argc == 0,
+                           "a constructor frame was given NO argument buffer while its construct supplied "
+                           "arguments to read — the buffer is dropped only for an owned list or a machine's "
+                           "own Construct, and the clause above allocates for those the moment there is one "
+                           "argument, so this body is about to index through NULL for every parameter");
                 }
                 if (con_args_owned) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL; }
                 nvar_buf = nlb + narg_alloc;
