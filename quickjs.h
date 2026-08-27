@@ -550,6 +550,19 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
    trampoline chain. Without this the eval body runs in its own activation off the chain, and a loop inside it cannot
    park for the scheduler (gen_state != flow base). */
 #define JS_EVAL_FLAG_TRAMP_CLOSURE (1 << 8)
+/* THIS PROGRAM'S SOURCE TEXT ARRIVED IN THE DOCUMENT'S OWN RESPONSE — an INLINE `<script>`. HTML §4.12.1 "The
+   script element" splits a document's programs by exactly one attribute: `src` "denotes that instead of using
+   the element's child text content as the script content, the script will be fetched from the specified URL",
+   and the section's own conformance table names the halves "Inline classic scripts" and "External classic
+   scripts". The split matters because the two halves have different SESSION-VARIANCE: the document is rendered
+   per request, against this visitor's credentials, while a subresource bundle at a content-addressed URL is
+   byte-identical for every visitor — which is the premise this whole engine rests on, that a logged-out visit
+   is served the same bundle containing the auth and admin code that never runs.
+   It rides down the whole nest exactly as eval-ness does, because it is a property of the SCRIPT and not of a
+   function: a function declared inside an inline script is inline-script code too, and a DIRECT eval inherits
+   it from its caller. Its ONE consumer is the object allocator, which stamps the records this half of the
+   document builds so that JSConcolicHooks.publish can tell them from the bundle's own. */
+#define JS_EVAL_FLAG_INLINE_SCRIPT (1 << 9)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -1901,14 +1914,29 @@ JS_EXTERN void  JS_ObjStateFree(JSRuntime *rt, void *blob);
             answers with another concolic, and the walk CALLS it. `+` and == must ask this before deciding a
             coercion applies — the operand is not an ordinary object and its coercion is the solver's, not the
             page's. Never a binary know-nothing test: it names the solver's value class, nothing more.
-     - absent: a GLOBAL the page reads and nothing defines. Two different things wear that shape and must not
-            be conflated. A missing WEB API is honestly absent — the page's own ReferenceError is the forcing
-            function naming the component to build — while server-injected APP STATE (window.__FLAGS / __USER /
-            __NEXT_DATA__) is unknown INPUT: the server writes it for a logged-in visitor and did not for this
-            one, so the read is SYMBOLIC and the auth gate FORKS to the logged-in arm. Collapsing it to
-            `undefined` throws on the first field access and buries every endpoint behind it, which is the
-            surface this engine exists to reach.
+     - absent: a read that fell off the END OF THE PROTOTYPE CHAIN — §10.1.8.1 OrdinaryGet ( obj, propertyKey,
+            receiver ) step 2.b, "If parent is null, return undefined" — where that `undefined` would be a
+            FABRICATION. Two different things wear that shape and must not be conflated. A missing WEB API is
+            honestly absent — the page's own ReferenceError is the forcing function naming the component to
+            build — while server-injected APP STATE is unknown INPUT: the server writes it for a logged-in
+            visitor and did not for this one, so the read is SYMBOLIC and the auth gate FORKS to the logged-in
+            arm. Collapsing it to `undefined` throws on the first field access and buries every endpoint behind
+            it, which is the surface this engine exists to reach.
+            IT IS ASKED FOR TWO BASES AND `obj` IS WHICH. The GLOBAL OBJECT, because a bare unresolved name and
+            `window.X` are one read spelled two ways; and a RECORD THE DOCUMENT PUBLISHED into the global
+            namespace (see .publish), because a server does not only write `window.__FLAGS` — it writes
+            `window.gon={}` and then two of the twenty-three fields its bundle reads, and every one of the
+            other twenty-one is the same unknown wearing a present parent. The engine has already established
+            that `obj` is one of the two before it asks; a host that cannot NAME the base it was handed is a
+            host whose registry disagrees with the engine's mark, which is a defect rather than a miss.
             Returns the concolic value, or JS_UNINITIALIZED to leave the read exactly as it was.
+     - publish: the document's INLINE half handing a RECORD to its EXTERNAL half, which is the one channel a
+            server has for injecting per-visitor state into a bundle it ships unchanged to everybody. Called
+            once per record, with the PARENT it is being published under (the global object, or a record
+            already published) and the NAME, so the host can compose the path the record's members are read
+            by: `gon.current_user_id`, never a bare `current_user_id` that two namespaces would collide on.
+            Called for the value's own object-valued members too, deepest-last, so a server's JSON dump is
+            published whole rather than one level of it.
      - rel: propagation through < <= > >= , the same shape as cmp and for the same reason. These coerce with
             ToPrimitive, which a concolic cannot satisfy — it is an object whose @@toPrimitive answers with
             another concolic — so the operator threw TypeError and took the program with it: a session check
@@ -1950,7 +1978,11 @@ typedef struct JSConcolicHooks {
     int (*add)(JSContext *ctx, JSValue *sp, JSConcolicAddOp op);
     int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
     int (*is)(JSValueConst v);
-    JSValue (*absent)(JSContext *ctx, JSAtom name);
+    JSValue (*absent)(JSContext *ctx, JSValueConst obj, JSAtom name);
+    /* THE DOCUMENT PUBLISHING A RECORD INTO THE GLOBAL NAMESPACE — see the paragraph above. `parent` is the
+       global object or a record already published under it; both are BORROWED. Installing this is what makes
+       the engine mark records at all, so a host that wants neither half installs neither. */
+    void (*publish)(JSContext *ctx, JSValueConst parent, JSAtom name, JSValueConst value);
     int (*rel)(JSContext *ctx, JSValue *sp, int op);
     /* `typeof v`. Returns the type STRING to use, or JS_UNINITIALIZED to run the real js_operator_typeof. An
        unknown value's type is unknown, and the engine must not answer it from the host object's REPRESENTATION

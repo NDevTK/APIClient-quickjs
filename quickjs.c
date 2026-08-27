@@ -1080,7 +1080,17 @@ typedef struct JSFunctionBytecode {
        IT IS ALSO SET BY JS_OrphanTakeOne, which is what makes an orphan a work item taken once rather than a
        question re-asked: see that function for why that is not a seen-set. */
     uint8_t entered : 1;
-    /* XXX: 2 bits available */
+    /* THIS CODE CAME FROM AN INLINE `<script>` — its source text arrived in the DOCUMENT'S OWN RESPONSE rather
+       than in a separately-fetched subresource (HTML §4.12.1 "The script element": `src` "denotes that instead
+       of using the element's child text content as the script content, the script will be fetched from the
+       specified URL"). Like from_eval it is a property of the SCRIPT and rides down the whole nest, and for the
+       same reason it is a bit on the BYTECODE rather than a flag somebody sets around an evaluation: an inline
+       script's function can be called back from the bundle an hour of scheduler time later, across parks,
+       awaits and flow switches, and the answer must still be the one its SOURCE decides. Its one reader is the
+       object allocator (JSObject.doc_built).
+       See JS_EVAL_FLAG_INLINE_SCRIPT for what the two halves are and why they differ. */
+    uint8_t from_inline_script : 1;
+    /* XXX: 1 bit available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -1512,6 +1522,19 @@ struct JSObject {
     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
+    /* APIClient forced-exec: THIS RECORD WAS BUILT BY THE DOCUMENT'S OWN INLINE SCRIPT — the half of the page
+       the server re-renders for every request — so its EXTENT was chosen against THIS VISITOR'S credentials
+       rather than by the program. Set at the allocation, from the code that is running (see
+       js_running_code_is_inline_script), for ordinary records only. */
+    uint8_t doc_built : 1;
+    /* …AND IT IS REACHABLE FROM THE GLOBAL through document-built records, so the server PUBLISHED it: it is
+       on the one channel a server has into a bundle it ships to everybody unchanged, and a member it does not
+       hold is unknown rather than `undefined`. Set by js_publish_document_namespace, which is also what tells
+       the host the PATH the record is read by. Both bits only ever go 0 -> 1: they are PROVENANCE, so they are
+       immutable once true and need no COW capture — a fork inherits what was already true when it happened,
+       and an arm that publishes a shared record states a fact the other arm's document is equally entitled to.
+       See JSConcolicHooks.publish for the channel these are the two ends of. */
+    uint8_t doc_namespace : 1;
     uint16_t class_id; /* see JS_CLASS_x */
     /* APIClient forced-exec: the FORK GENERATION at which this object was created (0 = baseline, pre-flow). An
        object is SHARED with a snapshot-forked sibling iff it existed at that flow's fork (flow_gen <= the flow's
@@ -3149,6 +3172,11 @@ void JS_SetJobRemoveHook(JSJobRemoveHook h) { g_job_remove_hook = h; }
    thousand lines below assert against unknown external input reaching them and a declaration that sits after
    its first assertion is a rule nobody can state. */
 static _Thread_local JSConcolicHooks g_concolic;
+
+/* WHICH HALF OF THE DOCUMENT IS RUNNING — declared here because the OBJECT ALLOCATOR asks it, a thousand lines
+   above the property walk that also does. Defined beside js_publish_document_namespace, which is the mechanism
+   it belongs to. */
+static bool js_running_code_is_inline_script(JSRuntime *rt);
 
 /* A C CALL CYCLE'S DEPTH, ASSERTED WHERE IT IS RELIED ON.
  *
@@ -8182,6 +8210,22 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->tmp_mark = 0;
     p->is_HTMLDDA = 0;
     p->is_prototype = 0;
+    /* WHICH HALF OF THE PAGE BUILT THIS RECORD, asked at the allocation because that is the only moment the
+       answer is available: `window.gon={}` and `var gon={}` and `Object.assign(window,{gon:{}})` are one fact
+       about the RECORD and three different operations, and a question asked at the operations is a question
+       the fourth spelling is added without. Ordinary records only — an Array states its own extent as
+       `length`, and a Function or a Date is not a record of fields at all — and only for a host that has
+       declared the channel, so every conformance runner pays one null compare.
+       THE FRAME WALK TERMINATES AT THE FIRST FRAME for a literal, because an object literal is built by an
+       opcode of the function that wrote it; it walks only when a C builtin is allocating on page code's
+       behalf, which is exactly when the page code beneath is the answer (an inline script's `JSON.parse`).
+       PUBLICATION IS CLEARED AT BIRTH TOO, and the namespace registry depends on it: the host keys a published
+       record by its ADDRESS with no reference held, which is sound only because a fresh object at a recycled
+       address cannot claim to be published until something publishes it — and publishing is what files the
+       row. */
+    p->doc_built = (class_id == JS_CLASS_OBJECT && unlikely(g_concolic.publish != NULL) &&
+                    js_running_code_is_inline_script(ctx->rt));
+    p->doc_namespace = 0;
     p->flow_gen = g_flow_gen;   /* forced-exec: 0 during setup (baseline), else the current fork generation */
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
@@ -11726,6 +11770,134 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
+/* WHICH HALF OF THE DOCUMENT IS RUNNING — the SESSION-VARIANT half (an inline `<script>`, re-rendered for
+ * every request) or the SESSION-INVARIANT one (a fetched subresource, the same bytes for every visitor). See
+ * JS_EVAL_FLAG_INLINE_SCRIPT for why those are the two halves.
+ *
+ * ASKED OF THE BYTECODE ON THE STACK, never of a flag set around an evaluation: this engine's programs suspend
+ * at any depth, interleave with siblings and resume in another session, and an inline script's function can be
+ * called back by the bundle an hour of scheduler time later, so the only thing that still knows which script a
+ * piece of work belongs to is the CODE PERFORMING IT. A call root is skipped (it names the function it is
+ * about to call, not an activation of it) and so is any frame with no bytecode — a C builtin ALLOCATING on the
+ * page's behalf is doing it FOR the page code beneath it, which is the frame that answers, and that is what
+ * makes an inline script's `JSON.parse` a document-built record. No JS frame at all means the work is the
+ * host's own C, which is neither half. */
+static bool js_running_code_is_inline_script(JSRuntime *rt)
+{
+    JSStackFrame *sf;
+
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
+        JSFunctionBytecode *b;
+        if (sf->is_call_root)
+            continue;
+        b = JS_GetFunctionBytecode(sf->cur_func);
+        if (b != NULL)
+            return b->from_inline_script;
+    }
+    return false;
+}
+
+/* THE DOCUMENT'S PUBLISHED NAMESPACE — every record its inline scripts BUILT that is REACHABLE FROM THE GLOBAL
+ * OBJECT through such records, named by the path it is reachable at. That is the one channel a server has for
+ * injecting per-visitor state into a bundle it ships to everybody unchanged, and both halves of the sentence
+ * are load-bearing.
+ *
+ * WHY THIS IS NOT "EVERY MISSING PROPERTY". §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 2.b's
+ * `undefined` is the right answer almost everywhere, because almost everywhere the PROGRAM decided the extent:
+ * `({}).foo` is undefined and the code that built the object is the code that says so. It is the wrong answer
+ * exactly where the extent was decided by the SERVER — `window.gon={}` followed by the two of the twenty-three
+ * fields this visitor is entitled to — and a record an inline script builds and keeps to itself is not on that
+ * channel: the text that decided its extent is text this run holds, so nothing about it is unknown.
+ *
+ * WHY IT IS ASKED OF THE HEAP AND NOT OF THE STORE. `window.gon={}`, `var gon={}`, `gon={}`,
+ * `Object.assign(window,{gon:{}})` and a getter that returns the record are one fact and five operations, and
+ * a question asked at the operations is a question the sixth spelling is added without — the engine's own
+ * global-var store does not even reach §10.1.9.2. So the operations are not watched at all: the RESULT is, by
+ * a walk from the global object, and a record that was never attached to it is never published however it was
+ * built.
+ *
+ * WHY IT DESCENDS ONLY THROUGH DOCUMENT-BUILT RECORDS. A server dump is a tree written as one literal
+ * (`window.__STATE__={"user":{"id":1}}`), so a one-level rule would leave every nested record answering
+ * `undefined` for fields a logged-in visitor's tree carried. But the global reaches the whole heap, so the
+ * descent has to stop somewhere, and the honest stop is the document's own tree: a bundle record that happens
+ * to contain a document record is reached by a path the BUNDLE composed, not by a name the server published.
+ * That also keeps the walk proportional to what the document injected rather than to the heap.
+ *
+ * THE WALK IS ITERATIVE because a server's tree is as deep as the server chose and the C stack is a non-limit
+ * in this engine, and the PUBLICATION MARK is its own visited set, so a cycle terminates and no record is
+ * published twice. Parents are published before their children, which is what lets the host compose a child's
+ * path out of its parent's.
+ *
+ * THE WORKLIST HOLDS RAW `JSObject *` AND THAT IS AN ARGUMENT, not an oversight: js_trigger_gc is called from
+ * exactly one place in this file — the OBJECT allocator — and nothing this walk or the host's hook does
+ * allocates an object (the hook dups the global, spells an atom into a C string, and mallocs), so no
+ * collection can run between pushing a record and popping it. A step added here that allocates an object
+ * breaks that and must root the worklist instead.
+ *
+ * WHEN IT RUNS: on a read that MISSES on a document-built record that is not yet published — see the tail of
+ * JS_GetPropertyInternal. Re-walking on a miss that finds nothing is the cost of not caching a NEGATIVE: a
+ * record the bundle attaches to the global later must start answering as a namespace then, and a remembered
+ * "not a namespace" would be a fact that silently expires. */
+static void js_publish_document_namespace(JSContext *ctx)
+{
+    JSObject **work = NULL;
+    JSObject *global = JS_VALUE_GET_OBJ(ctx->global_obj);
+    JSObject *p = global;
+    int n = 0, cap = 0;
+
+    for (;;) {
+        JSShape *sh = p->shape;
+        JSShapeProperty *prs;
+        int i;
+
+        for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+            JSObject *c;
+
+            if (prs->atom == JS_ATOM_NULL)
+                continue;
+            /* An accessor, a var ref or an autoinit slot holds no record here: reading it RUNS something, and
+               what it would answer is not a value the document wrote into this tree. */
+            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                continue;
+            if (JS_VALUE_GET_TAG(p->prop[i].u.value) != JS_TAG_OBJECT)
+                continue;
+            c = JS_VALUE_GET_OBJ(p->prop[i].u.value);
+            /* `window.self`, `window.top` and a page's own `window.app=window` all put the global object
+               inside the graph; it is not document-built, so the test below already excludes it, and this
+               says so where a reader would otherwise have to reason it out. */
+            if (c == global || !c->doc_built || c->doc_namespace)
+                continue;
+            DCHECK(c->class_id == JS_CLASS_OBJECT,
+                   "a record marked as built by the document is not an ordinary object — the allocator marks "
+                   "ordinary records only, because an Array states its own extent as `length` and a Function "
+                   "or a Date is not a record of fields at all, so a mark on one of those is the allocator "
+                   "and this walk disagreeing about what a namespace is");
+            if (n == cap) {
+                int ncap = cap ? cap * 2 : 8;
+                JSObject **w = js_realloc(ctx, work, sizeof(*w) * (size_t)ncap);
+                /* OUT OF MEMORY LEAVES A SHALLOWER NAMESPACE, NOT A BROKEN ONE: nothing below has been marked
+                   or published, so the engine's mark and the host's registry still agree exactly, and the next
+                   miss walks again. The exception is dropped because this is a READ's bookkeeping, not the
+                   read — the property answer owes the page nothing about it. */
+                if (!w) {
+                    JS_FreeValue(ctx, JS_GetException(ctx));
+                    goto done;
+                }
+                work = w;
+                cap = ncap;
+            }
+            c->doc_namespace = true;
+            g_concolic.publish(ctx, JS_MKPTR(JS_TAG_OBJECT, p), prs->atom, p->prop[i].u.value);
+            work[n++] = c;
+        }
+        if (n == 0)
+            break;
+        p = work[--n];
+    }
+done:
+    js_free(ctx, work);
+}
+
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                       JSAtom prop, JSValueConst this_obj,
                                       bool throw_ref_error)
@@ -11933,16 +12105,52 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     if (unlikely(throw_ref_error)) {
         return JS_ThrowReferenceErrorNotDefined(ctx, prop);
     }
-    /* A miss ON THE GLOBAL OBJECT is the same question a bare unresolved name asks, reached through `window.`
-       instead. Server-injected app state is written onto the global, so `window.__FLAGS` and `__FLAGS` are one
-       read spelled two ways — and every real bundle spells it the first way. Answering undefined here would
-       throw on the first field access and bury the gated surface exactly as it did before the hook existed.
-       Only the global: any other object's missing property is genuinely undefined. */
-    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
-        JS_VALUE_GET_OBJ(obj) == JS_VALUE_GET_OBJ(ctx->global_obj) && g_concolic.absent) {
-        JSValue a = g_concolic.absent(ctx, prop);
-        if (!JS_IsUninitialized(a))
-            return a;
+    /* §10.1.8.1 OrdinaryGet step 2.b — "If parent is null, return undefined" — AND THE TWO BASES FOR WHICH
+       THAT undefined WOULD BE A FABRICATION.
+       THE GLOBAL OBJECT, because a miss there is the same question a bare unresolved name asks, reached
+       through `window.` instead: server-injected app state is written onto the global, so `window.__FLAGS` and
+       `__FLAGS` are one read spelled two ways.
+       AND A RECORD THE DOCUMENT PUBLISHED into that namespace, because a server does not only write globals it
+       may leave out entirely — far more often it writes `window.gon={}` and then the handful of fields THIS
+       visitor is entitled to, and every field the bundle reads and the server did not write is exactly the
+       same unknown wearing a present parent. Restricting the rule to the global was not a narrower reading of
+       it: `gon.*`, `__INITIAL_STATE__.*`, `__NUXT__.*` and `__APOLLO_STATE__.*` are all records whose FIELDS
+       are read off a parent the document did write.
+       WHAT IS STILL OUT OF REACH, NAMED SO IT IS NOT MISTAKEN FOR A DECISION: a server that ships its state as
+       a `<script type="application/json">` DATA BLOCK — HTML §4.12.1 "The script element": "Setting the
+       attribute to any other value means that the script is a data block, which is not processed by the user
+       agent, but instead by author script or other tools" — and lets the BUNDLE parse it. That record is
+       built by bundle code out of document bytes, so nothing here marks it — the document-built bit is set
+       from the code that is running, and a `JSON.parse` in the bundle is bundle code however server-rendered
+       its input was. Reaching it needs the DOCUMENT'S OWN TEXT to be a provenance a value can carry from the
+       DOM through the parse, which is a different mechanism from this one and not a wider setting of it.
+       AND IT DOES NOT ASK WHO IS READING, which is the one narrowing that looks principled and is not. It is
+       tempting to say a channel needs both ends — a session-VARIANT producer and a session-INVARIANT consumer
+       — and to answer `undefined` when an inline script reads a record its own document published. But the
+       fact the answer turns on is WHOSE CHOICE THE EXTENT WAS, and that was the server's whichever half of the
+       document reads it: `window.__FLAGS={theme}` followed on the next line by `if(__FLAGS.admin)` is a gate
+       over state the server would have written for a logged-in visitor, and suppressing it buries the admin
+       code exactly as answering `undefined` on the global did. A reader test would also make the mechanism's
+       own fixtures unreachable — a one-document fixture has no external half — which is the tell that it is a
+       cost heuristic wearing an argument. §solver: err toward MORE exploration; the WFQ starves the arm that
+       emits nothing. */
+    if (g_concolic.absent && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        JSObject *base = JS_VALUE_GET_OBJ(obj);
+        bool ask = (base == JS_VALUE_GET_OBJ(ctx->global_obj));
+
+        if (!ask && base->doc_built) {
+            /* A record the document built: publication is what says whether it is on the CHANNEL or is merely
+               an object an inline script happened to make and keep, and it is asked here rather than at the
+               store for the reason js_publish_document_namespace gives. */
+            if (!base->doc_namespace)
+                js_publish_document_namespace(ctx);
+            ask = base->doc_namespace;
+        }
+        if (ask) {
+            JSValue a = g_concolic.absent(ctx, obj, prop);
+            if (!JS_IsUninitialized(a))
+                return a;
+        }
     }
     return JS_UNDEFINED;
 }
@@ -42875,19 +43083,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         p = p->shape->proto;
                         if (!p) {
-                            /* The chain is exhausted. A miss ON THE GLOBAL OBJECT is the same question a
-                               bare unresolved name asks, reached through `window.` instead: server-injected app
-                               state is written onto the global, so `window.__FLAGS` and `__FLAGS` are one read
-                               spelled two ways and every real bundle spells it the first way. This opcode
-                               answers its own misses instead of calling the generic walk, so the question has to
-                               be asked here too or the two spellings disagree. */
+                            /* THE CHAIN IS EXHAUSTED, AND WHAT THAT MEANS IS NOT THIS OPCODE'S TO DECIDE.
+                               §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 2.b answers
+                               `undefined`, and on two bases that answer is a FABRICATION — the global object,
+                               and a record the document published onto it. Which of those this base is takes a
+                               heap walk and a registry, and both live at the generic walk.
+                               THIS USED TO CARRY A COPY OF THE QUESTION and the copy could only ever be the
+                               HALF of it that fits in an opcode: it compared the base against the global and
+                               stopped, so `window.__FLAGS` was answered here while `gon.current_user_id` — the
+                               same unknown with a present parent — was answered `undefined` by this same
+                               opcode, silently and by omission. A second copy of a question is a second copy
+                               that can be behind, so there is no copy: the miss falls into the slow path,
+                               which re-walks a chain already known to miss and asks once. Only for a host that
+                               has installed the hook; every other pays one null compare on a miss. */
+                            if (unlikely(g_concolic.absent != NULL))
+                                goto get_field_slow_path;
                             val = JS_UNDEFINED;
-                            if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
-                                JS_VALUE_GET_OBJ(obj) == JS_VALUE_GET_OBJ(ctx->global_obj) &&
-                                g_concolic.absent) {
-                                JSValue a_ = g_concolic.absent(ctx, atom);
-                                if (!JS_IsUninitialized(a_)) val = a_;
-                            }
                             break;
                         }
                     }
@@ -42962,19 +43173,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         p = p->shape->proto;
                         if (!p) {
-                            /* The chain is exhausted. A miss ON THE GLOBAL OBJECT is the same question a
-                               bare unresolved name asks, reached through `window.` instead: server-injected app
-                               state is written onto the global, so `window.__FLAGS` and `__FLAGS` are one read
-                               spelled two ways and every real bundle spells it the first way. This opcode
-                               answers its own misses instead of calling the generic walk, so the question has to
-                               be asked here too or the two spellings disagree. */
+                            /* THE CHAIN IS EXHAUSTED, AND WHAT THAT MEANS IS NOT THIS OPCODE'S TO DECIDE.
+                               §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 2.b answers
+                               `undefined`, and on two bases that answer is a FABRICATION — the global object,
+                               and a record the document published onto it. Which of those this base is takes a
+                               heap walk and a registry, and both live at the generic walk.
+                               THIS USED TO CARRY A COPY OF THE QUESTION and the copy could only ever be the
+                               HALF of it that fits in an opcode: it compared the base against the global and
+                               stopped, so `window.__FLAGS` was answered here while `gon.current_user_id` — the
+                               same unknown with a present parent — was answered `undefined` by this same
+                               opcode, silently and by omission. A second copy of a question is a second copy
+                               that can be behind, so there is no copy: the miss falls into the slow path,
+                               which re-walks a chain already known to miss and asks once. Only for a host that
+                               has installed the hook; every other pays one null compare on a miss. */
+                            if (unlikely(g_concolic.absent != NULL))
+                                goto get_field2_slow_path;
                             val = JS_UNDEFINED;
-                            if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
-                                JS_VALUE_GET_OBJ(obj) == JS_VALUE_GET_OBJ(ctx->global_obj) &&
-                                g_concolic.absent) {
-                                JSValue a_ = g_concolic.absent(ctx, atom);
-                                if (!JS_IsUninitialized(a_)) val = a_;
-                            }
                             break;
                         }
                     }
@@ -45133,7 +45347,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        VALUE read asks: `typeof`, `delete` and a Reference are defined on an unresolvable one
                        and answer without needing to know what it would have held. */
                     if (wop == OP_get_var && g_concolic.absent) {
-                        JSValue cv = g_concolic.absent(ctx, atom);
+                        /* THE BASE IS THE GLOBAL OBJECT, and stating it is not a formality: the hook answers
+                           for two bases and the platform-name suppression belongs to exactly this one. An
+                           unresolvable Reference is a miss whose last link WAS the global record. */
+                        JSValue cv = g_concolic.absent(ctx, ctx->global_obj, atom);
                         if (!JS_IsUninitialized(cv)) {
                             js_with_has_free(ctx, wh);
                             *sp++ = cv;
@@ -46683,8 +46900,12 @@ JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, const char *fil
        for the cache and the name the host loader registers the module under DIVERGE, so the same module is
        loaded and EVALUATED once per import (test262's reuse-namespace-object / eval-rqstd-once). A placeholder
        standing in for data the caller has is exactly the shape that hides. */
+    /* …AND WHICH HALF OF THE DOCUMENT THIS PROGRAM IS (JS_EVAL_FLAG_INLINE_SCRIPT), which only the caller
+       holding the `<script>` row can say. Threaded rather than dropped for the same reason strictness is: a
+       flag the compile never sees is a fact the whole run then answers wrong, silently. */
     JSValue bc = JS_Eval(ctx, src, len, filename ? filename : "<flow>",
-                         JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY | (eval_flags & JS_EVAL_FLAG_STRICT));
+                         JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY |
+                         (eval_flags & (JS_EVAL_FLAG_STRICT | JS_EVAL_FLAG_INLINE_SCRIPT)));
     if (JS_IsException(bc)) { JS_FreeValue(ctx, bc); return NULL; }
     /* COMPILE_ONLY yields raw JS_TAG_FUNCTION_BYTECODE — wrap it in a closure with the global scope (var_refs
        NULL) exactly as JS_EvalFunctionInternal does, so it is a runnable JS_CLASS_BYTECODE_FUNCTION whose
@@ -46738,7 +46959,7 @@ JSValue JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const cha
            "base URL rather than leave it to be invented here");
     JSValue bc = JS_Eval(ctx, src, len, filename,
                          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
-                         (eval_flags & JS_EVAL_FLAG_STRICT));
+                         (eval_flags & (JS_EVAL_FLAG_STRICT | JS_EVAL_FLAG_INLINE_SCRIPT)));
     if (JS_IsException(bc)) return bc;
     DCHECK(JS_VALUE_GET_TAG(bc) == JS_TAG_MODULE, "a MODULE compile must yield a module");
     return JS_EvalFunction(ctx, bc);   /* create the module function, link the graph, evaluate; consumes bc */
@@ -50067,6 +50288,9 @@ typedef struct JSFunctionDef {
     bool is_eval : 1; /* true if eval code */
     bool from_eval : 1; /* true if this code, or the code it is nested in, came from an eval (not a script,
                            and not the Function constructor) — inherited from the parent def */
+    bool from_inline_script : 1; /* true if this code, or the code it is nested in, came from an INLINE
+                           `<script>` — see JSFunctionBytecode.from_inline_script; inherited from the parent
+                           def, and from the CALLER for a direct eval */
     bool is_global_var : 1; /* true if variables are not defined locally:
                            eval global, eval module or non strict eval */
     bool is_func_expr : 1; /* true if function expression */
@@ -64622,6 +64846,9 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     /* eval-ness is a property of the SCRIPT: a function declared inside an eval'd source is eval code too.
        The program def sets both from its eval_type; every nested def inherits them here. */
     fd->from_eval = parent ? parent->from_eval : false;
+    /* …AND SO IS INLINE-SCRIPT-NESS, for the same reason and by the same route: HTML §4.12.1 gives a `<script>`
+       ONE source, so every function declared inside it is code of that script. */
+    fd->from_inline_script = parent ? parent->from_inline_script : false;
     fd->eval_origin = (parent && parent->eval_origin != JS_ATOM_NULL)
                       ? JS_DupAtom(ctx, parent->eval_origin) : JS_ATOM_NULL;
 
@@ -68912,6 +69139,7 @@ static JSValue js_create_function_post(JSContext *ctx, JSFunctionDef *fd)
      */
     b->filename = fd->filename;
     b->from_eval = fd->from_eval;
+    b->from_inline_script = fd->from_inline_script;
     b->is_program = (fd->parent == NULL);
     b->eval_origin = fd->eval_origin;   /* HANDED OVER, like filename above; the def no longer owns it */
     fd->eval_origin = JS_ATOM_NULL;
@@ -69533,7 +69761,14 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (fd->from_eval)
         fd->eval_origin = js_eval_origin_atom(ctx);
     fd->backtrace_barrier = ((flags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0);
+    /* WHICH HALF OF THE DOCUMENT THIS PROGRAM IS — stated by the caller that holds the `<script>` row (the
+       address column is NULL exactly for an inline one) and inherited by every function compiled below. */
+    fd->from_inline_script = ((flags & JS_EVAL_FLAG_INLINE_SCRIPT) != 0);
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
+        /* A DIRECT EVAL IS ITS CALLER'S CODE for this purpose — `eval("x.y")` inside an inline script is text
+           that inline script composed, so it is the same session-variant half. An INDIRECT eval has no caller
+           to inherit from and takes the flag above, which is false unless the host said otherwise. */
+        fd->from_inline_script = b->from_inline_script;
         fd->new_target_allowed = b->new_target_allowed;
         fd->super_call_allowed = b->super_call_allowed;
         fd->super_allowed = b->super_allowed;
@@ -70234,6 +70469,12 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_set_flags(&flags, &idx, b->from_eval, 1);
     bc_set_flags(&flags, &idx, b->is_program, 1);
     bc_set_flags(&flags, &idx, s->allow_debug, 1);
+    /* APPENDED LAST, AND THAT IS WHY BC_VERSION DOES NOT MOVE. Every bit before this one keeps its position,
+       so a blob written by a build that predates this flag reads back identically and answers 0 here — which
+       is "not an inline script", the conservative half: a deserialized function is treated as the bundle's, so
+       the records it builds are never mistaken for the document's injected state. A bit inserted anywhere
+       earlier would shift the rest and demand the version byte. */
+    bc_set_flags(&flags, &idx, b->from_inline_script, 1);
     DCHECK(idx <= 16, "idx <= 16");
     bc_put_u16(s, flags);
     bc_put_u8(s, b->is_strict_mode);
@@ -71456,6 +71697,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     bc.from_eval = bc_get_flags(v16, &idx, 1);
     bc.is_program = bc_get_flags(v16, &idx, 1);
     has_debug_info = bc_get_flags(v16, &idx, 1);
+    bc.from_inline_script = bc_get_flags(v16, &idx, 1);   /* last: see the writer for why the version holds */
     if (bc_get_u8(s, &v8))
         goto fail;
     bc.is_strict_mode = (v8 > 0);
