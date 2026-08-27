@@ -884,7 +884,7 @@ typedef struct JSClassExoticMethods {
        the write is going, once, at the one place every capture converges on.
        BORROWED (the stand-in holds it, and the delta's entry holds only the object it names). JS_UNINITIALIZED
        = this object stands for itself, which is every class that does not declare this.
-       IT IS ASKED PER KEY, because a stand-in need not forward every one: HTML §7.2.5.1's own surface is
+       IT IS ASKED PER KEY, because a stand-in need not forward every one: HTML §7.2.3 "The WindowProxy exotic object"'s own surface is
        answered by the WindowProxy itself and only the rest is the Window's, and a capture that forwarded the
        first group would name the wrong object as surely as one that forwarded none. It runs NO PAGE CODE —
        every caller is a capture at the head of a write, so a class that reached the page here would run it
@@ -937,7 +937,7 @@ JS_EXTERN int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *c
 
 /* GIVE THE GLOBAL OBJECT A CLASS, so it can have EXOTIC own-property behaviour.
  *
- * HTML §7.2.5.1 makes the global a legacy platform object: `window[0]` names a child navigable without being an
+ * HTML §7.2.2.2 "Indexed access on the Window object" makes the global a legacy platform object: `window[0]` names a child navigable without being an
  * own property, and `Object.defineProperty(window, 0, …)` must fail. In this engine exotic behaviour comes from
  * an object's CLASS, and the global is created by JS_NewContext long before any host class is registered — so
  * a host that needs it hands the already-created global the class it registered.
@@ -948,7 +948,7 @@ JS_EXTERN int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *c
 JS_EXTERN int JS_SetGlobalClass(JSContext *ctx, JSClassID class_id);
 
 /* IS THIS ATOM AN ARRAY INDEX PROPERTY NAME? — ECMAScript's canonical numeric string in 0..2^32-2, which is the
-   same thing Web IDL calls a "supported property index" and HTML §7.2.5.1 branches on. An exotic
+   same thing Web IDL calls a "supported property index" and HTML §7.2.2.2 "Indexed access on the Window object" branches on. An exotic
    [[GetOwnProperty]]/[[DefineOwnProperty]]/[[Delete]] written outside this file has to answer it, and doing so
    from the atom's TEXT would both allocate on a lookup-miss path and re-derive a rule the engine already owns
    ("01" and "1e2" are not indices). Writes *pval on true. */
@@ -2406,7 +2406,7 @@ JS_EXTERN JSValue JS_ReadObject3(JSContext *ctx, const uint8_t *buf, size_t buf_
                                  int flags, JSSABTab *psab_tab,
                                  const JSTransferReadHook *transfer);
 /* Instantiate and evaluate a bytecode function. Only used when reading a script or module with JS_ReadObject().
-   FOR A MODULE THIS IS THE WHOLE OF HTML §8.1.3.3's "run a module script": it LOADS the graph
+   FOR A MODULE THIS IS THE WHOLE OF HTML §8.1.4.4 Calling scripts' "run a module script": it LOADS the graph
    (16.2.1.6.1.1 LoadRequestedModules), and only upon that load's fulfilment LINKS and EVALUATES it — so it
    returns a PROMISE that settles as the module's own evaluation promise does, and the embedder must pump jobs
    for it to progress. A JS_ResolveModule stood beside it to load the graph up front; loading cannot be

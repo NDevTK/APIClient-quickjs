@@ -138,7 +138,7 @@ typedef struct JSTrampStepDef {
        aborts in the driver, which tears the machine down through fini, so this runs from there — and only when
        a coercion was actually in flight, because a body that threw has already run its own cleanup. */
     void     (*onerror)(JSContext *ctx, JSValueConst this_val, int magic);
-    /* This machine's algorithm CATCHES an abrupt request result instead of propagating it — 27.2.1.3.2 step 9
+    /* This machine's algorithm CATCHES an abrupt request result instead of propagating it — 27.5.1.3 step 2.g
        rejects the promise when `Get(resolution, "then")` throws, so the throw is a VALUE to it, the way
        CONT_IMPORT's is to the interpreter. Declaring it is what lets the teardown hand the exception back to
        step() (as JS_EXCEPTION, with the throw still live in the context) rather than free the chain. Zero for
@@ -445,7 +445,7 @@ typedef struct JSStepHdr {
        shape cannot leak into the next request. NULL = the object, which is what every other consumer takes. */
     struct JSDescFacts *desc_facts;
     /* A DELEGATE request's inner machine, owned until the driver adopts it. Delegation is how a step builtin
-       performs an ABSTRACT OPERATION that is itself a machine — .finally's PromiseResolve(C, v), which 27.2.5.3
+       performs an ABSTRACT OPERATION that is itself a machine — .finally's PromiseResolve(C, v), which 27.5.5.3
        step 4 states as the operation and not as C.resolve, so it cannot be reached as an ordinary call.
        FORWARDING the inner's step from the outer's (what str.replace's @@replace delegation does) works only
        while the inner's requests carry everything in cb_result: a CAPABILITY or CONSTRUCT records the state the
