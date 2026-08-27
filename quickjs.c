@@ -30058,23 +30058,33 @@ static void js_sp_level_fail(JSContext *ctx, JSFunctionBytecode *b, uint32_t pos
 
 /* THE PENDING-CALL REGISTERS ARE IDLE AT EVERY OPCODE BOUNDARY — the other half of the height assert above, and
    the mechanism that MAKES the height it reports.
-   A call site declares three things a later arm must consume: the OPERAND SHAPE it overrides (call_cfirst /
-   call_cargc, taken by TAKE_CALL_SHAPE), an OWNED invocation list (call_args_owned), and the REQUESTER waiting
-   on the result (tramp_cont_state / _kind). All three are set in the same statement as the `goto` that hands
-   them over, and every arm that takes over consumes them — so none of them can legally survive to the next
-   fetch. `exception:` clears the first two for the same reason: a catch resumes in this frame and the next call
-   it makes would read them.
+   A call site declares four things a later arm must consume: the CALL operand shape it overrides (call_cfirst /
+   call_cargc, taken by TAKE_CALL_SHAPE), the CONSTRUCT operand shape (con_cargc, consumed by
+   do_construct_dispatch and by the body entry), an OWNED invocation list (call_args_owned), and the REQUESTER
+   waiting on the result (tramp_cont_state / _kind). All four are set in the same statement as the `goto` that
+   hands them over, and every arm that takes over consumes them — so none of them can legally survive to the
+   next fetch. `exception:` clears the shapes and the list for the same reason: a catch resumes in this frame
+   and the next call or construct it makes would read them.
    WHY THIS IS THE PAIR TO THE HEIGHT CHECK. A shape left standing is read by the NEXT call this frame makes,
    which is a call whose operands ARE on the stack — so a `[-2, argc]` method call is delivered as `[0, 0]`: the
    delivery frees nothing, sp does not come down, and the result is pushed on top. The receiver and the callee
    stay live under it (a leak nothing reports) and the stack stands exactly TWO slots high, which is what the
    height check then names one opcode later and cannot attribute. Asked here, the crash names the opcode that
    RAN with the shape standing — the arm that failed to consume it.
-   ONE TEST, THREE FACTS. The three registers are interpreter locals already in registers, so the fast path is a
-   single fused compare and a branch the predictor gets right forever — the same trade the height check and the
-   yield poll take — and the cold reporter says which of the three it was. Compiled out in release with them. */
+   WHY con_cargc IS IN IT NOW. It is the construct side's twin and it fails the same way: FIVE construct entries
+   (`new C()`, super(), a step machine's own Construct, a consumer's create-from-constructor, a capability's
+   subclass constructor) push NOTHING of their own into it and rely on its neutral -1 to mean "the arguments ARE
+   the operands". A stale one makes the next construct on the frame pop the PREVIOUS construct's operand count.
+   Establishing that was not a reading exercise: the register is set immediately before a `goto` at every site,
+   but the arms it is handed to can throw between the set and the read (an allocation failure, and
+   §10.1.13 OrdinaryCreateFromConstructor step 3's realm lookup on a revoked new.target), and the abrupt path
+   converged where nothing cleared it. So the clear at `exception:` is what MAKES the invariant true, and this
+   test is what keeps it that way.
+   ONE TEST, FOUR FACTS. The registers are interpreter locals already in registers, so the fast path is a single
+   fused compare and a branch the predictor gets right forever — the same trade the height check and the yield
+   poll take — and the cold reporter says which of them it was. Compiled out in release with them. */
 static void js_call_shape_idle_fail(JSContext *ctx, JSFunctionBytecode *b, uint32_t pos,
-                                    int cargc, int cfirst, int owned_n, int cont_kind)
+                                    int cargc, int cfirst, int owned_n, int cont_kind, int con_cargc)
 {
     char why[2560];
     char frames[1536];
@@ -30085,28 +30095,31 @@ static void js_call_shape_idle_fail(JSContext *ctx, JSFunctionBytecode *b, uint3
     js_why_backtrace(ctx, frames, sizeof frames);
     snprintf(why, sizeof why,
              "A PENDING-CALL REGISTER SURVIVED AN OPCODE BOUNDARY: at byte %u of `%.60s` (%.120s), "
-             "call_cargc=%d call_cfirst=%d call_args_owned_n=%d tramp_cont_kind=%d — the neutral state is "
-             "(-1, *, 0, 0). Each of the three is declared in the SAME statement as the `goto` that hands it "
-             "over and is consumed by whichever arm takes the call (TAKE_CALL_SHAPE for the shape, the arm's "
+             "call_cargc=%d call_cfirst=%d call_args_owned_n=%d tramp_cont_kind=%d con_cargc=%d — the neutral "
+             "state is (-1, *, 0, 0, -1). Each of the four is declared in the SAME statement as the `goto` that "
+             "hands it over and is consumed by whichever arm takes the call (TAKE_CALL_SHAPE for the call "
+             "shape, do_construct_dispatch or the constructor body entry for con_cargc, the arm's "
              "own free for the owned list, the frame push or the in-place delivery for the requester), so one "
              "standing HERE means the arm that just ran did not consume it. FIX THAT ARM, not this check. "
              "What it costs if left: the next call this frame makes reads the stale shape instead of its own, "
              "so a [-2, argc] method call is delivered as [0, 0] — nothing is freed, sp does not come down, "
              "and the result is pushed above the receiver and the callee, leaving the operand stack two slots "
-             "high with two values leaked. A stale requester delivers this frame's next call result into a "
+             "high with two values leaked. A stale con_cargc does the same to the next CONSTRUCT: the five "
+             "entries that push nothing into it read its neutral -1 as \"the arguments ARE the operands\". A "
+             "stale requester delivers this frame's next call result into a "
              "machine that was never waiting for it. The page's frame: %s",
              pos, fname ? fname : "(anonymous)", file ? file : "(no file)",
-             cargc, cfirst, owned_n, cont_kind, frames);
+             cargc, cfirst, owned_n, cont_kind, con_cargc, frames);
     DFAIL(why);
 }
 /* A statement, never an expression — see SP_LEVEL_CHECK above for the defect that rule exists for. */
 #define CALL_SHAPE_IDLE_CHECK() do {                                                            \
         if (unlikely(call_cargc != -1 || call_args_owned != NULL                                 \
-                     || tramp_cont_kind != CONT_NONE))                                           \
+                     || tramp_cont_kind != CONT_NONE || con_cargc != -1))                        \
             js_call_shape_idle_fail(ctx, b,                                                      \
                                     (uint32_t)(b ? (pc - b->byte_code_buf) : 0),                 \
                                     call_cargc, call_cfirst, call_args_owned_n,                  \
-                                    (int)tramp_cont_kind);                                       \
+                                    (int)tramp_cont_kind, con_cargc);                            \
     } while (0)
 #else
 #define SP_LEVEL_CHECK() do { } while (0)
@@ -32110,30 +32123,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_step_step;
                 }
                 if (cmach == NATIVE_PROMISE_EXEC && promise_exec_ready(ctx, con_args, con_argc)) {
-                    if (JS_IsUninitialized(con_proto)) {
-                        /* 27.5.3.1 step 3, the same hoist do_construct_tramp uses: the read happens BEFORE the
-                           arm's body, and the delivery resumes at do_promise_exec_arm past this — the arm was
-                           chosen before the read and is never re-tested after it. */
-                        JSCtorProto *cp = js_mallocz(ctx, sizeof(*cp));
-                        if (unlikely(!cp)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL;
-                                             JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
-                        cp->func = con_func; cp->ntgt = con_ntgt;   /* borrowed; see JSCtorProto */
-                        cp->super_ref = con_super_ref;   con_super_ref = JS_UNDEFINED;
-                        cp->args = con_args; cp->argc = con_argc;
-                        cp->args_owned = con_args_owned; con_args_owned = NULL;
-                        cp->cargc = con_cargc;
-                        cp->from_super = con_from_super;
-                        cp->first = (int8_t)tramp_first; cp->is_tail = tramp_is_tail;
-                        cp->outer = con_outer; cp->outer_kind = con_outer_kind;
-                        con_outer = NULL; con_outer_kind = CONT_NONE;
-                        cp->resume_arm = CTOR_RESUME_PROMISE_EXEC;
-                        sf->cur_pc = pc;
-                        gp_outer = cp; gp_outer_kind = CONT_CTOR_PROTO;
-                        gp_obj = cp->ntgt; gp_atom = JS_ATOM_prototype;
-                        gp_op = GP_GET; gp_val = JS_UNDEFINED;
-                        goto do_getprop_tramp;
-                    }
-                    goto do_promise_exec_arm;
+                    /* 27.5.3.1 step 3, the same hoist do_construct_tramp uses: the read happens BEFORE the
+                       arm's body, and the delivery resumes at do_promise_exec_arm past this — the arm was
+                       chosen before the read and is never re-tested after it. ASSERTED rather than branched
+                       on: con_proto is written only by the two CONT_CTOR_PROTO deliveries, and each of them
+                       jumps PAST this dispatch, so the alternative was an `else` no execution can reach, and
+                       it read the block local below out of a scope its own resume had skipped. */
+                    DCHECK(JS_IsUninitialized(con_proto),
+                           "the promise-executor arm was re-entered with a prototype already in hand — the "
+                           "delivery lands at do_promise_exec_arm, past this dispatch, so the read is issued "
+                           "exactly once and this arm is never chosen twice for one construct");
+                    JSCtorProto *cp = js_mallocz(ctx, sizeof(*cp));
+                    if (unlikely(!cp)) { free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL;
+                                         JS_FreeValue(ctx, con_super_ref); JS_ThrowOutOfMemory(ctx); goto exception; }
+                    cp->func = con_func; cp->ntgt = con_ntgt;   /* borrowed; see JSCtorProto */
+                    cp->super_ref = con_super_ref;   con_super_ref = JS_UNDEFINED;
+                    cp->args = con_args; cp->argc = con_argc;
+                    cp->args_owned = con_args_owned; con_args_owned = NULL;
+                    /* THE POP THE ARM OWES, PARKED — not con_cargc, which this dispatch consumed and reset a
+                       few lines above and which is therefore always -1 here. do_promise_exec_arm is reached
+                       ONLY from the delivery, which is a `goto` INTO this block from another label: the block
+                       locals con_cargc_in and con_pop are not initialised on that path, so the arm's
+                       `pe_cargc = con_pop` read whatever the slot happened to hold. It held the right value at
+                       -O0 (nothing between the two points writes that slot) and the register allocator is
+                       under no obligation to keep it — the shape a suspended construct must carry belongs on
+                       the RECORD that carries everything else it needs, which is what this field is. */
+                    cp->cargc = con_pop;
+                    cp->from_super = con_from_super;
+                    cp->first = (int8_t)tramp_first; cp->is_tail = tramp_is_tail;
+                    cp->outer = con_outer; cp->outer_kind = con_outer_kind;
+                    con_outer = NULL; con_outer_kind = CONT_NONE;
+                    cp->resume_arm = CTOR_RESUME_PROMISE_EXEC;
+                    sf->cur_pc = pc;
+                    gp_outer = cp; gp_outer_kind = CONT_CTOR_PROTO;
+                    gp_obj = cp->ntgt; gp_atom = JS_ATOM_prototype;
+                    gp_op = GP_GET; gp_val = JS_UNDEFINED;
+                    goto do_getprop_tramp;
                 }
                 /* THE DECLARED CONSTRUCTOR MACHINE is asked AFTER the arms above, not before them, and the
                    reason is Map/Set: 24.1.1.1 is ONE algorithm whose step 4 and step 6 are two different
@@ -32182,7 +32207,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         free_arg_list(ctx, con_args_owned, con_argc); con_args_owned = NULL; con_args = NULL;
                         pe_executor = pe_executor_own;
                     }
-                    pe_cfirst = tramp_first; pe_cargc = con_pop;
+                    /* the pop the DELIVERY restored into the construct shape register — read+reset, as every
+                       other consumer of it does. It is not con_pop: this label is entered by a `goto` from the
+                       CONT_CTOR_PROTO delivery, which enters the enclosing block past its own declarations. */
+                    pe_cfirst = tramp_first;
+                    DCHECK(con_cargc >= 0,
+                           "the promise-executor arm was entered with no parked operand count — its only entry "
+                           "is the prototype delivery, which restores the count the dispatch parked");
+                    pe_cargc = con_cargc; con_cargc = -1;
                     pe_super_ref = con_super_ref; con_super_ref = JS_UNDEFINED;
                     pe_proto = con_proto; con_proto = JS_UNINITIALIZED;   /* read+reset, as the dispatch does */
                     goto do_promise_exec_tramp;
@@ -45071,6 +45103,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        throw, and none of which can free a list it does not know about. */
     if (tac_args_own) { free_arg_list(ctx, tac_args_own, tac_args_own_n); tac_args_own = NULL; tac_args_own_n = 0; }
     call_cargc = -1;
+    /* AND THE CONSTRUCT SHAPE, which this label used to name as the precedent while not applying it. con_cargc
+       is set immediately before a `goto` at every one of its sites, so reading the sites alone says it can
+       never survive — but the ARM it is handed to can throw between the set and the read: do_construct_tramp
+       allocates the parked-prototype record, and do_construct_have_proto allocates the frame, the instance and
+       §10.1.13 OrdinaryCreateFromConstructor step 3's realm fallback, which throws for a revoked new.target.
+       Every one of those exits reaches here with the shape still standing, and a catch handler in THIS frame
+       then runs with it: the next construct pops the previous one's operand count off a stack that never held
+       it. Cleared where every abrupt path converges, which is what lets the idle check assert it. */
+    con_cargc = -1;
     /* The same rule for the construct's REQUESTER. Every arm that adopts con_outer clears it, so a non-NULL one
        here means the dispatch threw BETWEEN taking it and handing it to a state — and the code in between reads
        new_target's `prototype`, which is page code, so that is a live path: `Reflect.construct(Promise, [fn],
