@@ -855,6 +855,23 @@ typedef struct JSClassExoticMethods {
                                JSAtom prop, JSValueConst val,
                                JSValueConst getter, JSValueConst setter,
                                int flags);
+    /* THE CLASS'S OWN [[GetPrototypeOf]] — for a class whose prototype is COMPUTED and therefore cannot be the
+       link stored in the object's shape. Returns an OWNED Object, JS_NULL, or JS_EXCEPTION.
+       WHAT FORCED IT: HTML §7.2.3.1 [[GetPrototypeOf]] ( ) answers `OrdinaryGetPrototypeOf(W)` where W is the
+       WindowProxy's [[Window]] — the navigable's CURRENT active Window, which a navigation replaces — and null
+       for a Window the reader may not see. A stored link cannot express that in this engine for a reason
+       stronger than staleness: the binding is PER FLOW (it rides the host's copy-on-write delta), while a
+       shape's proto is not captured by that delta, so one forked arm's navigation would rewrite the prototype
+       every sibling arm reads.
+       IT RUNS NONE OF THE PAGE'S CODE, and that is a CONTRACT rather than a hint: it is consulted from
+       JS_GetPrototype, which C callers reach with no flow base under them to suspend into. A class whose
+       prototype answer could reach a getter belongs on the keyed entry's GP_GETPROTO — the route a Proxy's
+       `getPrototypeOf` trap takes — and not here.
+       A CLASS THAT DECLARES IT HAS NO PROTOTYPE SLOT TO WRITE, so its [[SetPrototypeOf]] is ECMAScript
+       §10.4.7.2 SetImmutablePrototype ( obj, proto ): JS_SetPrototypeInternal accepts the value this hook
+       already answers and refuses every other. That is HTML §7.2.3.2 [[SetPrototypeOf]] ( V )'s own answer, and
+       it FALLS OUT rather than being chosen — there is nowhere for a set to land. */
+    JSValue (*get_prototype)(JSContext *ctx, JSValueConst obj);
     /* The following methods can be emulated with the previous ones,
        so they are usually not needed */
     /* return < 0 if exception or true/false */

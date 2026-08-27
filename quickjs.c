@@ -11369,11 +11369,27 @@ static inline __exception int js_poll_interrupts(JSContext *ctx)
     }
 }
 
+/* THE CLASS'S OWN [[GetPrototypeOf]], or NULL when this object's prototype IS the link its shape stores.
+   Asked at every site that performs [[GetPrototypeOf]] as a spec internal method rather than following a link
+   it already holds — JS_GetPrototype, the SetImmutablePrototype arm below, and 7.3.21 OrdinaryHasInstance's
+   walk — which is what keeps ONE answer to one question. The three ORDINARY-lookup walks (10.1.8.1 OrdinaryGet,
+   10.1.9.2 OrdinarySetWithOwnDescriptor, 10.1.7 OrdinaryHasProperty) deliberately do not ask it: see the
+   comment on JS_GetPrototype. */
+static const JSClassExoticMethods *js_exotic_getproto(JSRuntime *rt, JSObject *p)
+{
+    const JSClassExoticMethods *em;
+    if (likely(!p->is_exotic))
+        return NULL;
+    em = rt->class_array[p->class_id].exotic;
+    return (em && em->get_prototype) ? em : NULL;
+}
+
 /* return -1 (exception) or true/false */
 static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val, bool throw_flag)
 {
     JSObject *proto, *p, *p1;
+    const JSClassExoticMethods *em;
     JSShape *sh;
 
     if (throw_flag) {
@@ -11401,6 +11417,34 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
 
     if (unlikely(p->class_id == JS_CLASS_PROXY))
         return js_proxy_setPrototypeOf(ctx, obj, proto_val, throw_flag);
+    /* 10.4.7.2 SetImmutablePrototype ( obj, proto ) — for a class that COMPUTES its prototype
+       (JSClassExoticMethods.get_prototype) there is no slot for a set to land in, so the only accepted value is
+       the one step 1's `obj.[[GetPrototypeOf]]()` already answers. It is HERE, above the shape read, because
+       the shape's link is NOT that answer for such a class: for HTML §7.2.3's WindowProxy it is the reading
+       realm's own surface object, so `sh->proto == proto` below would report "already equal" for the wrong
+       value and, worse, let every other value be WRITTEN into a link nothing reads any more — a mutation of the
+       per-flow binding's stand-in that no flow's delta captures.
+       Object.prototype's own arm below is the same clause (20.1.3 makes it an immutable prototype exotic
+       object) reached from a different direction, which is why the two read alike. */
+    em = js_exotic_getproto(ctx->rt, p);
+    if (unlikely(em != NULL)) {
+        JSValue cur = em->get_prototype(ctx, obj);   /* step 1 */
+        JSObject *cur_p;
+        if (unlikely(JS_IsException(cur)))
+            return -1;
+        cur_p = JS_IsNull(cur) ? NULL : JS_VALUE_GET_OBJ(cur);
+        JS_FreeValue(ctx, cur);
+        if (cur_p == proto)                          /* step 2: SameValue(proto, current) over Object|null */
+            return true;
+        if (throw_flag) {
+            char cbuf[ATOM_GET_STR_BUF_SIZE];
+            JS_ThrowTypeError(ctx, "the prototype of a '%s' is computed and cannot be set",
+                              JS_AtomGetStrRT(ctx->rt, cbuf, sizeof(cbuf),
+                                              ctx->rt->class_array[p->class_id].class_name));
+            return -1;
+        }
+        return false;                                /* step 3 */
+    }
     sh = p->shape;
     if (sh->proto == proto)
         return true;
@@ -11576,15 +11620,34 @@ static JSValueConst JS_GetPrototypePrimitive(JSContext *ctx, JSValueConst val)
     return ret;
 }
 
-/* Return an Object, JS_NULL or JS_EXCEPTION in case of Proxy object. */
+/* Return an Object, JS_NULL or JS_EXCEPTION in case of Proxy object.
+   THIS IS [[GetPrototypeOf]] AND NOT "the object's prototype link", and the difference is the whole reason the
+   exotic hook is consulted here: a class may COMPUTE its answer (JSClassExoticMethods.get_prototype), in which
+   case the shape's link is not what the internal method returns and for HTML §7.2.3's WindowProxy is not even
+   an object of the right document.
+   THE ORDINARY PROPERTY WALKS STILL FOLLOW THE SHAPE LINK, deliberately and not yet correctly — 10.1.8.1
+   OrdinaryGet step 3, 10.1.9.2 OrdinarySetWithOwnDescriptor step 2.a and 10.1.7 OrdinaryHasProperty step 3 all
+   say `O.[[GetPrototypeOf]]()`, so a class that computes one is answered TWO ways until the host stops using
+   that link for anything. It is load-bearing on the WindowProxy today: that class's shape link is the object
+   carrying the surface a CROSS-ORIGIN read is allowed to reach, which §7.2.3.1 answers null for, so routing the
+   walks here before those members are own properties of the Window would take a page's own `w.postMessage`
+   away. Closing it is a change to the host's member placement (Web IDL §3.7.3 Interface prototype object makes
+   every member of a [Global] object an OWN property of it), after which these walks ask this function too. */
 JSValue JS_GetPrototype(JSContext *ctx, JSValueConst obj)
 {
     JSValue val;
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
         JSObject *p;
+        const JSClassExoticMethods *em;
         p = JS_VALUE_GET_OBJ(obj);
         if (unlikely(p->class_id == JS_CLASS_PROXY)) {
             val = js_proxy_getPrototypeOf(ctx, obj);
+        } else if (unlikely((em = js_exotic_getproto(ctx->rt, p)) != NULL)) {
+            val = em->get_prototype(ctx, obj);
+            DCHECK(JS_IsException(val) || JS_IsNull(val) || JS_IsObject(val),
+                   "a class's [[GetPrototypeOf]] answered something that is neither an Object nor null — "
+                   "10.1.1's [[Prototype]] is one or the other, and every consumer here either walks the "
+                   "value as a chain link or hands it to a page as one");
         } else {
             p = p->shape->proto;
             if (!p)
@@ -76778,6 +76841,14 @@ static int js_instanceof_walk(JSContext *ctx, JSInstanceOf *s)
         JSObject *nxt;
         if (p->class_id == JS_CLASS_PROXY)
             return 0;                       /* its [[GetPrototypeOf]] is the page's: ask for it */
+        /* AND SO DOES A CLASS THAT COMPUTES ITS PROTOTYPE (JSClassExoticMethods.get_prototype) need the
+           request, for the other half of the same reason: step 6.a is `O.[[GetPrototypeOf]]()`, and the shape
+           link this loop follows is not that class's answer. The request's own trapless arm calls
+           JS_GetPrototype, so ONE function computes the link whichever route reaches it — reading the hook
+           here instead would be a second opinion, and a walk that decided `w instanceof Window` from the
+           WindowProxy surface object is exactly the wrong answer this exists to stop. */
+        if (js_exotic_getproto(ctx->rt, p))
+            return 0;
         nxt = p->shape->proto;
         if (!nxt) { s->result = JS_FALSE; return 1; }          /* step 6.b */
         if (nxt == proto) { s->result = JS_TRUE; return 1; }   /* step 6.c */
