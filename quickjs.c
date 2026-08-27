@@ -30016,15 +30016,18 @@ static int js_typeof_is_concolic(JSContext *ctx, JSValue *sp, JSAtom expected)
    the next line dominates it, and the table is walked in step with `pc`. Compiled out in release with the field.
    Bodies with no table (the bytecode reader's) and bytes the walk never reached are skipped, and a CALL-ROOT
    activation has no bytecode at all — `b` is NULL there and `stack_buf` is its var block. */
+static void js_sp_level_window(JSFunctionBytecode *b, uint32_t pos, char *out, size_t outsz);
 static void js_sp_level_fail(JSContext *ctx, JSFunctionBytecode *b, uint32_t pos,
                              int want, int got)
 {
-    char why[3072];
+    char why[3584];
     char frames[2048];
+    char window[512];
     char nbuf[ATOM_GET_STR_BUF_SIZE], fbuf[ATOM_GET_STR_BUF_SIZE];
     const char *fname = JS_AtomGetStr(ctx, nbuf, sizeof(nbuf), b->func_name);
     const char *file = JS_AtomGetStr(ctx, fbuf, sizeof(fbuf), b->filename);
 
+    js_sp_level_window(b, pos, window, sizeof window);
     js_why_backtrace(ctx, frames, sizeof frames);
     snprintf(why, sizeof why,
              "THE OPERAND STACK IS NOT AT THE HEIGHT THIS OPCODE WAS COMPILED FOR: at byte %u of `%.60s` "
@@ -30036,10 +30039,11 @@ static void js_sp_level_fail(JSContext *ctx, JSFunctionBytecode *b, uint32_t pos
              "most recent push or pop, which is either a call/continuation delivery that popped a different "
              "operand shape than its call site pushed (see do_cont_deliver: the shape is whatever the FRAME "
              "recorded, never the one the request declared), or an opcode whose runtime effect disagrees with "
-             "its quickjs-opcode.h n_pop/n_push. Dump the body (JS_DUMP_BYTECODE_FINAL) and read the two "
-             "instructions at and before byte %u. The page's frame: %s",
+             "its quickjs-opcode.h n_pop/n_push. THE OPCODES THAT GOT HERE, each with the depth the compiler "
+             "RECORDED at it (byte:name(op)@depth, `@?` = a byte the walk never reached): %s. The page's "
+             "frame: %s",
              pos, fname ? fname : "(anonymous)", file ? file : "(no file)",
-             (int)b->byte_code_buf[pos], want, got, got - want, pos, frames);
+             (int)b->byte_code_buf[pos], want, got, got - want, window, frames);
     DFAIL(why);
 }
 /* The ask itself. A statement, never an expression: `BREAK` is written as `if (cond) BREAK;` throughout the
@@ -50248,6 +50252,63 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #define short_opcode_info(op)           \
     opcode_info[(op) >= OP_TEMP_START ? \
                 (op) + (OP_TEMP_END - OP_TEMP_START) : (op)]
+
+#if APICLIENT_DEV
+/* THE OPCODES THAT LED TO A FAILED HEIGHT CHECK, decoded for the crash that reports it. The assert already
+   names the byte and told the reader to go dump the body — which costs a second run against a page whose bytes
+   have moved on, and on a shifted stack the FIX IS THE OPCODE BEFORE, so the one thing the report was missing
+   is the one thing the reader needs first. A byte offset alone identifies no lowering; `dup3 drop call_method
+   catch` identifies one on sight.
+   The decode is FORWARD FROM ZERO, which is the only sound direction — opcodes are variable-length, so there is
+   no reading backwards — and it is the same walk compute_stack_size performs, over the same size table, so a pc
+   it cannot land on exactly is itself the finding and is reported as one rather than guessed past. Each entry
+   carries the depth the compiler RECORDED there, so the report shows where the runtime and the table last
+   agreed. Names come from the same table when ENABLE_DUMPS is on (the shipped wasm builds with it); without it
+   the opcode numbers still identify the sequence against quickjs-opcode.h. */
+static void js_sp_level_window(JSFunctionBytecode *b, uint32_t pos, char *out, size_t outsz)
+{
+    enum { WIN = 10 };
+    uint32_t ring[WIN];
+    uint32_t p = 0;
+    int n = 0, i, first;
+    size_t k = 0;
+
+    out[0] = '\0';
+    if (!b->byte_code_buf)
+        return;
+    while (p < pos && p < (uint32_t)b->byte_code_len) {
+        int sz = short_opcode_info(b->byte_code_buf[p]).size;
+        ring[n % WIN] = p;
+        n++;
+        if (sz <= 0)
+            break;
+        p += (uint32_t)sz;
+    }
+    if (p != pos) {
+        snprintf(out, outsz,
+                 "the forward decode from byte 0 stopped at byte %u instead of %u, so the failing pc is not an "
+                 "opcode boundary this body contains — that, not the height, is the defect", p, pos);
+        return;
+    }
+    first = (n > WIN) ? n - WIN : 0;
+    for (i = first; i < n && k + 64 < outsz; i++) {
+        uint32_t q = ring[i % WIN];
+        uint8_t op = b->byte_code_buf[q];
+        unsigned lvl = b->stack_level_tab ? b->stack_level_tab[q] : 0xffffu;
+#ifdef ENABLE_DUMPS
+        const char *nm = short_opcode_info(op).name;
+#else
+        const char *nm = NULL;
+#endif
+        if (lvl == 0xffffu)
+            k += (size_t)snprintf(out + k, outsz - k, "%s%u:%.24s(op%u)@?", i > first ? " " : "",
+                                  q, nm ? nm : "op", (unsigned)op);
+        else
+            k += (size_t)snprintf(out + k, outsz - k, "%s%u:%.24s(op%u)@%u", i > first ? " " : "",
+                                  q, nm ? nm : "op", (unsigned)op, lvl);
+    }
+}
+#endif
 
 static void json_free_token(JSParseState *s, JSToken *token) {
     // Only free actual allocated values
