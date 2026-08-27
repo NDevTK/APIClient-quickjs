@@ -31522,7 +31522,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        again. */
                     narg_buf = (call_args_owned || tramp_cont_kind != CONT_NONE)
                              ? NULL : (JSValue *)call_argv;   /* else: the caller's stack (borrowed) */
-                    DCHECK(narg_buf != NULL || eff_argc == 0,
+                    /* THE ASSERT NAMES THE TWO DEREFERENCES, NOT THE FORMULA THAT MAKES THEM SAFE TODAY.
+                       `OP_get_arg idx` indexes arg_buf[idx] for idx in [0, arg_count) — the DECLARED parameter
+                       count — while OP_rest and both OP_special_object arguments builds index argv[0, argc),
+                       which is this same pointer under eff_argc. Two independent reads of one NULL, so both
+                       counts belong in the condition. Guarded on eff_argc alone it was true only VIA the
+                       narg_alloc formula above (narg_alloc 0 implies eff_argc >= arg_count, so eff_argc 0
+                       forces arg_count 0) — a derivation through the one expression a later route changes,
+                       and the same expression whose misreading shipped the segfault this assert was written
+                       for. A route reaching here with eff_argc 0 and arg_count > 0 would PASS it and index
+                       NULL on the body's first parameter read. Stating both is strictly tighter than either,
+                       and costs nothing while the implication holds. */
+                    DCHECK(narg_buf != NULL || (nb->arg_count == 0 && eff_argc == 0),
                            "a frame was given NO argument buffer while its call supplied arguments to read — "
                            "the buffer is dropped only for a callback or an owned list, and the clause above "
                            "allocates for those the moment there is one argument, so this frame is about to "
@@ -32448,7 +32459,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        other construct borrows the caller's operand stack or the derived frame's argv, which is
                        the ordinary `new C(a,b)` and must keep its buffer. */
                     narg_buf = (con_args_owned || cs->outer) ? NULL : (JSValue *)con_args;
-                    DCHECK(narg_buf != NULL || eff_argc == 0,
+                    /* BOTH COUNTS, for the reason do_tramp_call's twin states: arg_buf[idx] is indexed over the
+                       DECLARED arg_count and argv[0, argc) over eff_argc, and eff_argc alone was true only via
+                       the narg_alloc formula rather than of the dereferences themselves. */
+                    DCHECK(narg_buf != NULL || (nb->arg_count == 0 && eff_argc == 0),
                            "a constructor frame was given NO argument buffer while its construct supplied "
                            "arguments to read — the buffer is dropped only for an owned list or a machine's "
                            "own Construct, and the clause above allocates for those the moment there is one "
