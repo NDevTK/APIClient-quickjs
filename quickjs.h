@@ -817,7 +817,11 @@ static inline const char *JS_AtomToCString(JSContext *ctx, JSAtom atom)
 {
     return JS_AtomToCStringLen(ctx, NULL, atom);
 }
-JS_EXTERN JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val);
+/* §7.1.21 ToPropertyKey ( arg ) folded into an atom — the CONVERSION FAMILY, so it carries its call site for
+   the reason stated in full at JS_ToStringAt below. */
+JS_EXTERN JSAtom JS_ValueToAtomAt(JSContext *ctx, JSValueConst val, const char *file, int line);
+#define JS_ValueToAtom(ctx, val) \
+    JS_ValueToAtomAt((ctx), (val), __FILE__, __LINE__)
 
 /* object class support */
 
@@ -1145,8 +1149,26 @@ static inline JSValue JS_NewString(JSContext *ctx, const char *str) {
 JS_EXTERN JSValue JS_NewStringUTF16(JSContext *ctx, const uint16_t *buf,
                                     size_t len);
 JS_EXTERN JSValue JS_NewAtomString(JSContext *ctx, const char *str);
-JS_EXTERN JSValue JS_ToString(JSContext *ctx, JSValueConst val);
-JS_EXTERN JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val);
+/* THE CONVERTER'S OWN CALL SITE TRAVELS WITH THE REQUEST, for the SAME reason the byte consumer's does below
+   and against the SAME abort. §7.1.19 ToString ( arg ) step 9 asserts the remaining case is an Object and step
+   10 hands it to §7.1.1 ToPrimitive ( input [ , preferredType ] ), whose step 1.a is GetMethod(input,
+   %Symbol.toPrimitive%) and whose §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3 CALLS the page's
+   valueOf/toString — page code from a C activation with no flow base, which is a capability this engine does
+   not have. The crash that says so used to name only the value's CLASS and the page's innermost frame, and its
+   own instruction was "this is a JS_ToString, a JS_ToPropertyKey or a JS_ValueToAtom called straight from C" —
+   an instruction with no address in it, over roughly a hundred spellings, which is unfollowable exactly as the
+   byte consumer's was before its site travelled. The site is known at the one place that knows it, so it is
+   passed from there and the abort names the file:line to route.
+   ONE ABI IN BOTH BUILDS and MACROS RATHER THAN INLINE WRAPPERS, both for the reasons the block below states:
+   a translation unit built with a different APICLIENT_DEV cannot disagree about the argument list, and
+   __FILE__/__LINE__ inside a static inline expands at the HEADER, which is the one site that is never the
+   answer. */
+JS_EXTERN JSValue JS_ToStringAt(JSContext *ctx, JSValueConst val, const char *file, int line);
+#define JS_ToString(ctx, val) \
+    JS_ToStringAt((ctx), (val), __FILE__, __LINE__)
+JS_EXTERN JSValue JS_ToPropertyKeyAt(JSContext *ctx, JSValueConst val, const char *file, int line);
+#define JS_ToPropertyKey(ctx, val) \
+    JS_ToPropertyKeyAt((ctx), (val), __FILE__, __LINE__)
 /* THE BYTE CONSUMER'S OWN CALL SITE TRAVELS WITH THE REQUEST, because the assertion that fires underneath it
    is about the CALLER and the caller is the one thing the operand cannot name. These entries are ToString
    (ECMAScript §7.1.19 ToString ( arg )) followed by an encoder, and §7.1.19 step 9 asserts the remaining case

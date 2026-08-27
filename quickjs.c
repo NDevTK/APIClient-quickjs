@@ -1902,13 +1902,18 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
 #define HINT_LOOSE_EQ (-2)
 #define HINT_FORCE_ORDINARY (1 << 4) // don't try Symbol.toPrimitive
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint);
-static JSValue JS_ToStringFree(JSContext *ctx, JSValue val);
+/* The CONSUMING-side spellings of §7.1.19 / §7.1.21 carry their call site, exactly as the JS_ToCString family
+   does and for the same abort — see the contract above JS_ToStringAt in quickjs.h. The macro is what captures
+   it, so an internal caller written as `JS_ToStringFree(ctx, v)` names ITS line and not this one. */
+static JSValue JS_ToStringFreeAt(JSContext *ctx, JSValue val, const char *file, int line);
+#define JS_ToStringFree(ctx, val) \
+    JS_ToStringFreeAt((ctx), (val), __FILE__, __LINE__)
 static int JS_ToBoolFree(JSContext *ctx, JSValue val);
 static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val);
 static int JS_ToFloat64Free(JSContext *ctx, double *pres, JSValue val);
 static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val);
 static JSValue JS_ToPropertyKeyInternal(JSContext *ctx, JSValueConst val,
-                                        int flags);
+                                        int flags, const char *file, int line);
 static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len);
 static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
                                  JSValueConst flags);
@@ -2076,8 +2081,10 @@ static void js_c_closure_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark
 static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
                                  JSValueConst this_val,
                                  int argc, JSValueConst *argv, int flags);
-static JSAtom JS_ValueToAtomInternal(JSContext *ctx, JSValueConst val,
-                                     int flags);
+static JSAtom JS_ValueToAtomInternalAt(JSContext *ctx, JSValueConst val,
+                                       int flags, const char *file, int line);
+#define JS_ValueToAtomInternal(ctx, val, flags) \
+    JS_ValueToAtomInternalAt((ctx), (val), (flags), __FILE__, __LINE__)
 static JSAtom js_symbol_to_atom(JSContext *ctx, JSValueConst val);
 static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
                           JSGCObjectTypeEnum type);
@@ -6478,7 +6485,9 @@ static JSValue js_force_tostring(JSContext *ctx, JSValueConst val1, const char *
         DFAIL(why);
     }
 #endif
-    val = JS_ToString(ctx, val1);
+    /* the BYTE CONSUMER's site, forwarded rather than re-captured: an assertion below this frame that named
+       js_force_tostring would name the one place that is never the answer. */
+    val = JS_ToStringAt(ctx, val1, file, line);
     if (!JS_IsException(val))
         return val;
     // Stringification can fail when there is an exception pending,
@@ -12912,8 +12921,8 @@ static JSAtom js_symbol_to_atom(JSContext *ctx, JSValueConst val)
 }
 
 /* return JS_ATOM_NULL in case of exception */
-static JSAtom JS_ValueToAtomInternal(JSContext *ctx, JSValueConst val,
-                                     int flags)
+static JSAtom JS_ValueToAtomInternalAt(JSContext *ctx, JSValueConst val,
+                                       int flags, const char *file, int line)
 {
     JSAtom atom;
     uint32_t tag;
@@ -12927,7 +12936,7 @@ static JSAtom JS_ValueToAtomInternal(JSContext *ctx, JSValueConst val,
         atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, p));
     } else {
         JSValue str;
-        str = JS_ToPropertyKeyInternal(ctx, val, flags);
+        str = JS_ToPropertyKeyInternal(ctx, val, flags, file, line);
         if (JS_IsException(str))
             return JS_ATOM_NULL;
         if (JS_VALUE_GET_TAG(str) == JS_TAG_SYMBOL) {
@@ -12939,9 +12948,9 @@ static JSAtom JS_ValueToAtomInternal(JSContext *ctx, JSValueConst val,
     return atom;
 }
 
-JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val)
+JSAtom JS_ValueToAtomAt(JSContext *ctx, JSValueConst val, const char *file, int line)
 {
-    return JS_ValueToAtomInternal(ctx, val, /*flags*/0);
+    return JS_ValueToAtomInternalAt(ctx, val, /*flags*/0, file, line);
 }
 
 static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
@@ -15373,15 +15382,18 @@ static void js_why_backtrace(JSContext *ctx, char *dst, size_t n)
    function" inside an expression the page never wrote.
    A real object reaching here is a call site that runs user code from C with no flow base under it, which is a
    capability that does not exist rather than a case to handle: route it to the trampoline.
-   A BYTE CONSUMER CANNOT REACH THIS LINE ANY MORE, and that is why the message below no longer offers "a host
-   component that only wants BYTES asks for them at its own edge" as one of its remedies. js_force_tostring —
-   the single point JS_ToCStringLen2At and JS_ToCStringLenUTF16At both converge on, and therefore the point
-   every JS_ToCString spelling in the engine and the host converges on — asserts the object arrival one frame
-   EARLIER and names the consumer's own file:line, which it can do because the macro captured it and this
-   function cannot. The reader has no stack (a real page reports the message and nothing else), so a boundary
-   that can only name the VALUE sends them to search every edge that could have taken it. What still arrives
-   HERE is the other half: a JS_ToString, a JS_ToPropertyKey or a JS_ValueToAtom called straight from C by an
-   OPERATOR or a builtin that has not been routed. */
+   NEITHER A BYTE CONSUMER NOR A CONVERTER CAN REACH THIS LINE ANY MORE, and that is why the message below
+   offers neither "a host component that only wants BYTES asks for them at its own edge" nor "this is a
+   JS_ToString called straight from C" as a remedy. Both of those arrivals die one frame EARLIER, at a
+   boundary that can name the EDGE while this one can only name the CLASS: js_force_tostring for every
+   JS_ToCString spelling, and JS_ToStringInternal's object arm for every JS_ToString / JS_ToStringFree /
+   JS_ToPropertyKey / JS_ValueToAtom spelling — each of which is a macro that captured its caller's
+   __FILE__/__LINE__ (quickjs.h). The reader has no stack (a real page reports the message and nothing else),
+   so a boundary that can only name the VALUE sends them to search every edge that could have taken it.
+   HINT STRING therefore cannot arrive here at all: §7.1.19 ToString ( arg ) step 10 is its ONE caller and it
+   now asserts before the hop. What still arrives HERE is the NUMERIC half — an operator's or a builtin's
+   ToNumber/ToNumeric-side coercion (7.1.4 ToNumber, 7.1.13 ToBigInt, 13.15.3's `+`, a relational or a loose
+   equality) called straight from C without being routed to the trampoline. */
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
 {
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
@@ -15417,9 +15429,12 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
                  "js_primargs_step coerces the argument as a TOPRIMITIVE step; an operator asks "
                  "js_toprim_operand and goes to do_toprim_tramp with a tp_resume_at of its own; a step machine "
                  "already on the chain sets tp_outer/tp_value and delivers the primitive as its next step's "
-                 "result. A BYTE CONSUMER cannot be the culprit — every JS_ToCString spelling asserts one frame "
-                 "earlier at js_force_tostring, which names its file:line — so this is a JS_ToString, a "
-                 "JS_ToPropertyKey or a JS_ValueToAtom called straight from C. "
+                 "result. NEITHER A BYTE CONSUMER NOR A CONVERTER can be the culprit — every JS_ToCString "
+                 "spelling asserts one frame earlier at js_force_tostring and every JS_ToString / "
+                 "JS_ToPropertyKey / JS_ValueToAtom spelling asserts one frame earlier in "
+                 "JS_ToStringInternal's object arm, both of which name the asking file:line — and hint string "
+                 "has no other caller, so this is the NUMERIC side: a ToNumber / ToNumeric / `+` / relational "
+                 "/ loose-equality coercion performed from C. "
                  "The innermost frame here is the page's call into the site that has not been routed: %s",
                  cname ? cname : "(unnamed class)",
                  th == HINT_STRING ? "string" : th == HINT_NUMBER ? "number" : "default",
@@ -17951,8 +17966,11 @@ static JSValue js_concolic_operand_str(JSContext *ctx, JSValueConst v)
     return JS_UNDEFINED;
 }
 
+/* `file`/`line` are the CONSUMER's, captured by the macro over every public spelling — see the contract above
+   JS_ToStringAt in quickjs.h. They are read only by the two assertions in the object arm, which a release
+   build compiles out; the parameters stay in the signature there so ONE argument list serves both builds. */
 static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
-                                   int flags)
+                                   int flags, const char *file, int line)
 {
     /* the ToPrimitive result, when the object case took its one hop; owned by this frame */
     JSValue owned = JS_UNDEFINED, ret;
@@ -17960,6 +17978,11 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
     char buf[32];
     size_t len;
 
+    (void)file; (void)line;
+    DCHECK(file != NULL,
+           "a converter reached JS_ToStringInternal with no call site — every public spelling is a macro that "
+           "captures __FILE__/__LINE__, so a NULL means a caller was written against the raw entry and the "
+           "assertions in the object arm below would name nothing");
     for(;;) {
     tag = JS_VALUE_GET_NORM_TAG(val);
     switch(tag) {
@@ -18011,13 +18034,20 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                how to hunt for one. js_force_tostring — the single point JS_ToCStringLen2At and
                JS_ToCStringLenUTF16At both converge on, and therefore the point every JS_ToCString spelling in
                the engine and the host converges on — asserts the same arrival one frame EARLIER and names the
-               consumer's own file:line, which it can do because the macro captured it and this function
-               cannot. The reader has no stack (a real page reports the message and nothing else), so a
-               boundary that can only name the VALUE sends the reader to search every edge that could have
-               taken it; an orphan drive's argument reads the same bytes at all of them.
+               consumer's own file:line. The reader has no stack (a real page reports the message and nothing
+               else), so a boundary that can only name the VALUE sends the reader to search every edge that
+               could have taken it; an orphan drive's argument reads the same bytes at all of them.
                So what still arrives HERE is the other half: a JS_ToString or JS_ToPropertyKey called straight
                from C by an OPERATOR that did not answer over unknown input. The fix for that is never a
-               conversion, it is the operator's own derived result. */
+               conversion, it is the operator's own derived result.
+               AND THIS FUNCTION CAN NAME THAT SITE NOW — it took the byte consumer's own remedy, one boundary
+               to the left. `file`/`line` are the CONSUMER's, captured by the macro over every public spelling
+               (quickjs.h), so BOTH arrivals this arm cannot answer say WHERE to fix them: the concolic one
+               below, and the REAL OBJECT one after it, which is §7.1.19 step 10's hop into §7.1.1 ToPrimitive
+               ( input [ , preferredType ] ) and therefore the page's own valueOf/toString from a C activation
+               with no flow base. That second assert lives HERE rather than in JS_ToPrimitiveFree for exactly
+               the reason js_force_tostring's does: hint STRING has ONE caller — this line — so the boundary
+               that can name the edge is this one, and the one downstream can only name the class. */
             if (unlikely(g_concolic.is && g_concolic.is(val))) {
 #if APICLIENT_DEV
                 {
@@ -18040,13 +18070,15 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                              "ToString ( arg ) over unknown input with a derived concolic (JS_STEP_UNKNOWN), "
                              "and a JS_ToCString / JS_ToCStringLen / JS_ToCStringLenUTF16 on this value dies "
                              "one frame earlier in js_force_tostring, which names the consuming file:line. "
-                             "What is left is a JS_ToString or JS_ToPropertyKey called straight from C by an "
-                             "OPERATOR that has no answer over unknown input yet. BUILD THE ANSWER IN THAT "
+                             "What is left is the JS_ToString / JS_ToPropertyKey / JS_ValueToAtom at %s:%d, "
+                             "called straight from C by an OPERATOR that has no answer over unknown input "
+                             "yet. BUILD THE ANSWER IN THAT "
                              "OPERATOR — js_concolic_derive over the operand, named by the operation it "
                              "performs, with the example obtained by RUNNING the real operation on the "
                              "operand's own example — never by converting here: this function owes C a real "
                              "JSString and the page's value is not one.",
-                             shape ? shape : "(a shape this engine could not spell)");
+                             shape ? shape : "(a shape this engine could not spell)",
+                             file ? file : "(no call site)", line);
                     if (shape) JS_FreeCString(ctx, shape);
                     JS_FreeValue(ctx, sv);
                     DFAIL(why);
@@ -18055,6 +18087,46 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
                 ret = JS_ThrowTypeError(ctx, "stringifying unknown external input is not modelled yet");
                 goto done;
             }
+#if APICLIENT_DEV
+            {
+                /* THE OTHER ARRIVAL THIS BOUNDARY CANNOT ANSWER, ASSERTED WHERE THE EDGE IS STILL KNOWN.
+                   §7.1.19 ToString ( arg ) step 10 sends a real Object to §7.1.1 ToPrimitive ( input [ ,
+                   preferredType ] ) with hint string, and §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3
+                   CALLS the page's toString/valueOf — page code from a C activation with no flow base, which
+                   is a capability this engine does not have rather than a case to convert. This ran on for as
+                   long as the coercion family had no site to carry, and the abort one frame down could then
+                   say only WHICH CLASS died and WHERE THE PAGE was: a real page reports the message and
+                   nothing else, so "route the JS_ToString that did this" named roughly a hundred spellings and
+                   no address. */
+                char why[4096];
+                char frames[2048];
+                char cbuf[ATOM_GET_STR_BUF_SIZE];
+                const char *cname;
+
+                cname = JS_AtomGetStr(ctx, cbuf, sizeof(cbuf),
+                                      ctx->rt->class_array[JS_VALUE_GET_OBJ(val)->class_id].class_name);
+                js_why_backtrace(ctx, frames, sizeof frames);
+                snprintf(why, sizeof why,
+                         "ToString over a REAL OBJECT (class `%.40s`), asked for by the CONVERTER at %s:%d. "
+                         "§7.1.19 ToString ( arg ) steps 9-10 send an Object to §7.1.1 ToPrimitive ( input "
+                         "[ , preferredType ] ), whose step 1.a is GetMethod(input, %%Symbol.toPrimitive%%) "
+                         "and whose §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3 CALLS the page's "
+                         "valueOf/toString — page code from a C activation with no flow base under it, which "
+                         "is a capability this engine does not have rather than a case to handle. FIX IT AT "
+                         "THAT FILE:LINE, not here. ASK FIRST WHETHER THE SITE SHOULD BE ASKING AT ALL: a DOM "
+                         "member's argument is already a DOMString by its own IDL declaration (the "
+                         "declaration converts it on the trampoline), and an algorithm whose own step returns "
+                         "a non-String unevaluated owes nobody a conversion. If the site GENUINELY needs the "
+                         "primitive, ROUTE IT: a builtin declares PRIMARGS(mask, hint, nargs) at its "
+                         "JSTrampStepDef so js_primargs_step coerces the argument as a TOPRIMITIVE step; an "
+                         "operator asks js_toprim_operand and goes to do_toprim_tramp with a tp_resume_at of "
+                         "its own; a step machine already on the chain sets tp_outer/tp_value and takes the "
+                         "primitive as its next step's result. The page's call into this converter: %s",
+                         cname ? cname : "(unnamed class)",
+                         file ? file : "(no call site)", line, frames);
+                DFAIL(why);
+            }
+#endif
             val1 = JS_ToPrimitive(ctx, val, HINT_STRING);
             if (JS_IsException(val1)) {
                 ret = val1;
@@ -18101,22 +18173,23 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val,
     return ret;
 }
 
-JSValue JS_ToString(JSContext *ctx, JSValueConst val)
+JSValue JS_ToStringAt(JSContext *ctx, JSValueConst val, const char *file, int line)
 {
-    return JS_ToStringInternal(ctx, val, /*flags*/0);
+    return JS_ToStringInternal(ctx, val, /*flags*/0, file, line);
 }
 
-static JSValue JS_ToStringFree(JSContext *ctx, JSValue val)
+static JSValue JS_ToStringFreeAt(JSContext *ctx, JSValue val, const char *file, int line)
 {
     if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
         return val;
-    JSValue ret = JS_ToString(ctx, val);
+    /* the CALLER's site, forwarded rather than re-captured: this wrapper is never the answer. */
+    JSValue ret = JS_ToStringAt(ctx, val, file, line);
     JS_FreeValue(ctx, val);
     return ret;
 }
 
 static JSValue JS_ToPropertyKeyInternal(JSContext *ctx, JSValueConst val,
-                                        int flags)
+                                        int flags, const char *file, int line)
 {
     /* §7.1.21 ToPropertyKey ( arg ) OVER AN UNKNOWN KEY. A key must become an ATOM, and a concolic cannot be one — but
        its SHAPE is a real string and it is stable per source, so an unknown key denotes an unknown-but-
@@ -18130,12 +18203,12 @@ static JSValue JS_ToPropertyKeyInternal(JSContext *ctx, JSValueConst val,
         if (!JS_IsUninitialized(name))
             return name;
     }
-    return JS_ToStringInternal(ctx, val, flags | JS_TO_STRING_IS_PROPERTY_KEY);
+    return JS_ToStringInternal(ctx, val, flags | JS_TO_STRING_IS_PROPERTY_KEY, file, line);
 }
 
-JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val)
+JSValue JS_ToPropertyKeyAt(JSContext *ctx, JSValueConst val, const char *file, int line)
 {
-    return JS_ToPropertyKeyInternal(ctx, val, /*flags*/0);
+    return JS_ToPropertyKeyInternal(ctx, val, /*flags*/0, file, line);
 }
 
 static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
