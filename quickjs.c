@@ -1106,6 +1106,26 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+#if APICLIENT_DEV
+    /* THE OPERAND DEPTH AT EVERY OPCODE OF THIS BODY — kept instead of thrown away, because it is the only
+       thing that can say WHICH opcode left the operand stack at the wrong height.
+       compute_stack_size already computes it: its breadth-first walk visits every reachable pc and REFUSES a
+       body whose depth at a pc depends on the path that reached it ("inconsistent stack size"). That refusal is
+       what makes this a run-time invariant rather than a hint — the depth at a pc is a property of the BYTECODE,
+       so the interpreter standing at that pc with any other depth is a defect, not a variation. It is also the
+       number the frame is SIZED by, so a runtime that disagrees with it is running on a frame allocated by a
+       different rule.
+       WHY IT IS NEEDED AT ALL: a shifted operand stack is invisible where it is CREATED and only becomes a crash
+       at the next opcode that reads a fixed shape — which can be a whole expression later, in another frame, and
+       which then describes a WRONG VALUE rather than a wrong height. §6.2.5's reference-pair assert is exactly
+       that: it reports a base and a name, and the reader still has to guess which of the hundreds of pushes and
+       pops in between added the slot. This closes that gap by asking at EVERY dispatch, which is the only place
+       the question can be universal — a check written at the sites that RESTORE sp is per-spelling plumbing, and
+       every spelling it is not written at is a shift nobody is asked about.
+       0xffff marks a byte the walk never reached (an operand byte, dead code); NULL means the body came from the
+       bytecode READER, which carries `stack_size` on the wire and no per-pc table. */
+    uint16_t *stack_level_tab;
+#endif
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -29978,6 +29998,67 @@ static int js_typeof_is_concolic(JSContext *ctx, JSValue *sp, JSAtom expected)
     return 1;
 }
 
+#if APICLIENT_DEV
+/* THE OPERAND STACK IS AT THE HEIGHT THE COMPILER COMPUTED FOR THIS pc — asserted at the dispatch, which is the
+   only place in the interpreter where that question is universal.
+   A SHIFTED OPERAND STACK IS NOT A WRONG VALUE, AND EVERY CONSUMER OF ONE REPORTS IT AS ONE. §6.2.5 The
+   Reference Record Specification Type's pair assert is the worked example: it fires with a String in the base
+   slot and a Function in the name slot — which is the pair CORRECT and read one slot too high — and everything
+   it can say about the producer is the list of opcodes that could have pushed it. The extra slot was left by
+   some earlier opcode, possibly in another frame, and between the two there is no observable difference at all.
+   So it is asked HERE, where `pc` names the next opcode and `sp` is the height it is about to run at: the first
+   dispatch after the defect fires, so the crash names the opcode that FOLLOWS the one that shifted, and the
+   depth it names says by how much and in which direction.
+   COMPUTE_STACK_SIZE IS THE AUTHORITY, not a second model. Its walk refuses a body whose depth at a pc depends
+   on the path that reached it, and its answer is what the frame's operand block is SIZED by — so a runtime
+   height that disagrees with it is already running past the allocation the same number says how big to make.
+   THE COST IS ONE LOAD AND A PREDICTED BRANCH, on the same terms the yield poll takes: the indirect dispatch on
+   the next line dominates it, and the table is walked in step with `pc`. Compiled out in release with the field.
+   Bodies with no table (the bytecode reader's) and bytes the walk never reached are skipped, and a CALL-ROOT
+   activation has no bytecode at all — `b` is NULL there and `stack_buf` is its var block. */
+static void js_sp_level_fail(JSContext *ctx, JSFunctionBytecode *b, uint32_t pos,
+                             int want, int got)
+{
+    char why[3072];
+    char frames[2048];
+    char nbuf[ATOM_GET_STR_BUF_SIZE], fbuf[ATOM_GET_STR_BUF_SIZE];
+    const char *fname = JS_AtomGetStr(ctx, nbuf, sizeof(nbuf), b->func_name);
+    const char *file = JS_AtomGetStr(ctx, fbuf, sizeof(fbuf), b->filename);
+
+    js_why_backtrace(ctx, frames, sizeof frames);
+    snprintf(why, sizeof why,
+             "THE OPERAND STACK IS NOT AT THE HEIGHT THIS OPCODE WAS COMPILED FOR: at byte %u of `%.60s` "
+             "(%.120s), opcode %d, compute_stack_size says the depth here is %d and the interpreter is standing "
+             "at %d. The compiler's walk PROVED that depth is a property of the bytecode and not of the path "
+             "that reached it (it refuses a body where the two disagree), and it is the same number the frame's "
+             "operand block was sized by — so this is not a variation, it is a shifted stack, and the frame is "
+             "already %d slot(s) into its scratch reserve. FIX THE OPCODE BEFORE THIS ONE: the defect is the "
+             "most recent push or pop, which is either a call/continuation delivery that popped a different "
+             "operand shape than its call site pushed (see do_cont_deliver: the shape is whatever the FRAME "
+             "recorded, never the one the request declared), or an opcode whose runtime effect disagrees with "
+             "its quickjs-opcode.h n_pop/n_push. Dump the body (JS_DUMP_BYTECODE_FINAL) and read the two "
+             "instructions at and before byte %u. The page's frame: %s",
+             pos, fname ? fname : "(anonymous)", file ? file : "(no file)",
+             (int)b->byte_code_buf[pos], want, got, got - want, pos, frames);
+    DFAIL(why);
+}
+/* The ask itself. A statement, never an expression: `BREAK` is written as `if (cond) BREAK;` throughout the
+   interpreter, so anything that expands to a sequence detaches from the `if` — the defect quickjs-opcode.h's
+   dump macro produced once already, recorded at DISPATCH. */
+#define SP_LEVEL_CHECK() do {                                                                   \
+        if (b != NULL && b->stack_level_tab != NULL) {                                          \
+            uint32_t sp_pos_ = (uint32_t)(pc - b->byte_code_buf);                               \
+            if (sp_pos_ < (uint32_t)b->byte_code_len) {                                         \
+                uint16_t sp_want_ = b->stack_level_tab[sp_pos_];                                \
+                if (unlikely(sp_want_ != 0xffff && (int)sp_want_ != (int)(sp - stack_buf)))     \
+                    js_sp_level_fail(ctx, b, sp_pos_, (int)sp_want_, (int)(sp - stack_buf));    \
+            }                                                                                   \
+        }                                                                                       \
+    } while (0)
+#else
+#define SP_LEVEL_CHECK() do { } while (0)
+#endif
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -30262,6 +30343,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    the QUESTION can be universal, never narrow where the question is asked. */
 #if !DIRECT_DISPATCH
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) \
+                        SP_LEVEL_CHECK(); \
                         if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll; \
                         switch (opcode = *pc++)
 #define CASE(op)        case op
@@ -30286,6 +30368,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    `function` arm. The production wasm is built with ENABLE_DUMPS and test262 was not, which is why 43239 tests
    said nothing about it. Wrapping the dispatch in do/while is what makes the macro a statement. */
 #define DISPATCH()      do { DUMP_BYTECODE_OR_DONT(pc)                              \
+                             SP_LEVEL_CHECK();                                       \
                              if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll;    \
                              goto *dispatch_table[opcode = *pc++]; } while (0)
 #define SWITCH(pc)      DISPATCH();
@@ -68070,9 +68153,14 @@ static __exception int ss_check(JSContext *ctx, StackSizeState *s,
     return 0;
 }
 
+/* `plevel_tab` receives the per-pc operand-depth table this walk builds — see
+   JSFunctionBytecode.stack_level_tab, which is where it lives afterwards and why it is kept. In release there is
+   no reader for it, so it is freed here and the out-param answers NULL: the table is a DEV instrument, never a
+   thing the interpreter's correctness depends on. */
 static __exception int compute_stack_size(JSContext *ctx,
                                           JSFunctionDef *fd,
-                                          int *pstack_size)
+                                          int *pstack_size,
+                                          uint16_t **plevel_tab)
 {
     StackSizeState s_s, *s = &s_s;
     int i, diff, n_pop, pos_next, stack_len, pos, op, catch_pos, catch_level;
@@ -68255,13 +68343,19 @@ static __exception int compute_stack_size(JSContext *ctx,
     }
     js_free(ctx, s->pc_stack);
     js_free(ctx, s->catch_pos_tab);
+#if APICLIENT_DEV
+    *plevel_tab = s->stack_level_tab;   /* HANDED OVER to the bytecode; freed by free_function_bytecode */
+#else
+    *plevel_tab = NULL;
     js_free(ctx, s->stack_level_tab);
+#endif
     *pstack_size = s->stack_len_max;
     return 0;
  fail:
     js_free(ctx, s->pc_stack);
     js_free(ctx, s->catch_pos_tab);
     js_free(ctx, s->stack_level_tab);
+    *plevel_tab = NULL;
     *pstack_size = 0;
     return -1;
 }
@@ -68365,6 +68459,7 @@ static JSValue js_create_function_post(JSContext *ctx, JSFunctionDef *fd)
     JSValue func_obj;
     JSFunctionBytecode *b;
     struct list_head *el, *el1;
+    uint16_t *level_tab = NULL;   /* compute_stack_size's per-pc depth table; handed to `b` below */
     int stack_size, idx;
     int function_size, byte_code_offset, cpool_offset;
     int closure_var_offset, vardefs_offset;
@@ -68400,7 +68495,7 @@ static JSValue js_create_function_post(JSContext *ctx, JSFunctionDef *fd)
     if (resolve_labels(ctx, fd))
         goto fail;
 
-    if (compute_stack_size(ctx, fd, &stack_size) < 0)
+    if (compute_stack_size(ctx, fd, &stack_size, &level_tab) < 0)
         goto fail;
 
     function_size = sizeof(*b);
@@ -68417,6 +68512,14 @@ static JSValue js_create_function_post(JSContext *ctx, JSFunctionDef *fd)
     if (!b)
         goto fail;
     JS_REF_COUNT(b) = 1;
+
+#if APICLIENT_DEV
+    /* ADOPTED THE INSTANT THE BODY EXISTS, and the local is cleared with it: the table is indexed by an offset
+       into the buffer copied two lines below, so it belongs to exactly this `b` from here on and `fail:` must
+       not free it a second time. */
+    b->stack_level_tab = level_tab;
+#endif
+    level_tab = NULL;
 
     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
     b->byte_code_len = fd->byte_code.size;
@@ -68520,6 +68623,7 @@ static JSValue js_create_function_post(JSContext *ctx, JSFunctionDef *fd)
     js_free(ctx, fd);
     return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
  fail:
+    js_free(ctx, level_tab);   /* NULL once `b` adopted it, and on every path that never reached the walk */
     js_free_function_def(ctx, fd);
     return JS_EXCEPTION;
 }
@@ -68630,6 +68734,9 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     JS_FreeAtomRT(rt, b->eval_origin);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
+#if APICLIENT_DEV
+    js_free_rt(rt, b->stack_level_tab);   /* NULL for a body the bytecode reader built — see the field */
+#endif
 
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && JS_REF_COUNT(b) != 0) {
