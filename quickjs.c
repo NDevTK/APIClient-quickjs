@@ -700,7 +700,7 @@ struct JSContext {
        step machine there is nothing to run it from C. This is that algorithm as a callable the engine holds and
        never exposes, so the "call the algorithm" step is the same CALL request every other spelling issues. */
     JSValue regexp_builtin_exec;
-    /* 27.1.4.1 CreateAsyncFromSyncIterator step 3 is `! Get(asyncIterator, "next")` — infallible because the
+    /* 27.1.5.1 CreateAsyncFromSyncIterator ( syncIteratorRecord ) step 3 is `! Get(asyncIterator, "next")` — infallible because the
        object is a hidden intrinsic no page can reach. Performed as a real property read it was still a C-side
        read of JS_ATOM_next, indistinguishable at the call site from a consumer running the iterator protocol
        from C, which is the thing the ratchet exists to keep at zero. The method is the SAME object for every
@@ -11623,7 +11623,7 @@ static JSValue js_call_function(JSContext *ctx, JSValueConst this_val,
     return JS_Call(ctx, argv[1], argv[0], argc-2, argv+2);
 }
 
-/* DELETED: js_getOwnPropertyKeys. 27.1.3.4 Iterator.zipKeyed step 4.a is
+/* DELETED: js_getOwnPropertyKeys. proposal-joint-iteration Iterator.zipKeyed step 4.a is
    `? iterables.[[OwnPropertyKeys]]()` and the self-hosted body reached it through this helper's
    JS_GetOwnPropertyNames2 — the `ownKeys` trap, plus 10.5.11's invariant, from C. It asked for strings AND
    symbols, which is Reflect.ownKeys exactly, and that is already a step machine; the helper is now that machine
@@ -20689,7 +20689,7 @@ static void js_itercall_deliver(JSContext *ctx, JSValue *sp, JSValue ret_val)
    a second construction site is a second chance to forget. Consumes `method`. */
 static JSValue js_new_sync_dispose_wrapper(JSContext *ctx, JSValue method);
 
-/* DELETED: js_op_using_check. 27.3.1.1 GetDisposeMethod is one or two ordinary [[Get]]s on a value the page
+/* DELETED: js_op_using_check. 7.5.4 GetDisposeMethod ( value, kind ) is one or two ordinary [[Get]]s on a value the page
    supplies, so each is an accessor or a Proxy trap away from being the page's code — and this ran them with
    JS_GetProperty from C, below the live flow, which is what Symbol.asyncDispose-getter.js reached. The reads are
    requests at do_using_check_read now; everything else the helper did (the null/undefined skip, the two
@@ -21742,7 +21742,7 @@ JSValue JS_GetAsyncIteratorPrototype(JSContext *ctx)
     return js_dup(ctx->async_iterator_proto);
 }
 
-/* 27.1.4.1 CreateAsyncFromSyncIterator, for a HOST performing GetIterator(obj, ASYNC).
+/* 27.1.5.1 CreateAsyncFromSyncIterator ( syncIteratorRecord ), for a HOST performing GetIterator(obj, ASYNC).
  *
  * A host can do every OTHER step of that abstract operation with what quickjs-step.h already exports — the
  * @@asyncIterator and @@iterator reads and the method call are requests like any other. This one step it
@@ -24797,11 +24797,11 @@ static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call
                                   exists only between the yield and the resume, and it is the ONE way a machine
                                   parks. */
 #define CONT_ASYNC_AWAIT   74  /* cont_state = JSAsyncSettle (post unused): the async call's own outcome, deferred
-                                  across 27.7.5.3 Await's machine. */
-#define CONT_AFS_CONT      73  /* outer = JSAsyncFromSync: 27.1.4.4 steps 5-15, whose step 5 reads `constructor`
+                                  across 27.10.5.3 Await's machine. */
+#define CONT_AFS_CONT      73  /* outer = JSAsyncFromSync: 27.1.5.4 AsyncFromSyncIteratorContinuation steps 6-15, whose step 6 reads `constructor`
                                   off the value and is therefore the page's code. */
 #define CONT_AGEN_AWAIT_RET 72 /* cont_state = JSAgenSettle (post unused): the drive's own outcome, deferred
-                                  across 27.6.3.2 AsyncGeneratorAwaitReturn's requests. The machine finishes the
+                                  across 27.9.3.9 AsyncGeneratorAwaitReturn's requests. The machine finishes the
                                   algorithm itself, so this carries only what do_agen_drive_finish needs. */
 #define CONT_PROMISE_ALL_SETTLE 70 /* cont_state = JSPromiseAll: the AGGREGATE capability's reject(error). The
                                       capability is NewPromiseCapability(C) with C the `this` value, so a subclass
@@ -24819,7 +24819,7 @@ static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call
 enum { ASYNC_POST_FAIL = -1, ASYNC_POST_NONE = 0, ASYNC_POST_CALL = 1, ASYNC_POST_AWAIT = 2 };
 /* What an async body's completion still owes, once everything that runs no page code has been done. For
    ASYNC_POST_CALL that is `func(value)`, the capability's resolving function, which the CALLER places as a call.
-   For ASYNC_POST_AWAIT it is `value` and `st`: the whole of 27.7.5.3 is the driver's MACHINE, so nothing about
+   For ASYNC_POST_AWAIT it is `value` and `st`: the whole of 27.10.5.3 Await is the driver's MACHINE, so nothing about
    Await is prepared here any more — `await_promise` and `func` are the settle's alone.
    The `await_promise` field survives because js_async_function_await_finish is the machine's own attach step and
    takes its operands through this record. */
@@ -25356,7 +25356,7 @@ typedef struct JSIterFrom { int orig_cfirst, orig_cargc; uint8_t orig_is_tail;
                             /* GetIteratorDirect's nextMethod, parked across step 3's OrdinaryHasInstance — a
                                prototype walk whose links can be Proxies, so page code, so a suspension. */
                             JSValue nextm;
-                            /* THE METHOD'S REALM. 27.1.2.1 step 2 tests against %Iterator% and step 4 creates a
+                            /* THE METHOD'S REALM. 27.1.3.2.2 Iterator.from step 2 tests against %Iterator% and step 4 creates a
                                %WrapForValidIteratorPrototype% object — both intrinsics of the FUNCTION being
                                called, not of its caller. Reading them off `ctx` made
                                `otherRealm.Iterator.from(iter)` answer with `iter` itself, because it asked
@@ -25667,7 +25667,7 @@ typedef struct JSIterClose {
                                   NORMAL completion it owes step 6's "must be an Object", and under an unwind the
                                   result AND any throw of its own are discarded and the saved exception re-raised. */
 #define CONT_FORAWAIT_GET  35  /* cont_state = NULL: `for await`'s GetMethod(obj, @@asyncIterator). If the method
-                                  is nullish, 27.1.4.3 falls to the SYNC @@iterator and wraps — which is two more
+                                  is nullish, 7.4.4 GetIterator ( obj, kind ) falls to the SYNC @@iterator and wraps — which is two more
                                   points in the same walk, so each is its own kind rather than a phase byte
                                   nothing else would read. */
 #define CONT_FORAWAIT_SYNC_GET 36  /* cont_state = NULL: the @@iterator read reached after a nullish
@@ -25693,7 +25693,7 @@ typedef struct JSIterClose {
                                   a C recursion that drove it to completion. do_return applies IteratorNext's
                                   "result must be an object" check and IteratorComplete/IteratorValue, and places
                                   [value, done] exactly where js_for_of_next's tail does. */
-#define CONT_FOROF_ENUMREC_WRAP 53  /* the same read for `for await`'s SYNC branch. The wrap is 27.1.4.1, which
+#define CONT_FOROF_ENUMREC_WRAP 53  /* the same read for `for await`'s SYNC branch. The wrap is 27.1.5.1 CreateAsyncFromSyncIterator, which
                                        takes the sync iterator RECORD — so the read happens on the SYNC iterator
                                        FIRST and the wrapper is built from what it produced; the wrapper's own
                                        `next` is an intrinsic and needs no page-visible read. Doing it the other
@@ -25701,7 +25701,7 @@ typedef struct JSIterClose {
                                        read the sync iterator from C, a second observable Get with no flow base. */
 #define CONT_ITER_FROM_NEXT_GET 54  /* gp_outer = JSIterFrom: GetIteratorDirect's nextMethod read inside
                                        Iterator.from. Read UNCONDITIONALLY, before the %Iterator% hasInstance
-                                       test, because 27.1.3.1 completes the record first — and the wrap decision
+                                       test, because 27.1.3.2.2 Iterator.from completes the record first — and the wrap decision
                                        that follows needs the state, so the state outlives the read now instead
                                        of being freed just before it. */
 #define CONT_PROMISE_ALL_NEXT_GET 52  /* gp_outer = JSPromiseAll: GetIterator step 5.b for a Promise COMBINATOR.
@@ -26076,7 +26076,7 @@ static int js_append_fast_array(JSContext *ctx, JSValue *sp)
     return 1;
 }
 /* Iterator.from — EVERY argument, including a primitive and a non-iterable. There is nothing left to SELECT: the
-   tramp arm performs the whole of 27.1.3.1 (its TypeErrors included) and the C entry DFAILs, so the only thing
+   tramp arm performs the whole of 27.1.3.2.2 Iterator.from (its TypeErrors included) and the C entry DFAILs, so the only thing
    this does is pass the side-effect-free @@iterator probe along for the acquire to use. Its ABSENCE is the
    acquire's flattenable "O is its own iterator" case, never a reason to refuse the route. */
 /* DELETED: tramp_can_call_iterator_from. Iterator.from declares its walk at its own definition; it declined
@@ -26107,7 +26107,7 @@ typedef struct JSIteratorHelperData {
     void *consumer;          /* ITH_CONSUME: the consumer step awaiting this helper's {value,done} — a JSIteratorHelperData
                                 (helper-drives-helper), a JSIterConsume (Array.from/spread/Set/Map), etc. per consumer_kind */
     uint8_t consumer_kind;   /* CONT_* of `consumer`: CONT_ITER_HELPER / CONT_ITER_CONSUME / ... — how to re-enter it */
-    uint8_t read_closes_source;  /* 1 = this read is inside 27.1.4.5's IfAbruptCloseIterator — the flatMap
+    uint8_t read_closes_source;  /* 1 = this read is inside 27.1.4.6 Iterator.prototype.flatMap's IfAbruptCloseIterator — the flatMap
                                     acquire's @@iterator and nextMethod reads — so an abrupt one closes the
                                     SOURCE before propagating. The source's own result reads are not: there the
                                     source is what went wrong, and 7.4.x propagates without closing it. */
@@ -26785,8 +26785,8 @@ static inline bool tramp_body_is_async(JSValueConst func) {
    suspend — so a loop after an await preempted, parked ITSELF, and handed control back to a caller that went on
    executing bytecode over the live park. Nothing about that was a missing assert: there was no shape in which
    the C entry could park the whole flow, because the whole flow was not what it was driving.
-   (The rest of this file writes Await as 27.7.5.3, which is an older edition's number for the same section; the
-   pair above was read out of the current spec text rather than recalled, and the TITLE is what survives both.) */
+   (The pair above was read out of the spec text rather than recalled, and the TITLE is what survives an edition
+   the number does not — which is why every citation here carries one.) */
 static inline bool tramp_body_is_async_resume(JSValueConst func) {
     JSObject *fp;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT) return false;
@@ -27262,17 +27262,17 @@ typedef struct JSAsyncFromSync {
     uint8_t deliver;             /* AFS_* — WHERE the settle puts the wrapper's promise. The three entry opcodes
                                     differ only in that, so the drive and the settle are shared and this selects
                                     the tail. */
-    uint8_t close_on_rejection;  /* 27.1.4.4's closeOnRejection argument: true for .next/.throw, false for
+    uint8_t close_on_rejection;  /* 27.1.5.4 AsyncFromSyncIteratorContinuation's closeOnRejection argument: true for .next/.throw, false for
                                     .return (which has already closed the sync iterator). */
     JSValue drive_next;          /* the sync record's nextMethod (owned, taken at construction): the wrapper it was
                                     read from can be released before the drive returns. */
-    /* 27.1.4.4 steps 1-4: IteratorComplete then IteratorValue on the sync .next()'s RESULT. Both read the result
+    /* 27.1.5.4 steps 2-5: IteratorComplete then IteratorValue on the sync .next()'s RESULT. Both read the result
        object, which a hand-written sync iterator can make an accessor or a Proxy — page code, and the deliver
        read them with JS_GetProperty from C. They are requests now, one phase each, and the
        result parks here across them. */
     JSValue res_obj;             /* the sync iterator result being unpacked (owned) */
     uint8_t res_ph;              /* 0 = none, 1 = the `done` read is in flight, 2 = the `value` read is,
-                                    3 = 27.1.4.4/.5's GetMethod of the sync iterator's own return/throw is */
+                                    3 = 27.1.5.2.2/.2.3's GetMethod of the sync iterator's own return/throw is */
     uint8_t res_done;            /* what the `done` read produced, held across the `value` read */
     void *call_outer;            /* AFS_DELIVER_CALL: the machine or sequence WAITING for this call's result — the
                                     wrapper's method is an ordinary callee at do_generic_callee, so whoever made
@@ -27286,7 +27286,7 @@ typedef struct JSAsyncFromSync {
                                     It was recoverable by inverting close_on_rejection, which is a coincidence of
                                     that flag's definition and not a contract; re-deriving state instead of
                                     carrying it is the mistake tp_op_byte's stale-pointer segfault taught. */
-    uint8_t close_then_typeerror; /* 27.1.6.2.3 step 8: `.throw()` on a sync iterator with no `throw` closes it
+    uint8_t close_then_typeerror; /* 27.1.5.2.3 %AsyncFromSyncIteratorPrototype%.throw step 8: `.throw()` on a sync iterator with no `throw` closes it
                                      under a NORMAL completion (so the close's OWN throw is what rejects — step
                                      7d is an IfAbruptRejectPromise) and only then rejects with a fresh TypeError.
                                      Raising the TypeError first and closing abruptly instead discarded the
@@ -27815,11 +27815,11 @@ typedef struct JSIterConcatReturn {
     uint8_t held;
 } JSIterConcatReturn;
 
-/* 27.1.3.2.1.1.2 %WrapForValidIteratorPrototype%.return: RequireInternalSlot, then `? GetMethod(iterator, "return")`
+/* 27.1.3.2.2.1.2 %WrapForValidIteratorPrototype%.return: RequireInternalSlot, then `? GetMethod(iterator, "return")`
    and `? Call(returnMethod, iterator)` — BOTH the page's code on an accessor, a Proxy, or a plain method with a
    loop in it. js_iterator_wrap_next ran them with JS_GetProperty and JS_IteratorNext2 -> JS_Call from a C entry,
    so closing an `Iterator.from(plainObject)` wrapper aborted at the wrapped `return`'s back-edge.
-   `.next` is NOT part of this: 27.1.3.2.1.1.1 forwards VERBATIM, which makes it CALL-SITE-RESOLVED
+   `.next` is NOT part of this: 27.1.3.2.2.1.1 forwards VERBATIM, which makes it CALL-SITE-RESOLVED
    (tramp_unwrap_iter_next replaces the record) rather than a machine — a different mechanism, not a fallback. */
 typedef struct JSIterWrapReturn {
     JSStepHdr hdr;    /* MUST be first: the generic step driver casts the state to JSStepHdr * */
@@ -28842,7 +28842,7 @@ typedef struct JSCoerce1 {
 /* the Function constructor ToStrings EVERY argument, however many there are — a mask of positions cannot say
    that, so "all of them" is its own bit rather than a mask wide enough for today's tests. */
 #define PRIMARGS_ALL 0x200
-/* THE ITERATOR-HELPER FACTORY (27.1.4.3/.5 take/drop/map/filter/flatMap). Its last spec step is
+/* THE ITERATOR-HELPER FACTORY (27.1.4.11/.2/.8/.4/.6 take/drop/map/filter/flatMap). Its last spec step is
    GetIteratorDirect(this), whose `Get(iterator, "next")` is the page's own code — an accessor, a Proxy trap —
    and it ran from the C body, where a loop in it has no flow base. take/drop were already a coerce-then-compute
    machine and map/filter/flatMap were plain C functions, so the read existed in a body shared by both shapes and
@@ -29298,12 +29298,12 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val, in
 static JSValue js_async_generator_enqueue(JSContext *ctx, struct JSAsyncGeneratorData *s, int magic,
                                           JSValueConst arg);
 static int js_async_generator_pre(JSContext *ctx, struct JSAsyncGeneratorData *s, JSValue *out_value);
-#define AGEN_POST_AWAIT 2   /* js_async_generator_post: the body reached AWAIT, so the driver runs 27.6.3.8's
+#define AGEN_POST_AWAIT 2   /* js_async_generator_post: the body reached AWAIT, so the driver runs 27.10.5.3 Await's
                                machine on out->value (owned by the caller) and then places the drive's outcome */
 static const JSTrampStepDef js_agen_await_ret_def;
 static JSValue js_new_agen_await_ret(JSContext *ctx, JSValueConst generator, bool is_await);
 #define AGEN_PRE_AWAIT_RETURN 3  /* js_async_generator_pre: the head of the queue is a RETURN on a completed
-                                    generator, so 27.6.3.2 AsyncGeneratorAwaitReturn runs — which reads
+                                    generator, so 27.9.3.9 AsyncGeneratorAwaitReturn runs — which reads
                                     `constructor` off the returned value and is therefore the page's code. It
                                     runs no BODY, so the driver runs the machine and finishes; *out_value is the
                                     returned value (owned by the caller). */
@@ -29357,7 +29357,7 @@ static inline int tramp_agen_resume_kind(JSValueConst func) {
 
 static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                      int *pdone, int magic);
-/* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.3.2.1.1.1 is `Return ? Call([[NextMethod]], [[Iterator]])`
+/* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.3.2.2.1.1 is `Return ? Call([[NextMethod]], [[Iterator]])`
    with nothing after the call. That makes it CALL-SITE-RESOLVED (§C-stack): a driver replaces the
    (iterator, nextMethod) pair with the WRAPPED one and drives that, so a wrapped plain iterator's bytecode
    .next() runs on the tramp like any other. Reached through js_iterator_wrap_next instead, it recursed
@@ -29400,7 +29400,7 @@ static bool tramp_unwrap_iter_next(JSValueConst *piter, JSValueConst *pnext) {
 #define TRAMP_DRIVE_ITER_NEXT(diter, dnext, statep, kindc, pdrive, darg)                                \
     do {                                                                                                 \
         /* IteratorNext(record, value) FORWARDS its value, and WrapForValidIterator's .next does NOT      \
-           (27.1.3.2.1.1.1 step 4 calls with no arguments) — so a drive CARRYING one must not unwrap, or the  \
+           (27.1.3.2.2.1.1 step 4 calls with no arguments) — so a drive CARRYING one must not unwrap, or the  \
            wrapped iterator would see an argument the wrapper would have swallowed. */                    \
         if (JS_IsUninitialized(darg)) tramp_unwrap_iter_next(&(diter), &(dnext));                        \
         if (iter_helper_drive_ready((dnext), (diter))) {                                              \
@@ -30264,7 +30264,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSObject *gp_ta_site = NULL;                        /* the typed array a keyed write's coercion belongs to,
                                                            resolved by ta_atom_write_needs_toprim (borrowed) */
     JSValue agen_await_val = JS_UNDEFINED;              /* the value do_agen_await_ret_start awaits (owned) */
-    uint8_t agen_await_is_await = 0;                    /* 0 = 27.6.3.2 AwaitReturn, 1 = 27.6.3.8 Await */
+    uint8_t agen_await_is_await = 0;                    /* 0 = 27.9.3.9 AsyncGeneratorAwaitReturn, 1 = 27.10.5.3 Await */
     JSValue *agen_caller_sp = NULL;                     /* the caller's sp with the drive's operands already freed */
     uint8_t agen_tail = 0;                              /* `return ag.next()`: the promise IS the caller's return */
     void *tramp_step_outer = NULL;                      /* non-NULL = the step about to be pushed delivers its result to this machine's step, not to the operand stack (read+reset in do_step_tramp) */
@@ -32987,7 +32987,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 if (tramp_first == -2) {
-                    /* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.3.2.1.1.1 is
+                    /* WrapForValidIterator's .next FORWARDS VERBATIM — 27.1.3.2.2.1.1 is
                        `Return ? Call([[NextMethod]], [[Iterator]])`, with no arguments passed and nothing after
                        the call. That makes it a REWRITE like the bound arm below, not an arm of its own: produce
                        the wrapped (receiver, callee) and re-enter, so every kind below answers the wrapped .next
@@ -34349,7 +34349,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_iterfrom_tramp:
-            /* 27.1.3.1 Iterator.from(O), the WHOLE of it — the C entry is gone. Step 1 is
+            /* 27.1.3.2.2 Iterator.from ( obj ), the WHOLE of it — the C entry is gone. Step 1 is
                GetIteratorFlattenable(O, iterate-string-primitives), which is the shared acquire in its FLATTENABLE
                mode (the one step where it differs from GetIterator: an absent @@iterator makes O itself the
                iterator instead of a TypeError). Steps 2-6 (GetIteratorDirect's `next`, the %Iterator%
@@ -36469,7 +36469,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                       if (gk == CONT_PROMISE_ALL_THEN) { cont_st = gouter0; goto do_promise_all_attach_call; }
                       if (gk == CONT_AFS_GET) {
                           cont_st = gouter0;
-                          /* 27.1.4.4/.5's GetMethod continues INSIDE the entry block, not at the step: the rest
+                          /* 27.1.5.2.2/.2.3's GetMethod continues INSIDE the entry block, not at the step: the rest
                              of that operation pushes the drive's operands onto THIS frame's stack, and the step
                              label is a different point in the loop. Resuming there ran those pushes against a
                              frame whose closure var_refs the return path then read as garbage — a segfault in
@@ -37122,7 +37122,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_iter_from_have_next:
-            /* Iterator.from's nextMethod has arrived; 27.1.3.1 step 3 is next. This said the OrdinaryHasInstance
+            /* Iterator.from's nextMethod has arrived; 27.1.3.2.2 Iterator.from step 2's OrdinaryHasInstance is next. This said the OrdinaryHasInstance
                that follows is "a prototype walk — so nothing after the read is the page's code", which is FALSE
                the moment a link is a Proxy: its [[GetPrototypeOf]] is a trap, and this ran the walk from C, so
                `Iterator.from(Object.create(proxyWithGetPrototypeOf))` aborted. It is the same machine the
@@ -38107,7 +38107,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int afs_close = (afs_mode == AFS_DELIVER_CLOSE);
                 int afs_iter_magic = tramp_afs_magic; tramp_afs_magic = GEN_MAGIC_NEXT;   /* read + reset (ITERCALL only) */
                 int afs_noarg = tramp_afs_noarg; tramp_afs_noarg = 0;
-                /* 7.4.9's close OF THE WRAPPER *is* 27.1.6.2.2 with no argument — GetMethod the sync iterator's
+                /* 7.4.9's close OF THE WRAPPER *is* 27.1.5.2.2 %AsyncFromSyncIteratorPrototype%.return with no argument — GetMethod the sync iterator's
                    own `return`, call it, wrap the result — so it runs the ITERCALL operation and differs ONLY in
                    the delivery (its promise is never awaited). Written as its own arm it knew a GENERATOR source
                    and nothing else, and every other source fell to the generic 7.4.9 path, which reads `return`
@@ -38160,7 +38160,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 s->pending_error = JS_UNINITIALIZED;
                 s->deliver = afs_mode;
-                /* .return() passes closeOnRejection=false (27.1.6.2.2 step 13): it has already asked the sync
+                /* .return() passes closeOnRejection=false (27.1.5.2.2 step 13): it has already asked the sync
                    iterator to close, so neither step 6 nor step 14 may close it again. .next()/.throw() pass
                    true. AFS_DELIVER_CLOSE is OP_iterator_close driving the wrapper's own .return(). */
                 s->close_on_rejection = !(afs_itercall && afs_iter_magic == GEN_MAGIC_RETURN);
@@ -38175,7 +38175,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 else if (afs_mode == AFS_DELIVER_ITERNEXT || afs_mode == AFS_DELIVER_ITERCALL) { s->orig_cfirst = 0; s->orig_cargc = 0; s->orig_is_tail = 0; }
                 else { s->orig_cfirst = call_first_r; s->orig_cargc = call_pop; s->orig_is_tail = tramp_is_tail; }
                 if (afs_itercall) {
-                    /* 27.1.4.4 / .5: .return(v) and .throw(v) do NOT reuse [[NextMethod]] — they GetMethod the SYNC
+                    /* 27.1.5.2.2 / .2.3: .return(v) and .throw(v) do NOT reuse [[NextMethod]] — they GetMethod the SYNC
                        iterator's own `return`/`throw` first, and an ABSENT one settles without any drive at all
                        (return resolves {value:v,done:true}; throw closes the sync iterator and rejects with a
                        TypeError). That read is the PAGE's code on an accessor, so it is the machine's own
@@ -38206,7 +38206,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             cont_st = s;
                             goto do_async_from_sync_step;   /* wraps + delivers exactly like a driven result */
                         }
-                        /* 27.1.6.2.3 step 8.c: IteratorClose(syncIteratorRecord, closeCompletion), THEN reject
+                        /* 27.1.5.2.3 step 8.c: IteratorClose(syncIteratorRecord, closeCompletion), THEN reject
                            with the TypeError. Both halves of the close — GetMethod and the call — are the page's
                            code, so it is PARKED (a JSIterClose whose saved completion is the TypeError and whose
                            waiting machine is this one); JS_IteratorClose ran them from C, so a `return` with a
@@ -38248,7 +38248,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
                        "async-from-sync drive: operand push exceeds the frame's compiled stack_size");
                 { JSValueConst di = s->sync_iter, dn = s->drive_next;
-                  /* 27.1.4.2.1 steps 5-6: the value is forwarded only when the wrapper was GIVEN one — an
+                  /* 27.1.5.2.1 %AsyncFromSyncIteratorPrototype%.next steps 5-6: the value is forwarded only when the wrapper was GIVEN one — an
                      absent argument must not become an explicit `undefined` at the sync .next(). */
                   TRAMP_DRIVE_ITER_NEXT(di, dn, s, CONT_ASYNC_FROM_SYNC, NULL, s->drive_arg); }
             }
@@ -38430,7 +38430,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        "TypeError to raise after it");
                 if (unlikely(!ce)) { JS_ThrowOutOfMemory(ctx); goto do_async_from_sync_abrupt; }
                 ce->iter = js_dup(s->sync_iter);
-                /* UNINITIALIZED when nothing is pending, which IS the normal-completion close 27.1.6.2.3 step 8.c asks
+                /* UNINITIALIZED when nothing is pending, which IS the normal-completion close 27.1.5.2.3 step 8.c asks
                    for: the close's own throw then propagates and step 6's must-be-an-Object applies. */
                 ce->saved_exc = rt->current_exception;
                 rt->current_exception = JS_UNINITIALIZED;
@@ -39011,7 +39011,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
                 }
                 if (post == ASYNC_POST_AWAIT) {
-                    /* 27.7.5.3 as a MACHINE on this chain, with the async call's own outcome deferred across it.
+                    /* 27.10.5.3 Await ( arg ) as a MACHINE on this chain, with the async call's own outcome deferred across it.
                        The settle below still pushes a CALL, because that one IS a call — the capability's
                        resolving function — while Await is a whole algorithm. */
                     JSValue awfn = js_new_async_await(ctx, asf.st);
@@ -39826,7 +39826,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSAsyncPost apost;
                     int pr = js_async_generator_post(ctx, agen_s, agret, &apost);
                     if (pr == AGEN_POST_AWAIT) {
-                        /* the body reached AWAIT: run 27.6.3.8's machine on this chain, with the drive's own
+                        /* the body reached AWAIT: run 27.10.5.3 Await's machine on this chain, with the drive's own
                            outcome deferred across it — the SAME label the completed-return case uses, because
                            it is the same machine with a different attach. */
                         agen_await_val = apost.value;   /* owned, transferred to the label */
@@ -39840,8 +39840,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_agen_await_ret_start:
-            /* ONE placement for BOTH of the async generator's awaits — 27.6.3.2's on a completed return and
-               27.6.3.8's on a body Await. Neither runs a generator body, so each is a machine on THIS chain with
+            /* ONE placement for BOTH of the async generator's awaits — 27.9.3.9 AsyncGeneratorAwaitReturn's on a completed return and
+               27.10.5.3 Await's on a body Await. Neither runs a generator body, so each is a machine on THIS chain with
                the drive's own outcome deferred across it, the shape CONT_AGEN_SETTLE used to give the resolve
                call alone. agen_await_is_await picks which attach; everything else is identical, which is why
                there is one label and not two. */
@@ -39998,7 +39998,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         /* DELETED: do_agen_settled and the whole CONT_AGEN_SETTLE path. It existed to place Await's RESOLVE
-           call and then call js_async_generator_await_finish — half of 27.6.3.8, with the `constructor` READ
+           call and then call js_async_generator_await_finish — half of 27.10.5.3 Await, with the `constructor` READ
            that precedes the resolve still a JS_GetProperty from C. The machine at do_agen_await_ret_start is
            both halves and both of the generator's awaits, so there is nothing for a second placement to do. */
 
@@ -40330,7 +40330,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* the UNPACK, not the deliver: the deliver's own head drops the DRIVE's operands and this
                            request is not that call. Re-entering it would drop them a second time, with a stale
                            shape — the sp drift ASan caught. The phase on the state says which read this answers,
-                           and 27.1.4.4/.5's GetMethod continues inside the ENTRY block instead — this is the
+                           and 27.1.5.2.2/.2.3's GetMethod continues inside the ENTRY block instead — this is the
                            SUSPENDED delivery, and patching only the in-place one left an accessor `return` (a
                            bytecode getter, so it always suspends) resuming in the wrong phase and never
                            settling. */
@@ -42201,7 +42201,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                         slot is both where the enum_rec wants it and what the
                                                         frame's catch-search frees if the read throws. */
                 ret_val = JS_UNDEFINED;
-                /* GetIterator step 5.b, on the SYNC iterator, BEFORE any wrap: 27.1.4.3's async branch completes
+                /* GetIterator step 5.b, on the SYNC iterator, BEFORE any wrap: 7.4.4 GetIterator's async branch completes
                    the sync record first and hands it to CreateAsyncFromSyncIterator. Whether a wrap follows rides
                    the KIND, because the read can suspend and the register would not survive it. */
                 gp_outer = NULL;
@@ -42218,9 +42218,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 DCHECK(sp + 2 <= TRAMP_SP_LIMIT(sf),
                        "for-of acquire: enum_rec push exceeds the frame's compiled stack_size");
                 if (want_wrap) {
-                    /* 27.1.4.3 step 1.b.iii: the completed SYNC record becomes the wrapper's, and the enum_rec
+                    /* 7.4.4 GetIterator step 1.b.iii: the completed SYNC record becomes the wrapper's, and the enum_rec
                        drives the WRAPPER's own `next` — %AsyncFromSyncIteratorPrototype%.next, a hidden
-                       intrinsic, which is why step 3 of 27.1.4.1 is an infallible Get. */
+                       intrinsic, which is why step 3 of 27.1.5.1 CreateAsyncFromSyncIterator is an infallible Get. */
                     JSValue wnext, wrapped = JS_CreateAsyncFromSyncIterator(ctx, sp[-1], ret_val, &wnext);
                     ret_val = JS_UNDEFINED;
                     if (unlikely(JS_IsException(wrapped))) goto exception;
@@ -42275,7 +42275,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_for_await_of_start):
-            /* 27.1.4.3 GetIterator(obj, async): read @@asyncIterator; if it is nullish, read the SYNC @@iterator
+            /* 7.4.4 GetIterator ( obj, kind ) with kind async: read @@asyncIterator; if it is nullish, read the SYNC @@iterator
                and wrap the iterator it produces. Every one of those steps is user code — an accessor, a Proxy
                trap, the method itself — and the C acquire ran all of them from C, so `for await` over the
                ordinary `[Symbol.iterator]() { … }` had no flow base, exactly as `for of` did. */
@@ -42286,7 +42286,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             goto do_getprop_tramp;
 
         do_forawait_have_async_method:
-            /* the @@asyncIterator read completed. A nullish method is 27.1.4.3's fall to the SYNC branch. */
+            /* the @@asyncIterator read completed. A nullish method is 7.4.4 GetIterator's fall to the SYNC branch. */
             if (JS_IsUndefined(ret_val) || JS_IsNull(ret_val)) {
                 JS_FreeValue(ctx, ret_val); ret_val = JS_UNDEFINED;
                 gp_obj = sp[-1]; gp_atom = JS_ATOM_Symbol_iterator; gp_op = GP_GET; gp_val = JS_UNDEFINED;
@@ -42464,7 +42464,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (co && ck == CONT_ASYNC_FROM_SYNC) {
                     /* the wrapper asked for this close on its way to REJECTING its promise. Either the close
                        preserved a completion (that is the rejection) or it was the normal-completion close
-                       27.1.6.2.3 step 8 performs before rejecting with its own TypeError. */
+                       27.1.5.2.3 step 8 performs before rejecting with its own TypeError. */
                     JSAsyncFromSync *as2 = (JSAsyncFromSync *)co;
                     DCHECK(failed || as2->close_then_typeerror,
                            "an async-from-sync close ended with no completion and nothing to raise");
@@ -42609,7 +42609,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_using_check):
-            /* 27.3.1.2 CreateDisposableResource: undefined/null has no method, and everything else is
+            /* 7.5.3 CreateDisposableResource ( value, kind [ , method ] ): undefined/null has no method, and everything else is
                GetDisposeMethod — THE machine, the same one DisposableStack.prototype.use delegates to. An opcode
                has no callee slot to reach a def through, so it names the def by id; the hint picks which.
                The operand shape is first = 0, argc = 0: nothing is dropped, so the disposable stays at sp[-1]
@@ -42659,7 +42659,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 /* EVERY other callee. IteratorNext(record, value) FORWARDS its value, so there is no wrapper
-                   unwrap here — WrapForValidIterator.next takes no arguments (27.1.4.2.1 step 4), and unwrapping
+                   unwrap here — WrapForValidIterator.next takes no arguments (27.1.3.2.2.1.1 step 4), and unwrapping
                    would hand the wrapped iterator an argument the wrapper swallows. The split below is the
                    callee's FRAME KIND, never whether to suspend. */
                 {
@@ -45552,7 +45552,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the same rule. */
             JSIteratorHelperData *cit = (JSIteratorHelperData *)xcs;
             /* WHICH RECORD the abrupt `next` belonged to is the whole question. flatMap holds TWO: an abrupt on
-               the INNER is 27.1.4.4 step 6.c.i.ii's IfAbruptCloseIterator(innerNext, ITERATED) — it closes the
+               the INNER is 27.1.4.6 Iterator.prototype.flatMap step 6.c.i.ii's IfAbruptCloseIterator(innerNext, ITERATED) — it closes the
                OUTER — while an abrupt on the outer's own `next` is 7.4.9 step 2, which marks that record done
                and closes nothing. `drive_close` is take's close-on-limit `.return()`, whose own throw
                propagates rather than provoking a second close. */
@@ -45727,7 +45727,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (gouter && gk2 == CONT_ITER_HELPER_GET) {
                 /* the helper's `done`/`value` read threw: the source is [[Done]] for this helper and the throw
                    propagates, which is what the step's own -1 does — release the unpack and take that path.
-                   The flatMap ACQUIRE's reads are the exception: they sit inside 27.1.4.5's
+                   The flatMap ACQUIRE's reads are the exception: they sit inside 27.1.4.6 Iterator.prototype.flatMap's
                    IfAbruptCloseIterator, so the SOURCE is closed first. The read itself says which it is, because
                    only the step that issued it knows. */
                 JSIteratorHelperData *hit = gouter;
@@ -45743,7 +45743,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto exception;
             }
             if (gouter && gk2 == CONT_AFS_GET) {
-                /* the wrapper's `done`/`value` read threw: 27.1.4.4 is inside the IfAbruptRejectPromise, so the
+                /* the wrapper's `done`/`value` read threw: 27.1.5.4 AsyncFromSyncIteratorContinuation is inside the IfAbruptRejectPromise, so the
                    throw REJECTS the wrapper's promise rather than propagating — the same arm the deliver's own
                    abrupt takes. `giter` is UNINITIALIZED there, which that arm allows. */
                 cont_st = gouter;
@@ -46748,7 +46748,7 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
             int st = js_async_function_post_prepare(ctx, d, r, &post);
             if (st == ASYNC_POST_AWAIT) {
                 /* TOP-LEVEL AWAIT in a forked module body. The continuation stops being the scheduler's here:
-                   27.7.5.3 registers it on the awaited promise, and the JSAsyncFunctionData's ownership goes
+                   27.10.5.3 Await registers it on the awaited promise, and the JSAsyncFunctionData's ownership goes
                    with it. So this flow is done as a SCHEDULER flow — but its frame is now somebody else's and
                    must not be torn down, which is what the third answer says. */
                 JSValue awfn = js_new_async_await(ctx, post.st);
@@ -48725,12 +48725,12 @@ static int js_async_function_post_prepare(JSContext *ctx, JSAsyncFunctionData *s
                    "an async body's settle was handed a suspension that is not an AWAIT — a preempt is the "
                    "driver's to take (do_preempt on a chain, the FUNC_RET_PREEMPT arm on a base), so this one "
                    "reached the settle unclaimed and would be resolved INTO the promise as an integer");
-            /* await: 27.7.5.3 step 1 is PromiseResolve(%Promise%, value), and its RESOLVE CALL is page code —
+            /* await: 27.10.5.3 Await step 1 is PromiseResolve(%Promise%, value), and its RESOLVE CALL is page code —
                the native resolving function's `Get(resolution, "then")` when the awaited value is a thenable, so
                `await thenable` ran that read from C. The call is handed out like the settle and the rest of Await
                finishes once it has run. */
             JS_FreeValue(ctx, func_ret); /* not used */
-            /* THE WHOLE OF 27.7.5.3 IS THE DRIVER'S MACHINE NOW. This used to do step 1's PromiseResolve here —
+            /* THE WHOLE OF 27.10.5.3 Await IS THE DRIVER'S MACHINE NOW. This used to do step 1's PromiseResolve here —
                including its `constructor` READ on an already-native promise, which is the page's code and ran
                from C — and hand only the resolve CALL out. Routing half of an algorithm leaves the other half
                where it was, which is what kept this site named-but-unbuilt for so long. */
@@ -48769,7 +48769,7 @@ static int js_async_function_await_finish(JSContext *ctx, JSAsyncPost *p)
     return res ? -1 : 0;
 }
 
-/* 27.7.5.3 Await for an async FUNCTION, as a STEP MACHINE — the third algorithm built on
+/* 27.10.5.3 Await ( arg ) for an async FUNCTION, as a STEP MACHINE — the third algorithm built on
    step_promiseresolve_run and the last of the three sites this file used to name as unbuilt. Step 1 is
    PromiseResolve(%Promise%, value), whose `constructor` read on an already-native promise and whose resolve on
    a thenable are both the page's code; steps 2-3 (the continuation's resolving functions and PerformPromiseThen)
@@ -48785,12 +48785,12 @@ typedef struct JSAsyncAwait {
 } JSAsyncAwait;
 _Static_assert(offsetof(JSAsyncAwait, hdr) == 0, "JSStepHdr must be first in JSAsyncAwait");
 
-/* WHICH STEP OF 27.7.5.3 EACH STAGE RESTS AT. The second stage names a RANGE because the machine rests inside
+/* WHICH STEP OF 27.10.5.3 Await ( arg ) EACH STAGE RESTS AT. The second stage names a RANGE because the machine rests inside
    the only page-visible operation in it: PromiseResolve reads `constructor` off an already-promise argument, and
    the three steps after it — two CreateBuiltinFunction and PerformPromiseThen — invoke nothing. */
 #define AWA_STAGES(X) \
-    X(AWA_CTX,     "27.7.5.3 step 1 (asyncContext is the running execution context)") \
-    X(AWA_RESOLVE, "27.7.5.3 steps 2-7 (promise is PromiseResolve(%Promise%, value); PerformPromiseThen " \
+    X(AWA_CTX,     "27.10.5.3 Await step 1 (asyncContext is the running execution context)") \
+    X(AWA_RESOLVE, "27.10.5.3 Await steps 2-7 (promise is PromiseResolve(%Promise%, value); PerformPromiseThen " \
                    "attaches onFulfilled and onRejected)")
 enum { AWA_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_async_await_steps[] = { AWA_STAGES(JS_STEP_STAGE_LABEL) NULL };
@@ -48847,7 +48847,7 @@ static JSValue js_async_await_fini(JSContext *ctx, void *st, bool take_result)
 static const JSTrampStepDef js_async_await_def = {
     sizeof(JSAsyncAwait), js_async_await_step, js_async_await_fini, 0,
     .catches_abrupt = 1, .visit = js_async_await_visit,
-    .algorithm = "27.7.5.3 Await", .steps = js_async_await_steps };
+    .algorithm = "27.10.5.3 Await ( arg )", .steps = js_async_await_steps };
 
 /* THE ONE construction site: building the closure IS declaring it a machine, and both routes reach the
    algorithm through it. `s` is BORROWED — the handle takes its own reference. */
@@ -48967,7 +48967,7 @@ static bool js_async_function_resume_as_flow(JSContext *ctx, JSAsyncFunctionData
         JSAsyncPost post;
         int st = js_async_function_post_prepare(ctx, s, func_ret, &post);
         if (st == ASYNC_POST_AWAIT) {
-            /* 27.7.5.3 as a CALL-ROOT FLOW: this context has no tramp chain to route it onto.
+            /* 27.10.5.3 Await ( arg ) as a CALL-ROOT FLOW: this context has no tramp chain to route it onto.
                TRUE means "the resume did what it owed", which for an Await is that the machine is running — the
                continuation is the machine's business from here. Returning false on the success path made every
                caller read a registered await as a FAILURE: 221 module tests went red because
@@ -49268,7 +49268,7 @@ static int js_async_generator_resolve_function_create(JSContext *ctx,
 }
 
 /* DELETED: js_async_generator_await_prepare and js_async_generator_await_finish, and with them the whole
-   AGEN_AWAIT_CALL protocol. They split 27.6.3.8 into "the caller places the resolve CALL, then calls the
+   AGEN_AWAIT_CALL protocol. They split 27.10.5.3 Await into "the caller places the resolve CALL, then calls the
    finish" — which routed the CALL but left the `constructor` READ that precedes it as a JS_GetProperty from C,
    so an already-native promise with an accessor for `constructor` still ran user code with no flow base. The
    machine above is both halves and both algorithms, so the split has nothing left to describe. */
@@ -49375,7 +49375,7 @@ static void js_async_generator_complete(JSContext *ctx,
     }
 }
 
-/* 27.6.3.2 AsyncGeneratorAwaitReturn as a STEP MACHINE. Its step 6 is PromiseResolve(%Promise%, value), whose
+/* 27.9.3.9 AsyncGeneratorAwaitReturn ( gen ) as a STEP MACHINE. Its step 7 is PromiseResolve(%Promise%, value), whose
    `constructor` READ on an already-native promise is the page's code — return-suspendedStart-broken-promise.js
    defines an accessor for exactly that — and js_promise_resolve_native performed it from C. That read was the
    whole of AsyncGeneratorPrototype's remaining drive-to-completion, and this file named it as unbuilt for
@@ -49387,7 +49387,7 @@ static void js_async_generator_complete(JSContext *ctx,
    nothing and both drivers only need it to RUN.
    The GENERATOR rides func_data rather than `this`, because the call-root route calls the closure with an
    undefined receiver — one construction site, js_new_agen_await_ret, so the two routes cannot disagree.
-   TWO DEFS, ONE BODY: 27.6.3.8 AsyncGeneratorAwait is the same PromiseResolve followed by a DIFFERENT attach
+   TWO DEFS, ONE BODY: 27.10.5.3 Await is the same PromiseResolve followed by a DIFFERENT attach
    (the generator's own resolving functions rather than the resume-next pair), and it had the SAME C-side
    `constructor` read in js_async_generator_await_prepare. `arg` picks the attach; the page-visible half is
    shared, which is why the second conversion added no new plumbing at all. */
@@ -49402,23 +49402,25 @@ _Static_assert(offsetof(JSAgenAwaitRet, hdr) == 0, "JSStepHdr must be first in J
 /* WHICH STEP OF EACH ALGORITHM EACH STAGE RESTS AT. ONE walk, TWO algorithms: arg 0 is the awaited RETURN that
    drains the queue and arg 1 is the generator body's own await, and the standard numbers them separately — so
    one stage list is expanded once per algorithm with that algorithm's own step text.
-   The prose over the definitions said "27.6.3.2 AsyncGeneratorAwaitReturn" and "27.6.3.8 AsyncGeneratorAwait".
-   27.6.3.2 is AsyncGeneratorStart and 27.6.3.8 is AsyncGeneratorYield; AwaitReturn is 27.6.3.9, and the second
-   of the two is not an operation of its own at all — an async generator body's await IS 27.7.5.3 Await. */
+   There is no "AsyncGeneratorAwait" operation: an async generator body's await IS 27.10.5.3 Await ( arg ), the
+   same algorithm an async FUNCTION's await runs, which is why the second expansion names it. The pair the prose
+   over the definitions once named — AsyncGeneratorStart (27.9.3.2) and AsyncGeneratorYield (27.9.3.8) — are
+   neither of these two, and a stage list is the one place that mistake cannot be seen, because a private stage
+   number does not say which algorithm it is in. */
 #define AR_STAGES(X, HEAD, RESOLVE) \
     X(AR_HEAD,    HEAD) \
     X(AR_RESOLVE, RESOLVE)
 enum { AR_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
 static const char *const js_agen_await_ret_steps[] = {
     AR_STAGES(JS_STEP_STAGE_LABEL,
-        "27.6.3.9 steps 1-6 (queue is the [[AsyncGeneratorQueue]]; completion is its first request's)",
-        "27.6.3.9 steps 7-15 (promiseCompletion is PromiseResolve(%Promise%, completion.[[Value]]); "
+        "27.9.3.9 steps 1-6 (queue is the [[AsyncGeneratorQueue]]; completion is its first request's)",
+        "27.9.3.9 steps 7-15 (promiseCompletion is PromiseResolve(%Promise%, completion.[[Value]]); "
         "PerformPromiseThen attaches onFulfilled and onRejected)")
     NULL };
 static const char *const js_agen_await_steps[] = {
     AR_STAGES(JS_STEP_STAGE_LABEL,
-        "27.7.5.3 step 1 (asyncContext is the running execution context)",
-        "27.7.5.3 steps 2-7 (promise is PromiseResolve(%Promise%, value); PerformPromiseThen attaches "
+        "27.10.5.3 Await step 1 (asyncContext is the running execution context)",
+        "27.10.5.3 Await steps 2-7 (promise is PromiseResolve(%Promise%, value); PerformPromiseThen attaches "
         "onFulfilled and onRejected)")
     NULL };
 
@@ -49485,16 +49487,16 @@ static JSValue js_agen_await_ret_fini(JSContext *ctx, void *st, bool take_result
     return r;
 }
 
-/* arg 0 = 27.6.3.9 AsyncGeneratorAwaitReturn (the RESUME-NEXT resolving functions),
-   arg 1 = 27.7.5.3 Await, performed by the generator's own body. */
+/* arg 0 = 27.9.3.9 AsyncGeneratorAwaitReturn (the RESUME-NEXT resolving functions),
+   arg 1 = 27.10.5.3 Await, performed by the generator's own body. */
 static const JSTrampStepDef js_agen_await_ret_def = {
     sizeof(JSAgenAwaitRet), js_agen_await_ret_step, js_agen_await_ret_fini, 0,
     .catches_abrupt = 1   /* step 8: an abrupt PromiseResolve is this algorithm's VALUE, not a raise */, .visit = js_agen_await_ret_visit,
-    .algorithm = "27.6.3.9 AsyncGeneratorAwaitReturn", .steps = js_agen_await_ret_steps };
+    .algorithm = "27.9.3.9 AsyncGeneratorAwaitReturn ( gen )", .steps = js_agen_await_ret_steps };
 static const JSTrampStepDef js_agen_await_def = {
     sizeof(JSAgenAwaitRet), js_agen_await_ret_step, js_agen_await_ret_fini, 1,
     .catches_abrupt = 1, .visit = js_agen_await_ret_visit,
-    .algorithm = "27.7.5.3 Await (an async generator body's)", .steps = js_agen_await_steps };
+    .algorithm = "27.10.5.3 Await ( arg ) (an async generator body's)", .steps = js_agen_await_steps };
 
 /* THE ONE construction site: building the closure IS declaring it a machine, and the two drivers reach the
    algorithm through it — the interpreter as the state's func_obj, the reaction driver as a call-root callee. */
@@ -49615,7 +49617,7 @@ static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSVa
             JS_FreeValue(ctx, value);
             return 1;
         case FUNC_RET_AWAIT:
-            /* 27.6.3.8 AsyncGeneratorAwait: the driver runs the machine, exactly as it does for a RETURN on a
+            /* 27.10.5.3 Await: the driver runs the machine, exactly as it does for a RETURN on a
                completed generator. Both of its page-visible steps — the `constructor` read and the resolve —
                live there, so nothing about the await is performed here. */
             out->value = value;   /* owned, transferred */
@@ -49685,7 +49687,7 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
     return JS_ThrowInternalError(ctx, "async generator await continuation reached its C entry (route it through the call convergence point)");
 }
 
-/* AsyncGeneratorEnqueue (27.6.3.4): one .next()/.throw()/.return() request joins the queue and gets the promise
+/* AsyncGeneratorEnqueue (27.9.3.4): one .next()/.throw()/.return() request joins the queue and gets the promise
    the call evaluates to. `s == NULL` is the receiver-is-not-an-async-generator case, whose promise is REJECTED
    rather than thrown — a genuinely different outcome, not a fallback for the drive. */
 static JSValue js_async_generator_enqueue(JSContext *ctx, JSAsyncGeneratorData *s, int magic, JSValueConst arg)
@@ -77668,7 +77670,7 @@ static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
     return js_array_ctor_body(ctx, obj, argc, argv);
 }
 
-/* ---- 27.1.4.1 Array.fromAsync ---------------------------------------------------------------------
+/* ---- 23.1.2.2 Array.fromAsync ( items [ , mapper [ , thisArg ] ] ) ---------------------------------------------------------------------
    THE LAST SELF-HOSTED BUILTIN. It was a compiled JS module read back through JS_AUTOINIT_ID_BYTECODE, and that
    AUTOINIT — evaluating the module's top-level program from C on the first property read — was the whole of
    Array/fromAsync's 190 drives; fromAsync's own body never appeared in a backtrace. Porting it deletes the
@@ -77771,11 +77773,11 @@ enum {
                             "(CreateDataPropertyOrThrow(A, Pk, mappedValue))") \
     X(FA_PH_AL_SET_LEN, "proposal-array-from-async fromAsyncClosure the ARRAY-LIKE arm, step 3.n.viii (Set(A, " \
                             "\"length\", len, true))") \
-    X(FA_PH_AWAIT_CAP, "proposal-array-from-async fromAsyncClosure -> 27.7.5.3 Await step 2 (promiseCapability is " \
+    X(FA_PH_AWAIT_CAP, "proposal-array-from-async fromAsyncClosure -> 27.10.5.3 Await step 2 (promiseCapability is " \
                             "NewPromiseCapability(%Promise%))") \
-    X(FA_PH_AWAIT_RESOLVE, "proposal-array-from-async fromAsyncClosure -> 27.7.5.3 Await step 3 " \
+    X(FA_PH_AWAIT_RESOLVE, "proposal-array-from-async fromAsyncClosure -> 27.10.5.3 Await step 3 " \
                             "(Call(promiseCapability.[[Resolve]], undefined, <<value>>))") \
-    X(FA_PH_AWAIT_THEN, "proposal-array-from-async fromAsyncClosure -> 27.7.5.3 Await steps 4-7 (PerformPromiseThen " \
+    X(FA_PH_AWAIT_THEN, "proposal-array-from-async fromAsyncClosure -> 27.10.5.3 Await steps 4-7 (PerformPromiseThen " \
                             "with this algorithm's two continuations)") \
     X(FA_PH_CLOSE_ENTER, "proposal-array-from-async fromAsyncClosure -> 7.4.14 AsyncIteratorClose, entered by " \
                             "IfAbruptCloseAsyncIterator: the completion it is entered with wins over everything the close " \
@@ -78511,8 +78513,12 @@ static const JSTrampStepDef js_fromasync_def = {
     .visit = js_fromasync_visit,
     .algorithm = "fromAsyncClosure, resumed (proposal-array-from-async)", .steps = js_fromasync_steps };
 
-/* 27.1.4.1 steps 1-2 and 4-5: create the capability, build the state, and run the closure to its first Await.
-   The capability's promise is the answer whatever the closure does after that. */
+/* 23.1.2.2 Array.fromAsync ( items [ , mapper [ , thisArg ] ] ), its prologue: create the capability, build the
+   state, and run the closure to its first Await. The capability's promise is the answer whatever the closure
+   does after that. NO STEP NUMBERS, deliberately — proposal-array-from-async spells the prologue out as its own
+   steps (the NewPromiseCapability, the fromAsyncClosure, the AsyncFunctionStart), and the published clause is
+   written as an async function whose body IS the algorithm, so those steps have no counterpart to point at. The
+   stage labels below cite the proposal, which is the document these steps come from. */
 static int js_array_fromasync_step(JSContext *ctx, void *stt, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSFromAsync *s = stt;
@@ -82945,7 +82951,7 @@ static JSValue js_iter_wrap_return_fini(JSContext *ctx, void *st, bool take_resu
 static void js_iter_wrap_return_visit(JSContext *ctx, void *st, JSStepVisit *v);
 static const JSTrampStepDef js_iter_wrap_return_def =
     { sizeof(JSIterWrapReturn), js_iter_wrap_return_step, js_iter_wrap_return_fini, 0, .visit = js_iter_wrap_return_visit,
-      .algorithm = "27.1.3.2.1.1.2 %WrapForValidIteratorPrototype%.return", .steps = js_iter_wrap_return_steps };
+      .algorithm = "27.1.3.2.2.1.2 %WrapForValidIteratorPrototype%.return ( )", .steps = js_iter_wrap_return_steps };
 static const JSTrampStepDef js_date_toJSON_def = { sizeof(JSDateToJSON), js_date_tojson_step, js_date_tojson_fini, 0 , .visit = js_date_tojson_visit,
                      .algorithm = "21.4.4.37 Date.prototype.toJSON",
                      .steps = js_date_toJSON_steps };
@@ -83083,7 +83089,7 @@ static const JSTrampStepDef js_async_disposable_ctor_def =
 static const JSTrampStepDef js_finrec_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_FINALIZATION_REGISTRY, 1, generic, js_finrec_ctor_body, 0,
                         js_finrec_ctor_precheck);
-/* 27.1.3.1 Iterator: steps 1-2 are the abstract-class validation, step 3 is the whole constructor. */
+/* 27.1.3.1.1 Iterator ( ): step 1 is the abstract-class validation, step 2 is the whole constructor. */
 static const JSTrampStepDef js_iterator_ctor_def =
     CREATECTOR_DEF_FULL(JS_CLASS_ITERATOR, 0, generic, NULL, 0, js_iterator_ctor_precheck);
 static JSValue js_map_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv, int magic);
@@ -83733,11 +83739,11 @@ static const char *const js_dynfunc_steps[];
 static const JSTrampStepDef js_function_ctor_def  = DYNFUNC_DEF(JS_FUNC_NORMAL,
     "20.2.1.1 Function ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
 static const JSTrampStepDef js_genfn_ctor_def     = DYNFUNC_DEF(JS_FUNC_GENERATOR,
-    "27.3.1.1 GeneratorFunction ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
+    "27.6.1.1 GeneratorFunction ( ...paramArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
 static const JSTrampStepDef js_asyncfn_ctor_def   = DYNFUNC_DEF(JS_FUNC_ASYNC,
-    "27.7.1.1 AsyncFunction ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
+    "27.10.1.1 AsyncFunction ( ...paramArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
 static const JSTrampStepDef js_asyncgenfn_ctor_def= DYNFUNC_DEF(JS_FUNC_ASYNC_GENERATOR,
-    "27.4.1.1 AsyncGeneratorFunction ( ...parameterArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
+    "27.7.1.1 AsyncGeneratorFunction ( ...paramArgs, bodyArg ), which is 20.2.1.1.1 CreateDynamicFunction");
 #undef DYNFUNC_DEF
 #define DV_STEPDEF_DEF(N, GALG, SALG) \
     static const JSTrampStepDef js_dv_get_##N##_def = PRIMARGS_DEF(PRIMARGS(0x1, HINT_NUMBER, 2), generic_magic, js_dataview_getValue, JS_CLASS_##N##_ARRAY, GALG); \
@@ -83915,7 +83921,7 @@ static int js_promise_resolve_step(JSContext *ctx, void *st, JSValue cb_result, 
 }
 
 /* ================================================================================================================
-   27.1.3.3 Iterator.zip. It WAS self-hosted JavaScript — builtin-iterator-zip.js, compiled by qjsc and instantiated
+   Iterator.zip (proposal-joint-iteration). It WAS self-hosted JavaScript — builtin-iterator-zip.js, compiled by qjsc and instantiated
    by EVALUATING that bytecode from C on a lazy property read. Two things were wrong with that and only one of them
    is about the counter: a browser feature written in JavaScript is what CLAUDE.md's architecture forbids outright,
    and the program body plus the factory call it performed are BYTECODE BODIES entered by C recursion below a live
@@ -84237,12 +84243,26 @@ static int zip_close_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase, JSValue *
     return 0;
 }
 
-/* --- Iterator.zip itself (27.1.3.3 steps 1-16) --- */
-/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). The standard has no
-   section number for this one: joint-iteration is not in the published edition — every other number in this
-   file is ES2025 — so the algorithm is named and its steps are the proposal's own, exactly as the
-   ArrayBuffer-base64 machines are (B64OP_STAGES). A number invented here would be a claim about the standard
-   rather than a reference to it. */
+/* --- Iterator.zip itself (proposal-joint-iteration steps 1-16) --- */
+/* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). This file's numbers
+   are read out of the ECMAScript draft at https://tc39.es/ecma262/ — the only edition that numbers everything
+   this engine implements, since ES2025 numbers none of DisposableStack, Iterator.concat, Iterator.zip or
+   Iterator.prototype [ %Symbol.dispose% ]. A draft renumbers, so EVERY citation carries its clause TITLE beside
+   the number; a number whose neighbouring title no longer matches the clause is the drift, showing itself.
+   TWO deliberate exceptions, each because the draft clause is not the algorithm the machine runs, and a reader
+   sent to a clause the code does not follow is worse off than one sent nowhere.
+   Iterator.zip and Iterator.zipKeyed: the draft DOES number these (27.1.3.2.4 and 27.1.3.2.5) and the number is
+   withheld anyway, because the padding moved from a keyed lookup to a positional list and the step list
+   renumbered with it. Naming proposal-joint-iteration is a citation with a number in it — the proposal's own —
+   exactly as the ArrayBuffer-base64 machines are (B64OP_STAGES).
+   Iterator.prototype's helpers (every 27.1.4.x here — the five factories, `constructor` and
+   [ %Symbol.toStringTag% ]) are read out of ES2025, where 27.1.4 is The %Iterator.prototype% Object. Under the
+   draft those same numbers land on The %AsyncIteratorPrototype% Object, so they are read against the edition
+   named here or not at all. They stayed behind because their step text is older than either edition — it calls
+   the record's construction GetIteratorDirect(O), and BOTH editions build the Iterator Record with
+   [[NextMethod]]: undefined and no such read — so renumbering alone would put a freshly checked clause number on
+   step prose that is independently wrong. What that stage actually reads is a question for the code.
+   Reconciling either machine with its published clause is a change to the machine, not to this comment. */
 #define ZIP_STAGES(X) \
     X(ZS_INIT,      "proposal-joint-iteration Iterator.zip steps 2-3 (iterables and options are Objects) - and " \
                     "the dispatch of step 4's Get(options, \"mode\")") \
@@ -84551,7 +84571,7 @@ static JSValue js_iterator_zip_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* --- 27.1.3.4 Iterator.zipKeyed. It WAS builtin-iterator-zip-keyed.js, and the two C helpers that blob needed —
+/* --- Iterator.zipKeyed (proposal-joint-iteration). It WAS builtin-iterator-zip-keyed.js, and the two C helpers that blob needed —
    a `getOwnPropertyKeys` over JS_GetOwnPropertyNames2 and a `hasOwnEnumProperty` over
    JS_GetOwnPropertyFlagsInternal — were an `ownKeys` trap and a `getOwnPropertyDescriptor` trap performed from C.
    Both are requests here. The zipper it builds is the SAME record and the SAME drive: the whole difference is that
@@ -88328,7 +88348,7 @@ static void js_iterator_wrap_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
-/* 27.1.4.2.1 steps 1-2, and NOTHING ELSE. The FORWARD is call-site-resolved: do_generic_callee rewrites the
+/* 27.1.5.2.1 %AsyncFromSyncIteratorPrototype%.next steps 1-2, and NOTHING ELSE. The FORWARD is call-site-resolved: do_generic_callee rewrites the
    (receiver, callee) pair to the wrapped record and re-enters, and the drives that hold a record resolve it
    through tramp_unwrap_iter_next — so every spelling of `w.next()` runs the wrapped .next() on the tramp, with
    the arguments dropped exactly as step 4 requires. What is gone is the JS_IteratorNext -> JS_Call this used to
@@ -88350,16 +88370,16 @@ static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;   /* JS_GetOpaque2 already threw RequireInternalSlot's TypeError */
 }
 
-/* WHICH STEP OF 27.1.3.2.1.1.2 EACH STAGE RESTS AT. The prose here said 27.1.4.2.2, which is a step of
+/* WHICH STEP OF 27.1.3.2.2.1.2 EACH STAGE RESTS AT. The prose here said 27.1.4.2.2, which is a step of
    Iterator.prototype.drop; %WrapForValidIteratorPrototype% is a sub-clause of Iterator.from, and `return` is its
    second member. Two fidelity bugs went with the old C body: it forwarded its own ARGUMENTS to `return` (the
    spec calls it with none) and it required the result to be an Object (step 7 returns the call's result
    verbatim — only .next's IteratorNext imposes that check).
    The Call was an ISSUE stage and a CONSUME stage, so the machine parked one past the operation it was in. */
 #define IWR_STAGES(X) \
-    X(IWR_SLOT,   "27.1.3.2.1.1.2 steps 1-4 (RequireInternalSlot(O, [[Iterated]]); iterator is its [[Iterator]])") \
-    X(IWR_METHOD, "27.1.3.2.1.1.2 step 5 (returnMethod is GetMethod(iterator, \"return\"))") \
-    X(IWR_CALL,   "27.1.3.2.1.1.2 step 7 (Call(returnMethod, iterator))")
+    X(IWR_SLOT,   "27.1.3.2.2.1.2 steps 1-4 (RequireInternalSlot(O, [[Iterated]]); iterator is its [[Iterator]])") \
+    X(IWR_METHOD, "27.1.3.2.2.1.2 step 5 (returnMethod is GetMethod(iterator, \"return\"))") \
+    X(IWR_CALL,   "27.1.3.2.2.1.2 step 7 (Call(returnMethod, iterator))")
 enum { IWR_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_iter_wrap_return_steps[] = { IWR_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -88439,8 +88459,9 @@ static JSValue js_iterator_constructor_get(JSContext *ctx,
     return js_dup(func_data[0]);
 }
 
-/* 27.1.3.1 steps 1-2. Everything the Iterator constructor does before OrdinaryCreateFromConstructor, and all it
-   does: step 3 IS the create, so the declaration carries no body and the machine is the whole constructor.
+/* 27.1.3.1.1 Iterator ( ) step 1. Everything the Iterator constructor does before OrdinaryCreateFromConstructor,
+   and all it does: step 2 IS the create, so the declaration carries no body and the machine is the whole
+   constructor.
    The abstract-class test compares against the DECLARATION rather than a C function pointer, because there is no
    C function left to compare against — which is the point. */
 static int js_iterator_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
@@ -88709,7 +88730,7 @@ static int js_iter_concat_return_step(JSContext *ctx, void *st, JSValue cb_resul
         DCHECK(it != NULL, "Iterator.concat .return(): the receiver lost its data across its `return` read");
         /* the C body called whatever the read produced and let JS_CallFree raise on a non-callable, so a nullish
            `return` was a TypeError rather than a no-op. That is what it did, and it is kept: this is not
-           GetMethod — 27.1.4.1.2's concat iterator calls the property it read. */
+           GetMethod — 27.1.3.2.1's concat iterator calls the property it read. */
         s->cb[0] = js_dup(it->iter);
         s->cb[1] = rm;
         it->running = true;
@@ -88769,7 +88790,7 @@ static const JSCFunctionListEntry js_iterator_concat_proto_funcs[] = {
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Iterator Concat", JS_PROP_CONFIGURABLE ),
 };
 
-/* 27.1.2.1 Iterator.concat. Step 3.b reads `@@iterator` on EVERY argument, which is the page's [[Get]] — an
+/* 27.1.3.2.1 Iterator.concat ( ...items ). Step 3.b reads `@@iterator` on EVERY argument, which is the page's [[Get]] — an
    accessor body or a Proxy `get` trap — and it ran from C once per argument. The requirement is not just that the
    read routes: the spec INTERLEAVES it with step 3.a's object check, so argument 1's check happens after argument
    0's read, which is why the walk is a cursor over the machine rather than a loop that validates up front. */
@@ -88868,7 +88889,7 @@ static JSValue js_iterator_concat_fini(JSContext *ctx, void *st, bool take_resul
     return r;
 }
 
-/* DELETED: js_iterator_from. Its body was already only a DFAIL — the whole of 27.1.3.1 is do_iterfrom_tramp —
+/* DELETED: js_iterator_from. Its body was already only a DFAIL — the whole of 27.1.3.2.2 Iterator.from is do_iterfrom_tramp —
    and with the walk declared at the definition no pointer names it. */
 
 static int check_iterator(JSContext *ctx, JSValueConst obj)
@@ -89574,7 +89595,7 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         return 1;   /* drive the inner iterator */
     }
     case ITHP_FLATMAP_INNER:
-        /* res = INNER {value,done}: 27.1.4.5's inner loop does IteratorStepValue — IteratorComplete then
+        /* res = INNER {value,done}: 27.1.4.6 Iterator.prototype.flatMap's inner loop does IteratorStepValue — IteratorComplete then
            IteratorValue — and YIELDS the value, so the helper builds a fresh CreateIterResultObject around it.
            Emitting the inner's own result OBJECT instead (what this did) leaked the delegate's object identity
            through `helper.next()`, and moved the `value` read from inside the helper to whoever consumed it. */
@@ -101231,7 +101252,7 @@ static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
     return obj;
 }
 
-/* 27.3.3.3 DisposableStack.prototype.dispose, i.e. DisposeResources with the sync-dispose hint.
+/* 27.3.3.4 DisposableStack.prototype.dispose ( ), i.e. DisposeResources with the sync-dispose hint.
    Every resource's dispose method is the PAGE'S CODE, so the loop that runs them is a step machine and each call
    is a request — the JS_Call loop that stood here entered a bytecode body by C recursion below the live flow, and
    a `finally` or a loop inside a dispose method could not park.
@@ -101452,7 +101473,7 @@ static JSValue js_new_sync_dispose_wrapper(JSContext *ctx, JSValue method)
     return wrapped;
 }
 
-/* 27.3.1.1 GetDisposeMethod + 27.3.1.2 CreateDisposableResource's object check, as THE step machine — one
+/* 7.5.4 GetDisposeMethod ( value, kind ) + 7.5.3 CreateDisposableResource's object check, as THE step machine — one
    implementation for both callers. There were two: this C helper (for DisposableStack.prototype.use) and the
    `using` opcode's own inline reads, and both ran the [[Get]]s from C, so a dispose ACCESSOR or a Proxy get trap
    had no flow base. The reads are requests here, and `hint` rides the DEFINITION's `arg` — which is why there
@@ -101568,7 +101589,7 @@ static const JSTrampStepDef js_get_dispose_async_def = {
 
 static int js_disposable_ctor_precheck(JSContext *ctx, const JSStepHdr *h)
 {
-    /* 27.3.2.1 step 1 / 27.4.2.1 step 1: NewTarget undefined means the CALL form, which these constructors
+    /* 27.3.1.1 DisposableStack ( ) step 1 / 27.4.1.1 AsyncDisposableStack ( ) step 1: NewTarget undefined means the CALL form, which these constructors
        reject before anything is created — and therefore before the `prototype` read. */
     if (JS_IsUndefined(h->this_val)) {
         JS_ThrowTypeError(ctx, "Constructor requires 'new'");
@@ -101637,9 +101658,9 @@ static JSDisposableStack *js_disposable_stack_get(JSContext *ctx,
     return s;
 }
 
-/* 27.3.3.4 / 27.4.3.4 DisposableStack.prototype.use as a STEP MACHINE. Its one page-visible step is
+/* 27.3.3.7 DisposableStack.prototype.use ( value ) / 27.4.3.7 AsyncDisposableStack.prototype.use as a STEP MACHINE. Its one page-visible step is
    GetDisposeMethod, which it DELEGATES to — the same machine the `using` opcode drives, so there is one
-   implementation of 27.3.1.1 and not a builtin's copy beside an opcode's. `arg` carries the class id, exactly
+   implementation of 7.5.4 GetDisposeMethod and not a builtin's copy beside an opcode's. `arg` carries the class id, exactly
    as the C body's magic did. */
 typedef struct JSDisposableUse {
     JSStepHdr hdr;      /* MUST be first */
@@ -101968,7 +101989,7 @@ static int js_async_dispose_link_new(JSContext *ctx, JSValue value, JSValue meth
     return 0;
 }
 
-/* 27.4.3.3 AsyncDisposableStack.prototype.disposeAsync -> DisposeResources with the async-dispose hint.
+/* 27.4.3.4 AsyncDisposableStack.prototype.disposeAsync ( ) -> DisposeResources with the async-dispose hint.
    The FIRST resource's dispose method is called SYNCHRONOUSLY (the Await comes after it), so that one call is a
    request made by this machine; the rest become a chain of js_async_dispose_link closures, each of which is a
    step machine too. The resource list is STOLEN for the reason the sync machine steals it — that first call is
@@ -104308,7 +104329,7 @@ static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
     if (JS_VALUE_GET_TAG(res) == JS_TAG_UNINITIALIZED)
         return 1;   /* first step: nothing to process, drive .next() */
     if (!s->res_ph && !JS_IsObject(res)) {
-        /* IteratorNext requires the result be an Object (spec 27.1.3.4 step 3). JS_GetProperty on a primitive
+        /* IteratorNext requires the result be an Object (7.4.6 IteratorNext ( iteratorRecord [ , value ] ) step 3). JS_GetProperty on a primitive
            boxes it and reads .done as undefined rather than throwing, so this must be enforced here — the ONE
            point every drive (generator settle AND plain-iterator .next return) feeds its result through. */
         JS_FreeValue(ctx, res);
@@ -104663,7 +104684,7 @@ typedef struct JSPromiseThenFinally {
 } JSPromiseThenFinally;
 _Static_assert(offsetof(JSPromiseThenFinally, hdr) == 0, "JSStepHdr must be first in JSPromiseThenFinally");
 
-/* WHICH STEP OF 27.5.5.3 EACH STAGE RESTS AT. These two are not clauses of their own: ES2025 states them as the
+/* WHICH STEP OF 27.5.5.3 EACH STAGE RESTS AT. These two are not clauses of their own: the standard states them as the
    ABSTRACT CLOSURES 27.5.5.3 step 6.a (thenFinallyClosure) and step 6.c (catchFinallyClosure), whose sub-steps
    are numbered identically and differ only in the closure built at .iv — so one list serves both, and the
    `algorithm` says which of the pair a parked flow is in.
@@ -105052,11 +105073,11 @@ static JSValue js_iter_close_throw_create(JSContext *ctx, JSValueConst sync_iter
     return js_new_step_closure(ctx, &js_iter_close_throw_def, 1, 0, 1, &sync_iter);
 }
 
-/* 27.1.4.4 AsyncFromSyncIteratorContinuation steps 5-15 as a STEP MACHINE. Step 5 is
+/* 27.1.5.4 AsyncFromSyncIteratorContinuation steps 6-15 as a STEP MACHINE. Step 6 is
    PromiseResolve(%Promise%, value), whose `constructor` READ on an already-native value is the page's code, and
    the C version performed it through js_promise_resolve_native — the last of that helper's drives. Everything
    after it (the unwrap closure, the onRejected closure, PerformPromiseThen) invokes nothing.
-   The RESULT says what the caller still owes: TRUE means step 5 completed abruptly and step 6 requires
+   The RESULT says what the caller still owes: TRUE means step 6 completed abruptly and step 7 requires
    IteratorClose FIRST, with the exception left live for the close's saved completion. Undefined means done. A
    -1 means the caller owes IfAbruptRejectPromise, with the exception live for the same reason.
    The operands ride FUNC_DATA — the sync iterator, the capability's two functions, and the two flags — because
@@ -105205,12 +105226,12 @@ static void js_async_from_sync_iterator_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
-/* 27.1.4.1 CreateAsyncFromSyncIterator. It takes the sync iterator RECORD — iterator plus nextMethod — because
+/* 27.1.5.1 CreateAsyncFromSyncIterator ( syncIteratorRecord ). It takes the sync iterator RECORD — iterator plus nextMethod — because
    that is what the spec passes it: the record was completed by GetIterator's own step 5.b, and step 3 here reads
    `next` off the ASYNC wrapper, an intrinsic, not off the sync iterator again. Reading it off the sync iterator
    here (what this did) was both a second observable Get on the page's object and a C-side one, with no flow base
    for the accessor or Proxy trap that answers it. `next_method` is TRANSFERRED. */
-/* 27.1.4.1 CreateAsyncFromSyncIterator returns an ITERATOR RECORD, not an object, and both callers needed the
+/* 27.1.5.1 CreateAsyncFromSyncIterator returns an ITERATOR RECORD, not an object, and both callers needed the
    [[NextMethod]] half — so both performed step 3's Get themselves, from C, against JS_ATOM_next. The AO hands
    the whole record back instead: `sync_iter` is BORROWED, `next_method` is CONSUMED, and *pnext receives the
    wrapper's own next method, which the realm already holds. */
@@ -105239,7 +105260,7 @@ static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
     return async_iter;
 }
 
-/* 27.1.4.2/.3/.4 has NO body left here. %AsyncFromSyncIteratorPrototype% is a hidden intrinsic — nothing in JS
+/* 27.1.5.2.1/.2.2/.2.3 %AsyncFromSyncIteratorPrototype%.next/.return/.throw have NO body left here. %AsyncFromSyncIteratorPrototype% is a hidden intrinsic — nothing in JS
    can name it, and a wrapper object only ever exists inside `for await` / a `yield*` delegation — so every call
    to these three methods comes from the interpreter, and every one of them is routed onto
    do_async_from_sync_tramp: the .next() question is asked once about the CALLEE at do_generic_callee (so
@@ -105258,7 +105279,7 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
 }
 
 /* DELETED: js_async_from_sync_iterator_proto_funcs. The three methods are built one at a time below so the
-   realm can KEEP the `next` it made — 27.1.4.1 step 3 needs the record's [[NextMethod]], and reading it back off
+   realm can KEEP the `next` it made — 27.1.5.1 step 3 needs the record's [[NextMethod]], and reading it back off
    the prototype was a C-side JS_GetProperty against JS_ATOM_next, the exact shape a consumer running the
    iterator protocol from C has. The list could not hand a member back, so the list is gone. */
 
@@ -108205,7 +108226,7 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
         return -1;
     ctx->array_ctor = obj1;
     {
-        /* 27.1.4.1, a step machine. It was the LAST self-hosted builtin, read back through an autoinit that
+        /* 23.1.2.2 Array.fromAsync, a step machine. It was the LAST self-hosted builtin, read back through an autoinit that
            evaluated its module's program from C on the first property read — the whole of Array/fromAsync's
            190 drives. */
         JSValue fa = JS_NewCFunctionMagic(ctx, NULL, "fromAsync", 1, JS_CFUNC_step, STEPDEF_ARRAY_FROMASYNC);
