@@ -27320,21 +27320,26 @@ typedef struct JSAsyncFromSync {
 /* ITERCALL: OP_iterator_call — `for await`/yield* delegating .return(v)/.throw(v) onto the wrapper. Delivers
    like ITERNEXT and then pushes the opcode's `false` ret_flag (the method WAS present). */
 enum { AFS_DELIVER_CALL = 0, AFS_DELIVER_CLOSE, AFS_DELIVER_ITERNEXT, AFS_DELIVER_ITERCALL };
-/* THE DELIVERY MODE AND THE OPERAND SHAPE ARE ONE DECLARATION, ASSERTED WHERE THE SHAPE IS SPENT. A CALL entry
-   takes the caller's operands through TAKE_CALL_SHAPE, so its `first` is the call's own: -2 for the method
-   spelling, -1 for the plain one — NEVER 0, which is what the three opcode entries declare because their
-   operands are the opcode's and are not popped here at all. The two are set in the same breath at the entry and
-   read in the same breath at the settle, and between them lies the whole drive, a suspension and possibly a
-   fork; a settle that pops (0, 0) while delivering a CALL frees nothing, leaves sp where it was and pushes the
-   promise on top of the live receiver and callee. Nothing reports that: the frame simply stands two slots high
-   until the NEXT opcode's height check names a byte that is innocent. Asked here, the crash is one opcode
-   earlier and names the pair that disagreed. */
-#define AFS_SETTLE_SHAPE_AGREES(deliver_, first_, argc_)                                                 \
-    DCHECK((deliver_) != AFS_DELIVER_CALL || (first_) < 0,                                               \
-           "an async-from-sync settle is delivering a CALL result while holding an OPCODE entry's operand "\
-           "shape — a call's `first` is -2 or -1, never 0, so this pop frees nothing and the promise is "  \
-           "pushed above a live receiver and callee. The mode and the shape are set together at the entry: "\
-           "find the entry whose two halves disagree")
+/* THE POP A SETTLE PERFORMS STAYS INSIDE THE FRAME'S OPERAND BLOCK. The settle frees cargv[cfirst..cargc) where
+   cargv is sp - cargc, so the lowest slot it touches is sp - cargc + cfirst, and that is also where sp lands.
+   This is the invariant the entry's own TAKE_CALL_SHAPE comment memorialises: hardcoding a method shape for
+   7.4.9's unwind close, whose arguments are an OWNED list and whose caller operands are untouched, "freed two
+   slots BELOW the frame's stack buffer" — a read and a free under the allocation, which corrupts whatever the
+   frame's buffer is adjacent to and reports as anything at all.
+   WHAT THIS DELIBERATELY DOES NOT ASSERT, having tried: that a CALL delivery's `first` is negative. It is NOT.
+   `first == 0` with `argc == 0` is the CORRECT and required declaration for a call whose arguments are an owned
+   list and whose caller stack holds nothing to pop — 7.4.9's unwind close builds exactly that, and the entry
+   documents it four lines above where it is read. An assert forbidding it fires on a healthy program, and the
+   cost is not the crash: it is that the message reads as authoritative and sends the next reader to look for an
+   entry whose two halves disagree, when what actually disagreed was the assert and the spec. The shape is not
+   checkable from the pair alone — a settle cannot know which entry produced it — so what is checked here is the
+   thing that is true of every entry. */
+#define AFS_SETTLE_SHAPE_AGREES(sp_, stack_buf_, first_, argc_)                                          \
+    DCHECK((sp_) - (argc_) + (first_) >= (stack_buf_),                                                   \
+           "an async-from-sync settle's operand pop reaches BELOW the frame's stack buffer — it is about "\
+           "to free and pop slots that are not this frame's. The shape came from the entry: a CALL takes " \
+           "the caller's through TAKE_CALL_SHAPE, an owned-list call declares (0, 0), and the opcode "     \
+           "entries declare (0, 0) because their operand is written in place, never popped")
 static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor, int argc, JSValueConst *argv, int magic);
 static __exception int perform_promise_then(JSContext *ctx, JSValueConst promise, JSValueConst *resolve_reject, JSValueConst *cap_resolving_funcs);
 static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx, bool done);
@@ -38309,7 +38314,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue *cargv;
                     js_async_from_sync_end(ctx, s); js_free_rt(rt, s);
                     if (cok != CONT_NONE) goto do_afs_call_outer;
-                    AFS_SETTLE_SHAPE_AGREES(deliver, cfirst, cargc);
+                    AFS_SETTLE_SHAPE_AGREES(sp, stack_buf, cfirst, cargc);
                     cargv = sp - cargc;
                     for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                     sp += cfirst - cargc;
@@ -38404,7 +38409,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                           "does not route — add its arm here");
                     goto exception;
                 }
-                AFS_SETTLE_SHAPE_AGREES(deliver, cfirst, cargc);
+                AFS_SETTLE_SHAPE_AGREES(sp, stack_buf, cfirst, cargc);
                 cargv = sp - cargc;
                 for (i = cfirst; i < cargc; i++) JS_FreeValue(ctx, cargv[i]);
                 sp += cfirst - cargc;
