@@ -24283,9 +24283,18 @@ typedef struct JSArgList {
     /* WHERE the finished list goes. One sequence, several consumers: the list is an operand and reading it is the
        same algorithm whoever asked, so the resumption point is a field rather than a second continuation. */
     uint8_t resume;         /* ARGL_TO_APPLY / ARGL_TO_CONSTRUCT */
-    /* the shape to resume into. All BORROWED: every entry that parks here is a caller-stack operand shape, and
-       those slots outlive the suspension exactly as an operator's do. */
-    JSValueConst func, this_arg, src;
+    /* THE SHAPE TO RESUME INTO, OWNED — because a machine that can be CLONED cannot hold a pointer into the
+       stack of the flow it was cloned from. These three were borrowed views of the caller's operand slots,
+       which is sound for the flow that pushed them: those slots outlive the suspension exactly as an
+       operator's do, and that is still what keeps the values alive across the finish (the registers below take
+       them as borrowed and this record releases its own reference a line later). It is NOT sound for a
+       sibling. clone_deep_flow copies the frame, so the clone's stack_buf is a different allocation and every
+       borrowed slot pointer copied into it names storage belonging to a flow that is free to unwind it — the
+       cross-flow read no assert downstream could attribute. A record that owns what it resumes into is
+       self-sufficient, which is the whole precondition for §7.3.19 forking at all.
+       cfirst/cargc/is_tail stay POSITIONAL: they describe the operand CLEANUP the call performs on whichever
+       stack it is running on, and the sibling's own copies sit at the same offsets. */
+    JSValue func, this_arg, src;
     int cfirst, cargc;
     uint8_t is_tail;
 } JSArgList;
@@ -25670,7 +25679,50 @@ static void js_arg_list_free(JSContext *ctx, JSArgList *al)
     js_free(ctx, al->tab);
     JS_FreeValue(ctx, al->coerce);
     JS_FreeAtom(ctx, al->idx);
+    /* the resume shape, which this record OWNS — see the struct. EVERY exit of the sequence converges here
+       (the two finish paths, do_arg_list_throw, and the four teardowns the keyed and coercion abandons reach),
+       which is why owning these three costs one release site and not seven. The finish paths read them into
+       con_func/ap_func FIRST and the caller's operand slots hold their own reference, so this release is the
+       machine's alone. */
+    JS_FreeValue(ctx, al->func);
+    JS_FreeValue(ctx, al->this_arg);
+    JS_FreeValue(ctx, al->src);
     js_free_rt(ctx->rt, al);
+}
+
+/* THE SAME SEQUENCE FOR A SIBLING. 7.3.19's `length` and every one of its element reads are the page's code, so
+   a flow can fork ANYWHERE inside this machine — a getter that branches on unknown input, a Proxy `get` trap
+   that does — and until this existed tramp_cont_clone_one crashed by kind on the link instead, which made
+   `f.apply(t, arrayLikeWithAForkingGetter)` unreachable rather than merely slow.
+   EVERY OWNED FIELD IS DUPPED, and the list is the one js_arg_list_free releases: the two are read together
+   precisely so a field added to the record cannot be added to only one of them. `tab` is the collected prefix
+   and the clone allocates its own — two arms sharing one block would have the first to finish hand its values
+   to a call while the second still names them. */
+static JSArgList *js_arg_list_clone(JSContext *ctx, const JSArgList *al)
+{
+    JSArgList *n = js_mallocz(ctx, sizeof(*n));
+    uint32_t k;
+
+    if (unlikely(!n))
+        return NULL;
+    n->len = al->len; n->i = al->i;
+    n->phase = al->phase; n->resume = al->resume;
+    n->cfirst = al->cfirst; n->cargc = al->cargc; n->is_tail = al->is_tail;
+    n->coerce = js_dup(al->coerce);
+    n->idx = JS_DupAtom(ctx, al->idx);
+    n->func = js_dup(al->func);
+    n->this_arg = js_dup(al->this_arg);
+    n->src = js_dup(al->src);
+    if (al->tab) {
+        /* the block is sized by the LENGTH the sequence answered, not by the fill — js_mallocz gives the
+           unfilled tail the UNDEFINED the original's has, and `n` is what a teardown frees. */
+        size_t cap = (size_t)max_uint32(1, (uint32_t)al->len);
+        n->tab = js_mallocz(ctx, sizeof(JSValue) * cap);
+        if (unlikely(!n->tab)) { js_arg_list_free(ctx, n); return NULL; }
+        for (k = 0; k < al->n; k++) n->tab[k] = js_dup(al->tab[k]);
+        n->n = al->n;
+    }
+    return n;
 }
 
 /* Can CreateListFromArrayLike(src) be performed without invoking anything? Only for a FAST array or arguments
@@ -31085,7 +31137,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             agl->idx = JS_ATOM_NULL;
                             agl->phase = ARGL_LEN;
                             agl->resume = ARGL_TO_CONSTRUCT;
-                            agl->func = cf; agl->this_arg = cnt; agl->src = carr;
+                            /* the record OWNS its resume shape — see JSArgList. The operand slots hold their
+                               own reference for the whole suspension; this one is what a CLONE needs. */
+                            agl->func = js_dup(cf); agl->this_arg = js_dup(cnt); agl->src = js_dup(carr);
                             agl->cfirst = -2; agl->cargc = 1;   /* the caller pushed the triple, not the list */
                             agl->is_tail = 0;
                             sf->cur_pc = pc;
@@ -32204,7 +32258,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         agl->coerce = JS_UNDEFINED;
                         agl->idx = JS_ATOM_NULL;
                         agl->phase = ARGL_LEN;
-                        agl->func = nfunc; agl->this_arg = thisArg; agl->src = arrayArg;
+                        /* the record OWNS its resume shape — see JSArgList. */
+                        agl->func = js_dup(nfunc); agl->this_arg = js_dup(thisArg); agl->src = js_dup(arrayArg);
                         agl->cfirst = ap_cfirst; agl->cargc = ap_cargc; agl->is_tail = tramp_is_tail;
                         sf->cur_pc = pc;
                         cont_st = agl;
@@ -34810,9 +34865,50 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_getprop_tramp;
                 }
                 if (al->phase == ARGL_LEN_PRIM) {
-                    /* the rest of step 3 is ToLength, whose ToPrimitive is the page's code for an OBJECT. */
+                    /* the rest of step 3 is §7.3.18 LengthOfArrayLike ( obj )'s ToLength, whose ToPrimitive is
+                       the page's code for an OBJECT.
+                       THE UNKNOWN IS ANSWERED BEFORE THE COERCION IS ASKED FOR — the order
+                       step_length_value already uses on the read side, and the order this arm did not have.
+                       §7.1.1 ToPrimitive ( input [ , preferredType ] ) over unknown external input is the
+                       IDENTITY (do_toprim_step short-circuits it before reading @@toPrimitive off a value that
+                       stands for input the page never determined), so dispatching the coercion for one
+                       delivered the SAME OBJECT back to THIS phase and ran this arm a second time on it. What
+                       fired then was the once-only assert below — and its message is about ORDERING for a
+                       defect that is a MISSING ARM, which is the worst kind of true crash: it reads as a
+                       re-entry in the trampoline's continuation seam and sends its reader there.
+                       With the question asked here the assert becomes a statement about the engine's own
+                       logic, which is what it was always meant to be: ToPrimitive can now hand this phase
+                       only a primitive, so a second coercion of one `length` is unreachable rather than
+                       merely unobserved. */
+                    if (unlikely(js_value_is_concolic(ret_val))) {
+                        JS_FreeValue(ctx, al->coerce);
+                        al->coerce = ret_val; ret_val = JS_UNDEFINED;   /* owned across the ask, and freed by
+                                                                          the teardown below */
+                        DFAIL("§7.3.19 CreateListFromArrayLike ( obj [ , validElementTypes ] ) step 3 — `Let "
+                              "length be ? LengthOfArrayLike(obj)` — over UNKNOWN EXTERNAL INPUT: "
+                              "`f.apply(t, x)`, `f(...x)`, `new C(...x)` or `Reflect.apply` where the `length` "
+                              "read produced input the page never determined. Do NOT coerce it and do NOT pick "
+                              "a number: §7.1.22 ToLength ( arg ) owes C a real int64, and a pick would decide "
+                              "HOW MANY of the callee's parameters are bound — which of its arms run, and "
+                              "whether its rest parameter is empty — from a fact no run established. A length "
+                              "is not one fact with one answer: every non-negative integer is a world, and the "
+                              "answer is the per-position outcome-fork chain the READ side already asks under "
+                              "the key `LengthOfArrayLike>%d` (step_length_unknown), asked here on the tramp "
+                              "the way §10.4.2.4 ArraySetLength ( array, propertyDesc )'s chain is. This "
+                              "record is now cloneable, so the fork's SIBLING can be built; what is still "
+                              "missing is the PARK at the ask — a yield-anchor kind for this carrier, with its "
+                              "clone_deep_flow arm and its deep-resume arm, the way CONT_ARRAY_LEN_YIELD is "
+                              "§10.4.2.4's. Build that anchor, then the chain.");
+                        JS_ThrowTypeError(ctx, "an argument-list length that is unknown external input is not "
+                                               "modelled yet");
+                        goto do_arg_list_throw;
+                    }
                     if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
-                        DCHECK(JS_IsUndefined(al->coerce), "the arg-list length is coerced once");
+                        DCHECK(JS_IsUndefined(al->coerce),
+                               "7.3.19's `length` reached its coercion twice. ToPrimitive answers this phase "
+                               "with a primitive or with the unknown-input value the arm above has already "
+                               "taken, so a second object here means some other request was delivered to this "
+                               "machine's phase");
                         al->coerce = ret_val; ret_val = JS_UNDEFINED;
                         tp_outer = al; tp_outer_kind = CONT_ARG_LIST;
                         tp_value = al->coerce; tp_hint = HINT_NUMBER;
@@ -34846,7 +34942,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 al->i++;
             do_arg_list_elem:
                 if (al->i < al->len) {
-                    /* step 5's `? Get(obj, ! ToString(𝔽(index)))`, one element at a time. */
+                    /* step 6's Repeat, one element at a time: 6.a is `Let indexName be ! ToString(𝔽(index))`
+                       and 6.b is `Let next be ? Get(obj, indexName)`, which is the read that suspends. (The
+                       number stood here as "step 5", which is `Let index be 0` — a citation that sends its
+                       reader to the wrong step reads as authoritative and is worse than none.) */
                     al->idx = JS_NewAtomInt64(ctx, al->i);
                     if (unlikely(al->idx == JS_ATOM_NULL)) goto do_arg_list_throw;
                     gp_outer = al; gp_outer_kind = CONT_ARG_LIST;
@@ -46668,6 +46767,12 @@ static void *cont_outer_get(void *st, uint8_t kind, uint8_t *out_kind)
            than defaulted, for CONT_PROMISE_ALL's reason — a requester that reads as absent is indistinguishable
            from one this walk simply does not know, and only one of those is correct. */
         return NULL;
+    case CONT_ARG_LIST:
+        /* 7.3.19 IS TERMINAL FOR THE SAME REASON, and the record says so by having no `outer` field at all: the
+           finished List is handed to do_apply_tramp / do_construct_dispatch, which place their result on the
+           operand stack. The sequence sits UNDER a keyed read or a coercion (it is their gp_outer / tp_outer),
+           never over one, so this is where a chain walked up from either of those stops. */
+        return NULL;
     case CONT_TOPRIM:
         *out_kind = ((struct JSToPrim *)st)->outer_kind;
         return ((struct JSToPrim *)st)->outer;
@@ -46753,6 +46858,12 @@ static void *tramp_cont_clone_one(JSContext *ctx, void *st, uint8_t kind)
         return js_array_len_clone(ctx, (const JSArrayLen *)st);
     if (kind == CONT_OP_KEYED)
         return js_op_keyed_clone(ctx, (const JSOpKeyed *)st);
+    if (kind == CONT_ARG_LIST)
+        /* 7.3.19's sequence, which is a LINK under whichever read it is waiting on — its `length` Get, its
+           ToPrimitive, or an element Get — and never a frame's own cont_state, because it parks by parking
+           that read. Both of the page's operations it performs can fork, so this is reached by an ordinary
+           `f.apply(t, x)` whose `x` has a getter that branches on unknown input. */
+        return js_arg_list_clone(ctx, (const JSArgList *)st);
     if (kind == CONT_GETPROP)
         /* a keyed property OPERATION whose callee turned out to be a step machine — `new Proxy(t, {ownKeys:
            Object.getOwnPropertyNames})` — so the machine is the frame's continuation and the operation is the
@@ -47581,6 +47692,17 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
         JSOpKeyed *ok = st;
         JS_FreeAtom(ctx, ok->atom);
         js_free_rt(rt, ok);
+        return;
+    }
+    if (kind == CONT_ARG_LIST) {
+        /* 7.3.19's SEQUENCE, TERMINAL for cont_outer_get's reason — the finished List goes to a call, whose
+           result is the operand stack's, so there is nothing above it to release and the walk stops here.
+           THE OTHER DIRECTION OF js_arg_list_clone, and it lands in the SAME diff because that is what this
+           walk's own DFAIL asks for: a kind present in only one of the two is a flow that can be forked and
+           cannot be evicted, paged or freed, which is exactly the shape a flow suspended inside
+           `f.apply(t, arrayLikeWithAGetter)` has. The record owns its resume shape, its collected prefix and
+           its index atom, and js_arg_list_free is the one place that list is spelled. */
+        js_arg_list_free(ctx, (JSArgList *)st);
         return;
     }
     if (kind == CONT_TOPRIM) {
