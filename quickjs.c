@@ -27518,6 +27518,32 @@ static void js_create_requester_abandon(JSContext *ctx, void *cont, uint8_t kind
     DCHECK(kind == CONT_ITER_CONSUME, "coroutine-create requester: unknown machine kind");
     js_iter_consume_end(ctx, (struct JSIterConsume *)cont); js_free_rt(ctx->rt, cont);
 }
+#if APICLIENT_DEV
+/* WHICH REQUESTER KINDS MAY CARRY A NULL STATE — ONE declaration, read at BOTH ends of a step machine's
+   invocation: where the machine RECORDS its requester, and where a delivery consumes it.
+   A continuation whose whole state IS its kind carries a NULL pointer, so `if (state && kind == …)` at a
+   delivery reads "nothing is waiting" for exactly those kinds and falls through to the placement that means
+   nothing was — the same defect the abandon above documents, one layer along, and the reason it is worth a
+   declaration rather than a second hand-written list per delivery.
+   WHAT IT COST, so the shape is recognisable next time. ECMAScript §7.4.11 IteratorClose ( iteratorRecord,
+   completion ) step 3.c's `Call(innerResult, iterator)` is CONT_ITER_CLOSE_CALL, and its state is NULL for
+   OP_iterator_close's own close (the iterator stays at sp[-1] for the whole sequence, so there is nothing to
+   allocate). §27.1.2.1.2 %IteratorHelperPrototype%.return ( ) is a STEP MACHINE. So closing an Iterator Helper
+   recorded (CONT_ITER_CLOSE_CALL, NULL), the step machine's DONE arm tested the POINTER, the close's delivery
+   was skipped, and the machine's result was pushed as a BARE OPERAND on top of the [this, method] the close had
+   pushed: nothing dropped them, the 7.4.11 step 6 object check never ran, the iterator was never freed, and the
+   frame stood exactly two slots high with two values leaked. Nothing read the shifted stack, so for as long as
+   the operand-height assert did not exist this was a silent corruption that passed its own test262 file.
+   ROUTE ON THE KIND. A kind that legitimately has no state must be DECLARED here — never discovered by a
+   pointer test that quietly means something else. */
+static bool js_cont_state_optional(uint8_t kind)
+{
+    return kind == CONT_SETTER || kind == CONT_INSTANCEOF
+        || kind == CONT_FOROF_NEXT || kind == CONT_FOROF_ACQUIRE || kind == CONT_FORAWAIT_WRAP
+        || kind == CONT_ITER_NEXT_OP || kind == CONT_ITER_CALL
+        || kind == CONT_ITER_CLOSE_CALL;
+}
+#endif
 typedef struct JSAsyncFromSyncIteratorData {   /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR opaque (hoisted for the for-await consumer) */
     JSValue sync_iter;
     JSValue next_method;
@@ -33666,6 +33692,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     h->outer = inner5 ? tramp_step_outer
                                       : (tramp_cont_kind != CONT_NONE ? tramp_cont_state : NULL);
                     h->outer_kind = inner5 ? tramp_step_outer_kind : tramp_cont_kind;
+                    /* THE PAIR IS ONE DECLARATION, ASSERTED WHERE IT IS RECORDED. Every delivery of this
+                       machine's result — DONE, UNKNOWN and ABRUPT alike — reads (outer, outer_kind) together,
+                       and a kind whose state is legitimately NULL is listed in js_cont_state_optional. So a
+                       kind recorded here with no state and no entry there is either a call site that set the
+                       kind and forgot the state, or a new stateless kind that has not been declared; the
+                       second is exactly what makes a delivery's `if (state && kind == …)` silently mean "no
+                       requester". Asked at the record so the crash names the call site rather than a
+                       shifted operand stack several opcodes later. */
+                    DCHECK(h->outer != NULL || h->outer_kind == CONT_NONE
+                           || js_cont_state_optional(h->outer_kind),
+                           "a step machine recorded a requester KIND that owns a state and was handed none — "
+                           "fix the call site that set tramp_cont_kind without tramp_cont_state, or DECLARE "
+                           "the kind in js_cont_state_optional so every delivery routes it by kind instead of "
+                           "testing the pointer");
                     h->outer_forof = inner5 ? 0 : tramp_cont_forof;
                     TAKE_CALL_SHAPE();
                     h->orig_cfirst = inner5 ? 0 : call_first_r;
@@ -33768,14 +33808,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp += cfirst1 - cargc1;
                         goto exception;
                     }
-                    if (souter0 && (sk0 == CONT_ITER_CONSUME || sk0 == CONT_ITER_HELPER
-                                    || sk0 == CONT_ITER_CLOSE_CALL || sk0 == CONT_ASYNC_FROM_SYNC
-                                    || sk0 == CONT_PROMISE_ALL)) {
+                    if (sk0 == CONT_ITER_CONSUME || sk0 == CONT_ITER_HELPER
+                        || sk0 == CONT_ITER_CLOSE_CALL || sk0 == CONT_ASYNC_FROM_SYNC
+                        || sk0 == CONT_PROMISE_ALL) {
                         /* the machine WAS a call made by one of these sequences, so its throw is that call's
                            abrupt result and the sequence owns it — IfAbruptCloseIterator for a consumer, and
-                           7.4.9's "the abrupt completion wins" for a close. Delivered exactly as a returned heap
-                           frame's throw is; unwinding here instead would tear the sequence down behind its back. */
+                           ECMAScript §7.4.11 IteratorClose ( iteratorRecord, completion )'s "the abrupt
+                           completion wins" for a close. Delivered exactly as a returned heap frame's throw is;
+                           unwinding here instead would tear the sequence down behind its back — and, for the
+                           opcode's close, leave the [this, method] it pushed standing on the operand stack.
+                           KEYED ON THE KIND, never on the state pointer: see js_cont_state_optional. */
                         int cfirst0 = h->orig_cfirst, cargc0 = h->orig_cargc;
+                        DCHECK(souter0 != NULL || js_cont_state_optional(sk0),
+                               "a sequence's call threw and the sequence it belongs to has no state — only a "
+                               "kind declared in js_cont_state_optional may arrive here with a NULL one");
                         h->outer = NULL; h->outer_kind = CONT_NONE;
                         tramp_step_abrupt_free(ctx, stt);
                         ret_val = JS_EXCEPTION; cont_st = souter0;
@@ -33958,15 +34004,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         ret_val = JS_UNDEFINED;
                         goto do_consume_deliver_iterator;
                     }
-                    if (souter && (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER
-                                   || souter_kind == CONT_ITER_CLOSE_CALL
-                                   || souter_kind == CONT_ASYNC_FROM_SYNC
-                                   || souter_kind == CONT_PROMISE_ALL)) {
+                    if (souter_kind == CONT_ITER_CONSUME || souter_kind == CONT_ITER_HELPER
+                        || souter_kind == CONT_ITER_CLOSE_CALL
+                        || souter_kind == CONT_ASYNC_FROM_SYNC
+                        || souter_kind == CONT_PROMISE_ALL) {
                         /* the machine WAS a call one of these sequences made — a consumer's CALLBACK
                            (`Array.from(g, String)`, `.map(Math.abs)`), an iterator's `return`, or the sync
                            .next() an async-from-sync wrapper drives. Its result and the caller's operands are
                            handed to that sequence's one delivery, exactly as a heap frame's are; the operand
-                           drop lives there, so it is not repeated here. */
+                           drop lives there, so it is not repeated here.
+                           KEYED ON THE KIND, never on the state pointer. `for (const v of it.filter(f));` ends
+                           at OP_iterator_close, whose §7.4.11 step 3.c Call is CONT_ITER_CLOSE_CALL with a NULL
+                           state — and %IteratorHelperPrototype%.return is a step machine, so the pointer test
+                           that used to stand here dropped the close's delivery entirely. */
+                        DCHECK(souter != NULL || js_cont_state_optional(souter_kind),
+                               "a sequence's call completed and the sequence it belongs to has no state — only "
+                               "a kind declared in js_cont_state_optional may arrive here with a NULL one");
                         ret_val = r; cont_st = souter;
                         call_first_r = cfirst; call_pop = cargc;
                         if (souter_kind == CONT_ITER_HELPER) goto do_helper_deliver;
@@ -34073,6 +34126,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         DCHECK(souter_kind == CONT_STEP, "step outer continuation: unknown sequence kind");
                         goto do_step_step;
                     }
+                    /* THE BARE OPERAND IS THE PLACEMENT FOR "NOBODY IS WAITING", AND NOTHING ELSE. Every arm
+                       above names the place a requester wants this machine's result; falling past all of them
+                       means the call site declared no continuation at all — an ordinary `f()` whose result is
+                       the opcode's operand. Reaching here WITH a kind is a delivery that was silently skipped,
+                       and the frame then stands as many slots high as that delivery would have dropped, with
+                       the operands it should have freed still live. That is not a wrong value anywhere: it is a
+                       shifted stack the next opcode's height check reports at an innocent byte, or — before
+                       that check existed — nothing at all. So a continuation kind no arm above routes CRASHES
+                       here, naming itself, instead of being placed as if it were absent. */
+                    DCHECK(souter_kind == CONT_NONE,
+                           "a step machine's result is about to be pushed as a BARE OPERAND while a "
+                           "continuation kind is recorded for it — ROUTE THAT KIND in the arms above. The arms "
+                           "that fall through this way are the ones that tested the state POINTER, and a kind "
+                           "whose whole state IS its kind carries a NULL one (js_cont_state_optional lists "
+                           "them); the cost is a leaked operand pair and an operand stack that is high by "
+                           "exactly what the skipped delivery would have dropped");
                     if (itail) { ret_val = r; goto do_return; }
                     *sp++ = r;
                     BREAK;
