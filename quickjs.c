@@ -25110,9 +25110,13 @@ static bool promise_exec_ready(JSContext *ctx, JSValueConst *call_argv, int call
                                   across 27.10.5.3 Await's machine. */
 #define CONT_AFS_CONT      73  /* outer = JSAsyncFromSync: 27.1.5.4 AsyncFromSyncIteratorContinuation steps 6-15, whose step 6 reads `constructor`
                                   off the value and is therefore the page's code. */
-#define CONT_AGEN_AWAIT_RET 72 /* cont_state = JSAgenSettle (post unused): the drive's own outcome, deferred
-                                  across 27.9.3.9 AsyncGeneratorAwaitReturn's requests. The machine finishes the
-                                  algorithm itself, so this carries only what do_agen_drive_finish needs. */
+#define CONT_AGEN_DEFER    72  /* cont_state = JSAgenSettle: the drive's own outcome, deferred across whatever
+                                  the head of its queue needs. TWO machines take it and the kind is about the
+                                  DEFERRAL, not about either of them — §27.9.3.9 AsyncGeneratorAwaitReturn's
+                                  requests, and §27.9.3.5 AsyncGeneratorCompleteStep ( gen, completion, done
+                                  [ , realm ] )'s settle, which is the capability's resolving function and
+                                  therefore a machine like any other. The
+                                  record says where the drive resumes; the machine finishes its own algorithm. */
 #define CONT_PROMISE_ALL_SETTLE 70 /* cont_state = JSPromiseAll: the AGGREGATE capability's reject(error). The
                                       capability is NewPromiseCapability(C) with C the `this` value, so a subclass
                                       supplies its own resolving functions and this is the page's bytecode — three
@@ -25183,6 +25187,13 @@ typedef struct JSAgenSettle {
                                       frame, so a raw pointer would be stale on resume */
     void *cont; uint8_t ck;         /* where the finish delivers the promise (the drive's own continuation) */
     uint8_t is_tail;
+    /* WHERE THE DRIVE GOES NEXT, which is a fact about the caller and not about the machine. An
+       AsyncGeneratorAwaitReturn finishes the drive; a §27.9.3.5 AsyncGeneratorCompleteStep settle reached from
+       `post` has a body outcome consumed and a queue that may hold more, so it re-enters the pump. It rides
+       the record because interpreter locals do not survive a park, and the settle is a suspension point — that
+       is the whole reason it stopped being a JS_Call. */
+    uint8_t after_drive;            /* 0 = finish the drive, 1 = ask the pump again */
+    struct JSAsyncGeneratorData *agen;   /* the machine the pump is driving; BORROWED, kept alive by `hold` */
 } JSAgenSettle;
 /* The async call's own outcome, deferred across whatever its completion still owes — the settle CALL, or Await's
    machine. `post` went with the split it belonged to: the machine performs its own attach, so the settled label
@@ -26633,7 +26644,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_AFS_GET:
     case CONT_PROMISE_ALL_RESOLVE:
     case CONT_PROMISE_ALL_THEN:
-    case CONT_AGEN_AWAIT_RET:
+    case CONT_AGEN_DEFER:
     case CONT_AFS_CONT:
     case CONT_ASYNC_AWAIT:
     case CONT_STEP_YIELD:
@@ -29681,9 +29692,16 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val, in
                                        int magic);
 static JSValue js_async_generator_enqueue(JSContext *ctx, struct JSAsyncGeneratorData *s, int magic,
                                           JSValueConst arg);
-static int js_async_generator_pre(JSContext *ctx, struct JSAsyncGeneratorData *s, JSValue *out_value);
+static int js_async_generator_pre(JSContext *ctx, struct JSAsyncGeneratorData *s, JSAsyncPost *out);
 #define AGEN_POST_AWAIT 2   /* js_async_generator_post: the body reached AWAIT, so the driver runs 27.10.5.3 Await's
                                machine on out->value (owned by the caller) and then places the drive's outcome */
+#define AGEN_SETTLE 4       /* EITHER half of the pump: §27.9.3.5 AsyncGeneratorCompleteStep's Call is owed, and
+                               out->func / out->value carry it (both owned by the caller). It is a REQUEST rather
+                               than something the pump performs because the callee is the capability's resolving
+                               function, whose `Get(resolution, "then")` is the page's code — so it belongs on a
+                               flow, and a C activation has none. Which label the drive resumes at is the
+                               CALLER's fact, not this one's: `pre` answers one request and the drive finishes,
+                               `post` has consumed a body outcome and asks the pump again. */
 static const JSTrampStepDef js_agen_await_ret_def;
 static JSValue js_new_agen_await_ret(JSContext *ctx, JSValueConst generator, bool is_await);
 #define AGEN_PRE_AWAIT_RETURN 3  /* js_async_generator_pre: the head of the queue is a RETURN on a completed
@@ -30649,6 +30667,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                                            resolved by ta_atom_write_needs_toprim (borrowed) */
     JSValue agen_await_val = JS_UNDEFINED;              /* the value do_agen_await_ret_start awaits (owned) */
     uint8_t agen_await_is_await = 0;                    /* 0 = 27.9.3.9 AsyncGeneratorAwaitReturn, 1 = 27.10.5.3 Await */
+    JSValue agen_settle_fn = JS_UNDEFINED;              /* §27.9.3.5 AsyncGeneratorCompleteStep's Call, handed out by the pump: */
+    JSValue agen_settle_val = JS_UNDEFINED;             /* the capability's resolving function and the completion (both owned) */
+    uint8_t agen_settle_after = 0;                      /* 0 = finish the drive after it, 1 = ask the pump again */
     JSValue *agen_caller_sp = NULL;                     /* the caller's sp with the drive's operands already freed */
     uint8_t agen_tail = 0;                              /* `return ag.next()`: the promise IS the caller's return */
     void *tramp_step_outer = NULL;                      /* non-NULL = the step about to be pushed delivers its result to this machine's step, not to the operand stack (read+reset in do_step_tramp) */
@@ -33958,6 +33979,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_free_rt(rt, ass0);
                         goto exception;
                     }
+                    if (sk0 == CONT_AGEN_DEFER) {
+                        /* the machine the head of the queue needed FAILED — an AsyncGeneratorAwaitReturn whose
+                           plumbing could not be built, or the completion step's own settle. Either way the
+                           drive can never be resumed, so its deferred outcome is released and the throw
+                           propagates, exactly as Await's does one arm up.
+                           IT WAS NOT ROUTED AT ALL BEFORE, and the tell was not a wrong answer: the walk that
+                           tears a step chain down hands back a requester it does not own, and
+                           tramp_step_chain_free DCHECKs that there is none — so this arrived as an assert about
+                           the walk rather than as the async generator's failure. The operand drop is here
+                           because it is here for every other arm: an AwaitReturn declared (0, 0) and a settle
+                           declares the three it pushed, and the shape says which without this arm asking. */
+                        JSAgenSettle *ags0 = souter0;
+                        int cfirst3 = h->orig_cfirst, cargc3 = h->orig_cargc;
+                        JSValue *acargv;
+                        h->outer = NULL; h->outer_kind = CONT_NONE;
+                        tramp_step_abrupt_free(ctx, stt);
+                        acargv = sp - cargc3;
+                        DCHECK(cargc3 >= cfirst3,
+                               "an async-generator deferral records operands ending below where they start");
+                        for (i = cfirst3; i < cargc3; i++) JS_FreeValue(ctx, acargv[i]);
+                        sp += cfirst3 - cargc3;
+                        JS_FreeValue(ctx, ags0->prom);
+                        JS_FreeValue(ctx, ags0->hold);
+                        if (ags0->ck != CONT_NONE)
+                            js_create_requester_abandon(ctx, ags0->cont, ags0->ck);
+                        js_free_rt(rt, ags0);
+                        goto exception;
+                    }
                     if (sk0 == CONT_AFS_CONT) {
                         /* the continuation threw (a failed closure build, or step 5 abrupt with nothing to
                            close): step 7's IfAbruptRejectPromise, with the exception still live. */
@@ -34186,7 +34235,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             if (needs_close) goto do_afs_park_close;
                             goto do_afs_cont_done;
                         }
-                        if (souter_kind == CONT_AGEN_AWAIT_RET) {
+                        if (souter_kind == CONT_AGEN_DEFER) {
                             /* the machine WAS AsyncGeneratorAwaitReturn; it answers nothing and has already
                                registered its own continuation, so only the drive's outcome is left to place. */
                             JS_FreeValue(ctx, r);
@@ -40166,17 +40215,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             /* fall through */
         do_agen_drive_enter:
-            /* Ask the machine what the head of the queue needs. It settles everything that needs no body run
-               (a completed generator, an awaiting return), and returns 1 having delivered the resume input. */
+            /* Ask the machine what the head of the queue needs. It answers with the resume input delivered (1),
+               with nothing to do (0), or with an operation the QUEUE needs and a C activation cannot perform —
+               an awaiting return, or the completion step's own settle. */
             {
-                JSValue arv = JS_UNDEFINED;
-                int prc = js_async_generator_pre(ctx, agen_s, &arv);
+                JSAsyncPost apre;
+                int prc = js_async_generator_pre(ctx, agen_s, &apre);
                 if (prc == AGEN_PRE_AWAIT_RETURN) {
-                    agen_await_val = arv;      /* owned, transferred to the label */
+                    agen_await_val = apre.value;      /* owned, transferred to the label */
                     agen_await_is_await = 0;
                     goto do_agen_await_ret_start;
                 }
-                JS_FreeValue(ctx, arv);
+                if (prc == AGEN_SETTLE) {
+                    /* this arm answered ONE request and the drive is done after it, which is what `pre`
+                       returning 0 used to mean once it had called. */
+                    agen_settle_fn = apre.func; agen_settle_val = apre.value;   /* owned, transferred */
+                    agen_settle_after = 0;
+                    goto do_agen_settle_start;
+                }
+                JS_FreeValue(ctx, apre.value);
                 if (!prc)
                     goto do_agen_drive_finish;
             }
@@ -40286,6 +40343,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         agen_await_is_await = 1;
                         goto do_agen_await_ret_start;
                     }
+                    if (pr == AGEN_SETTLE) {
+                        /* the body YIELDED, COMPLETED or THREW: §27.9.3.5 AsyncGeneratorCompleteStep settles the
+                           request at the head of the queue, and the queue may hold more — so the drive asks the
+                           pump again afterwards, which is what `post` returning 1 used to mean once it had
+                           called. */
+                        agen_settle_fn = apost.func; agen_settle_val = apost.value;   /* owned, transferred */
+                        agen_settle_after = 1;
+                        goto do_agen_settle_start;
+                    }
                     if (pr)
                         goto do_agen_drive_enter;
                 }
@@ -40316,8 +40382,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ars->hold = agen_hold; agen_hold = JS_UNDEFINED;
                 ars->cont = agen_cont; ars->ck = agen_ck; ars->is_tail = agen_tail;
                 ars->caller_depth = (int)(agen_caller_sp - stack_buf);
+                ars->after_drive = 0;   /* AwaitReturn finishes the drive */
+                ars->agen = agen_s;
                 ((JSStepHdr *)ar_stt)->outer = ars;
-                ((JSStepHdr *)ar_stt)->outer_kind = CONT_AGEN_AWAIT_RET;
+                ((JSStepHdr *)ar_stt)->outer_kind = CONT_AGEN_DEFER;
                 ((JSStepHdr *)ar_stt)->orig_cfirst = 0;
                 ((JSStepHdr *)ar_stt)->orig_cargc = 0;
                 ((JSStepHdr *)ar_stt)->orig_is_tail = 0;
@@ -40331,16 +40399,61 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto exception;
             }
 
+        do_agen_settle_start:
+            /* §27.9.3.5 AsyncGeneratorCompleteStep's `Perform ! Call(promiseCapability.[[Resolve]]/[[Reject]],
+               undefined, « value »)`, PLACED rather than performed. Its callee is a native resolving function,
+               which tramp_step_def_of already answers as a step machine — so the operands go on this chain and
+               the ONE call entry drives it, and §27.5.1.3's `Get(resolution, "then")` on the iterator-result
+               object becomes a request like every other page read. It reached js_promise_resolve_function_call's
+               DFAIL before, which is what named this conversion.
+               The drive's own outcome rides the SAME record AsyncGeneratorAwaitReturn's does, for the same
+               reason: the call can suspend, and a parked flow keeps no interpreter locals. Neither the promise
+               nor the receiver may sit in one across it. */
+            {
+                JSAgenSettle *ass;
+                ass = js_malloc_rt(rt, sizeof(*ass));
+                if (unlikely(!ass)) {
+                    JS_FreeValue(ctx, agen_settle_fn); agen_settle_fn = JS_UNDEFINED;
+                    JS_FreeValue(ctx, agen_settle_val); agen_settle_val = JS_UNDEFINED;
+                    JS_ThrowOutOfMemory(ctx);
+                    goto do_agen_await_ret_fail;
+                }
+                ass->prom = agen_prom; agen_prom = JS_UNDEFINED;
+                ass->hold = agen_hold; agen_hold = JS_UNDEFINED;
+                ass->cont = agen_cont; ass->ck = agen_ck; ass->is_tail = agen_tail;
+                ass->caller_depth = (int)(agen_caller_sp - stack_buf);
+                ass->after_drive = agen_settle_after; agen_settle_after = 0;
+                ass->agen = agen_s;
+                DCHECK(sp + 3 <= TRAMP_SP_LIMIT(sf),
+                       "async-generator settle: operand push exceeds the frame's compiled stack_size");
+                *sp++ = JS_UNDEFINED;                                    /* this */
+                *sp++ = agen_settle_fn;  agen_settle_fn = JS_UNDEFINED;  /* the resolving function (owned) */
+                *sp++ = agen_settle_val; agen_settle_val = JS_UNDEFINED; /* the completion (owned) */
+                call_argv = sp - 1; call_argc = 1; tramp_first = -2; tramp_is_tail = 0;
+                /* the operands ARE the three just pushed, which is what an UNSET shape states — and it has to
+                   be stated, because a shape left over from an earlier call on this frame is read instead. */
+                call_cfirst = 0; call_cargc = -1;
+                tramp_cont_state = ass; tramp_cont_kind = CONT_AGEN_DEFER;
+                goto do_generic_callee;
+            }
+
         do_agen_await_ret_done:
-            /* AsyncGeneratorAwaitReturn finished (or failed): restore the drive's deferred outcome and place it.
-               `ret_val` is already released by whichever arm got here. */
+            /* WHATEVER THE HEAD OF THE QUEUE NEEDED IS DONE — an AsyncGeneratorAwaitReturn, or the completion
+               step's settle. Restore the drive's deferred outcome and go where the record says. `ret_val` is
+               already released by whichever arm got here; a settle's result is discarded by §27.9.3.5, which
+               performs its Call with `!` and keeps nothing. */
             {
                 JSAgenSettle *ars = cont_st;
+                uint8_t after;
                 cont_st = NULL;
                 agen_prom = ars->prom; agen_hold = ars->hold;
                 agen_cont = ars->cont; agen_ck = ars->ck; agen_tail = ars->is_tail;
                 agen_caller_sp = stack_buf + ars->caller_depth;
+                agen_s = ars->agen;
+                after = ars->after_drive;
                 js_free_rt(rt, ars);
+                if (after)
+                    goto do_agen_drive_enter;
             }
             goto do_agen_drive_finish;
 
@@ -49814,19 +49927,33 @@ static int js_async_generator_await_finish(JSContext *ctx, JSAsyncPost *p, JSAsy
 }
 #endif
 
-static void js_async_generator_resolve_or_reject(JSContext *ctx,
-                                                 JSAsyncGeneratorData *s,
-                                                 JSValueConst result,
-                                                 int is_reject)
+/* §27.9.3.5 AsyncGeneratorCompleteStep ( gen, completion, done [ , realm ] ) steps 1-4 and 7 — everything about
+   it EXCEPT the Call, which is HANDED OUT rather than performed.
+   THE CALL IS PAGE CODE AND THIS IS A C ACTIVATION. `promiseCapability.[[Resolve]]` is a native resolving
+   function, and §27.5.1.3's resolveSteps read `Get(resolution, "then")` off the completion — an ordinary
+   iterator-result object whose prototype is %Object.prototype%, so the read is the page's the moment anything
+   defines a `then` accessor there. js_promise_resolve_function_call already refuses that from C, by name
+   ("hand that caller's call out and place it on a flow"), which is the forcing function this conversion was
+   waiting for rather than one it had to build.
+   WHAT IS HANDED OUT is the resolving function and the value, both OWNED by the caller. The request record is
+   still retired here — the queue must not hold a settled request across the suspension — so the function is
+   dup'd out of it before it goes. There is no second implementation to fall back to: this function no longer
+   knows how to call anything. */
+static void js_async_generator_complete_step(JSContext *ctx,
+                                             JSAsyncGeneratorData *s,
+                                             JSValueConst result,
+                                             int is_reject,
+                                             JSValue *out_func, JSValue *out_value)
 {
     JSAsyncGeneratorRequest *next;
-    JSValue ret;
 
+    DCHECK(!list_empty(&s->queue),
+           "§27.9.3.5 AsyncGeneratorCompleteStep step 1 asserts the queue is not empty, and this settle has no "
+           "request to answer — the pump reached a completion step with nothing at the head of the queue");
     next = list_entry(s->queue.next, JSAsyncGeneratorRequest, link);
     list_del(&next->link);
-    ret = JS_Call(ctx, next->resolving_funcs[is_reject], JS_UNDEFINED, 1,
-                  &result);
-    JS_FreeValue(ctx, ret);
+    *out_func = js_dup(next->resolving_funcs[is_reject]);
+    *out_value = js_dup(result);
     JS_FreeValue(ctx, next->result);
     JS_FreeValue(ctx, next->promise);
     JS_FreeValue(ctx, next->resolving_funcs[0]);
@@ -49837,20 +49964,28 @@ static void js_async_generator_resolve_or_reject(JSContext *ctx,
 static void js_async_generator_resolve(JSContext *ctx,
                                        JSAsyncGeneratorData *s,
                                        JSValueConst value,
-                                       bool done)
+                                       bool done,
+                                       JSValue *out_func, JSValue *out_value)
 {
     JSValue result;
     result = js_create_iterator_result(ctx, js_dup(value), done);
-    /* XXX: better exception handling ? */
-    js_async_generator_resolve_or_reject(ctx, s, result, 0);
+    /* The "XXX: better exception handling ?" that stood here was about an allocation failure reaching the
+       settle as a value. It cannot: the only way this fails is OOM, and an OOM that carried the exception
+       sentinel INTO a resolving function would settle the request with the runtime's no-exception marker —
+       a value no page ever produced, delivered as though the generator had yielded it. */
+    CHECK(!JS_IsException(result),
+          "an async generator's iterator-result object could not be allocated, so the request at the head of "
+          "its queue can be settled with nothing — a dropped settlement leaves a promise pending for ever");
+    js_async_generator_complete_step(ctx, s, result, 0, out_func, out_value);
     JS_FreeValue(ctx, result);
  }
 
 static void js_async_generator_reject(JSContext *ctx,
                                        JSAsyncGeneratorData *s,
-                                       JSValueConst exception)
+                                       JSValueConst exception,
+                                       JSValue *out_func, JSValue *out_value)
 {
-    js_async_generator_resolve_or_reject(ctx, s, exception, 1);
+    js_async_generator_complete_step(ctx, s, exception, 1, out_func, out_value);
 }
 
 static void js_async_generator_complete(JSContext *ctx,
@@ -50014,12 +50149,13 @@ static JSValue js_new_agen_await_ret(JSContext *ctx, JSValueConst generator, boo
    it is the reason the second entrant needs no second driver. There used to be one — a C
    js_async_generator_resume_next that installed the body as its own flow base and parked it there while the
    promise reaction that called it went on executing bytecode — and it is DELETED, not kept behind the route. */
-static int js_async_generator_pre(JSContext *ctx, JSAsyncGeneratorData *s, JSValue *out_value)
+static int js_async_generator_pre(JSContext *ctx, JSAsyncGeneratorData *s, JSAsyncPost *out)
 {
     JSAsyncGeneratorRequest *next;
     JSValue value;
 
-    *out_value = JS_UNDEFINED;
+    out->func = JS_UNDEFINED; out->value = JS_UNDEFINED;
+    out->await_promise = JS_UNDEFINED; out->st = NULL;
     for(;;) {
         if (list_empty(&s->queue))
             return 0;
@@ -50040,15 +50176,17 @@ static int js_async_generator_pre(JSContext *ctx, JSAsyncGeneratorData *s, JSVal
             break;
         case JS_ASYNC_GENERATOR_STATE_COMPLETED:
             if (next->completion_type == GEN_MAGIC_NEXT) {
-                js_async_generator_resolve(ctx, s, JS_UNDEFINED, true);
+                js_async_generator_resolve(ctx, s, JS_UNDEFINED, true, &out->func, &out->value);
             } else if (next->completion_type == GEN_MAGIC_RETURN) {
                 s->state = JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN;
-                *out_value = js_dup(next->result);
+                out->value = js_dup(next->result);
                 return AGEN_PRE_AWAIT_RETURN;
             } else {
-                js_async_generator_reject(ctx, s, next->result);
+                js_async_generator_reject(ctx, s, next->result, &out->func, &out->value);
             }
-            return 0;
+            /* the settle is the caller's to place, and the drive is FINISHED after it: this arm answers one
+               request and returns, exactly as it did when it called. */
+            return AGEN_SETTLE;
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
             value = js_dup(next->result);
@@ -50087,9 +50225,9 @@ static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSVa
     if (JS_IsException(func_ret)) {
         value = JS_GetException(ctx);
         js_async_generator_complete(ctx, s);
-        js_async_generator_reject(ctx, s, value);
+        js_async_generator_reject(ctx, s, value, &out->func, &out->value);
         JS_FreeValue(ctx, value);
-        return 1;
+        return AGEN_SETTLE;
     }
     if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT) {
         value = s->func_state.frame.cur_sp[-1];
@@ -50100,9 +50238,9 @@ static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSVa
             s->state = (JS_VALUE_GET_INT(func_ret) == FUNC_RET_YIELD_STAR)
                      ? JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR
                      : JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD;
-            js_async_generator_resolve(ctx, s, value, false);
+            js_async_generator_resolve(ctx, s, value, false, &out->func, &out->value);
             JS_FreeValue(ctx, value);
-            return 1;
+            return AGEN_SETTLE;
         case FUNC_RET_AWAIT:
             /* 27.10.5.3 Await: the driver runs the machine, exactly as it does for a RETURN on a
                completed generator. Both of its page-visible steps — the `constructor` read and the resolve —
@@ -50118,9 +50256,9 @@ static int js_async_generator_post(JSContext *ctx, JSAsyncGeneratorData *s, JSVa
     value = s->func_state.frame.cur_sp[-1];
     s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
     js_async_generator_complete(ctx, s);
-    js_async_generator_resolve(ctx, s, value, true);
+    js_async_generator_resolve(ctx, s, value, true, &out->func, &out->value);
     JS_FreeValue(ctx, value);
-    return 1;
+    return AGEN_SETTLE;
 }
 
 /* ONE C ENTRY, TWO ALGORITHMS, AND ONLY ONE OF THEM RUNS A BODY.
@@ -50158,12 +50296,16 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
                "§27.9.3.9 AsyncGeneratorAwaitReturn's closures assert the generator is draining-queue, and this "
                "one is in neither of the two states this engine spells that with");
         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
-        if (is_reject) {
-            js_async_generator_reject(ctx, s, arg);
-        } else {
-            js_async_generator_resolve(ctx, s, arg, true);
-        }
-        return JS_UNDEFINED;
+        (void)is_reject; (void)arg;
+        DFAIL("§27.9.3.9 AsyncGeneratorAwaitReturn's fulfilledClosure/rejectedClosure reached their C entry, "
+              "and their whole body is §27.9.3.5 AsyncGeneratorCompleteStep — whose Call is the capability's "
+              "resolving function, so it needs a flow to be placed on and a C activation has none. The pump's "
+              "two halves hand that settle out (AGEN_SETTLE) and the interpreter places it; these closures "
+              "cannot, because they are an ordinary JS_NewCFunctionData callee that the convergence point runs "
+              "IN PLACE. BUILD THEM AS A STEP MACHINE — one stage, one CALL request — the way §27.9.3.9's own "
+              "requests already are (js_agen_await_ret_def), and route them at their creation in "
+              "js_async_generator_resolve_function_create rather than here");
+        return JS_ThrowInternalError(ctx, "async generator AwaitReturn closure reached its C entry (build it as a step machine)");
     }
     DFAIL("an async generator's await continuation reached its C entry — §27.10.5.3 Await's onFulfilled/"
           "onRejected perform §9.4.7 RunSuspendedContext, which is a BODY ENTRY on the running flow's chain. "
