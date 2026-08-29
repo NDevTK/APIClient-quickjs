@@ -10775,6 +10775,36 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
     return r;
 }
 
+/* WHERE A BYTECODE FRAME IS, AS ONE ARITHMETIC. `cur_pc` names the byte the frame CONTINUES at — the
+   interpreter stores it past the opcode it has fetched — so the opcode the frame is STANDING at is the byte
+   before it, which is what the `- 1` here has always been. It was written out at each reader instead, and a
+   reader is where an off-by-one about a boundary goes unnoticed: `find_line_num` takes a uint32_t, so a frame
+   whose cur_pc is the body's first byte computes -1, wraps to UINT32_MAX, walks the WHOLE pc2line table without
+   ever exceeding it and returns the LAST line of the function. A wrong line is not a missing line — it is a
+   position the reader has no way to distrust — which is the same reason the walk that fed
+   Error.prepareStackTrace asserts rather than printing "(missing)".
+   THE DOMAIN IS ASSERTED, NOT ASSUMED. A frame that has not executed an opcode yet continues at its first one
+   and is standing there, which is the only case the `off ? off - 1 : 0` names; anything outside the body is a
+   pc from another body or none at all, and there is no line either of those could honestly produce. */
+static uint32_t js_frame_pc_pos(const JSStackFrame *sf, const JSFunctionBytecode *b)
+{
+    ptrdiff_t off;
+
+    /* Upstream's two walks disagreed about this and both were wrong: one printed "(missing)" behind a FIXME
+       saying a bytecode handler in JS_CallInternal forgets `sf->cur_pc = pc`, the other subtracted from a null
+       pointer and read a line number out of the result. Neither is reachable now — `restart:` gives every frame
+       a position before its first opcode and the dispatch keeps it current — so a NULL here is a body entered
+       by a path that does not go through `restart:`, which is a route to fix and not a case to render. */
+    DCHECK(sf->cur_pc != NULL, "a bytecode frame on the stack has no program counter, so its position in a "
+           "stack trace cannot be computed — the call path that pushed it never reached `restart:`");
+    off = sf->cur_pc - b->byte_code_buf;
+    DCHECK(off >= 0 && off <= (ptrdiff_t)b->byte_code_len,
+           "a bytecode frame's program counter points outside the body it belongs to — the frame and the "
+           "bytecode disagree about which function is running, so every position read off it names a byte in "
+           "some other function");
+    return off > 0 ? (uint32_t)(off - 1) : 0;
+}
+
 /* "eval at f (file:12:3)" — V8's rendering of WHERE an eval was called, for CallSite#getEvalOrigin. The
    caller is the frame this compile is happening under, so this is only meaningful at compile time; the atom it
    returns rides the compiled code. JS_ATOM_NULL when there is no caller frame (the host called eval itself),
@@ -10803,8 +10833,10 @@ static JSAtom js_eval_origin_atom(JSContext *ctx)
         if (js_class_has_bytecode(p->class_id))
             b = p->u.func.function_bytecode;
     }
-    if (b && sf->cur_pc) {
-        line = find_line_num(ctx, b, sf->cur_pc - b->byte_code_buf - 1, &col);
+    if (b) {
+        /* the `&& sf->cur_pc` that stood here was the other spelling of "carry on with a frame whose position
+           is unknown", and it is gone with the condition it guarded: a bytecode frame HAS a position. */
+        line = find_line_num(ctx, b, js_frame_pc_pos(sf, b), &col);
         dbuf_printf(&dbuf, " (");
         /* An eval CALLED FROM eval'd code carries the whole chain: `eval at Inner (eval at Outer (f:73:3),
            <input>:1:20)`. It is the same composition the frame rendering uses, for the same reason — the
@@ -30784,12 +30816,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    The cost of asking everywhere is one thread-local byte load and a branch the predictor gets right forever —
    the indirect jump on the next line dominates it. That is the trade this design turns on: make the TEST free so
    the QUESTION can be universal, never narrow where the question is asked. */
+/* AND THE POSITION THE FRAME IS AT, for the same reason and on the same terms. `cur_pc` is what every stack
+   trace, every error line and every `eval at …` origin is computed from, and it used to be written by the
+   handlers that could see a reason to — eighty-two of them, which is the shape of a question asked where
+   somebody predicted it would matter. Upstream carried the FIXME for the gap that leaves ("a bytecode handler
+   in JS_CallInternal forgets sf->cur_pc = pc"), and every opcode that RAISES without calling out is one: a TDZ
+   read, an undeclared-global read, a coercion TypeError. Each of them builds an Error, and an Error is built by
+   walking the frames — so the frame's position is read at exactly the opcodes least likely to have stored one.
+   Written here it cannot be missed, and it is also RIGHT rather than merely present: a per-site store names
+   wherever `pc` had got to, past the operands and sometimes past the opcode, while this names the opcode being
+   executed. The per-site stores STAY, and are not a superseded copy of this: they set the RESUME point a
+   returning call continues at, which is past the operands on purpose. One store per dispatch into a field the
+   frame is already hot in, on the same trade the yield poll above takes.
+   Placed AFTER the fetch so `cur_pc - 1` lands on the opcode's own byte, and after the yield poll so a park —
+   which stores its resume point itself — is not overwritten by a dispatch that never happens. */
 #if !DIRECT_DISPATCH
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) \
                         SP_LEVEL_CHECK(); \
                         CALL_SHAPE_IDLE_CHECK(); \
                         if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll; \
-                        switch (opcode = *pc++)
+                        opcode = *pc++; \
+                        sf->cur_pc = pc; \
+                        switch (opcode)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -30815,7 +30863,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                              SP_LEVEL_CHECK();                                       \
                              CALL_SHAPE_IDLE_CHECK();                                \
                              if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll;    \
-                             goto *dispatch_table[opcode = *pc++]; } while (0)
+                             opcode = *pc++;                                         \
+                             sf->cur_pc = pc;                                         \
+                             goto *dispatch_table[opcode]; } while (0)
 #define SWITCH(pc)      DISPATCH();
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
@@ -31212,6 +31262,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        trampoline's pushes (do_tramp_call, the construct push, the apply reshape), and the coroutine resume —
        so the mark cannot be missed by a call shape nobody thought of. See JSFunctionBytecode.entered. */
     b->entered = 1;
+    /* AND IT IS STANDING SOMEWHERE, from this instant. The frame is born with a NULL cur_pc — three separate
+       birth sites write that NULL — and until the body reached an opcode that happened to store one, a stack
+       trace taken through it had no position to report; upstream rendered that as "(missing)" in one walk and
+       read a line number out of a null-pointer subtraction in the other. It is the same argument `entered`
+       makes one line up: every entry converges HERE before the first opcode, so stating it here is a fact no
+       call shape can forget, and `pc` is already exactly what it should say — the body's first byte on a fresh
+       entry, the resume point on a coroutine resume, both of which are where the frame is about to execute. */
+    sf->cur_pc = pc;
     for(;;) {
 
         SWITCH(pc) {
@@ -114075,16 +114133,13 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
         /* Upstream's other walk printed "(missing)" here and carried a FIXME saying a bytecode handler in
            JS_CallInternal forgets `sf->cur_pc = pc`, "almost never user observable except with intercepting JS
            proxies that throw exceptions" — and this walk, the one that feeds Error.prepareStackTrace, never had
-           the check at all: it subtracts from a null pointer and reads a line number out of the result. Both
-           spellings of "carry on with a frame whose position is unknown" are gone; a bytecode frame on the stack
-           has a program counter, and if one does not the walk says so where it is born. Proxy traps trampoline
-           in this engine, which is the FIXME's own scenario, so this is the assertion that decides whether the
-           upstream bug survived the conversion. */
-        DCHECK(sf->cur_pc != NULL, "a bytecode frame on the stack has no program counter, so its position in a "
-               "stack trace cannot be computed — the call path that pushed it never stored one");
-        line_num1 = find_line_num(ctx, b,
-                                  sf->cur_pc - b->byte_code_buf - 1,
-                                  &col_num1);
+           the check at all: it subtracts from a null pointer and reads a line number out of the result. The
+           FIXME was RIGHT and its remedy was per-site: `sf->cur_pc = pc` written at each handler that might be
+           observed, which is a line every new opcode must remember and eighty-two of which existed. That is the
+           shape this engine does not keep — the question "where is this frame" is universal, so it is answered
+           where every opcode already converges rather than at the opcodes somebody predicted would be looked
+           at. Both spellings of "carry on with a frame whose position is unknown" are gone with it. */
+        line_num1 = find_line_num(ctx, b, js_frame_pc_pos(sf, b), &col_num1);
         csd->native = false;
         csd->is_eval = b->from_eval;
         csd->eval_origin = b->eval_origin != JS_ATOM_NULL
