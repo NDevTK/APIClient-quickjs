@@ -29703,6 +29703,7 @@ static int js_async_generator_pre(JSContext *ctx, struct JSAsyncGeneratorData *s
                                CALLER's fact, not this one's: `pre` answers one request and the drive finishes,
                                `post` has consumed a body outcome and asks the pump again. */
 static const JSTrampStepDef js_agen_await_ret_def;
+static const JSTrampStepDef js_agen_complete_step_def;
 static JSValue js_new_agen_await_ret(JSContext *ctx, JSValueConst generator, bool is_await);
 #define AGEN_PRE_AWAIT_RETURN 3  /* js_async_generator_pre: the head of the queue is a RETURN on a completed
                                     generator, so 27.9.3.9 AsyncGeneratorAwaitReturn runs — which reads
@@ -49855,8 +49856,16 @@ static int js_async_generator_resolve_function_create(JSContext *ctx,
     JSValue func;
 
     for(i = 0; i < 2; i++) {
-        func = JS_NewCFunctionData(ctx, js_async_generator_resolve_function, 1,
-                                   i + is_resume_next * 2, 1, vc(&generator));
+        /* ROUTED HERE, AT CREATION, because the two pairs are different kinds of thing and no call site should
+           have to ask which one it received. §27.9.3.9 AsyncGeneratorAwaitReturn's pair SETTLES the queue —
+           a Call on the request capability's resolving function, which is page code — so it is a machine that
+           places that call on a flow. §27.10.5.3 Await's pair RESUMES THE BODY, which is a frame entry the
+           convergence point performs at do_agen_resume_tramp, so it stays an ordinary closure whose C entry is
+           that route's backstop. Both used to be the same closure with the kind encoded in `magic`, and the
+           settling half then had no way to place its call at all. */
+        func = is_resume_next
+             ? js_new_step_closure(ctx, &js_agen_complete_step_def, 1, i, 1, vc(&generator))
+             : JS_NewCFunctionData(ctx, js_async_generator_resolve_function, 1, i, 1, vc(&generator));
         if (JS_IsException(func)) {
             if (i == 1)
                 JS_FreeValue(ctx, resolving_funcs[0]);
@@ -50128,6 +50137,96 @@ static JSValue js_new_agen_await_ret(JSContext *ctx, JSValueConst generator, boo
                                1, 0, 1, &generator);
 }
 
+/* §27.9.3.9 AsyncGeneratorAwaitReturn ( gen )'s fulfilledClosure and rejectedClosure, AS A MACHINE — because
+   their whole body is §27.9.3.5 AsyncGeneratorCompleteStep ( gen, completion, done [ , realm ] ), whose Call is
+   the request capability's resolving function, and §27.5.1.3's resolveSteps read `Get(resolution, "then")` off
+   the value it settles with. That read is the page's, so the Call has to be PLACED on a flow; an ordinary
+   JS_NewCFunctionData closure is run IN PLACE by the convergence point and has nowhere to place it.
+   ONE MACHINE, TWO SPELLINGS, and the magic is the whole difference: fulfilled settles with a NORMAL completion,
+   rejected with a THROW one. Nothing else about them differs, which is why there is one def and not two — the
+   same shape DisposeResources' chain link gives its own resolve/reject pair.
+   WHAT IS STILL MISSING, named rather than built: the closures' last step is AsyncGeneratorDrainQueue(gen), and
+   this performs only the completion step — exactly as the C body it replaces did, so a second request queued
+   behind the returned one is not settled here. Draining is the PUMP's walk (js_async_generator_pre) and this
+   machine has no drive under it to re-enter, so building it means giving the reaction driver a drive context.
+   That is a change to the pump's shape and not another placement of this one. */
+typedef struct JSAgenCompleteStep {
+    JSStepHdr hdr;       /* MUST be first: the generic driver casts the state to JSStepHdr * */
+    JSValue cb[3];       /* the settle CALL's [this, func, value], OWNED here */
+    uint8_t call_phase;  /* step_call_run's own cursor */
+} JSAgenCompleteStep;
+_Static_assert(offsetof(JSAgenCompleteStep, hdr) == 0, "JSStepHdr must be first in JSAgenCompleteStep");
+
+#define ACS_STAGES(X) \
+    X(ACS_SETTLE, "27.9.3.9's fulfilledClosure/rejectedClosure step 3 -> 27.9.3.5 AsyncGeneratorCompleteStep " \
+                  "step 8's Call(promiseCapability.[[Resolve]]/[[Reject]], undefined, « value »)")
+enum { ACS_STAGES(JS_STEP_STAGE_ENUM) };
+static const char *const js_agen_complete_step_steps[] = { ACS_STAGES(JS_STEP_STAGE_LABEL) NULL };
+
+static int js_agen_complete_step_step(JSContext *ctx, void *st, JSValue cb_result,
+                                      JSValue **out_cb, int *out_argc)
+{
+    JSAgenCompleteStep *m = st;
+    JSCFunctionDataRecord *rec = JS_VALUE_GET_OBJ(m->hdr.func_obj)->u.c_function_data_record;
+    JSValueConst gobj = rec->data[0];
+    JSAsyncGeneratorData *s = JS_GetOpaque(gobj, JS_CLASS_ASYNC_GENERATOR);
+    JSValue out = JS_UNDEFINED;
+    int r;
+
+    /* the closure holds a counted reference to the generator OBJECT, and only that object's finalizer clears
+       the opaque — so a NULL here is a closure built by something other than the create below. */
+    DCHECK(s != NULL,
+           "§27.9.3.9's completion-step closure carries no machine — its captured generator object is the "
+           "reference keeping the state alive, so a cleared opaque means it was not built over one");
+    if (m->call_phase == 0) {
+        JSValue fn = JS_UNDEFINED, val = JS_UNDEFINED;
+        DCHECK(s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN ||
+               s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED,
+               "§27.9.3.9's closures assert the generator is draining-queue, and this one is in neither of the "
+               "two states this engine spells that with");
+        m->cb[0] = JS_UNDEFINED; m->cb[1] = JS_UNDEFINED; m->cb[2] = JS_UNDEFINED;
+        s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
+        /* step_arg answers past a call's real operands with undefined, which is the fulfilment spelling called
+           with nothing — and undefined is exactly what §27.9.3.5 would settle with there. */
+        js_async_generator_complete_step(ctx, s, step_arg(&m->hdr, 0), rec->magic & 1, &fn, &val);
+        r = step_call_run(ctx, &m->call_phase, STEP_CB(m->cb), fn, JS_UNDEFINED, 1, vc(&val),
+                          cb_result, &out, out_cb, out_argc);
+        JS_FreeValue(ctx, fn);
+        JS_FreeValue(ctx, val);   /* step_call_run dup'd both into cb[] */
+        DCHECK(r == JS_STEP_CALL,
+               "the completion step's Call did not park on its first phase — step_call_run's phase 0 always "
+               "issues the request, so anything else here means the buffer or the cursor is not this "
+               "machine's");
+        return r;
+    }
+    /* the settle returned. §27.9.3.5 performs its Call with `!` and keeps nothing, so the result is discarded
+       and the closure's own completion is undefined. */
+    r = step_call_run(ctx, &m->call_phase, STEP_CB(m->cb), JS_UNDEFINED, JS_UNDEFINED, 0, NULL,
+                      cb_result, &out, out_cb, out_argc);
+    DCHECK(r == 0, "the completion step's Call resumed and did not end — step_call_run's second phase always "
+                   "releases the buffer and answers");
+    if (r < 0)
+        return -1;
+    JS_FreeValue(ctx, out);
+    return 0;
+}
+
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The settle call's buffer, and nothing else: the generator is
+   the CLOSURE's captured data and the completion has been handed to the buffer by the time anything can fork. */
+static void js_agen_complete_step_visit(JSContext *ctx, void *st, JSStepVisit *v)
+{
+    JSAgenCompleteStep *m = st;
+    int i;
+    for (i = 0; i < 3; i++) v->val(ctx, &m->cb[i]);
+}
+
+static const JSTrampStepDef js_agen_complete_step_def = {
+    sizeof(JSAgenCompleteStep), js_agen_complete_step_step, NULL, 0,
+    /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
+    .visit = js_agen_complete_step_visit,
+    .algorithm = "27.9.3.9 AsyncGeneratorAwaitReturn ( gen )'s fulfilledClosure / rejectedClosure",
+    .steps = js_agen_complete_step_steps };
+
 /* DELETED: js_async_gen_park_resume / _clone / _free, the async generator's own pump park. They existed only
    because js_async_generator_resume_next made the body its OWN flow base and had to park it there; the body's
    resume is now a frame on the running flow's chain (do_agen_resume_tramp), so a back-edge inside it is an
@@ -50278,35 +50377,20 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
                                                    int argc, JSValueConst *argv,
                                                    int magic, JSValueConst *func_data)
 {
-    bool is_reject = magic & 1;
     JSAsyncGeneratorData *s = JS_GetOpaque(func_data[0], JS_CLASS_ASYNC_GENERATOR);
-    JSValueConst arg = argv[0];
 
-    (void)this_obj; (void)argc;
+    (void)this_obj; (void)argc; (void)argv; (void)magic;
     /* NOT "what if s == NULL", which is what stood here: the closure holds a counted reference to the generator
        OBJECT in func_data[0], and only that object's finalizer clears the opaque — so a NULL here is a closure
        built by something other than js_async_generator_resolve_function_create, not a lifetime race. */
     DCHECK(s != NULL,
            "an async generator's resolving function carries no machine — its captured generator object is the "
            "reference keeping the state alive, so a cleared opaque means this closure was not built over one");
-
-    if (magic >= 2) {
-        DCHECK(s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN ||
-               s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED,
-               "§27.9.3.9 AsyncGeneratorAwaitReturn's closures assert the generator is draining-queue, and this "
-               "one is in neither of the two states this engine spells that with");
-        s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
-        (void)is_reject; (void)arg;
-        DFAIL("§27.9.3.9 AsyncGeneratorAwaitReturn's fulfilledClosure/rejectedClosure reached their C entry, "
-              "and their whole body is §27.9.3.5 AsyncGeneratorCompleteStep — whose Call is the capability's "
-              "resolving function, so it needs a flow to be placed on and a C activation has none. The pump's "
-              "two halves hand that settle out (AGEN_SETTLE) and the interpreter places it; these closures "
-              "cannot, because they are an ordinary JS_NewCFunctionData callee that the convergence point runs "
-              "IN PLACE. BUILD THEM AS A STEP MACHINE — one stage, one CALL request — the way §27.9.3.9's own "
-              "requests already are (js_agen_await_ret_def), and route them at their creation in "
-              "js_async_generator_resolve_function_create rather than here");
-        return JS_ThrowInternalError(ctx, "async generator AwaitReturn closure reached its C entry (build it as a step machine)");
-    }
+    (void)s;   /* the assert is its only reader; this entry no longer has an algorithm to run on it */
+    /* THE `magic >= 2` ARM IS GONE WITH THE CLOSURES THAT REACHED IT. §27.9.3.9 AsyncGeneratorAwaitReturn's
+       pair is js_agen_complete_step_def now, declared where it is built, so nothing creates a magic 2 or 3 for
+       this entry to answer — and the branch that used to tell them apart went with them rather than surviving
+       as a selector for a kind that no longer arrives. What is left is one algorithm and one backstop. */
     DFAIL("an async generator's await continuation reached its C entry — §27.10.5.3 Await's onFulfilled/"
           "onRejected perform §9.4.7 RunSuspendedContext, which is a BODY ENTRY on the running flow's chain. "
           "Route this call shape through the call convergence point (do_generic_callee's tramp_agen_resume_kind "
