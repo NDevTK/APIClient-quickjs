@@ -48,12 +48,16 @@
 #include "libregexp.h"
 #include "dtoa.h"
 
-#if defined(EMSCRIPTEN) || defined(_MSC_VER)
-
-#define DIRECT_DISPATCH  0
-#else
-#define DIRECT_DISPATCH  1
-#endif
+/* DELETED: DIRECT_DISPATCH and the `switch` dispatch it selected for the interpreter. It was a SECOND COPY OF
+   THE OPCODE ENTRY — its own SWITCH/CASE/DEFAULT/BREAK, its own preempt poll, its own `sf->cur_pc` store — and
+   the whole of this engine's attention mechanism is that every opcode converges on ONE dispatch, so a second
+   one is a second place every routing change has to be made and the only place an omission is invisible.
+   IT DID NOT COMPILE, which is how a second copy ends when nothing builds it: `BREAK` expanded to a bare
+   `break` and the interpreter's tramp rewrite had long since moved call opcodes out of the switch, so two
+   `BREAK;` sites were outside any loop or switch at all. No configuration lost a working build when it went —
+   a branch that cannot compile is not support for the platform it names. That was the whole of the MSVC and
+   the (misspelt, never-defined) EMSCRIPTEN case; the computed-goto form is now unconditional, and a toolchain
+   without `&&label` is an honest build failure at the table rather than a fallback that silently drifts. */
 
 #include "quickjs-check.h"
 
@@ -30852,18 +30856,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    frame is already hot in, on the same trade the yield poll above takes.
    Placed AFTER the fetch so `cur_pc - 1` lands on the opcode's own byte, and after the yield poll so a park —
    which stores its resume point itself — is not overwritten by a dispatch that never happens. */
-#if !DIRECT_DISPATCH
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) \
-                        SP_LEVEL_CHECK(); \
-                        CALL_SHAPE_IDLE_CHECK(); \
-                        if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll; \
-                        opcode = *pc++; \
-                        sf->cur_pc = pc; \
-                        switch (opcode)
-#define CASE(op)        case op
-#define DEFAULT         default
-#define BREAK           break
-#else
     __extension__ static const void * const dispatch_table[256] = {
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
 #define def(id, size, n_pop, n_push, f)
@@ -30892,7 +30884,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           DISPATCH()
-#endif
 
     if (js_poll_interrupts(caller_ctx))
         return JS_EXCEPTION;
