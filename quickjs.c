@@ -23857,11 +23857,17 @@ static void js_iter_helper_abandon(JSContext *ctx, void *st);
    one whose abrupt handling belongs to the interpreter (a combinator rejects its aggregate; a consumer owes
    IfAbruptCloseIterator and then yields). Reporting rather than freeing is the whole point: a JSPromiseAll freed
    through JSStepHdr's teardown reads its `def` out of the middle of the struct. */
-/* The shared abandon walk; DEFINED past JSToPrim, whose links it reads. */
-static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t *out_kind);
-static void *tramp_step_chain_free_upto(JSContext *ctx, void *st, uint8_t *out_kind)
+/* The shared abandon walk; DEFINED past JSToPrim, whose links it reads.
+   OUT_CFIRST / OUT_CARGC ARE PART OF THE HAND-OVER, NOT AN EXTRA. The requester handed back is one whose abrupt
+   handling an unwind arm performs, and every such arm begins by DROPPING the operands of the call that just
+   failed — so the requester and the shape of ITS call are ONE record, and reporting the first without the second
+   hands an arm a shape belonging to somebody else's call. See the walk's own comment for what that cost. */
+static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t *out_kind,
+                                int *out_cfirst, int *out_cargc);
+static void *tramp_step_chain_free_upto(JSContext *ctx, void *st, uint8_t *out_kind,
+                                        int *out_cfirst, int *out_cargc)
 {
-    return tramp_chain_unwind(ctx, st, CONT_STEP, out_kind);
+    return tramp_chain_unwind(ctx, st, CONT_STEP, out_kind, out_cfirst, out_cargc);
 }
 /* The common case: nothing is left for the interpreter to answer for. A requester this walk does not own reaching
    here would be one whose abrupt handling was silently skipped, so it CRASHES rather than leaking the answer. */
@@ -23880,10 +23886,11 @@ static void tramp_step_abrupt_free(JSContext *ctx, void *st)
 static void tramp_step_chain_free(JSContext *ctx, void *st)
 {
     uint8_t left = 0;
-    void *rest = tramp_step_chain_free_upto(ctx, st, &left);
+    int lcf = 0, lcg = 0;
+    void *rest = tramp_step_chain_free_upto(ctx, st, &left, &lcf, &lcg);
     DCHECK(!rest, "a step chain ended in a requester whose abrupt handling only the interpreter can perform — "
                   "use tramp_step_chain_free_upto and hand it to that kind's unwind arm");
-    (void)rest; (void)left;
+    (void)rest; (void)left; (void)lcf; (void)lcg;
 }
 enum { ArrayFind, ArrayFindIndex, ArrayFindLast, ArrayFindLastIndex };
 /* ORed into the find family's mode for the TypedArray receivers. The find STEP is already receiver-agnostic (it
@@ -25816,14 +25823,39 @@ static struct JSToPrim *js_toprim_clone(JSContext *ctx, const struct JSToPrim *o
    the interpreter (a combinator rejects its aggregate; a consumer owes IfAbruptCloseIterator and then yields).
    Reporting rather than freeing is the whole point: a JSPromiseAll freed through JSStepHdr's teardown reads its
    `def` out of the middle of the struct. */
-static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t *out_kind)
+/* THE OPERAND SHAPE TRAVELS WITH THE REQUESTER, because it is a fact about the CALL and the requester is who
+   made it. Each hop states the shape of the invocation of the link it is tearing down — which is exactly the
+   call the NEXT requester pushed — so whatever this returns, `*out_cfirst`/`*out_cargc` describe the call that
+   requester is about to be told failed.
+   WHAT THE MISSING HALF COST, so the shape is recognisable next time. The exception unwind reads the failed
+   call's shape off the THROWING FRAME, which is right for a frame whose caller IS the requester and wrong the
+   moment a machine sits between: `Promise.any.call(P, [1])` where the capability's resolve throws goes
+   throwing-frame -> Promise.resolve's step machine (whose request operands are its own buffer, so the frame
+   records the EMPTY shape) -> this walk -> the combinator. §27.5.4.3 Promise.any ( iterable ) step 8's
+   IfAbruptRejectPromise arm then dropped NOTHING while §27.5.4.3.1 PerformPromiseAny ( iteratorRecord, ctor,
+   resultCapability, promiseResolve )'s per-element `? Call(promiseResolve, ctor, « next »)`
+   had pushed THREE onto the caller's stack, so the aggregate was yielded onto a stack three slots high — and
+   the yield's own pop then freed three values that belonged to somebody else. That arm ALREADY drops the
+   drive's operands correctly when the throwing frame's caller is the combinator itself; handing the requester
+   on without its shape is what defeated it.
+   A LINK CREATED BY A REQUEST RECORDS THE EMPTY SHAPE and one created by a CALL records the caller-stack shape,
+   which is why the step hop can read one field pair for both cases rather than asking which it was. */
+static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t *out_kind,
+                                int *out_cfirst, int *out_cargc)
 {
+    bool stated = false;   /* has a hop said what shape the requester's call has? */
     *out_kind = 0;   /* CONT_NONE, declared below with the rest of the namespace */
+    *out_cfirst = 0; *out_cargc = 0;
     while (st) {
         if (kind == CONT_STEP) {
             JSStepHdr *h = st;
             void *nxt = h->outer;
             uint8_t nk = h->outer_kind;
+            /* READ BEFORE THE FREE, like every other field this walk carries out of a state it is destroying.
+               do_step_tramp records the machine's own invocation here: the caller-stack shape when a CALL site
+               pushed the operands, and (0, 0) when another machine requested it and its arguments live in that
+               machine's buffer. */
+            *out_cfirst = h->orig_cfirst; *out_cargc = h->orig_cargc; stated = true;
             tramp_step_state_free(ctx, h, false);
             st = nxt; kind = nk;
             continue;
@@ -25832,6 +25864,10 @@ static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t 
             struct JSToPrim *tp = st;
             void *nxt = tp->outer;
             uint8_t nk = tp->outer_kind;
+            /* a ToPrimitive is a REQUEST, and JSToPrim OWNS the coercion call's operands (its cb[3], moved there
+               precisely so a frame that merely wrote `a + b` is not required to have three spare slots) — so the
+               machine that asked for it pushed nothing onto the caller's stack. */
+            *out_cfirst = 0; *out_cargc = 0; stated = true;
             js_toprim_free(ctx, tp);
             if (nxt && nk == CONT_IMPORT) {
                 /* the specifier's coercion threw. There is nothing to unwind INTO: the capability it was created
@@ -25856,19 +25892,34 @@ static void *tramp_chain_unwind(JSContext *ctx, void *st, uint8_t kind, uint8_t 
             continue;
         }
         if (kind == CONT_FROM_CTOR) {
+            /* both of these hops end at a CONSUME machine's own requester, and a consume machine is asked for by
+               a CONSTRUCT — §24.1.1.1 Map ( [ iterable ] ) step 6 and §23.2.5.1 TypedArray ( ...args ) step 6.a
+               are the only creations that set one. A requested Construct puts nothing on the caller's stack,
+               which the unwind's own CONT_CONSTRUCT arm asserts. */
+            *out_cfirst = 0; *out_cargc = 0; stated = true;
             st = js_from_ctor_abandon_upto(ctx, st, &kind);
             continue;
         }
         if (kind == CONT_ITER_CONSUME_FWD) {
             /* the machine was a consume machine's CALLBACK and threw: the source owes IfAbruptCloseIterator.
                Its requester chain comes back as the next link rather than being walked from inside it. */
+            *out_cfirst = 0; *out_cargc = 0; stated = true;
             st = js_iter_consume_abandon_upto(ctx, st, &kind);
             continue;
         }
         if (kind == CONT_ITER_HELPER_FWD)  { js_iter_helper_abandon(ctx, st); return NULL; }
+        /* THE HAND-OVER IS (requester, kind, SHAPE) — a hop that tears a link down without saying what shape the
+           next requester's call has leaves the caller reading a shape from wherever it happened to have one, and
+           that is a shape belonging to a different call. A link kind added above without stating it FIRES here
+           rather than being handed on half-described. */
+        DCHECK(stated,
+               "a chain-unwind hop handed a requester to the interpreter without stating the operand shape of "
+               "the call that requester made — state it at the hop (a REQUEST-created link is (0, 0); a "
+               "CALL-created one records the caller-stack shape on its own state)");
         *out_kind = kind;
         return st;
     }
+    (void)stated;
     return NULL;
 }
 
@@ -25888,7 +25939,11 @@ static void js_import_cap_free(JSContext *ctx, JSImportCap *ic)
 static void js_toprim_abandon(JSContext *ctx, struct JSToPrim *tp)
 {
     uint8_t left = 0;
-    void *rest = tramp_chain_unwind(ctx, tp, CONT_TOPRIM, &left);
+    /* the leftover is PARKED for the exception label, which restores the caller stack itself and drops the
+       OPCODE's operands — this walk's reported shape has no consumer on that path. */
+    int lcf = 0, lcg = 0;
+    void *rest = tramp_chain_unwind(ctx, tp, CONT_TOPRIM, &left, &lcf, &lcg);
+    (void)lcf; (void)lcg;
     if (rest) {
         DCHECK(ctx->pending_gp_unwind == NULL,
                "pending_gp_unwind already set — a nested keyed-operation unwind needs a queue");
@@ -45888,8 +45943,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         tramp_frame_free(rt, rtf);
     step_unwind_redispatch:
         /* THE requester dispatch, entered a second time when a step machine's own chain ended in a requester only
-           one of these arms can answer for. The frame is already popped; every arm below reads only xcs/xck and
-           the shape locals, which is what makes re-entry sound. */
+           one of these arms can answer for. The frame is already popped; every arm below reads xcs/xck AND the
+           shape locals, and all four are ONE RECORD about ONE call — the requester, and the operands of the call
+           it made that has just failed. Re-entry is sound only because the walk replaces all four together; it
+           used to replace the first two and leave the shape describing the frame that threw, which belongs to a
+           different call the moment a machine stands between that frame and the requester. */
         if (xck == CONT_ITER_HELPER) {
             /* the map/filter/flatMap callback THREW. Control never reaches the step's resume, so IfAbruptCloseIterator
                must happen HERE - the spec closes the underlying iterator when the callback throws, and skipping it is
@@ -46258,7 +46316,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto do_iter_close_finish;
             } else {
                 uint8_t sleft = 0;
-                void *srest = tramp_step_chain_free_upto(ctx, gouter, &sleft);
+                /* this label restores no caller stack — the operation's operands are the request's own — so the
+                   shape the walk reports has no consumer here. */
+                int scf = 0, scg = 0;
+                void *srest = tramp_step_chain_free_upto(ctx, gouter, &sleft, &scf, &scg);
+                (void)scf; (void)scg;
                 if (srest && sleft == CONT_GETPROP) {
                     /* The machine that asked for this operation was itself invoked BY a keyed operation — an
                        ACCESSOR the walk found on behalf of another request's GP_GET/GP_SET, which is what an
@@ -46422,12 +46484,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    JSPromiseAll through JSStepHdr's teardown read its `def` out of the middle of the struct.
                    The same hand-copied-list failure the construct-abandon had, in the same shape. */
                 uint8_t left = CONT_NONE;
-                void *rest = tramp_step_chain_free_upto(ctx, xcs, &left);
+                int lcf = 0, lcg = 0;
+                void *rest = tramp_step_chain_free_upto(ctx, xcs, &left, &lcf, &lcg);
                 if (rest) {
                     /* the machine was invoked BY one of the interpreter's own sequences — a combinator's
                        per-element C.resolve, a consumer's callback — whose abrupt handling is an arm of this very
-                       dispatch (reject the aggregate, IfAbruptCloseIterator). Re-enter with it. */
-                    xcs = rest; xck = left;
+                       dispatch (reject the aggregate, IfAbruptCloseIterator). Re-enter with it.
+                       THE SHAPE GOES WITH IT. xcf/xcg described the THROWING FRAME's call, which is the shape
+                       the requester pushed only while the requester IS that frame's caller; a machine standing
+                       between them makes it somebody else's — and a step machine's request operands live in its
+                       own buffer, so the shape left standing is the EMPTY one. Every arm below drops xcf..xcg
+                       before it does anything else, so handing the requester over without its shape is handing
+                       an arm a drop that frees nothing (or frees the wrong slots). The walk reports the shape of
+                       the invocation it tore down, which is precisely the call this requester made. */
+                    xcs = rest; xck = left; xcf = lcf; xcg = lcg;
                     goto step_unwind_redispatch;
                 }
                 xcs = NULL;
@@ -48380,7 +48450,10 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
         /* the machine AND every machine waiting on it. What the walk does not own it REPORTS, and here that
            report is the next iteration rather than a hand-back to the interpreter. */
         uint8_t left = CONT_NONE;
-        void *rest = tramp_step_chain_free_upto(ctx, st, &left);
+        /* a released park has no caller stack to restore: the shape has no consumer here. */
+        int lcf = 0, lcg = 0;
+        void *rest = tramp_step_chain_free_upto(ctx, st, &left, &lcf, &lcg);
+        (void)lcf; (void)lcg;
         tramp_cont_free(ctx, rest, left);
         return;
     }
@@ -48457,7 +48530,10 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
            abrupt completion from either PROPAGATES, so the sequence dies and takes its requester with it, and
            that is what the shared walk performs. */
         uint8_t left = CONT_NONE;
-        void *rest = tramp_chain_unwind(ctx, st, CONT_TOPRIM, &left);
+        /* a released park has no caller stack to restore: the shape has no consumer here. */
+        int lcf = 0, lcg = 0;
+        void *rest = tramp_chain_unwind(ctx, st, CONT_TOPRIM, &left, &lcf, &lcg);
+        (void)lcf; (void)lcg;
         tramp_cont_free(ctx, rest, left);
         return;
     }
@@ -104611,13 +104687,35 @@ static int js_promise_all_attach_args(JSContext *ctx, JSPromiseAll *s, int index
 
 static int js_promise_all_step(JSContext *ctx, JSPromiseAll *s, JSValue res)
 {
-    JSValue value, next_promise, rr;
+    JSValue value, next_promise;
     int done;
     if (s->finalizing) {
         /* the aggregate resolve/reject callback (driven on the tramp) returned: `res` is that callback's discarded
            return value — free it here, since this early exit does not flow into the normal result-consuming code. */
+        DCHECK(!JS_IsException(res),
+               "the aggregate settle completed ABRUPTLY and this returns DONE, which would yield the aggregate "
+               "promise with the throw still pending — IfAbruptRejectPromise's Call is a `?` step, so it must "
+               "PROPAGATE. Build that exit (the CONT_PROMISE_ALL_SETTLE unwind arm is what it looks like for a "
+               "callee that got a frame); a bytecode settle reaches that arm instead, so only a step-machine or "
+               "bodiless settle can arrive here");
         JS_FreeValue(ctx, res);
         return 0;   /* the combinator is DONE */
+    }
+    /* AN ABRUPT DELIVERY IS A COMPLETION, NOT A VALUE — and every branch below reads `res` as one, which is what
+       made this the wrong half of a pair. The two sibling machines both take an abrupt: do_consume_deliver says
+       so in its own comment ("the step's own abrupt path owns it, so it is delivered rather than intercepted")
+       and js_iter_consume_step tests JS_IsException at each phase; this walk tested it nowhere, so a throwing
+       per-element `? Call(promiseResolve, ctor, « next »)` was stored AS the element's promise and its `then`
+       was read off the exception sentinel.
+       §27.5.4.3 Promise.any ( iterable ) steps 7-8 and §27.5.4.1 Promise.all ( iterable ) steps 7-8 are the same
+       two lines: the abrupt is the combinator's result, the iterator is closed when the record is not done, and
+       IfAbruptRejectPromise settles the aggregate. That is exactly what -1 means here — promise_all_err reads
+       driving_next / iter_done to decide the close, which is the [[Done]] test — so the phase does not change
+       the answer, only which of them owes the close, and it already knows that. */
+    if (unlikely(JS_IsException(res))) {
+        s->resolving_elem = 0;
+        s->attaching = 0;
+        return -1;
     }
     if (s->resolving_elem) {
         /* `res` is C.resolve(value)'s promise, driven on the tramp. Everything the old JS_Call's tail did lives
