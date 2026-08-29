@@ -49959,6 +49959,20 @@ static void js_async_generator_complete_step(JSContext *ctx,
     DCHECK(!list_empty(&s->queue),
            "§27.9.3.5 AsyncGeneratorCompleteStep step 1 asserts the queue is not empty, and this settle has no "
            "request to answer — the pump reached a completion step with nothing at the head of the queue");
+    /* WHAT A NORMAL COMPLETION IS SETTLED WITH, asserted where BOTH arms converge rather than at either
+       caller — because the two arms carry different things and only this function sees both. Step 6.a hands
+       the completion's [[Value]] itself to [[Reject]]; step 7.d hands [[Resolve]] the iterator result step
+       7.c built out of it, and a caller that skips that wrapping settles the request's promise with a bare
+       value whose `.value` and `.done` both read undefined. Nothing about that throws, nothing about it is a
+       wrong TYPE at any C boundary, and the promise settles on time — so this assert is the only thing
+       between that mistake and a page reading undefined out of a `.return(v)` it will never suspect. */
+    DCHECK(is_reject ||
+           (JS_VALUE_GET_TAG(result) == JS_TAG_OBJECT &&
+            find_own_property1(JS_VALUE_GET_OBJ(result), JS_ATOM_done) != NULL),
+           "§27.9.3.5 AsyncGeneratorCompleteStep step 7.d settles a NORMAL completion with the "
+           "CreateIteratorResultObject its step 7.c built, never with the completion's [[Value]] — this "
+           "settle carries a value that has no own `done`, so it is the raw completion value and the "
+           "iterator-result wrapping was skipped");
     next = list_entry(s->queue.next, JSAsyncGeneratorRequest, link);
     list_del(&next->link);
     *out_func = js_dup(next->resolving_funcs[is_reject]);
@@ -50159,7 +50173,8 @@ _Static_assert(offsetof(JSAgenCompleteStep, hdr) == 0, "JSStepHdr must be first 
 
 #define ACS_STAGES(X) \
     X(ACS_SETTLE, "27.9.3.9's fulfilledClosure/rejectedClosure step 3 -> 27.9.3.5 AsyncGeneratorCompleteStep " \
-                  "step 8's Call(promiseCapability.[[Resolve]]/[[Reject]], undefined, « value »)")
+                  "step 6.a's Call(promiseCapability.[[Reject]], undefined, « value ») or step 7.d's " \
+                  "Call(promiseCapability.[[Resolve]], undefined, « iteratorResult »)")
 enum { ACS_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_agen_complete_step_steps[] = { ACS_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -50186,9 +50201,22 @@ static int js_agen_complete_step_step(JSContext *ctx, void *st, JSValue cb_resul
                "two states this engine spells that with");
         m->cb[0] = JS_UNDEFINED; m->cb[1] = JS_UNDEFINED; m->cb[2] = JS_UNDEFINED;
         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
+        DCHECK(rec->magic == 0 || rec->magic == 1,
+               "§27.9.3.9 AsyncGeneratorAwaitReturn ( gen ) has exactly two closures — step 11's "
+               "fulfilledClosure and step 13's rejectedClosure — so this machine has no third spelling to be");
         /* step_arg answers past a call's real operands with undefined, which is the fulfilment spelling called
-           with nothing — and undefined is exactly what §27.9.3.5 would settle with there. */
-        js_async_generator_complete_step(ctx, s, step_arg(&m->hdr, 0), rec->magic & 1, &fn, &val);
+           with nothing, and undefined is what the closure's own `value`/`reason` parameter binds to there.
+           WHICH COMPLETION IT IS DECIDES WHAT THE REQUEST IS SETTLED WITH, and that is §27.9.3.5
+           AsyncGeneratorCompleteStep ( gen, completion, done [ , realm ] )'s own split rather than this
+           machine's: step 6.a rejects with the completion's [[Value]] itself, while step 7.d resolves with the
+           CreateIteratorResultObject its step 7.c builds — and `done` is fixed TRUE by the closures' own step
+           3, AsyncGeneratorCompleteStep(gen, result, true). Handing the value straight to the completion step
+           settled `it.return(42)` with the NUMBER 42: `.value` and `.done` both read undefined off it, the
+           iterator-result prototype is Number.prototype, and nothing throws to say the protocol was broken. */
+        if (rec->magic)
+            js_async_generator_reject(ctx, s, step_arg(&m->hdr, 0), &fn, &val);
+        else
+            js_async_generator_resolve(ctx, s, step_arg(&m->hdr, 0), /*done*/true, &fn, &val);
         r = step_call_run(ctx, &m->call_phase, STEP_CB(m->cb), fn, JS_UNDEFINED, 1, vc(&val),
                           cb_result, &out, out_cb, out_argc);
         JS_FreeValue(ctx, fn);
