@@ -32067,6 +32067,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #if APICLIENT_DEV
     if (unlikely(g_no_user_code_depth != 0)) {
         char frames[2048], why[3072];
+        /* LOWERED BEFORE THE TRACE IS RENDERED, and that is not tidiness — it is what stops this arm being its
+           own trap. The render is asserted to run none of the page's code (js_why_backtrace takes the DEFAULT
+           CallSite rendering, never Error.prepareStackTrace), but if that claim ever stopped holding the entry
+           would land back on this line with the flag still up and render again, for ever: an abort that hangs
+           instead of reporting, which is strictly worse than the defect it came to name. The flag is spent —
+           DFAIL below does not return in a dev build — so there is nothing after this that could want it. */
+        g_no_user_code_depth = 0;
         js_why_backtrace(caller_ctx, frames, sizeof frames);
         snprintf(why, sizeof why,
                  "a C getter that DECLARED it runs none of the page's code has just entered a BYTECODE BODY, so "
