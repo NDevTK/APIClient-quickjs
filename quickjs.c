@@ -38892,8 +38892,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSPromiseAll *pa = (JSPromiseAll *)cont_st;
                 JSValue pre, prj;
                 cont_st = NULL;
-                /* 7.3.19 Invoke is GetV then ? Call, and Call's step 1 is "If IsCallable(F) is false, throw a
-                   TypeError" — which for a combinator is an abrupt completion that REJECTS the aggregate. It was
+                /* 7.3.20 Invoke ( value, propertyKey [ , argList ] ) is GetV then ? Call, and 7.3.13
+                   Call ( func, thisValue [ , argList ] ) step 2 is "If IsCallable(func) is false, throw a
+                   TypeError exception" — which for a combinator is an abrupt completion that REJECTS the
+                   aggregate. It was
                    never raised: the operands went to the convergence point, which is the right place to resolve a
                    callee KIND but not the place that knows this call's failure belongs to a promise. The whole
                    corpus missed it because the only tests for a non-callable `then` are the new keyed pair's;
@@ -77560,30 +77562,30 @@ static JSValue js_function_call_fini(JSContext *ctx, void *st, bool take_result)
    flow base. It is the existing sub-sequences here: step_length_run for `? ToLength(? Get(src,"length"))` and
    step_getidx_run per element, the same two the array walks already share.
    ONE WALK, THREE ALGORITHMS, ONE STAGE LIST expanded once per algorithm with that algorithm's own step
-   numbers: validate, then 7.3.18 CreateListFromArrayLike's length and its per-element Get, then the internal
+   numbers: validate, then 7.3.19 CreateListFromArrayLike's length and its per-element Get, then the internal
    method. Reflect.construct differs only in which internal method ends it, which is why it shares the list and
    not a hand-copied one. */
 #define FAPPLY_STAGES(X, VALIDATE, TAIL) \
     X(FAPPLY_VALIDATE, VALIDATE) \
-    X(FAPPLY_LENGTH,   "7.3.18 CreateListFromArrayLike step 2 (len is LengthOfArrayLike(argumentsList): " \
-                       "ToLength(Get(obj, \"length\")))") \
-    X(FAPPLY_ELEMS,    "7.3.18 CreateListFromArrayLike step 5.b (next is Get(obj, ToString(index))), one " \
+    X(FAPPLY_LENGTH,   "7.3.19 CreateListFromArrayLike step 3 (length is LengthOfArrayLike(argumentsList), " \
+                       "which 7.3.18 LengthOfArrayLike is ToLength(Get(obj, \"length\")))") \
+    X(FAPPLY_ELEMS,    "7.3.19 CreateListFromArrayLike step 6.b (next is Get(obj, indexName)), one " \
                        "element per step") \
     X(FAPPLY_CALL,     TAIL)
 enum { FAPPLY_STAGES(JS_STEP_STAGE_ENUM, "", "") };
 static const char *const js_function_apply_steps[] = {
     FAPPLY_STAGES(JS_STEP_STAGE_LABEL,
                   "20.2.3.1 steps 1-3 (func is the this value; IsCallable; a nullish argArray is an empty "
-                  "list) and 7.3.18 step 1 (obj must be an Object)",
+                  "list) and 7.3.19 step 2 (obj must be an Object)",
                   "20.2.3.1 step 6 (Call(func, thisArg, argList))") NULL };
 static const char *const js_reflect_apply_steps[] = {
     FAPPLY_STAGES(JS_STEP_STAGE_LABEL,
-                  "28.1.1 step 1 (IsCallable(target)) and 7.3.18 step 1 (argumentsList must be an Object)",
+                  "28.1.1 step 1 (IsCallable(target)) and 7.3.19 step 2 (argumentsList must be an Object)",
                   "28.1.1 step 4 (Call(target, thisArgument, args))") NULL };
 static const char *const js_reflect_construct_steps[] = {
     FAPPLY_STAGES(JS_STEP_STAGE_LABEL,
                   "28.1.2 steps 1-3 (IsConstructor(target); newTarget defaults to target and must itself be a "
-                  "constructor) and 7.3.18 step 1 (argumentsList must be an Object)",
+                  "constructor) and 7.3.19 step 2 (argumentsList must be an Object)",
                   "28.1.2 step 5 (Construct(target, args, newTarget))") NULL };
 
 typedef struct JSFuncApply {
