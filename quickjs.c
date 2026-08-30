@@ -11937,6 +11937,27 @@ static void js_publish_document_namespace(JSContext *ctx)
 
             if (prs->atom == JS_ATOM_NULL)
                 continue;
+            /* THE KEY RULE, ASKED WHERE MEMBERSHIP IS DECIDED. The two arms below ask it of the key being
+               READ; this asks it of the key a record is REACHED BY, which is the prior question — whether
+               the record is on the channel at all. The difference in what skipping it costs is the whole
+               reason it belongs here: a mis-named member answers one read wrongly, while a record published
+               through a key no server can write becomes a namespace, after which BOTH arms apply the key
+               rule perfectly correctly to that record's own string-keyed fields and every one of them
+               answers with an unknown. Nothing then looks like a channel bug.
+               Web IDL §3.7.3 Internal slots are exactly that shape in this engine — a record of named
+               fields hung off a PRIVATE SYMBOL (engine/host/browser/core/idl_slots.h) — so a walk that
+               descends through a symbol turns every platform object an inline script leaves on the global
+               into a namespace.
+               Measured: `var e = new Event("go")` published its slot record, so `e.type` and `e.eventPhase`
+               answered with unknowns spelled `{e.eventSlots.type}` (a provenance composed out of a symbol's
+               DESCRIPTION, which is neither unique nor a name), `e.defaultPrevented` answered TRUE on an
+               event nothing had cancelled, and DOM §2.7 Interface EventTarget's dispatchEvent(event) method
+               step 1 — "If event's dispatch flag is set, or if its initialized flag is not set, then throw
+               an InvalidStateError DOMException" — threw on the FIRST dispatch of a freshly constructed
+               event. A symbol is not a name a server published a member under, and it is not a name this
+               walk may reach one through either. */
+            if (!JS_AtomIsPublishedName(ctx->rt, prs->atom))
+                continue;
             /* An accessor, a var ref or an autoinit slot holds no record here: reading it RUNS something, and
                what it would answer is not a value the document wrote into this tree. */
             if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
@@ -11998,8 +12019,10 @@ done:
    that document — while the inline `1 & {}` beside it was fine, which is why the failure read as an operator
    bug and sent readers into the coercion trampoline rather than into a property read.
    So the ASK is one function per arm and the KEY RULE is one function under both (js_absent_ask /
-   js_present_ask below), and it is EXPORTED because the host is the channel's other end: absent.c composes a
-   PATH out of this key, so it asserts the rule rather than trusting it — a third base added to the ask later
+   js_present_ask below) AND under the WALK that decides membership (js_publish_document_namespace above,
+   where the same omission cost the whole internal-slot surface rather than one member), and it is EXPORTED
+   because the host is the channel's other end: absent.c composes a PATH out of this key, so it asserts the
+   rule rather than trusting it — a third base added to the ask later
    (the §4.12.1 data block the miss arm's comment names) then carries the rule for free, and a route that
    bypasses the ask fires in the host instead of arriving as a plausible member of a namespace. */
 bool JS_AtomIsPublishedName(JSRuntime *rt, JSAtom atom)
