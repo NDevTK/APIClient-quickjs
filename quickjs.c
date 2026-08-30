@@ -533,7 +533,7 @@ typedef struct JSStackFrame {
        JS_FlowNew base and a per-flow generator-data clone are owned by the host and by a COW delta's counted
        reference — none of those can be freed by a collection, so a cell in them needs no root. It is written by
        EVERY constructor of a frame, including the ones that build one field by field (clone_susp_frame's
-       callers, js_async_frame_clone, reaction_call_flow_init), because a frame whose owner nobody recorded is
+       callers, reaction_call_flow_init), because a frame whose owner nobody recorded is
        indistinguishable from one that has none. */
     struct JSGCObjectHeader *cur_gc_obj;
 } JSStackFrame;
@@ -1286,10 +1286,9 @@ typedef struct JSAsyncFunctionState {
        deliberately-cleared are ONE state and nothing has to be remembered to reach it.
        IT WAS WRITTEN THE OTHER WAY FIRST AND THAT COST A FALSE ABORT. The asserts read `list_empty(&park_link)`,
        which is a HEAD predicate (`el->next == el`) and answers FALSE for the {NULL,NULL} a zeroed or detached
-       node holds — so every base built by a constructor that did not self-link the field read as parked. There
-       is a fourth constructor (js_async_frame_clone's per-flow activation clone, which builds a
-       JSAsyncFunctionData field by field rather than through async_func_init), it did not, and an ordinary
-       async body that had never parked in its life aborted at its own teardown. Asking `park_fn` is both the
+       node holds — so every base built by a constructor that did not self-link the field read as parked. The
+       per-flow clone of an async activation is allocated from zeroed bytes and does not self-link, so an
+       ordinary async body that had never parked in its life aborted at its own teardown. Asking `park_fn` is both the
        true question and the one no constructor can get wrong by omission. */
     struct list_head park_link;     /* on JSRuntime.parked_flows while park_fn != NULL; meaningless otherwise */
     JSFlowParkFn *park_fn;          /* NULL iff not parked — THE authority; park_link is then unread */
@@ -30238,8 +30237,8 @@ void JS_RequestFlowYield(void) { FLOW_YIELD_REQUEST(JS_PREEMPT_HOST); }
 /* A BASE IS BORN UNPARKED — established HERE only where the memory does not already say so, which is what
    keeps this from becoming a list. A base's unparked state is `park_fn == NULL` and nothing else (see
    JSAsyncFunctionState), so every constructor that allocates with js_mallocz has it for free, and this file
-   builds bases from zeroed bytes in at least six places: async_func_init's callers, flow_clone_state_alloc's
-   three arms, clone_deep_flow's async and generator arms, and js_async_frame_clone. A `flow_park_init` call
+   builds bases from zeroed bytes in at least five places: async_func_init's callers, flow_clone_state_alloc's
+   three arms, and clone_deep_flow's async and generator arms. A `flow_park_init` call
    at "the clone sites" would be a list that is ALREADY incomplete and harmlessly so, and a list that reads as
    complete while it is not is worse than no list at all.
    So it is called from the two functions that turn memory into a base and initialise every OTHER field of it
@@ -39569,9 +39568,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    done_generator suspend as a completion code, and walked off the end of the body's bytecode. */
                 as->func_state.base_kind = FLOW_BASE_ASYNC_CALL;
                 /* AND THE FRAME NAMES THE OBJECT THAT OWNS IT — the line this create was missing, and the ONE
-                   async-activation constructor of the five that did not have it (js_async_function_start,
-                   flow_clone_state_alloc, clone_deep_flow and js_async_frame_clone all record theirs, the
-                   latter three by direct write). It is a hand-copied list with one member missed, and the miss
+                   async-activation constructor of the four that did not have it (js_async_function_start,
+                   flow_clone_state_alloc and clone_deep_flow all record theirs, the latter two by direct
+                   write). It is a hand-copied list with one member missed, and the miss
                    is silent by construction: nothing reads cur_gc_obj until the body CAPTURES A LOCAL.
                    WHAT IT COSTS, in get_captured_cell's own words: an open cell aliases a slot in this frame,
                    so when something the COLLECTOR can free owns the frame, the cell takes a counted reference
@@ -47440,7 +47439,7 @@ static void async_func_set_owner(JSRuntime *rt, JSAsyncFunctionState *s, JSGCObj
         if (!vr || vr->is_detached)
             continue;
         /* A CELL THIS FRAME DID NOT MINT ALIASES THE FRAME IT NAMES, NOT THIS ONE. A clone's array is filled by
-           SHARING the source frame's cells (clone_susp_frame, js_async_frame_clone), so an entry here can point
+           SHARING the source frame's cells (clone_susp_frame, which is every clone in this file), so an entry here can point
            into another frame's slot and already root THAT frame's owner. Adopting it would root this owner for
            storage this owner does not hold, and would take a second reference for a cell that has one — so the
            question asked is which frame the cell aliases, which is the cell's own field and not a guess. */
@@ -47935,7 +47934,7 @@ static int clone_susp_frame(JSContext *ctx, JSAsyncFunctionState *cs, const JSAs
        asked of the cell's own field rather than of the array it was found in. The owner field is the worked
        example: it is NOT written here, because a cell taken from the source roots the SOURCE's owner and that
        is what keeps the storage it aliases alive. The CLONE's own owner is written by whoever minted the clone
-       (flow_clone_state_alloc, js_async_frame_clone), before this function fills the frame. */
+       (flow_clone_state_alloc, clone_deep_flow's async and generator arms), before this function fills the frame. */
     cf->var_ref_count = of->var_ref_count;
     for (int vi = 0; vi < of->var_ref_count; vi++) { cf->var_refs[vi] = of->var_refs[vi]; if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++; }
     cf->cur_pc = of->cur_pc;
@@ -49309,91 +49308,67 @@ static void js_generator_finalizer(JSRuntime *rt, JSValueConst obj)
    reach through a resolve/reject closure pair. That activation is FLOW state: when two arms settle one promise
    (which they do the moment a fork inherits a pending reply), both resume it, and the first arm's completion
    tears the frame down under the second. The capability is SHARED and not re-minted — it is the async function's
-   own promise, whose settlement the delta already isolates per flow. */
+   own promise, whose settlement the delta already isolates per flow.
+   ONE FRAME CLONE, NOT TWO — the same sentence JS_FlowClone's shallow arm carries, and this was the LAST
+   function still disagreeing with it. It built the JSAsyncFunctionData and its frame FIELD BY FIELD, and it had
+   drifted in exactly the three fields that arm had: it never assigned `this_val` (so the clone's frame carried
+   what js_mallocz left, which is JS_TAG_INT 0 and not even UNDEFINED) and it dropped `step_func`/`step_this`.
+   All three are silent in a way a reader of this function cannot see. The receiver's is the one that CRASHES,
+   at clone_susp_frame's own assertion the next time the clone is forked — the state owns the one reference and
+   the frame borrows it, so a frame carrying something else has an owner nothing will find. The other two are
+   never even loud: `f.caller` reads `!JS_IsUndefined(sf->step_func)` to decide whether a continuation-holding
+   builtin is standing between two frames, and an int 0 answers that question YES, so a resumed clone reported
+   `null` for a caller that was there. The two paths differ in exactly ONE thing — where the LIVE point is —
+   and that is the parameter and the line below. */
 static JSAsyncFunctionData *js_async_frame_clone(JSContext *ctx, JSAsyncFunctionData *s)
 {
-    JSStackFrame *sf = &s->func_state.frame, *cf;
-    JSAsyncFunctionData *d;
-    JSObject *fp;
-    JSFunctionBytecode *b;
-    int al, lc;
+    JSStackFrame *sf = &s->func_state.frame;
+    JSAsyncFunctionState *c;
     ptrdiff_t live;
 
     DCHECK(s->is_active, "cloning an async activation that has already been torn down");
     DCHECK(sf->cur_sp != NULL, "cloning an async activation that is not suspended — an awaiting one always is");
     DCHECK(s->func_state.tramp_top == NULL,
            "an awaiting activation with a live tramp chain — an await suspends at the base, not mid-descent");
-    fp = JS_VALUE_GET_OBJ(sf->cur_func);
-    DCHECK(js_class_has_bytecode(fp->class_id), "an async continuation whose cur_func has no bytecode");
-    b = fp->u.func.function_bytecode;
-    al = sf->arg_count;
-    /* the ONE layout law — this frame was built by async_func_init, which sizes with TRAMP_FRAME_SLOTS because
-       its operands are reshaped by the same tramp pushes an interpreter frame's are. */
-    lc = TRAMP_FRAME_SLOTS(al, b);
+    /* THE CLONE IS BORN IN THE CONTAINER ITS BASE KIND NAMES, so this asks what flow_clone_state_alloc is about
+       to answer: an async activation's state is EMBEDDED in the JSAsyncFunctionData this function returns, and
+       a base that said anything else would be minted as a bare state and handed back through a header that is
+       not there. Both constructors of one (js_async_function_start and the tramp's async call) mark it. */
+    DCHECK(s->func_state.base_kind == FLOW_BASE_ASYNC_CALL,
+           "an async activation whose base is not an ASYNC_CALL — the clone is reached through the "
+           "JSAsyncFunctionData its state is embedded in, so a bare state would be read past its allocation");
+    DCHECK(!sf->is_call_root, "an async activation whose frame is a call root — an await suspends in the body's "
+                              "own bytecode, and a call root has none");
+    DCHECK(js_class_has_bytecode(JS_VALUE_GET_OBJ(sf->cur_func)->class_id),
+           "an async continuation whose cur_func has no bytecode");
     live = sf->cur_sp - sf->arg_buf;
-    DCHECK(live >= 0 && live <= lc,
+    /* the ONE layout law — this frame was built by async_func_init, which sizes with TRAMP_FRAME_SLOTS because
+       its operands are reshaped by the same tramp pushes an interpreter frame's are. The clone reads the same
+       macro inside clone_susp_frame, so the bound and the allocation cannot disagree. */
+    DCHECK(live >= 0 && live <= TRAMP_FRAME_SLOTS(sf->arg_count,
+               JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode),
            "js_async_frame_clone: the activation's live region is outside its own frame slots");
-    DCHECK(sf->var_ref_count == b->var_ref_count,
-           "js_async_frame_clone: the frame's var-ref count disagrees with its bytecode's — the clone is sized "
-           "from the bytecode, so a larger frame count writes past the allocation");
 
-    d = js_mallocz(ctx, sizeof(*d));
-    if (!d)
+    /* AND THE PARK RECORD IS NOT AMONG THE FIELDS TAKEN FROM `s` — a decision, so it is written down rather
+       than left as an absence, and it is now flow_clone_state_alloc's paragraph rather than a second copy of
+       it here. The SOURCE may be parked (a body preempted at its base has exactly the shape asserted above),
+       and a clone that carried the record would hand the pump a continuation that rebuilds a frame the other
+       arm's completion already freed.
+       THE FIRST VERSION OF THAT INVARIANT MADE THIS FUNCTION ABORT: the asserts asked `list_empty(&park_link)`,
+       a HEAD predicate that answers FALSE for the {NULL,NULL} a zeroed node holds, so a clone allocated from
+       zeroed bytes read as parked and an ordinary async body aborted at its own teardown having never parked in
+       its life. `park_fn` is the authority for that reason — see JSAsyncFunctionState. */
+    c = flow_clone_state_alloc(ctx, &s->func_state);
+    if (!c)
         return NULL;
-    JS_REF_COUNT(d) = 1;
-    add_gc_object(ctx->rt, &d->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
-    d->resolving_funcs[0] = js_dup(s->resolving_funcs[0]);
-    d->resolving_funcs[1] = js_dup(s->resolving_funcs[1]);
-    cf = &d->func_state.frame;
-    /* THE CLONE'S FRAME BELONGS TO THE CLONE. This function builds a JSAsyncFunctionData field by field rather
-       than through async_func_init, which is exactly where a field added to the frame gets missed — and missing
-       it here is silent: every cell this arm later mints would root nothing, so the sibling activation could be
-       collected while a closure it created still aliases its slots. The cells COPIED from the source below are
-       a different matter: they alias the source's slots and root the source's owner, which is why this is a
-       direct write and not async_func_set_owner's adoption. */
-    cf->cur_gc_obj = &d->header;
-    cf->arg_buf = js_malloc(ctx, sizeof(JSValue) * (lc > 0 ? lc : 1) + sizeof(JSVarRef *) * b->var_ref_count);
-    if (!cf->arg_buf) {
-        d->is_active = false;
-        js_async_function_free(ctx->rt, d);
+    if (clone_susp_frame(ctx, c, &s->func_state, live) < 0) {
+        flow_clone_state_free_shell(ctx, c);
         return NULL;
     }
-    for (ptrdiff_t i = 0; i < live; i++)
-        cf->arg_buf[i] = js_dup(sf->arg_buf[i]);
-    cf->is_strict_mode = sf->is_strict_mode;
-    cf->cur_func = js_dup(sf->cur_func);
-    cf->arg_count = al;
-    cf->var_buf = cf->arg_buf + al;
-    cf->var_refs = TRAMP_VAR_REFS(cf->var_buf + b->var_count, b);
-    DCHECK((JSValue *)cf->var_refs == cf->arg_buf + lc,
-           "js_async_frame_clone: the var-ref array is not at the end of the frame slots — the allocation size "
-           "and the placement come from the same layout law and must agree");
-    cf->var_ref_count = sf->var_ref_count;   /* closed cells are shared and isolated by the delta */
-    for (int vi = 0; vi < sf->var_ref_count; vi++) {
-        cf->var_refs[vi] = sf->var_refs[vi];
-        if (cf->var_refs[vi]) JS_REF_COUNT(cf->var_refs[vi])++;
-    }
-    cf->cur_pc = sf->cur_pc;
-    cf->cur_sp = cf->arg_buf + live;
-    cf->prev_frame = NULL;
-    d->func_state.this_val = js_dup(s->func_state.this_val);
-    d->func_state.argc = s->func_state.argc;
-    d->func_state.throw_flag = s->func_state.throw_flag;
-    d->func_state.base_kind = s->func_state.base_kind;
-    d->func_state.tramp_top = NULL;
-    /* AND THE PARK RECORD IS DELIBERATELY NOT AMONG THE FIELDS COPIED ABOVE — which is a decision, so it is
-       written down rather than left as an absence. The SOURCE may be parked: a body preempted at its base has
-       exactly the shape this function asserts (cur_sp set, tramp_top NULL), so a clone taken over one is
-       ordinary. A park is ONE activation's ONE resume point, and a clone that carried it would hand the pump a
-       continuation that rebuilds a frame the other arm's completion already freed. `d` came from js_mallocz,
-       and an unparked base IS `park_fn == NULL` (see JSAsyncFunctionState), so the clone is already unparked
-       and the sibling parks on its own record when it reaches its own suspend point.
-       THE FIRST VERSION OF THAT INVARIANT MADE THIS FUNCTION ABORT. It asked `list_empty(&park_link)`, a HEAD
-       predicate that answers FALSE for the {NULL,NULL} a zeroed node holds, so this clone — which builds a
-       JSAsyncFunctionData field by field rather than through async_func_init — read as parked and an ordinary
-       async body aborted at its own teardown having never parked in its life. */
-    d->is_active = true;
-    return d;
+    c->argc = s->func_state.argc;
+    c->throw_flag = s->func_state.throw_flag;
+    c->frame.cur_sp = c->frame.arg_buf + live;   /* SHALLOW: the live point is the activation's own */
+    return flow_async_data(c);
 }
 
 /* The per-flow ASYNC-activation swap, the exact twin of the generator one below: the resolve/reject CLOSURE is
