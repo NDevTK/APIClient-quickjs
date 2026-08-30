@@ -22873,7 +22873,7 @@ static int step_length_unknown(JSContext *ctx, JSStepHdr *h, int64_t *plen)
                "the unknown-length chain resumed holding something that is not unknown input — the operand it "
                "forks over has to be the value the length read actually produced");
         snprintf(h->len_op, sizeof h->len_op, "LengthOfArrayLike>%d", h->len_probe);
-        r = step_fork_run(ctx, h, h->coerce, h->len_op, 2, &arm);
+        r = step_fork_run(ctx, h, h->coerce, h->len_op, 2, JS_OUTCOME_REAL_UNSTATED, &arm);
         if (r)
             return r;                     /* JS_STEP_FORK: the driver snapshots the sibling and re-enters here */
         if (arm == 0) {                   /* the length is exactly this many */
@@ -23112,17 +23112,23 @@ static uint32_t step_fork_key(const char *op)
     return k ? k : 1u;   /* 0 is reserved for "nothing asked", which a zeroed header already reads as */
 }
 
-int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int *parm)
+int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int real, int *parm)
 {
     (void)ctx;
     if (h->fork_phase == FORK_PH_ASK) {
         DCHECK(n >= 2, "a step machine declared an outcome fork with fewer than two feasible completions — a "
                        "single completion is not a fork, it is the answer");
+        DCHECK(real == JS_OUTCOME_REAL_UNSTATED || (real >= 0 && real < n),
+               "a step machine declared a REAL completion that is not one of the completions it declared "
+               "feasible — `real` is a completion index or JS_OUTCOME_REAL_UNSTATED, and a third value is a "
+               "machine answering a different question here (the arm a non-forking run takes is the NUMBERING "
+               "rule above, not this)");
         DCHECK(h->fork_op == NULL, "an outcome fork was asked for while another one's operands were still on "
                                    "this machine's header");
         h->fork_over = over;   /* BORROWED for the length of the request; the driver reads and resets it */
         h->fork_op = op;
         h->fork_n = n;
+        h->fork_real = real;
         /* WRITTEN ON EVERY ASK, including the sibling's first one: a clone carries the key of the ask it was
            forked at, and re-asking there overwrites it with the identical value. */
         h->fork_ask_key = step_fork_key(op);
@@ -34859,13 +34865,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        the sibling RESUMES here holding the other outcome. Nothing is replayed. */
                     JSValueConst fover = h->fork_over;
                     const char *fop = h->fork_op;
-                    int fn = h->fork_n, harm;
+                    int fn = h->fork_n, freal = h->fork_real, harm;
                     /* read + reset BEFORE the snapshot, like every other request input — a clone taken with the
-                       operands still on it would carry a borrowed pointer into a flow it does not belong to. */
+                       operands still on it would carry a borrowed pointer into a flow it does not belong to.
+                       `fork_real` resets to the SENTINEL and not to 0: 0 is a completion, so a stale zero would
+                       be a claim about a real session that no machine made. */
                     h->fork_over = JS_UNDEFINED; h->fork_op = NULL; h->fork_n = 0;
+                    h->fork_real = JS_OUTCOME_REAL_UNSTATED;
+                    DCHECK(freal == JS_OUTCOME_REAL_UNSTATED || (freal >= 0 && freal < fn),
+                           "an outcome fork reached the driver with a REAL completion outside the ones its "
+                           "machine declared — the ask asserts this too, so a value that only fails HERE is a "
+                           "STALE one read off a state whose last request was never reset, which is the one "
+                           "failure the sentinel-reset above exists to make impossible");
                     DCHECK(h->fork_phase == FORK_PH_ASK,
                            "an outcome fork was decided while an answer to a previous one was still outstanding");
-                    harm = g_flow_control.outcome ? g_flow_control.outcome(ctx, fover, fop, fn) : -1;
+                    harm = g_flow_control.outcome ? g_flow_control.outcome(ctx, fover, fop, fn, freal) : -1;
                     if (harm < 0)
                         harm = 0;   /* no forking policy (the @S candidate re-fire): ONE concrete path down the
                                        machine's outcome 0, which is what that numbering means — exactly as a
@@ -36456,7 +36470,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            value. */
                         al->fork_ask_key = step_fork_key(askop);
                         harm = g_flow_control.outcome
-                             ? g_flow_control.outcome(ctx, al->val, askop, 2) : -1;
+                             ? g_flow_control.outcome(ctx, al->val, askop, 2,
+                                                      JS_OUTCOME_REAL_UNSTATED) : -1;
                         if (harm < 0)
                             harm = 0;   /* no forking policy (the @S candidate re-fire): ONE concrete path down
                                            outcome 0, which is what that numbering means — exactly as a declined
@@ -98585,7 +98600,7 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
             /* TWO COMPLETIONS: 0 is step 8's value and 1 is step 2's SyntaxError. The value comes first
                because outcome 0 is what a run with no forking policy takes, and a candidate re-fire on its way
                to a sink must not be diverted into a throw it did not choose. */
-            r = step_fork_run(ctx, &s->hdr, text, "JSON.parse", 2, &arm);
+            r = step_fork_run(ctx, &s->hdr, text, "JSON.parse", 2, JS_OUTCOME_REAL_UNSTATED, &arm);
             if (r) { JS_FreeValue(ctx, cb_result); return r; }
             if (arm) {
                 /* the THROW completion, raised for real so the page's own `catch` runs and whatever is behind

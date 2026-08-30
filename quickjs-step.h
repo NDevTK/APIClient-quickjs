@@ -511,10 +511,14 @@ typedef struct JSStepHdr {
        way a property write does. The DONE path otherwise always leaves exactly one value on the operand stack, and
        an opcode's COMPILED stack has no slot for it (unlike a call site, whose callee slot is the result slot). */
     uint8_t discard_result;
-    /* AN OUTCOME FORK — see step_fork_run. `fork_over` and `fork_op` are the request's operands and are
-       BORROWED, exactly as desc_get/desc_set are: the machine holds the operand (it is one of its own
-       arguments or a value on its state) and the driver READS AND RESETS them before it does anything else,
-       so a request cannot leak into the next one and a SNAPSHOT taken at the fork carries neither.
+    /* AN OUTCOME FORK — see step_fork_run. `fork_over`, `fork_op`, `fork_n` and `fork_real` are the request's
+       operands, and the first two are BORROWED exactly as desc_get/desc_set are: the machine holds the operand
+       (it is one of its own arguments or a value on its state) and the driver READS AND RESETS them before it
+       does anything else, so a request cannot leak into the next one and a SNAPSHOT taken at the fork carries
+       neither.
+       `fork_real` IS RESET TO JS_OUTCOME_REAL_UNSTATED AND NOT TO ZERO, which is the whole reason the sentinel
+       has a name: zero is a legal completion, so a stale zero left behind by a finished request would read as
+       the positive claim "a real session takes outcome 0" at the next ask that forgot to state one.
        `fork_arm` is the answer and `fork_phase` says whether one is outstanding — 0 is "ask", and it is 0 in
        the sibling's snapshot ON PURPOSE: the sibling re-enters at the same point, ASKS AGAIN, and its own
        decision vector replays the arm it was forked for. That is what makes a parked and resumed sibling take
@@ -523,6 +527,7 @@ typedef struct JSStepHdr {
     JSValueConst fork_over;
     const char  *fork_op;
     int          fork_n;
+    int          fork_real;
     int          fork_arm;
     uint8_t      fork_phase;
     /* WHICH QUESTION THE OUTSTANDING ANSWER BELONGS TO — the identity of the ask, so that the answer cannot be
@@ -986,10 +991,23 @@ JS_EXTERN int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj
  * A machine therefore numbers its ordinary completion first, because the @S candidate re-fire runs ONE
  * concrete path and must not be diverted down an exceptional arm on its way to the sink.
  *
+ * `real` IS THE MACHINE'S SECOND DECLARATION AND IT IS A DIFFERENT QUESTION FROM THE NUMBERING ABOVE: not
+ * "which completion does a run with no forking policy take" but "which completion does THIS operation reach
+ * when run on the operand's EXAMPLE" — the concrete value the run already carries. A branch gets that answer
+ * from the condition's own example; an outcome's arms are not booleans, so the seam that holds the operand and
+ * the operation's NAME cannot compute it and must not guess it from the name. The machine can, because it owns
+ * the semantics, and it says so HERE rather than anywhere else so that the two declarations sit together and
+ * neither can be added without the other being visible. JS_OUTCOME_REAL_UNSTATED (quickjs.h) is what a machine
+ * passes when it cannot say — an operand carrying no example, an operation whose completion over one is not
+ * computable here — and it is a positive statement: the fork still happens, both arms still run, and neither
+ * is marked forced. Stating it is what makes the ordinary completion the PRIMARY arm and a forced one as
+ * visible in a request's provenance as a forced branch already is.
+ *
  * Returns JS_STEP_FORK (the caller returns it — the state must be complete-or-empty at that point, since the
  * SIBLING'S SNAPSHOT IS TAKEN THERE), or 0 once *parm is this flow's outcome. Both a park and a cross-session
  * resume land back on the ask, which re-derives the same arm from the flow's decision vector. */
-JS_EXTERN int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int *parm);
+JS_EXTERN int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int real,
+                            int *parm);
 
 /* ToString AS A REQUEST — the coercion nearly every Web IDL argument actually is. `DOMString type`,
    `DOMString name`, `DOMString selector`: each is ToString on whatever the page passed, so

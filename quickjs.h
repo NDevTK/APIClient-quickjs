@@ -1660,6 +1660,22 @@ JS_EXTERN int JS_ReclaimMemory(JSRuntime *rt, size_t wanted);
                 universal; WHEN it should is this hook's, and nothing about the page's bytecode shape gates
                 either. The substrate for the WFQ to interleave flows by value instead of running each to
                 completion. */
+/* "THIS ASK MAKES NO CLAIM ABOUT WHICH COMPLETION A REAL SESSION REACHES" — the one value outside 0..n-1 that
+   an outcome fork's `real` may take, and a POSITIVE STATEMENT rather than the absence of one.
+   `real` is the completion this machine's operation reaches when RUN ON THE OPERAND'S EXAMPLE. A branch has
+   that answer for free: the condition carries a concrete example and coercing it to a boolean IS the arm a
+   session carrying real values takes, which is what makes one arm PRIMARY and the other FORCED. An outcome has
+   no condition and its arms are not booleans — they are numbered COMPLETIONS of a real operation — so nothing
+   at the seam can derive it: the seam holds the operand and the operation's NAME, never its semantics, and
+   deciding from the name would be a recognizer. Only the MACHINE can say, at its own definition, and this is
+   what it says when it cannot: `JSON.parse` over an operand carrying no example has no completion to report,
+   and an ask whose operand is example-free has none by construction.
+   IT IS NOT "OUTCOME 0". Outcome 0 is what a run with NO FORKING POLICY takes, which is a statement about this
+   engine's numbering; `real` is a statement about a session carrying real values, and answering the second
+   with the first would invent which completion such a session reaches — the same invention as picking an arm
+   for an example-free branch. A machine that cannot say passes this and behaves exactly as one that could not
+   be asked: the fork happens, both arms run, neither is marked forced. */
+#define JS_OUTCOME_REAL_UNSTATED (-1)
 typedef struct JSFlowControlHooks {
     int  (*branch)(JSContext *ctx, JSValueConst cond);
     /* A NATIVE OPERATION WHOSE COMPLETION IS ONE OF N FEASIBLE OUTCOMES — the same decision `branch` makes,
@@ -1674,11 +1690,17 @@ typedef struct JSFlowControlHooks {
        is everything the constraint key needs: the solver builds it from the operand's own source identity
        exactly as it builds a comparison's, so no grammar and no policy crosses into the engine. `n` is how
        many completions the machine declares feasible.
+       `real` is the ASKING MACHINE'S OWN DECLARATION of the completion its operation reaches when run on the
+       operand's example, or JS_OUTCOME_REAL_UNSTATED (above) when it cannot say. It is a parameter for the
+       same reason `branch`'s arm is computed by the seam and this one is not: the answer belongs to the
+       operation, and no two operations answer it alike. It decides which arm the parent KEEPS and whether the
+       arm a flow ends on is FORCED, so a machine that states it makes an outcome fork report its provenance
+       exactly as a branch does.
        Returns the outcome THIS flow takes (0..n-1), ORed with 0x100 when a sibling was prepared for another —
        the same protocol `branch` uses, so the fork is one mechanism and not two. -1 means there is no decision
        to make (no forking policy installed: the @S candidate re-fire runs ONE concrete path), which the caller
        reads as outcome 0, the same way a declined `branch` falls through to the ordinary ToBool. */
-    int  (*outcome)(JSContext *ctx, JSValueConst over, const char *op, int n);
+    int  (*outcome)(JSContext *ctx, JSValueConst over, const char *op, int n, int real);
     void (*fork)(JSContext *ctx, JSValue *clone);       /* BASE-activation fork: build the hot sibling from a frame clone.
                                                            (The deleted `replay` hook re-ran a nested/deep flow from its
                                                            start — BANNED, not byte-identical; that fork now DFAILs until a
