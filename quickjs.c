@@ -22525,6 +22525,42 @@ static int step_setprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
     return 0;
 }
 
+/* THE SAME WRITE WITH 7.3.4 Set ( O, P, V, Throw )'s FLAG FALSE — `O.[[Set]](key, value, O)`, whose boolean is
+ * DISCARDED rather than turned into a TypeError, so it is request 14 and not the Set(O,P,V,true) above. The
+ * receiver is O, which is what 7.3.4 states ("Let success be ? O.[[Set]](P, V, O)"); only the answer differs.
+ * On a Proxy it is the `set` trap, and on an accessor it is the setter, exactly as request 8 is.
+ *
+ * IT IS EXPORTED AND ITS THROWING TWIN IS NOT, because the caller that needed a keyed write from OUTSIDE the
+ * engine needed THIS one: Web IDL § 3.7.6 Attributes' create-an-attribute-setter step 4.5.8.4 is "Perform
+ * ? Set(Q, forwardId, V, false)" — the [PutForwards] forwarding, whose whole point is that a target refusing
+ * the write is not an error the forwarding invents. Handing that caller the throwing form would have been the
+ * near-miss that reads correct: it agrees for every Q whose forwarded member is an accessor with a setter, and
+ * it manufactures a TypeError the moment a page redefines the attribute this forwards THROUGH — which is a
+ * shape reachable from script, since not every [PutForwards] carrier is [LegacyUnforgeable].
+ *   0 = done, 14 = the caller must return that step code, -1 = threw. */
+int step_setprop_bare_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValueConst value,
+                          JSValue in, JSValue **out_cb, int *out_argc)
+{
+    if (h->get_phase == GET_PH_START) {
+        JS_FreeValue(ctx, in);
+        DCHECK(h->get_atom == JS_ATOM_NULL, "a keyed operation is already in flight on this machine's header");
+        step_keyed_inflight(h);
+        h->get_atom = JS_DupAtom(ctx, atom);
+        h->cb_coerce[0] = (JSValue)obj;     /* borrowed: the machine holds all three across the write */
+        h->cb_coerce[1] = (JSValue)obj;     /* 7.3.4's RECEIVER is O itself, never a third operand */
+        h->cb_coerce[2] = (JSValue)value;
+        *out_cb = h->cb_coerce; *out_argc = (int)atom;
+        h->get_phase = GET_PH_GOT;
+        return 14;
+    }
+    DCHECK(atom == JS_ATOM_NULL || atom == h->get_atom,
+           "a bare keyed write was answered at a DIFFERENT call site than the one that parked it — see the "
+           "read's contract above");
+    if (step_keyed_abrupt(ctx, h, in)) return -1;   /* a throwing setter or `set` trap */
+    JS_FreeValue(ctx, in);                  /* the boolean [[Set]] answered is Set(O,P,V,false)'s to discard */
+    return 0;
+}
+
 /* an INDEX key. ! ToString(𝔽(idx)) is what the spec's element access reduces to, and the atom is the engine's
    representation of exactly that. */
 static int step_getidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64_t idx, JSValue in,

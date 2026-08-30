@@ -731,6 +731,21 @@ static inline JSValueConst step_arg(const JSStepHdr *h, int i)
 JS_EXTERN int step_getprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom, JSValue in,
                                JSValue *pout, JSValue **out_cb, int *out_argc);
 
+/* A KEYED WRITE AS A REQUEST, in 7.3.4 Set ( O, P, V, Throw )'s Throw-FALSE form: `O.[[Set]](key, value, O)`
+   with the boolean it answers DISCARDED. The read above is one half of what a browser component needs of a
+   property; this is the other, and it runs the page's code for the same reasons — the target may be an
+   accessor whose setter loops, or a Proxy whose `set` trap does.
+   THE THROWING FORM IS DELIBERATELY NOT HERE. Web IDL § 3.7.6 Attributes' create-an-attribute-setter step
+   4.5.8.4 — the [PutForwards] forwarding, which is the operation a host had no way to perform at all — is
+   stated with Throw false, and the difference is reachable from script wherever the forwarded-through
+   attribute is not [LegacyUnforgeable]: the throwing form invents a TypeError where the spec's silently does
+   nothing. A host needing Set(O,P,V,true) exports that one when it has a member that means it, rather than
+   taking this one and being wrong in the direction nothing tests.
+   `atom` is BORROWED. Returns 14 (the caller returns it), 0 once the write is done, or -1 — the same abrupt
+   encoding as every other keyed request above. */
+JS_EXTERN int step_setprop_bare_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom atom,
+                                    JSValueConst value, JSValue in, JSValue **out_cb, int *out_argc);
+
 /* A NUMERIC COERCION AS A REQUEST — the other half of what a browser component needs, and the half that was
    missing. Web IDL's integer types (`[EnforceRange] unsigned long long milliseconds`, `long`, `unsigned long`)
    are ToNumber on whatever the page passed, so `AbortSignal.timeout({valueOf(){ for(;;){} }})` is the page's
