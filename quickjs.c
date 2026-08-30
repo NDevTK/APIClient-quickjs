@@ -10619,7 +10619,17 @@ static JSValue js_callsite_data_render(JSContext *ctx, const JSCallSiteData *csd
    no accessor and no Proxy trap, and an array the page has converted away from that representation simply has
    no frames this function can read (`n` stays 0 and the render is the empty string, which is what a trace of
    no frames renders to anyway — one path, no special case). V8 formats its default stack from its internal
-   frame array for the same reason, so a page mutating the structured array does not change it there either. */
+   frame array for the same reason, so a page mutating the structured array does not change it there either.
+   RESIDUAL — the code is right and narrower than V8, and here is exactly how much. A page that converts the
+   array out of the fast representation (`delete frames[0]`, a non-index own property, an index define) keeps
+   its CallSites as ordinary own data slots, and V8's default rendering is unaffected because V8 never reads
+   the structured array at all: it holds the frames privately and materializes that array only for the hook.
+   This renders "" for such an error instead. THE NEXT DIFF IS THE V8 SHAPE, not an own-index walk that would
+   only re-derive the same list one atom at a time: the pending pair holds the CallSite objects because the
+   HOOK needs them as a JS array, so what it should park is the frames in a form the page cannot reach, with
+   the accessor building the array at the moment it calls `prepareStackTrace`. ITS ABSENCE SHOWS as an error
+   whose `.stack` is empty after a hook that mutated the shape of the array it was handed, and as a host
+   diagnostic naming no throw site for that same error while the frames are still sitting on the object. */
 static JSValue js_callsite_array_render(JSContext *ctx, JSValueConst arr)
 {
     DynBuf dbuf;
