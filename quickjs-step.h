@@ -853,11 +853,29 @@ JS_EXTERN int step_construct_run(JSContext *ctx, uint8_t *phase, JSValue *cb, in
  * was legitimately mid-flight. That fired on the smoke fixture, and the machine was right: nothing had moved.
  * Written as a comparison against `to` rather than as a "resuming?" flag, because a flag would be the machine
  * telling the assert when not to run, which is the recognizer shape this file bans everywhere else. */
+/* AND THE SCAN IS BOUNDED BY THE ARRAY'S OWN SIZE, NEVER BY THE TERMINATOR IT IS LOOKING FOR — because the
+ * terminator is a thing a CALL SITE supplies, and a scan that trusts it to be there reads past the end of the
+ * array the moment one site forgets. That is not a diagnostic that degrades: reading `rest_[n]` off an
+ * n-element automatic array is undefined behaviour, and an optimising compiler is entitled to conclude the loop
+ * never exits and to emit the infinite jump that says so. It did — one `[PutForwards]` transition, written with
+ * its cursor and no terminator, compiled at -O1 into a two-byte `jmp .` INSIDE the step body, so every
+ * assignment through that binding (`el.style = …`, `rule.media = …`, `window.location = …`) burned the whole
+ * CPU budget in ONE C activation with the interpreter never getting control back — the drive-to-completion this
+ * file's every other rule exists to prevent, arrived through a missing comma-NULL rather than through a loop
+ * anybody wrote. THE SIZE IS KNOWN AT THE EXPANSION, so the bound is the size; the terminator stays the
+ * convention every site already writes, and its ABSENCE is now a named abort at the site that forgot it instead
+ * of a program the compiler is free to reshape. Asked before the transition test, because a malformed list is
+ * malformed whether or not the stage moves. */
 #define STEP_GOTO(dst, to, ...) do {                                                                    \
         const uint8_t *const step_goto_rest_[] = { __VA_ARGS__ };                                       \
-        int step_goto_i_;                                                                               \
+        const size_t step_goto_n_ = sizeof step_goto_rest_ / sizeof step_goto_rest_[0];                 \
+        size_t step_goto_i_;                                                                            \
+        DCHECK(step_goto_rest_[step_goto_n_ - 1] == NULL,                                               \
+               "a STEP_GOTO's cursor list does not end in its NULL terminator — the list is what the "  \
+               "transition asserts over, and one that does not say where it stops is a scan off the "   \
+               "end of it. Append NULL to the cursors this transition names");                          \
         if ((dst) != (to))                                                                              \
-            for (step_goto_i_ = 0; step_goto_rest_[step_goto_i_] != NULL; step_goto_i_++)               \
+            for (step_goto_i_ = 0; step_goto_i_ + 1 < step_goto_n_; step_goto_i_++)                     \
                 DCHECK(*step_goto_rest_[step_goto_i_] == 0,                                             \
                        "a stage was left with a sub-sequence's request still in flight — the next "     \
                        "stage's request will collect this one's answer");                               \
