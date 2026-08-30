@@ -633,6 +633,16 @@ JS_EXTERN JSStepVisit *JS_StepFreeVisitor(void);
  * free-and-null leaves the visit's free a no-op, free-without-null makes the visit's free a double free. So the
  * teardown folds the declaration into this number before `release` and again after, and asserts they match.
  *
+ * WHAT THE NUMBER IS MADE OF IS SLOT IDENTITY, NEVER A REFERENCE COUNT, and a caller has to know that to read
+ * the assert it fires. The property is "the declaration still names what it named": free-and-null, replace and
+ * hand-over all move it. Free-WITHOUT-null does not — it reaches the discharge as the second free and the
+ * allocator answers there. A reference count would appear to close that gap and cannot: a count says how many
+ * holders an object has and never WHICH, so a `release` giving back somebody else's reference to a declared
+ * object moves it exactly as a `release` discharging the declaration does, and where the slot is the sole
+ * holder the count can only be read out of a block the offending `release` has already returned. So this
+ * bracket does NOT forbid a `release` from moving reference counts elsewhere in the agent's object graph; it
+ * forbids it from touching the slots the declaration names.
+ *
  * EVERY operation is folded, not only the reference-holding ones. What `release` may own is what the
  * declaration does NOT name, and this walk reaches only what it DOES — so a `buf` named by the visit is the
  * declaration's allocation exactly as a `val` is its reference: the fork copies it with js_malloc and the

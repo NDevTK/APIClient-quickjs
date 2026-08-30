@@ -24413,6 +24413,19 @@ static void js_step_visit_dup_shared(JSContext *ctx, void **slot, int *refs, voi
 }
 static void js_step_visit_free_shared(JSContext *ctx, void **slot, int *refs, void (*destroy)(JSContext *, void *)) {
     if (!*slot) return;
+    /* A NAMED RECORD IS A HELD RECORD. The slot being non-NULL IS this state's reference, so the count cannot
+       already be spent when the discharge arrives; if it is, somebody dropped this state's reference and left
+       the slot naming the record — the one spelling of the second list that the fingerprint bracket around
+       `release` cannot see, because it leaves both the pointer and the count-holder set looking untouched from
+       outside. Asserted here rather than diagnosed at the destroy, which runs one caller further on. */
+    DCHECK(refs != NULL,
+           "a step state's `shared` slot names a record and hands its teardown no reference count — the count "
+           "lives IN the record, so a non-NULL slot always has one; the caller passed the pair inconsistently");
+    DCHECK(*refs > 0,
+           "a step state's shared record reached its discharge with its reference already given back — the "
+           "declaration's `shared` slot still names the record, so this state's reference was dropped by "
+           "something that is not this walk; find the `release` or teardown that dropped it and delete that "
+           "drop, the declaration is the one list");
     if (--(*refs) == 0) destroy(ctx, *slot);
     *slot = NULL;
 }
@@ -24502,8 +24515,28 @@ void JS_StepVisitFree(JSContext *ctx, JSStepVisitFn visit, void *state)
  * free the SECOND one.
  *
  * So the teardown folds every value the declaration names into a number before `release` and again after, and
- * the two must be equal. Both mistakes move it: nulling a slot changes the tag, and dropping a reference
- * changes the count.
+ * the two must be equal.
+ *
+ * WHAT IS FOLDED IS SLOT IDENTITY — the tag, and the payload where the payload is a pointer — AND NEVER A
+ * REFERENCE COUNT. A count states how many holders an object has and never WHICH, so a `release` that discharged
+ * the declaration and a `release` that gave back SOMEBODY ELSE'S reference to an object a declared slot also
+ * names (removing an agent-wide map entry keyed BY that object) move it by the same amount in the same
+ * direction, and no extra measurement separates them — dup'ing the declaration around the call shifts both by
+ * +1 and cancels nothing. That is not a caveat on an otherwise-working check, it is the whole of it: the count
+ * fold has NO case in which its reading is both defined and unambiguous. Where the object has another holder it
+ * reads valid memory and cannot say which reference moved; where the slot was the SOLE holder it can only get
+ * an unambiguous answer by reading the refcount header of a block the offending `release` has just returned to
+ * the allocator, so the answer is undefined behavior and ASan reports a use-after-free inside the fold rather
+ * than the @WHY that names the culprit. Ambiguous exactly where it is defined, undefined exactly where it would
+ * be unambiguous. It cost every completed `document.createElement` of a defined name, and it was measuring a
+ * fact about the heap where the question is about a slot.
+ *
+ * IDENTITY ANSWERS THE QUESTION THE DISCHARGE ACTUALLY ASKS: the discharge acts on the slots this walk reaches,
+ * so "does the declaration still name what it named" is the property, and every spelling that leaves it naming
+ * something else — free-and-null, replace, hand-over — moves the number, from a read that dereferences nothing.
+ * The free-WITHOUT-null spelling leaves the slot identical and is invisible here; it reaches the discharge as
+ * the second free, and the allocator answers. That is not a new concession — it is the same trade the next
+ * paragraph already takes for `v->buf`, now taken for `v->val` for the same reason.
  *
  * EVERY OPERATION IS FOLDED, NOT ONLY THE REFERENCE-HOLDING ONES. This used to fold `val` and `atom` alone,
  * arguing that "a `buf`/`array`/`shared` pointer is what `release` is allowed to own, so folding those would
@@ -24518,12 +24551,16 @@ void JS_StepVisitFree(JSContext *ctx, JSStepVisitFn visit, void *state)
  * what makes the free-and-null spelling visible; the free-WITHOUT-null spelling leaves the pointer unchanged
  * and is caught by the allocator itself when the discharge frees it a second time.
  *
- * A value already freed to zero by the offending release is read here after its allocation is gone. That read
- * is the diagnosis, not a new bug: the number will differ and this fires, which is the outcome either way. But
- * UNDER ASan THE SANITIZER GETS THERE FIRST — the fold reads the arena header of a block that has been
- * returned, so `node engine/build.mjs native address min` reports a use-after-free INSIDE this function rather
- * than the @WHY below it. The report's allocation site is the value the offending `release` freed, and the
- * culprit is the `release` that ran immediately before this fold; read the @WHY that names it, not this frame. */
+ * ONE OPERATION STILL FOLDS A COUNT, AND IT IS A DIFFERENT KIND OF COUNT: `v->shared`'s. Its holders are not
+ * the heap's — a shared record's references are taken and dropped by js_step_visit_dup_shared and
+ * js_step_visit_free_shared and by nothing else, so the population is CLOSED to the step states of forked flows
+ * and no algorithm-level give-back can reach it. A change there names the second list and nothing else, which
+ * is the property the heap's count does not have. It is also the file's one remaining dereference in this walk,
+ * so it is the one place where a `release` that dropped the LAST reference without nulling leaves ASan
+ * reporting a use-after-free INSIDE the fold: the report's allocation site is the record that `release` freed,
+ * and the culprit is the `release` that ran immediately before this fold — read the @WHY that names it, not
+ * this frame. Every other operation folds pointers and never dereferences them, which is what quickjs-step.h's
+ * own contract for this function has always said. */
 static void js_step_fp_fold(JSContext *ctx, uint64_t x)
 {
     ctx->rt->step_owned_fp = (ctx->rt->step_owned_fp ^ x) * 1099511628211ULL;   /* FNV-1a's prime */
@@ -24533,15 +24570,16 @@ static void js_step_visit_fp_val(JSContext *ctx, JSValue *slot)
     js_step_fp_fold(ctx, (uint64_t)(JS_VALUE_GET_TAG(*slot) + 1));
     /* The PAYLOAD is folded only when it is a pointer. A JSValue's union is written through its int32 member
        for an immediate, so the rest of it is indeterminate bytes, and folding those would make the number
-       differ between two reads of one unchanged slot — a check that fires at random is worse than none. */
-    if (JS_VALUE_HAS_REF_COUNT(*slot)) {
-        void *p = JS_VALUE_GET_PTR(*slot);
-        /* The count through JS_REF_COUNT — the pair js_dup and JS_FreeValueRT use, under the same tag test, so
-           the set of tags this reads a header for is the set that HAS one by construction rather than by a
-           second judgement about which of them are arena allocations. */
-        js_step_fp_fold(ctx, (uint64_t)(uintptr_t)p);
-        js_step_fp_fold(ctx, (uint64_t)(uint32_t)JS_REF_COUNT(p));
-    }
+       differ between two reads of one unchanged slot — a check that fires at random is worse than none.
+       The tag test is JS_VALUE_HAS_REF_COUNT — the pair js_dup and JS_FreeValueRT decide by, so the set of tags
+       whose payload this reads as a pointer is the set that HAS one by construction rather than by a second
+       judgement about which of them are arena allocations. The pointer is FOLDED, never dereferenced: it is
+       stable for the object's lifetime (nothing in this engine relocates a live JSObject or a JSString a slot
+       names — the collector is mark-and-sweep with no compaction, and JS_ConcatString2's in-place arm grows
+       into slack it already has rather than reallocating), so two reads of an untouched slot agree, and a slot
+       whose object a misbehaving `release` has already returned is read without faulting on it. */
+    if (JS_VALUE_HAS_REF_COUNT(*slot))
+        js_step_fp_fold(ctx, (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(*slot));
 }
 static void js_step_visit_fp_atom(JSContext *ctx, JSAtom *slot) { js_step_fp_fold(ctx, (uint64_t)*slot); }
 /* THE POINTER, WHICH IS THE WHOLE OF WHAT AN OWNED ALLOCATION IS TO THIS QUESTION. None of these reads the
@@ -24574,8 +24612,13 @@ static void js_step_visit_fp_buf(JSContext *ctx, void **slot, size_t bytes)
 }
 static void js_step_visit_fp_machine(JSContext *ctx, void **slot)
 { js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*slot); }
-/* The pointer AND the count, because dropping a reference to a shared record is the same mistake as dropping
-   one to a value: the record survives, and the arm that still names it frees it a second time at zero. */
+/* THE POINTER AND THE COUNT — the one count this walk folds, and it is folded for the reason the heap's is not.
+   A shared record's references are taken by js_step_visit_dup_shared and dropped by js_step_visit_free_shared
+   and by nothing else, so the holder set is CLOSED to the step states of forked flows: no algorithm-level
+   give-back reaches it, and a `release` cannot be dropping somebody else's reference here because there is no
+   somebody else. A move is therefore the second list and nothing else, which is exactly what a move of the
+   heap's count is not. Dropping one is the same outcome a value's would be: the record survives, and the arm
+   that still names it frees it a second time at zero. */
 static void js_step_visit_fp_shared(JSContext *ctx, void **slot, int *refs, void (*destroy)(JSContext *, void *))
 {
     (void)destroy;
