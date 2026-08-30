@@ -12311,15 +12311,33 @@ static JSValue js_absent_ask(JSContext *ctx, JSValueConst obj, JSAtom prop)
     return g_concolic.absent(ctx, obj, prop);
 }
 
+/* THE ONE PLACE A READ THAT REACHES THE PAGE'S CODE IS DISCOVERED, so `file`/`line` are the READER's — captured
+   by the macro over every public spelling (see the contract above JS_GetPropertyAt in quickjs.h). They are read
+   only by the two assertions in the accessor arms, which a release build compiles out; the parameters stay in
+   the signature there so ONE argument list serves both builds.
+   The INTERPRETER's own routed reads pass js_read_site_routed for the file and their own __LINE__: reaching an
+   accessor from one of those is not an unrouted caller at all but the read opcode's tramp_accessor_getter walk
+   disagreeing with this one about a single object, which is a different bug with a different fix — and the
+   line still says WHICH opcode disagreed, which is the half of the address that is still worth having.
+   Stating that as a positive value rather than a NULL is the point: a hole here would be indistinguishable
+   from a caller written against the raw entry, which is the defect a defaulted field always is. */
+static const char js_read_site_routed[] = "the interpreter's own routed read";
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                       JSAtom prop, JSValueConst this_obj,
-                                      bool throw_ref_error)
+                                      bool throw_ref_error,
+                                      const char *file, int line)
 {
     JSObject *p;
     JSProperty *pr;
     JSShapeProperty *prs;
     uint32_t tag;
 
+    (void)file; (void)line;
+    DCHECK(file != NULL,
+           "a property read reached JS_GetPropertyInternal with no call site — every public spelling is a macro "
+           "that captures __FILE__/__LINE__ and every internal caller passes js_read_site_routed, so a NULL "
+           "means a caller was written against the raw entry and the assertions in the accessor arms below "
+           "would name nothing");
     tag = JS_VALUE_GET_TAG(obj);
     if (unlikely(tag != JS_TAG_OBJECT)) {
         switch(tag) {
@@ -12390,29 +12408,64 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                            this engine — Window (§7.1's `window.name`), DOMException, Attr, and any page object
                            whose config the browser half reads — so four completely different bugs printed the
                            identical line, and the search the atom was added to prevent happened anyway, one
-                           layer in. The caller is still not in the report (the wasm stack is function indices),
-                           but the RECEIVER'S CLASS plus the HOLDER'S CLASS narrow it to one component: a
+                           layer in. The RECEIVER'S CLASS plus the HOLDER'S CLASS narrow it to one component: a
                            `name` on JS_CLASS_DOMEXCEPTION is an error-report path, on the global it is an
                            attacker-source read, on JS_CLASS_OBJECT it is a page config.
                            The two classes are separate because the getter is normally found on a PROTOTYPE, so
                            the holder names the interface and the receiver names the instance the read was
-                           actually made on — and when they differ, that difference is the identification. */
+                           actually made on — and when they differ, that difference is the identification. And
+                           WHICH-OF-THE-TWO is DIAGNOSTIC ONLY: tramp_accessor_getter walks own slot and
+                           prototypes with one rule and routes either the same way, so nothing about the route
+                           turns on it. It is the identification that turns on it, which is why both are named.
+                           AND THE CALLER IS IN THE REPORT NOW, WHICH IT COULD HAVE BEEN ALL ALONG. The line
+                           that stood here said it could not be — "the wasm stack is function indices" — and
+                           that is a claim about the NATIVE stack, which nothing here was ever going to walk.
+                           The two addresses that matter are both reachable: the C site travels with the request
+                           (quickjs.h's macro over every public spelling), and js_why_backtrace renders the JS
+                           frames without running a byte of the page's code. A crash whose remedy is "route this
+                           site" and whose text is identical wherever it fires is one nobody can act on. */
 #if APICLIENT_DEV
                         {
                             char pbuf[ATOM_GET_STR_BUF_SIZE], hbuf[ATOM_GET_STR_BUF_SIZE];
-                            char rbuf[ATOM_GET_STR_BUF_SIZE], why[320];
+                            char rbuf[ATOM_GET_STR_BUF_SIZE], why[4096];
+                            char frames[2048], site[320];
                             JSRuntime *rt0 = ctx->rt;
                             const char *rcls = "a primitive";
+                            bool routed = (file == js_read_site_routed);
                             if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
                                 rcls = JS_AtomGetStr(ctx, rbuf, sizeof(rbuf),
                                                      rt0->class_array[JS_VALUE_GET_OBJ(obj)->class_id].class_name);
+                            if (routed)
+                                snprintf(site, sizeof site, "%s (%s:%d)", js_read_site_routed, __FILE__, line);
+                            else
+                                snprintf(site, sizeof site, "%s:%d", file ? file : "(no call site)", line);
+                            js_why_backtrace(ctx, frames, sizeof frames);
                             snprintf(why, sizeof why,
-                                     "JS_GetPropertyInternal reached a getter for `%s` on %s (the accessor is "
-                                     "held by %s) — route this read onto the tramp chain instead of running the "
-                                     "getter from C",
+                                     "A property READ reached a getter for `%s` on %s (the accessor is held by "
+                                     "%s), asked for by the C READER at %s. §10.1.8.1 OrdinaryGet ( obj, "
+                                     "propertyKey, receiver ) step 7 is `Return ? Call(getter, receiver)` — the "
+                                     "page's function, and a C activation has no flow base under it, so a loop "
+                                     "in that body drives to completion instead of parking. This is a "
+                                     "capability this engine does not have rather than a case to handle; the "
+                                     "C-drives-JS body was DELETED, not left behind an assert. %s The page's "
+                                     "call into this reader: %s",
                                      JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop), rcls,
                                      JS_AtomGetStr(ctx, hbuf, sizeof(hbuf),
-                                                   rt0->class_array[p->class_id].class_name));
+                                                   rt0->class_array[p->class_id].class_name),
+                                     site,
+                                     routed
+                                     ? "SO THIS IS NOT AN UNROUTED READER: the opcode already asked "
+                                       "tramp_accessor_getter and was told there was no accessor, so that walk "
+                                       "and this one disagree about THIS object — fix the walk, not a call site."
+                                     : "FIX IT AT THAT FILE:LINE, not here. ASK FIRST WHETHER THE SITE SHOULD "
+                                       "BE READING AT ALL: an engine-owned array's element is the engine's own "
+                                       "storage and a host DIAGNOSTIC must reach no page code at all, so both "
+                                       "read the slot off the shape rather than performing a [[Get]]. If the "
+                                       "site GENUINELY needs the property, ROUTE IT: a step machine already on "
+                                       "the chain issues the keyed request (gp_op = GP_GET, gp_outer_kind = "
+                                       "CONT_STEP) and takes the value as its next step's result, which is the "
+                                       "same request Reflect.get issues and the same one the read opcodes make.",
+                                     frames);
                             DFAIL(why);
                         }
 #endif
@@ -12508,9 +12561,48 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                    over a shape slot's. So an accessor arriving HERE is a read performed from
                                    C, with no flow base to run the getter on, and it is that CALLER that has an
                                    unbuilt route rather than the class: HTML §7.2.3.5's same-origin WindowProxy
-                                   answers with the other document's Window's accessors on purpose. */
-                                DFAIL("an exotic [[GetOwnProperty]] accessor reached the C read — route it "
-                                      "onto the tramp chain");
+                                   answers with the other document's Window's accessors on purpose. AND THAT
+                                   CALLER IS NAMED, for the reason the shape-slot arm above states at length —
+                                   "route it" with no address in it is an instruction over hundreds of
+                                   spellings, and the site travels with the request precisely so this one can
+                                   spend it. */
+#if APICLIENT_DEV
+                                {
+                                    char why[4096], frames[2048], site[320];
+                                    char pbuf[ATOM_GET_STR_BUF_SIZE], hbuf[ATOM_GET_STR_BUF_SIZE];
+                                    bool routed = (file == js_read_site_routed);
+                                    if (routed)
+                                        snprintf(site, sizeof site, "%s (%s:%d)",
+                                                 js_read_site_routed, __FILE__, line);
+                                    else
+                                        snprintf(site, sizeof site, "%s:%d",
+                                                 file ? file : "(no call site)", line);
+                                    js_why_backtrace(ctx, frames, sizeof frames);
+                                    snprintf(why, sizeof why,
+                                             "An exotic [[GetOwnProperty]] answered `%s` on %s with an "
+                                             "ACCESSOR and the read is being performed from C, asked for by "
+                                             "the C READER at %s. §10.1.8.1 OrdinaryGet ( obj, propertyKey, "
+                                             "receiver ) step 7 calls that getter and a C activation has no "
+                                             "flow base to call it on. tramp_accessor_getter asks the class "
+                                             "for the same descriptor and hands the getter to the tramp "
+                                             "chain, so the CLASS is not what is missing — the reader is. "
+                                             "%s The page's call into this reader: %s",
+                                             JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop),
+                                             JS_AtomGetStr(ctx, hbuf, sizeof(hbuf),
+                                                           ctx->rt->class_array[p->class_id].class_name),
+                                             site,
+                                             routed
+                                             ? "SO THIS IS NOT AN UNROUTED READER: the opcode already asked "
+                                               "tramp_accessor_getter and was told there was no accessor, so "
+                                               "that walk and this one disagree about THIS object — fix the "
+                                               "walk, not a call site."
+                                             : "ROUTE IT: a step machine already on the chain issues the "
+                                               "keyed request (gp_op = GP_GET, gp_outer_kind = CONT_STEP) and "
+                                               "takes the value as its next step's result.",
+                                             frames);
+                                    DFAIL(why);
+                                }
+#endif
                                 return JS_ThrowTypeError(ctx, "getter");
                             } else {
                                 return desc.value;
@@ -12537,9 +12629,10 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     return JS_UNDEFINED;
 }
 
-JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop)
+JSValue JS_GetPropertyAt(JSContext *ctx, JSValueConst this_obj, JSAtom prop,
+                         const char *file, int line)
 {
-    return JS_GetPropertyInternal(ctx, this_obj, prop, this_obj, false);
+    return JS_GetPropertyInternal(ctx, this_obj, prop, this_obj, false, file, line);
 }
 
 static JSValue JS_ThrowTypeErrorPrivateNotFound(JSContext *ctx, JSAtom atom)
@@ -13779,7 +13872,7 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
 }
 
 static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
-                                   JSValue prop)
+                                   JSValue prop, const char *file, int line)
 {
     JSAtom atom;
     JSValue ret;
@@ -13815,15 +13908,19 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
     JS_FreeValue(ctx, prop);
     if (unlikely(atom == JS_ATOM_NULL))
         return JS_EXCEPTION;
-    ret = JS_GetProperty(ctx, this_obj, atom);
+    ret = JS_GetPropertyAt(ctx, this_obj, atom, file, line);
     JS_FreeAtom(ctx, atom);
     return ret;
 }
 
-JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
-                             uint32_t idx)
+JSValue JS_GetPropertyUint32At(JSContext *ctx, JSValueConst this_obj,
+                               uint32_t idx, const char *file, int line)
 {
-    return JS_GetPropertyInt64(ctx, this_obj, idx);
+    /* THE CALLER'S SITE, FORWARDED — not this line's. The macro captured it one frame up; re-capturing here
+       would name quickjs.c for every JS_GetPropertyUint32 in the tree, which is the one site that is never the
+       answer. Same reason the header spells all four as macros rather than letting three forward through
+       JS_GetProperty. */
+    return JS_GetPropertyInt64At(ctx, this_obj, idx, file, line);
 }
 
 /* DELETED: JS_TryGetPropertyInt64. It was the has-then-get pair every array builtin used to walk a sparse
@@ -13831,7 +13928,8 @@ JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
    step_getidx_run — but the body kept compiling, so it kept being a C entry that runs a Proxy's `has` and `get`
    traps with no flow base, and the [[HasProperty]] ratchet kept counting it as a consumer still to convert. A
    superseded body that still compiles is the fallback this project forbids, whether or not anything reaches it. */
-JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx)
+JSValue JS_GetPropertyInt64At(JSContext *ctx, JSValueConst obj, int64_t idx,
+                              const char *file, int line)
 {
     JSAtom prop;
     JSValue val;
@@ -13847,21 +13945,21 @@ JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx)
     if (prop == JS_ATOM_NULL)
         return JS_EXCEPTION;
 
-    val = JS_GetProperty(ctx, obj, prop);
+    val = JS_GetPropertyAt(ctx, obj, prop, file, line);
     JS_FreeAtom(ctx, prop);
     return val;
 }
 
 /* `prop` may be pure ASCII or UTF-8 encoded */
-JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
-                          const char *prop)
+JSValue JS_GetPropertyStrAt(JSContext *ctx, JSValueConst this_obj,
+                            const char *prop, const char *file, int line)
 {
     JSAtom atom;
     JSValue ret;
     atom = JS_NewAtom(ctx, prop);
     if (atom == JS_ATOM_NULL)
         return JS_EXCEPTION;
-    ret = JS_GetProperty(ctx, this_obj, atom);
+    ret = JS_GetPropertyAt(ctx, this_obj, atom, file, line);
     JS_FreeAtom(ctx, atom);
     return ret;
 }
@@ -31806,7 +31904,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_generic_callee;
                         }
                     }
-                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false,
+                                                 js_read_site_routed, __LINE__);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
@@ -37188,7 +37287,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         js_free_prop_enum(ctx, ktab, klen);
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     } else {
-                        ret_val = JS_GetPropertyInternal(ctx, fwd ? gp_fwd : gp_obj, gp_atom, gp_recv_r, false);
+                        ret_val = JS_GetPropertyInternal(ctx, fwd ? gp_fwd : gp_obj, gp_atom, gp_recv_r, false,
+                                                         js_read_site_routed, __LINE__);
                         if (unlikely(JS_IsException(ret_val))) goto getprop_throw;
                     }
                 do_getprop_complete:
@@ -43863,7 +43963,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_generic_callee;
                         }
                     }
-                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false,
+                                                 js_read_site_routed, __LINE__);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
@@ -43965,7 +44066,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_generic_callee;   /* do_return pops this+getter, pushes value -> [receiver][value] */
                         }
                     }
-                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false,
+                                                 js_read_site_routed, __LINE__);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
@@ -44445,7 +44547,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
-                val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+                val = JS_GetPropertyValue(ctx, sp[-2], sp[-1], js_read_site_routed, __LINE__);
                 JS_FreeValue(ctx, sp[-2]);
                 sp[-2] = val;
                 sp--;
@@ -44541,7 +44643,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
-                val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+                val = JS_GetPropertyValue(ctx, sp[-2], sp[-1], js_read_site_routed, __LINE__);
                 sp[-1] = val;
                 if (unlikely(JS_IsException(val)))
                     goto exception;
@@ -44624,7 +44726,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
-                val = JS_GetPropertyInternal(ctx, sp[-2], atom, sp[-3], false);
+                val = JS_GetPropertyInternal(ctx, sp[-2], atom, sp[-3], false,
+                                             js_read_site_routed, __LINE__);
                 JS_FreeAtom(ctx, atom);
                 if (unlikely(JS_IsException(val)))
                     goto exception;
@@ -111995,7 +112098,7 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
             space = p ? max_int(0, p->u.array.count - s->start) : 0;
             count = min_int(count, space);
             for (n = 0; n < count; n++) {
-                val = JS_GetPropertyValue(ctx, s->src, js_int32(s->start + n));
+                val = JS_GetPropertyValue(ctx, s->src, js_int32(s->start + n), __FILE__, __LINE__);
                 if (JS_IsException(val))
                     return -1;
                 if (JS_SetPropertyValue(ctx, s->arr, js_int32(n), val, JS_PROP_THROW) < 0)

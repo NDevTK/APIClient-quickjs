@@ -1296,13 +1296,37 @@ JS_EXTERN bool JS_IsDate(JSValueConst v);
    asking this of anything that is not a Date is fatal in dev, since JS_IsDate is how you find out. */
 JS_EXTERN double JS_GetDateValue(JSValueConst v);
 
-JS_EXTERN JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop);
-JS_EXTERN JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
-                                       uint32_t idx);
-JS_EXTERN JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
-                                      int64_t idx);
-JS_EXTERN JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
-                                    const char *prop);
+/* THE READER'S OWN CALL SITE TRAVELS WITH THE REQUEST, for the SAME reason the converter's and the byte
+   consumer's do above and against the SAME abort. §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 7
+   is `Return ? Call(getter, receiver)` — the page's function, from a C activation with no flow base under it,
+   which is a capability this engine does not have. The read OPCODES route it (tramp_accessor_getter hands the
+   getter to the tramp chain as a 0-arg method call); a C caller cannot, so the crash that says so is the only
+   thing standing between a getter and a drive-to-completion.
+   That crash could name the PROPERTY, the RECEIVER's class and the HOLDER's class, and no address — and these
+   four spellings have hundreds of call sites between them, so "route this read" was an instruction with
+   nowhere to go, exactly as "route the JS_ToString that did this" was before the converter's site travelled.
+   THE SITE IS KNOWN AT THE ONE PLACE THAT KNOWS IT, so it is passed from there.
+   ONE ABI IN BOTH BUILDS and MACROS RATHER THAN INLINE WRAPPERS, both for the reasons the converter's block
+   states: a translation unit built with a different APICLIENT_DEV cannot disagree about the argument list, and
+   __FILE__/__LINE__ inside a static inline expands at the HEADER, which is the one site that is never the
+   answer. Each spelling carries its OWN site rather than forwarding through the next: the three below all end
+   in JS_GetPropertyAt, and a site captured there would name quickjs.c for every one of them. */
+JS_EXTERN JSValue JS_GetPropertyAt(JSContext *ctx, JSValueConst this_obj, JSAtom prop,
+                                   const char *file, int line);
+#define JS_GetProperty(ctx, this_obj, prop) \
+    JS_GetPropertyAt((ctx), (this_obj), (prop), __FILE__, __LINE__)
+JS_EXTERN JSValue JS_GetPropertyUint32At(JSContext *ctx, JSValueConst this_obj,
+                                         uint32_t idx, const char *file, int line);
+#define JS_GetPropertyUint32(ctx, this_obj, idx) \
+    JS_GetPropertyUint32At((ctx), (this_obj), (idx), __FILE__, __LINE__)
+JS_EXTERN JSValue JS_GetPropertyInt64At(JSContext *ctx, JSValueConst this_obj,
+                                        int64_t idx, const char *file, int line);
+#define JS_GetPropertyInt64(ctx, this_obj, idx) \
+    JS_GetPropertyInt64At((ctx), (this_obj), (idx), __FILE__, __LINE__)
+JS_EXTERN JSValue JS_GetPropertyStrAt(JSContext *ctx, JSValueConst this_obj,
+                                      const char *prop, const char *file, int line);
+#define JS_GetPropertyStr(ctx, this_obj, prop) \
+    JS_GetPropertyStrAt((ctx), (this_obj), (prop), __FILE__, __LINE__)
 
 JS_EXTERN int JS_SetProperty(JSContext *ctx, JSValueConst this_obj,
                              JSAtom prop, JSValue val);
