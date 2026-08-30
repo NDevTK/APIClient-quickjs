@@ -928,6 +928,14 @@ JS_EXTERN JSValue JS_GetArrayBufferView(JSContext *ctx, JSValueConst obj, size_t
    test comes first, and anything else is fatal at the call. */
 JS_EXTERN bool JS_IsFixedLengthBufferSource(JSValueConst obj);
 JS_EXTERN bool JS_IsSharedBufferSource(JSValueConst obj);
+/* AND THE THIRD QUESTION § 3.2.26 ASKS OF THAT BUFFER, which is not a refusal but a value: step 5 of "get a
+   copy of the bytes held by the buffer source" is "If IsDetachedBuffer(jsArrayBuffer) is true, then return the
+   empty byte sequence". A caller must be able to ask it BEFORE it reads the view's window, because the only
+   route from a view to its buffer (JS_GetArrayBufferView, above) refuses an out-of-bounds view and a detached
+   buffer makes every view over it out of bounds — so without this the algorithm met an exception at the step
+   before the one that defines its answer. Same contract as the pair above: no context, no throw, and the
+   buffer-source brand test comes first. */
+JS_EXTERN bool JS_IsDetachedBufferSource(JSValueConst obj);
 
 /* %IteratorPrototype%. Web IDL §3.7.10 states that the ITERATOR PROTOTYPE OBJECT of an `iterable<>` interface
    has %IteratorPrototype% as its [[Prototype]] — that inheritance is what gives `headers.keys()` the whole

@@ -111374,6 +111374,25 @@ bool JS_IsSharedBufferSource(JSValueConst obj)
     return js_buffer_source_buffer(obj)->shared;
 }
 
+/* ECMAScript's IsDetachedBuffer over the same underlying buffer — the THIRD question Web IDL § 3.2.26 Buffer
+   source types asks of it, and the one that had no answer. Its two conversions above are refusals; this one is
+   a POSITIVE STATEMENT inside an algorithm that produces a value: "get a copy of the bytes held by the buffer
+   source" reads the view's window in its steps 1-4 and then, in step 5, "If IsDetachedBuffer(jsArrayBuffer) is
+   true, then return the empty byte sequence".
+   IT EXISTS BECAUSE THE WINDOW IS WHAT CANNOT BE READ FIRST. An embedder's only route from a VIEW to its
+   buffer is JS_GetArrayBufferView, which refuses an out-of-bounds view — and a detached buffer makes every
+   view over it out of bounds — so a caller performing that algorithm reached an EXCEPTION at step 3 for the
+   input step 5 defines the answer to. The ArrayBuffer arm hid it: JS_GetBufferBytes answers NULL with a zero
+   length for a detached buffer, so `digest(alg, detachedBuffer)` hashed the empty message correctly while
+   `digest(alg, viewOntoDetachedBuffer)` aborted, and the abort named the brand test rather than the detach.
+   NO CONTEXT AND NO THROW, exactly as its two siblings state and for the same reason: § 3.2.26's algorithms
+   have no detach test of their own to gate this behind, so a detached or out-of-bounds view must still be able
+   to be ASKED. The brand test comes first, and anything else is fatal at the call. */
+bool JS_IsDetachedBufferSource(JSValueConst obj)
+{
+    return js_buffer_source_buffer(obj)->detached != 0;
+}
+
 /* THE VIEW'S BYTE LENGTH AS THE SPEC COMPUTES IT, WHICH IS NOT ALWAYS `ta->length`. A length-tracking view has
    [[ByteLength]] = auto, and ECMAScript § 10.4.5.12 TypedArrayByteLength and § 25.3.1.3 GetViewByteLength both
    turn on that one line — "If obj.[[ByteLength]] is not auto, return obj.[[ByteLength]]" — and derive the
