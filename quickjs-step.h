@@ -883,9 +883,29 @@ JS_EXTERN void JS_DiagFreeCString(JSContext *ctx, const char *s, char *owned);
    JSTypedArray. The alternative from outside the engine is reading `buffer`/`byteOffset`/`byteLength` as
    PROPERTIES, which are accessors — page-visible, patchable, and a C-driven getter call the flow design has no
    driver for. Returns the underlying ArrayBuffer (owned) with the view's window, or an exception.
-   The bytes come from JS_GetArrayBuffer on the result. */
+   The bytes come from JS_GetArrayBuffer on the result.
+   THE WINDOW IT ANSWERS WITH IS THE SPEC'S, NOT THE [[ByteLength]] SLOT'S. A length-tracking view — one built
+   over a resizable ArrayBuffer with no explicit length — has [[ByteLength]] = auto, so ECMAScript
+   § 10.4.5.12 TypedArrayByteLength and § 25.3.1.3 GetViewByteLength derive its length from the buffer at every
+   read. This returns that derived length (JS_GetTypedArrayBuffer does too); it once returned the slot, which
+   for such a view records the buffer's size at CONSTRUCTION and is stale the moment the buffer is resized. */
 JS_EXTERN JSValue JS_GetArrayBufferView(JSContext *ctx, JSValueConst obj, size_t *pbyte_offset,
                                         size_t *pbyte_length);
+
+/* WEB IDL § 3.2.26 Buffer source types' TWO REFUSALS, each asked of the buffer under a buffer source — of V
+   itself for an ArrayBuffer, of V.[[ViewedArrayBuffer]] for a DataView or a typed array, which is § 3.2.26's
+   own "underlying buffer of a buffer source type instance". One call answers every arm of that conversion, so
+   a binding layer performs no walk of its own and cannot get the two arms' wording apart.
+   JS_IsFixedLengthBufferSource is ECMAScript § 25.1.3.9 IsFixedLengthArrayBuffer over that buffer, and it is
+   what § 3.2.26's last conversion step tests: a type not carrying § 3.3.1's [AllowResizable] extended
+   attribute must throw a TypeError when this is false. JS_IsSharedBufferSource is IsSharedArrayBuffer over the
+   same buffer, for the step just before it, which refuses a shared buffer to a type not carrying [AllowShared].
+   NEITHER TAKES A CONTEXT AND NEITHER THROWS, which is what lets a caller ask them in § 3.2.26's own order:
+   that algorithm has no detach and no bounds test, so a detached or out-of-bounds view must still be told
+   whether its buffer is resizable rather than met with an exception. Both REQUIRE a buffer source — the brand
+   test comes first, and anything else is fatal at the call. */
+JS_EXTERN bool JS_IsFixedLengthBufferSource(JSValueConst obj);
+JS_EXTERN bool JS_IsSharedBufferSource(JSValueConst obj);
 
 /* %IteratorPrototype%. Web IDL §3.7.10 states that the ITERATOR PROTOTYPE OBJECT of an `iterable<>` interface
    has %IteratorPrototype% as its [[Prototype]] — that inheritance is what gives `headers.keys()` the whole
