@@ -2653,6 +2653,29 @@ JS_EXTERN JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
                                        const char *name,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
+/* DECLARE THAT AN ATTRIBUTE GETTER'S C BODY RUNS NONE OF THE PAGE'S CODE — the C-function twin of
+   JSClassExoticMethods' get_own_property_no_user_code below, made at the point the member is installed.
+ *
+ * WHAT IT BUYS. A property read that lands on an accessor may not invoke it from C: §10.1.8.1 OrdinaryGet
+ * ( obj, propertyKey, receiver ) step 7 is `Return ? Call(getter, receiver)`, the getter is normally the page's
+ * function, and a C activation has no flow base under it — a loop in that body would drive to completion
+ * instead of parking, so the read opcodes route it onto the trampoline and a C reader that reaches one aborts
+ * naming the site. That reasoning is entirely about a body that RUNS THE PAGE. It is vacuous for a C getter
+ * that runs none: there is no continuation to hold, nothing to preempt, and the routed path reaches the very
+ * same C function through the very same dispatch. A member that says so is answered where it is asked.
+ *
+ * WHAT IT DOES NOT BUY, AND THIS IS THE HALF THAT MATTERS. The default is UNDECLARED and stays undeclared:
+ * saying nothing means "this needs routing, and it crashes". The declaration is not a way to quiet an abort —
+ * it is a CLAIM, and a false one FIRES: while a declared getter runs, entry into any bytecode body aborts and
+ * names this member, because bytecode is the one door the page's code comes through. A getter that later gains
+ * a route to the page — a [[Get]] on an object whose prototype the page can extend, a coercion of a value the
+ * page can make an object, a callback — therefore crashes rather than silently keeping an exemption it has
+ * stopped deserving. Declare a member only where you would be content for the engine to prove you wrong.
+ *
+ * It takes the minted FUNCTION OBJECT, so the claim is per member and never per installer, per file or per
+ * function pointer: two members sharing one C body with different magics are two objects and two decisions. */
+JS_EXTERN void JS_DeclareCFunctionNoUserCode(JSValueConst func_obj);
+
 typedef void JSCClosureFinalizerFunc(void*);
 JS_EXTERN JSValue JS_NewCClosure(JSContext *ctx, JSCClosure *func,
                                  const char *name,

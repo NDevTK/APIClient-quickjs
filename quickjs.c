@@ -1611,6 +1611,24 @@ struct JSObject {
                27.5.3.1 step 2's non-callable executor). Deleting any of those leaves the field still needed to
                say WHICH machine runs — which is the test that separates routing from a fallback. */
             uint8_t native_machine;
+            /* THIS BODY RUNS NONE OF THE PAGE'S CODE — the C-function twin of JSClassExoticMethods'
+               get_own_property_no_user_code, and it exists for the same reason and is read at the same kind of
+               seam. A property READ that lands on an accessor cannot invoke it from C, because §10.1.8.1
+               OrdinaryGet ( obj, propertyKey, receiver ) step 7's `Return ? Call(getter, receiver)` is the
+               PAGE'S function and a C activation has no flow base under it — a loop in that body would drive to
+               completion. That reasoning is about a body that RUNS THE PAGE, and it is VACUOUS for a C getter
+               that runs none: there is no continuation to hold, nothing to preempt, and the routed path calls
+               the identical C function through the identical js_call_c_function.
+               0 = UNDECLARED, which is the default and stays the default: an undeclared getter reached from C
+               is a read that must be routed and the accessor arm crashes naming it. Only a body whose author
+               DECLARED this is answered directly, and the declaration is FALSIFIED at runtime — see
+               js_no_user_code_enter and the assert at JS_CallInternal's bytecode dispatch, which is the one
+               door the page's code comes through. It is not a list of exempt function pointers and not a
+               predicate at the read: a new getter is undeclared until its own install line says otherwise, and
+               a declared one that later gains a route to the page aborts at the frame that proves it.
+               It is one byte in this struct's existing tail padding — 20 bytes inside a 24-byte union either
+               way, exactly as native_machine above. */
+            uint8_t no_user_code;
             int16_t magic;
         } cfunc;
         /* array part for fast arrays and typed arrays */
@@ -8704,6 +8722,7 @@ JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
     p->u.cfunc.length = length;
     p->u.cfunc.cproto = cproto;
     p->u.cfunc.native_machine = 0;   /* declared afterwards by the few builtins that are machines */
+    p->u.cfunc.no_user_code = 0;     /* UNDECLARED until the installer of this member says otherwise */
     p->u.cfunc.magic = magic;
     p->is_constructor = (cproto == JS_CFUNC_constructor ||
                          cproto == JS_CFUNC_constructor_magic ||
@@ -8731,6 +8750,62 @@ JSValue JS_NewCFunction2(JSContext *ctx, JSCFunction *func,
     return JS_NewCFunction3(ctx, func, name, length, cproto, magic,
                             ctx->function_proto, 0);
 }
+
+/* THE DECLARATION, made where the member is installed — see u.cfunc.no_user_code for what it claims and why the
+   claim is worth anything. It is a separate call rather than a parameter on the mint for the reason
+   js_declare_native_machine is: the mint is the shape every C function shares, and a property only a handful of
+   them have is stated by the handful, so a member that says nothing is undeclared by construction rather than
+   by passing a default nobody read.
+   IT IS NOT REVERSIBLE AND THERE IS NO UNDECLARE. A capability is declared at the definition; a call site that
+   wanted to take it back would be the predicate-at-the-call-site this exists to make impossible. */
+void JS_DeclareCFunctionNoUserCode(JSValueConst func_obj)
+{
+    JSObject *fp;
+    DCHECK(JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT,
+           "a no-user-code declaration on something that is not an object");
+    fp = JS_VALUE_GET_OBJ(func_obj);
+    DCHECK(fp->class_id == JS_CLASS_C_FUNCTION,
+           "a no-user-code declaration on a callee that is not a C function — the claim is about a C BODY, and "
+           "a bytecode, bound or proxied callee IS the page's code by construction");
+    DCHECK(fp->u.cfunc.cproto == JS_CFUNC_getter || fp->u.cfunc.cproto == JS_CFUNC_getter_magic,
+           "a no-user-code declaration on a C function that is not an attribute GETTER — the only seam that "
+           "reads it is the accessor arm of a property read, so declaring it anywhere else is a claim nothing "
+           "asks and a reader would take for one that had been checked");
+    fp->u.cfunc.no_user_code = 1;
+}
+/* Does THIS callee carry the declaration? A plain struct read, and deliberately not a question about anything
+   else: a bytecode getter, a bound one, a proxied one and an undeclared C one all answer false and all route. */
+static inline bool js_cfunc_no_user_code(JSObject *fp)
+{
+    return fp->class_id == JS_CLASS_C_FUNCTION && fp->u.cfunc.no_user_code;
+}
+
+/* THE FALSIFIER'S STATE. A declaration is its author's word about a C body, which is exactly the shape of claim
+   that is true when written and quietly stops being true — a helper three calls down gains a [[Get]] on an
+   object whose prototype a page can extend, and nothing says so. So the word is CHECKED while it is being
+   relied on: the depth is raised for the length of a declared body and the assert at JS_CallInternal's bytecode
+   dispatch — the one door the page's code comes through — fires if any of the page runs under it.
+   IT IS RAISED AT js_call_c_function AND NOWHERE ELSE, which is what makes the check as wide as the claim. The
+   claim is about the BODY, so it is true or false however the body was reached: the accessor arm's direct call,
+   the read opcode's routed call, `Reflect.get`, and `Object.getOwnPropertyDescriptor(o,'x').get.call(y)` are
+   four ways to the same body and would have been four places to remember. Every one of them converges on the
+   C-function invocation, so the question is asked once, there — the same reason the step question is asked at
+   do_generic_callee rather than at each call opcode.
+   THE ADDRESS IS THE BACKTRACE. An assert every declared member in the engine can reach must carry its own
+   address, and js_call_c_function has already pushed this getter's JSStackFrame with `cur_func` set by the time
+   the body runs — so the frame walk names the member, and it renders without running a byte of the page. */
+#if APICLIENT_DEV
+static _Thread_local int g_no_user_code_depth = 0;
+static inline void js_no_user_code_enter(void) { g_no_user_code_depth++; }
+static inline void js_no_user_code_leave(void)
+{
+    DCHECK(g_no_user_code_depth > 0, "a no-user-code activation was left more times than it was entered");
+    g_no_user_code_depth--;
+}
+#else
+static inline void js_no_user_code_enter(void) { }
+static inline void js_no_user_code_leave(void) { }
+#endif
 
 typedef struct JSCFunctionDataRecord {
     JSCFunctionData *func;
@@ -12525,6 +12600,36 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
                     if (unlikely(!pr->u.getset.getter)) {
                         return JS_UNDEFINED;
+                    } else if (js_cfunc_no_user_code(pr->u.getset.getter)) {
+                        /* A GETTER THAT DECLARED IT RUNS NONE OF THE PAGE'S CODE, answered where it is asked.
+                           THIS IS NOT THE DELETED FALLBACK COMING BACK, and the test that separates them is
+                           mechanical: delete the arm below and this one is still needed, because the read must
+                           produce a value and nothing else will produce it. It is one of two algorithms the
+                           callee kind distinguishes, not a softer path chosen when the hard one is awkward.
+                           WHAT THE ARM BELOW IS ABOUT DOES NOT EXIST HERE. Routing exists so that a body which
+                           runs the page gets a flow base to park on; a body that runs none has no continuation
+                           to hold, no back-edge to preempt and no page frame to suspend — and the routed path
+                           would reach THIS SAME C function through THIS SAME js_call_c_function, so routing it
+                           is not a stronger answer, it is the identical call with a tramp frame around it. An
+                           abort here fires where nothing is wrong, and a crash that fires where nothing is
+                           wrong is how the next reader learns to distrust the ones that matter.
+                           THE CLASS CALL HOOK, NOT JS_CallInternal. The interpreter is not entered for a C
+                           callee and saying so is worth a line: JS_CallInternal's own non-bytecode arm does
+                           exactly this dispatch, and going through it would put JS_GetPropertyInternal back
+                           into the interpreter cycle that deleting the old JS_CallFree removed. The hook still
+                           owns everything that makes the call correct — §3.7 answers a per-realm fact from the
+                           callee's OWN realm, which js_call_c_function does with `ctx = p->u.cfunc.realm`, and
+                           it pushes the JSStackFrame a backtrace needs.
+                           THE RECEIVER IS `this_obj`, which is step 7's `receiver` and not `obj`: the getter is
+                           normally found on a PROTOTYPE and the value belongs to the instance the read was made
+                           on. NOTHING IS RAISED HERE: the declaration is checked inside js_call_c_function, for
+                           the length of the body and for every way of reaching it, so this arm has one job. */
+                        JSObject *g = pr->u.getset.getter;
+                        DCHECK(ctx->rt->class_array[g->class_id].call == js_call_c_function,
+                               "a declared no-user-code getter is not dispatched by js_call_c_function — the "
+                               "declaration asserts a C-FUNCTION callee, so a different call hook here means "
+                               "the class table and JS_DeclareCFunctionNoUserCode disagree about what it is");
+                        return js_call_c_function(ctx, JS_MKPTR(JS_TAG_OBJECT, g), this_obj, 0, NULL, 0);
                     } else {
                         /* THE GETTER RUNS PAGE CODE, and running it from here would run it in a C activation
                            with no flow base — a loop in the body drives to completion instead of parking. The
@@ -24744,6 +24849,23 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
            || cproto == JS_CFUNC_consume || cproto == JS_CFUNC_iterdrive,
            "a C function whose cproto names a body carries none — its registration declared a machine and left "
            "the row pointing at a body arm, or a new bodyless cproto was added without joining this list");
+    /* AND IF THIS BODY DECLARED THAT IT RUNS NONE OF THE PAGE'S CODE, THAT IS HELD OVER IT WHILE IT RUNS — see
+       js_no_user_code_enter. It is raised HERE, at the one point every call shape converges on, rather than at
+       the accessor arm that relies on the declaration: the claim is about the BODY, so a routed read, a direct
+       C read, `Reflect.get` and a `.get.call(x)` off a descriptor must all be held to it, and four raise sites
+       would be four chances for one to be missed.
+       THE PAIR CANNOT BE SPLIT, and that is ASSERTED rather than read off the switch below: two of its arms
+       (iterdrive, consume) RETURN instead of breaking, so an arm reached with this raised would leave it raised
+       for the life of the thread and every later bytecode entry would abort naming an innocent member. They are
+       unreachable here because JS_DeclareCFunctionNoUserCode refuses any cproto but an attribute getter's — and
+       this is where that refusal is RELIED ON, so this is where it is restated. */
+    if (unlikely(p->u.cfunc.no_user_code)) {
+        DCHECK(cproto == JS_CFUNC_getter || cproto == JS_CFUNC_getter_magic,
+               "a no-user-code declaration is riding a cproto that is not an attribute getter's — the arms "
+               "below that RETURN rather than break would strand the raise, so the declaration's own cproto "
+               "check and this one have drifted apart");
+        js_no_user_code_enter();
+    }
     switch(cproto) {
     case JS_CFUNC_constructor:
     case JS_CFUNC_constructor_or_func:
@@ -24890,6 +25012,8 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     default:
         abort();
     }
+    if (unlikely(p->u.cfunc.no_user_code))
+        js_no_user_code_leave();
 
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
@@ -31923,6 +32047,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
            "the page's own code was entered while a flow is PARKED — resume it first (while "
            "(JS_ResumeParkedFlow(rt));). A forced preempt is transparent only if nothing observable runs "
            "between the park and its resume, and a bytecode body is the observable thing");
+
+    /* AND THE no_user_code DECLARATION IS FALSIFIED HERE, AT THE SAME DOOR AND FOR THE SAME REASON. A C getter
+       that DECLARED it runs none of the page's code is CALLED by JS_GetPropertyInternal's accessor arm instead
+       of being routed, and that declaration is its author's word — the kind of claim that is true when written
+       and stops being true when a helper three calls down gains a [[Get]] on a page-reachable object, a
+       coercion of a value the page can make an object, or a callback. There is nothing an installer can check,
+       so the word is checked where breaking it SHOWS: bytecode is the one door the page's code comes through
+       (the DCHECK above says so in its own words), so a declared body that reaches this line has a wrong
+       declaration and the frame it is standing on is the proof.
+       IT IS NOT CONDITIONAL ON A FLOW EXISTING, unlike the C-recursion assert below. That one is about a body
+       that cannot suspend, which is only a defect while there is a scheduler to suspend into; this one is about
+       a STATEMENT BEING FALSE, which is equally false during baseline setup — and the whole worth of a
+       declaration is that it cannot quietly stop being true in the one window nobody is watching.
+       THE ADDRESS IS THE FRAME LIST. Every declared member in the engine reaches this one line, so a message
+       naming only the remedy would name an action with no object — the mistake this file has made four times.
+       js_call_c_function pushed the declared getter's JSStackFrame with `cur_func` set before it ran the body,
+       so the walk NAMES that getter, and js_why_backtrace renders it without running a byte of the page. */
+#if APICLIENT_DEV
+    if (unlikely(g_no_user_code_depth != 0)) {
+        char frames[2048], why[3072];
+        js_why_backtrace(caller_ctx, frames, sizeof frames);
+        snprintf(why, sizeof why,
+                 "a C getter that DECLARED it runs none of the page's code has just entered a BYTECODE BODY, so "
+                 "the declaration made at that member's install site is WRONG. Reads of that member are "
+                 "answered from C on the strength of it; every undeclared accessor is routed onto the tramp so "
+                 "a loop in the page's body can park, and this one has now run the page with no flow base under "
+                 "it. Either REMOVE the JS_DeclareCFunctionNoUserCode at that install site, which puts the read "
+                 "back on the routed path, or find what the body reaches — a [[Get]] on an object whose "
+                 "prototype the page can extend, a coercion of a value the page can make an object, a callback "
+                 "— and stop it reaching the page rather than declaring that it does not. The DECLARED GETTER "
+                 "is the C frame below the page's: %s",
+                 frames);
+        DFAIL(why);
+    }
+#endif
 
     if (unlikely(g_flow_base_gen != NULL)) {
         /* A BYTECODE BODY ENTERED BY C RECURSION while a flow exists. It cannot suspend — the scheduler has no
