@@ -10598,31 +10598,55 @@ static JSValue js_callsite_data_render(JSContext *ctx, const JSCallSiteData *csd
 }
 
 /* The same text, from the CallSite OBJECTS a pending trace holds. The accessor renders from these because by
-   then the records belong to the objects; the rendering is the one above, not a second copy. */
+   then the records belong to the objects; the rendering is the one above, not a second copy.
+
+   THE ELEMENTS ARE READ OUT OF THE ENGINE'S OWN ELEMENT STORAGE, NEVER THROUGH [[Get]], AND THE ARRAY IS PAGE
+   DATA RATHER THAN THE ENGINE'S OWN RECORD — the second half is what makes the first half necessary, and it
+   was not true when this was written. build_backtrace parks [prepare, callsites] and the ACCESSOR hands the
+   callsites array to `Error.prepareStackTrace(error, structuredStackTrace)`, so the page holds it; and a hook
+   that THROWS leaves the pair pending (the memoising write is on the normal-return arm), so the very same
+   array comes back here on the next read and on every host diagnostic taken of that error afterwards. Two
+   measured shapes, both of which aborted the engine on ordinary page data:
+     - `Object.defineProperty(frames, 0, {get(){}})` made the element read an accessor, and
+       `JS_GetPropertyUint32` reached JS_GetPropertyInternal's getter DFAIL — a host diagnostic running the
+       page's code, which is the one thing a diagnostic must not do;
+     - `frames[0] = 1` left the array dense with a non-CallSite in it, and the DCHECK that stood here fired.
+       That assert claimed "only build_backtrace fills that array"; the page fills it too, so it was asserting
+       an invariant page data can break, which is not a should-never-happen at all. It is deleted, not
+       softened: a slot that is not a CallSite is SKIPPED, because what a diagnostic owes is the frames it can
+       still read and never an abort decided by the document it is describing.
+   Reading `u.array` directly closes both at once — the dense storage is the engine's own, a shape read reaches
+   no accessor and no Proxy trap, and an array the page has converted away from that representation simply has
+   no frames this function can read (`n` stays 0 and the render is the empty string, which is what a trace of
+   no frames renders to anyway — one path, no special case). V8 formats its default stack from its internal
+   frame array for the same reason, so a page mutating the structured array does not change it there either. */
 static JSValue js_callsite_array_render(JSContext *ctx, JSValueConst arr)
 {
     DynBuf dbuf;
     JSValue r;
-    uint32_t k, n;
+    JSObject *p = NULL;
+    uint32_t k, n = 0;
 
-    if (js_get_length32(ctx, &n, arr))
-        return JS_EXCEPTION;
+    if (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(arr);
+        if (p->class_id == JS_CLASS_ARRAY && p->fast_array)
+            n = p->u.array.count;
+    }
     js_dbuf_init(ctx, &dbuf);
     for (k = 0; k < n; k++) {
-        JSValue v = JS_GetPropertyUint32(ctx, arr, k);
-        JSCallSiteData *csd;
-        if (JS_IsException(v)) { dbuf_free(&dbuf); return JS_EXCEPTION; }
-        csd = JS_GetOpaque(v, JS_CLASS_CALL_SITE);
-        DCHECK(csd != NULL, "a pending stack trace held something that is not a CallSite — only "
-               "build_backtrace fills that array, and it fills it with CallSites");
+        const JSCallSiteData *csd = JS_GetOpaque(p->u.array.u.values[k], JS_CLASS_CALL_SITE);
         if (csd)
             js_callsite_data_line(ctx, &dbuf, csd);
-        JS_FreeValue(ctx, v);
     }
     r = dbuf_error(&dbuf) ? JS_NULL : JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
     dbuf_free(&dbuf);
     return r;
 }
+
+/* Declared rather than moved: it is the trampoline's own question and it belongs beside the walkers it is
+   built out of. In release DCHECK type-checks its condition without evaluating it, so the declaration is
+   needed in both builds. */
+static bool js_read_is_page_code(JSContext *ctx, JSValueConst v, JSAtom atom);
 
 /* The recorded stack of an Error, WITHOUT running any of the page's code — for a host printing a diagnostic.
    Reading the `stack` PROPERTY invokes the accessor, and that accessor may have to call Error.prepareStackTrace,
@@ -10630,16 +10654,63 @@ static JSValue js_callsite_array_render(JSContext *ctx, JSValueConst arr)
    bypassed. When the trace is still the pending [prepare, callsites] pair the answer is the DEFAULT rendering —
    the same one the accessor gives a read that happens inside the hook. It used to be UNDEFINED, on the grounds
    that the engine had no rendering of its own and inventing one would be a second formatter; there is one
-   formatter now, so the diagnostic gets the real frames without running a line of the page's code. */
+   formatter now, so the diagnostic gets the real frames without running a line of the page's code.
+
+   AND THE NON-ERROR ARM IS THE OTHER HALF OF THAT SENTENCE, WHICH IT USED TO CONTRADICT. It was
+   `JS_GetPropertyStr(ctx, error, "stack")` — a full [[Get]], which walks the prototype chain, invokes an
+   accessor and calls a Proxy trap, i.e. exactly the page code the paragraph above forbids. The value it reads
+   is under the page's control in the first place (`throw {stack: "at forged (evil.js:1:1)"}` is already a
+   forged frame in a host report, which is a fidelity fact rather than a bug), but the ROUTE mattered more than
+   the value: reaching page code from this C activation is what the whole error-reporting path is written to
+   avoid, and the engine's own asserts stood in the way rather than the design doing so. Measured, on ordinary
+   page data, each one killing the instance from INSIDE §8.1.4.6's "report an exception":
+     `throw Object.defineProperty({}, 'stack', {get(){}})`  -> JS_GetPropertyInternal's getter DFAIL;
+     `throw new Proxy({}, {get(){}})`                       -> js_proxy_get's DFAIL.
+   In release neither aborts and neither runs the getter either — the first throws a TypeError and the second
+   an InternalError — so what the page gets there is a PENDING EXCEPTION raised inside error reporting, which
+   the callers cannot see (they test `JS_IsString`) and the next operation inherits. A page deciding whether
+   the host lives, or leaving a live exception in the host's diagnostic, are the same defect twice.
+   SO THE READ IS A DIFFERENT ALGORITHM AND NOT A GUARDED [[Get]]: the OWN slot, taken off the shape, which is
+   the same discipline js_callsite_method_name and can_add_backtrace already follow and reaches no user code by
+   construction. That is the whole of what this arm was ever for — build_backtrace's can_add_backtrace arm
+   gives a DOMException an own `stack` DATA property through js_error_add_own, and nothing else here has one.
+   An own ACCESSOR is not that property: the slot is writable and configurable, so a page may legitimately
+   redefine it, and the answer is then "this host has no recorded stack for that value" (JS_UNDEFINED, which is
+   what this function already answers for every value with nothing to read) rather than an abort — the getter
+   would fire on page data, which is not a should-never-happen. Error Stacks (TC39 proposal) agrees about where
+   a stack lives and is worth the citation because it removes the last reason to reach for a property at all:
+   §2 "GetStack ( error )" and §3 "GetStackString ( error )" both open "Assert: error has an [[ErrorData]]
+   internal slot", and §1.2 "System.getStackString ( error )" throws a TypeError for a value without one. No
+   step anywhere in it reads a `"stack"` property off anything. */
 JSValue JS_GetErrorStackString(JSContext *ctx, JSValueConst error)
 {
     JSObject *p;
     if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
         return JS_UNDEFINED;
     p = JS_VALUE_GET_OBJ(error);
-    if (p->class_id != JS_CLASS_ERROR)
-        return JS_GetPropertyStr(ctx, error, "stack");   /* a DOMException & co. keep an own DATA property */
+    if (p->class_id != JS_CLASS_ERROR) {
+        JSProperty *pr;
+        JSShapeProperty *prs = find_own_property(&pr, p, JS_ATOM_stack);
+        if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            return JS_UNDEFINED;
+        /* THE DIAGNOSTIC BOUNDARY, ASSERTED AGAINST THE ENGINE'S OWN ORACLE FOR THE SAME QUESTION. The shape
+           read above and js_read_is_page_code's walk must agree that this value's `stack` reaches no user
+           code, and they can only disagree if one of them is wrong about the object: both stop at the first
+           own slot and both refuse a Proxy, so an own NORMAL slot on a non-Proxy is a no-page-code read in
+           both. It cannot fire on page data — a page that redefines `stack` as an accessor has already been
+           answered above — so what it catches is the engine growing a class whose `stack` an exotic hook
+           answers, which is precisely the shape in which a slot read starts being the wrong algorithm. */
+        DCHECK(!js_read_is_page_code(ctx, error, JS_ATOM_stack),
+               "the host diagnostic found an own data `stack` and the property machinery still calls that read "
+               "page code — the shape read and the read walk disagree about one object, so the slot read is no "
+               "longer the same operation the interpreter would perform");
+        return js_dup(pr->u.value);
+    }
     if (js_error_stack_is_pending(p->u.object_data)) {
+        /* THE PAIR IS NOT THE ARRAY, and only the array is page data. `u.object_data` has no JS exposure — the
+           accessor takes the pair's two elements and hands out the SECOND, never the pair — so this read is on
+           an object build_backtrace made and nothing else can reach, which is why it stays an ordinary one
+           while the element read below is not. */
         JSValue sites = JS_GetPropertyUint32(ctx, p->u.object_data, 1), r;
         if (JS_IsException(sites))
             return JS_UNDEFINED;
