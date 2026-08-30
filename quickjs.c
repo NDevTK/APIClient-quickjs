@@ -1090,8 +1090,8 @@ typedef struct JSFunctionBytecode {
        specified URL"). Like from_eval it is a property of the SCRIPT and rides down the whole nest, and for the
        same reason it is a bit on the BYTECODE rather than a flag somebody sets around an evaluation: an inline
        script's function can be called back from the bundle an hour of scheduler time later, across parks,
-       awaits and flow switches, and the answer must still be the one its SOURCE decides. Its one reader is the
-       object allocator (JSObject.doc_built).
+       awaits and flow switches, and the answer must still be the one its SOURCE decides. Its one reader is
+       js_document_record_grant, which is where JSObject.doc_built is handed out.
        See JS_EVAL_FLAG_INLINE_SCRIPT for what the two halves are and why they differ. */
     uint8_t from_inline_script : 1;
     /* XXX: 1 bit available */
@@ -1526,12 +1526,17 @@ struct JSObject {
     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
-    /* APIClient forced-exec: THIS RECORD WAS BUILT BY THE DOCUMENT'S OWN INLINE SCRIPT — the half of the page
-       the server re-renders for every request — so its EXTENT was chosen against THIS VISITOR'S credentials
-       rather than by the program. Set at the allocation, from the code that is running (see
-       js_running_code_is_inline_script), for ordinary records only. */
+    /* APIClient forced-exec: THE DOCUMENT'S OWN BYTES WROTE THIS RECORD'S EXTENT — the half of the page the
+       server re-renders for every request decided which members exist — so the extent was chosen against THIS
+       VISITOR'S CREDENTIALS rather than by the program, and a member it does not hold is unknown rather than
+       `undefined`.
+       IT IS GRANTED, NEVER INFERRED, and js_document_record_grant is the one place that grants it. Read that
+       function for why the fact is the EXTENT'S AUTHOR and not the allocation: this bit used to be set by the
+       object ALLOCATOR for any ordinary object born while an inline script was somewhere on the stack, which
+       is a proxy that answers the same for `window.gon={}` and for `new Event("go")` — and a platform object
+       on this channel answers a member Web IDL DEFINES with an unknown, silently. */
     uint8_t doc_built : 1;
-    /* …AND IT IS REACHABLE FROM THE GLOBAL through document-built records, so the server PUBLISHED it: it is
+    /* …AND IT IS REACHABLE FROM THE GLOBAL through such records, so the server PUBLISHED it: it is
        on the one channel a server has into a bundle it ships to everybody unchanged, and a member it does not
        hold is unknown rather than `undefined`. Set by js_publish_document_namespace, which is also what tells
        the host the PATH the record is read by. Both bits only ever go 0 -> 1: they are PROVENANCE, so they are
@@ -3176,11 +3181,6 @@ void JS_SetJobRemoveHook(JSJobRemoveHook h) { g_job_remove_hook = h; }
    thousand lines below assert against unknown external input reaching them and a declaration that sits after
    its first assertion is a rule nobody can state. */
 static _Thread_local JSConcolicHooks g_concolic;
-
-/* WHICH HALF OF THE DOCUMENT IS RUNNING — declared here because the OBJECT ALLOCATOR asks it, a thousand lines
-   above the property walk that also does. Defined beside js_publish_document_namespace, which is the mechanism
-   it belongs to. */
-static bool js_running_code_is_inline_script(JSRuntime *rt);
 
 /* A C CALL CYCLE'S DEPTH, ASSERTED WHERE IT IS RELIED ON.
  *
@@ -8260,21 +8260,14 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->tmp_mark = 0;
     p->is_HTMLDDA = 0;
     p->is_prototype = 0;
-    /* WHICH HALF OF THE PAGE BUILT THIS RECORD, asked at the allocation because that is the only moment the
-       answer is available: `window.gon={}` and `var gon={}` and `Object.assign(window,{gon:{}})` are one fact
-       about the RECORD and three different operations, and a question asked at the operations is a question
-       the fourth spelling is added without. Ordinary records only — an Array states its own extent as
-       `length`, and a Function or a Date is not a record of fields at all — and only for a host that has
-       declared the channel, so every conformance runner pays one null compare.
-       THE FRAME WALK TERMINATES AT THE FIRST FRAME for a literal, because an object literal is built by an
-       opcode of the function that wrote it; it walks only when a C builtin is allocating on page code's
-       behalf, which is exactly when the page code beneath is the answer (an inline script's `JSON.parse`).
-       PUBLICATION IS CLEARED AT BIRTH TOO, and the namespace registry depends on it: the host keys a published
-       record by its ADDRESS with no reference held, which is sound only because a fresh object at a recycled
-       address cannot claim to be published until something publishes it — and publishing is what files the
-       row. */
-    p->doc_built = (class_id == JS_CLASS_OBJECT && unlikely(g_concolic.publish != NULL) &&
-                    js_running_code_is_inline_script(ctx->rt));
+    /* THE ALLOCATION DECIDES NOTHING ABOUT THE INJECTION CHANNEL, AND BOTH BITS ARE CLEARED AT BIRTH FOR THE
+       SAME REASON. The host keys a published record by its ADDRESS with no reference held, which is sound only
+       because a fresh object at a recycled address cannot claim to be published — or to be a document record —
+       until something says so, and the two things that say so are js_document_record_grant and the walk it
+       feeds. This line used to ask which half of the page was on the STACK, which is a question about the
+       allocation rather than about the record: read js_document_record_grant for why the extent's AUTHOR is
+       the fact and the allocator could not see it. */
+    p->doc_built = 0;
     p->doc_namespace = 0;
     p->flow_gen = g_flow_gen;   /* forced-exec: 0 during setup (baseline), else the current fork generation */
     p->first_weak_ref = NULL;
@@ -11863,7 +11856,12 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
  * about to call, not an activation of it) and so is any frame with no bytecode — a C builtin ALLOCATING on the
  * page's behalf is doing it FOR the page code beneath it, which is the frame that answers, and that is what
  * makes an inline script's `JSON.parse` a document-built record. No JS frame at all means the work is the
- * host's own C, which is neither half. */
+ * host's own C, which is neither half.
+ *
+ * IT ANSWERS WHICH HALF IS RUNNING AND NOTHING ELSE, which is the whole of what it is FOR and the whole of what
+ * it may be asked. Its one caller is js_document_record_grant, at a site that already knows a record's extent
+ * is being written; asking it at an ALLOCATION instead — where nothing knows what is being built — is the
+ * proxy that put every platform object on the injection channel. */
 static bool js_running_code_is_inline_script(JSRuntime *rt)
 {
     JSStackFrame *sf;
@@ -11879,10 +11877,102 @@ static bool js_running_code_is_inline_script(JSRuntime *rt)
     return false;
 }
 
-/* THE DOCUMENT'S PUBLISHED NAMESPACE — every record its inline scripts BUILT that is REACHABLE FROM THE GLOBAL
- * OBJECT through such records, named by the path it is reachable at. That is the one channel a server has for
- * injecting per-visitor state into a bundle it ships to everybody unchanged, and both halves of the sentence
- * are load-bearing.
+/* THE ONE GRANT OF INJECTION-CHANNEL MEMBERSHIP — the RULE that decides whether a record is on it, stated
+ * positively and asked at the moment the fact exists.
+ *
+ * THE RULE: a record is on the server's injection channel iff THE DOCUMENT'S OWN BYTES WROTE ITS EXTENT. That
+ * is the fact the whole channel rests on — `window.gon={}` followed by the two of the twenty-three fields THIS
+ * visitor is entitled to is a member list the SERVER chose against THIS VISITOR'S CREDENTIALS, so a field the
+ * bundle reads and the record does not hold is unknown rather than `undefined`. Everything else in this
+ * mechanism (the reachability walk, the key rule, the two read arms) narrows that set; nothing widens it.
+ *
+ * WHY MEMBERSHIP IS GRANTED BY THE OPERATION AND NOT INFERRED FROM THE ALLOCATION. It used to be inferred, by
+ * the object allocator, from `class_id == JS_CLASS_OBJECT` plus "an inline script is somewhere on the stack" —
+ * and that is a PROXY for the rule rather than the rule. It answers the same for `window.gon={}` and for
+ * `var e = new Event("go")`, because a platform constructor allocating an ordinary object on an inline
+ * script's behalf looks exactly like an object literal from the stack: this engine's platform objects ARE
+ * ordinary objects (Web IDL §2.12 "Objects implementing interfaces" lets an implementation choose, and an
+ * ordinary object with a Symbol-keyed slot record is what the components chose), and a step-machine
+ * constructor pushes no C frame at all, so neither the class nor the frame chain can tell the two apart.
+ *
+ * AND A PLATFORM OBJECT ON THIS CHANNEL IS SILENTLY WRONG, WHICH IS WHY THE DIRECTION MATTERS. Its extent is
+ * not the document's to choose: Web IDL §3.8 "Platform objects implementing interfaces" — "A JavaScript value
+ * value is a platform object if value is an Object and if value has a [[PrimaryInterface]] internal slot" —
+ * makes the member list the INTERFACE'S, so a missing member has the answer §10.1.8.1 OrdinaryGet ( O, P,
+ * Receiver ) step 2.b gives it and minting an unknown there is the engine failing to know its own state. Worse
+ * for this project specifically: a member of an interface this engine HAS NOT BUILT YET must be honestly
+ * absent, because that absence is the forcing function that names the component to write — an unknown in its
+ * place lets a flow run past a missing capability and report a surface it never reached, which is the same
+ * loss this whole file exists to prevent, arriving through the other end of the channel.
+ *
+ * SO THE GRANT IS A POSITIVE ACT BY THE OPERATION THAT WROTE THE EXTENT, and there are exactly two of them:
+ * the OBJECT-LITERAL opcode running inline-script bytecode, and `JSON.parse` of text an inline script handed
+ * it (a server dump rendered into the page as `window.__STATE__=JSON.parse("…")` is the same fact as the same
+ * dump written as a literal). Both are the document's bytes deciding a member list. Nothing else grants, so
+ * every platform object, every Web IDL dictionary and every record a C builtin composes is off the channel BY
+ * CONSTRUCTION — including the one the next platform component adds, which is the point: an exclusion rule
+ * would have had to be REMEMBERED there, and the failure of forgetting it is silent.
+ *
+ * WHAT THAT NARROWING COSTS, NAMED RATHER THAN DISCOVERED. A record an inline script builds some OTHER way —
+ * `Object.create(null)`, `new Config()`, `Object.fromEntries(…)` — is no longer on the channel, so a read that
+ * misses on it answers `undefined` and a gate over it does not fork. That is a LOST FORK, which the WFQ makes
+ * recoverable and an absent @H example makes visible; the other direction is a member answered with an unknown
+ * on an object that has a real answer, which throws nothing and is read as state. Both defects that ended a
+ * document this session were the second direction, so where this rule is uncertain it refuses.
+ *
+ * `v` is borrowed. Ordinary-object-ness is ASSERTED and not filtered: both grant sites build the record
+ * themselves, so a non-ordinary object here is a third site that has not read this comment. */
+static void js_document_record_grant(JSContext *ctx, JSValueConst v)
+{
+    JSObject *p;
+
+    /* No host has declared the channel: every conformance runner pays one bit test at the two grant sites and
+       nothing else — the frame walk this used to do per ALLOCATION is gone. */
+    if (likely(g_concolic.publish == NULL))
+        return;
+    if (!js_running_code_is_inline_script(ctx->rt))
+        return;
+    DCHECK(JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT,
+           "the injection channel was offered membership for something that is not an object — a grant names "
+           "the RECORD whose extent was just written, and a primitive has no extent to have been chosen");
+    p = JS_VALUE_GET_OBJ(v);
+    DCHECK(p->class_id == JS_CLASS_OBJECT,
+           "a grant named a record that is not an ordinary object. An Array states its own extent as `length` "
+           "and a Function or a Date is not a record of fields at all, and a PLATFORM object's extent is Web "
+           "IDL §3.8's rather than the document's — so a third grant site has been added for something whose "
+           "member list the document's bytes did not write");
+    DCHECK(!p->doc_namespace,
+           "a record was granted channel membership AFTER the walk had already published it — the two bits "
+           "only ever go 0 -> 1 and the publication composes the path this record's members are reported "
+           "under, so a grant arriving second means the walk published something it had not yet been told was "
+           "a document record");
+    p->doc_built = true;
+}
+
+/* IS THIS RECORD ON THE SERVER'S INJECTION CHANNEL — the ONE membership question, asked by the WALK that
+   publishes and by BOTH arms that read, and by the interpreter fast paths that decide whether a hit may be
+   answered inline. That is the same treatment the KEY rule got one question along, and for the same reason:
+   the key rule arrived on one arm and the arm without it answered every well-known symbol with a callable
+   unknown, so a rule that decides an answer belongs in one function under every site that needs the answer,
+   not in a condition each site spells for itself.
+   The assert is the half that makes it a contract rather than an accessor: membership is handed out by
+   js_document_record_grant alone, so every consumer is entitled to the grant's own precondition and a bit
+   that arrived some other way says so HERE, at a reader, rather than turning up as a member of a namespace
+   that answers a Web IDL member with an unknown. */
+static bool js_object_is_document_record(JSObject *p)
+{
+    DCHECK(!p->doc_built || p->class_id == JS_CLASS_OBJECT,
+           "a record on the injection channel is not an ordinary object — js_document_record_grant is the "
+           "only thing that grants membership and it asserts ordinary-object-ness at the grant, so this bit "
+           "was set by something that is not the grant");
+    return p->doc_built;
+}
+
+/* THE DOCUMENT'S PUBLISHED NAMESPACE — every record whose EXTENT THE DOCUMENT'S OWN BYTES WROTE
+ * (js_document_record_grant is what decides that, and it is the only thing that does) that is REACHABLE FROM
+ * THE GLOBAL OBJECT through such records, named by the path it is reachable at. That is the one channel a
+ * server has for injecting per-visitor state into a bundle it ships to everybody unchanged, and every half of
+ * the sentence is load-bearing.
  *
  * WHY THIS IS NOT "EVERY MISSING PROPERTY". §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 2.b's
  * `undefined` is the right answer almost everywhere, because almost everywhere the PROGRAM decided the extent:
@@ -11898,8 +11988,8 @@ static bool js_running_code_is_inline_script(JSRuntime *rt)
  * a walk from the global object, and a record that was never attached to it is never published however it was
  * built.
  *
- * WHY IT DESCENDS ONLY THROUGH DOCUMENT-BUILT RECORDS. A server dump is a tree written as one literal
- * (`window.__STATE__={"user":{"id":1}}`), so a one-level rule would leave every nested record answering
+ * WHY IT DESCENDS ONLY THROUGH RECORDS THE DOCUMENT'S BYTES WROTE. A server dump is a tree written as one
+ * literal (`window.__STATE__={"user":{"id":1}}`), so a one-level rule would leave every nested record answering
  * `undefined` for fields a logged-in visitor's tree carried. But the global reaches the whole heap, so the
  * descent has to stop somewhere, and the honest stop is the document's own tree: a bundle record that happens
  * to contain a document record is reached by a path the BUNDLE composed, not by a name the server published.
@@ -11944,10 +12034,13 @@ static void js_publish_document_namespace(JSContext *ctx)
                through a key no server can write becomes a namespace, after which BOTH arms apply the key
                rule perfectly correctly to that record's own string-keyed fields and every one of them
                answers with an unknown. Nothing then looks like a channel bug.
-               Web IDL §3.7.3 Internal slots are exactly that shape in this engine — a record of named
-               fields hung off a PRIVATE SYMBOL (engine/host/browser/core/idl_slots.h) — so a walk that
-               descends through a symbol turns every platform object an inline script leaves on the global
-               into a namespace.
+               An INTERNAL SLOT — ECMAScript §6.1.7.2 Object Internal Methods and Internal Slots, which Web
+               IDL §3.8 "Platform objects implementing interfaces" makes a platform object's brand — is
+               exactly that shape in this engine: a record of named fields hung off a PRIVATE SYMBOL
+               (engine/host/browser/core/idl_slots.h). So a walk that descends through a symbol turns every
+               platform object an inline script leaves on the global into a namespace. (The number this
+               paragraph used to carry, §3.7.3, is "Interface prototype object" and says nothing about
+               slots — a citation nobody could look up read as one nobody needed to.)
                Measured: `var e = new Event("go")` published its slot record, so `e.type` and `e.eventPhase`
                answered with unknowns spelled `{e.eventSlots.type}` (a provenance composed out of a symbol's
                DESCRIPTION, which is neither unique nor a name), `e.defaultPrevented` answered TRUE on an
@@ -11966,15 +12059,10 @@ static void js_publish_document_namespace(JSContext *ctx)
                 continue;
             c = JS_VALUE_GET_OBJ(p->prop[i].u.value);
             /* `window.self`, `window.top` and a page's own `window.app=window` all put the global object
-               inside the graph; it is not document-built, so the test below already excludes it, and this
-               says so where a reader would otherwise have to reason it out. */
-            if (c == global || !c->doc_built || c->doc_namespace)
+               inside the graph; nothing granted it channel membership, so the test below already excludes it,
+               and this says so where a reader would otherwise have to reason it out. */
+            if (c == global || !js_object_is_document_record(c) || c->doc_namespace)
                 continue;
-            DCHECK(c->class_id == JS_CLASS_OBJECT,
-                   "a record marked as built by the document is not an ordinary object — the allocator marks "
-                   "ordinary records only, because an Array states its own extent as `length` and a Function "
-                   "or a Date is not a record of fields at all, so a mark on one of those is the allocator "
-                   "and this walk disagreeing about what a namespace is");
             if (n == cap) {
                 int ncap = cap ? cap * 2 : 8;
                 JSObject **w = js_realloc(ctx, work, sizeof(*w) * (size_t)ncap);
@@ -12047,13 +12135,13 @@ bool JS_AtomIsPublishedName(JSRuntime *rt, JSAtom atom)
    intrinsic the page touches into an unknown. A published record's own slots are the server's, and its
    prototype's are Object.prototype's, so the holder is asked and not the receiver.
    WHAT IS OUT OF REACH, NAMED SO IT IS NOT MISTAKEN FOR A DECISION: a server-written SCALAR global,
-   `window.isAdmin=false`. `doc_built` is set by the OBJECT allocator, so a scalar written straight onto the
-   global carries no mark at all and there is nothing here to ask about — the missing piece is a MARK on that
-   store, not a wider predicate here, and widening this one to reach it would have to catch every builtin on
-   the global to do it. */
+   `window.isAdmin=false`. Channel membership is a fact about a RECORD — js_document_record_grant grants it to
+   the thing whose extent the document's bytes wrote — and a scalar is not a record, so there is nothing here
+   to ask about. The missing piece is a mark on that STORE, not a wider predicate here, and widening this one
+   to reach it would have to catch every builtin on the global to do it. */
 static bool js_present_ask(JSContext *ctx, JSObject *holder, JSAtom prop, JSValueConst held)
 {
-    if (likely(g_concolic.present == NULL) || !holder->doc_built)
+    if (likely(g_concolic.present == NULL) || !js_object_is_document_record(holder))
         return false;
     /* An OBJECT-valued member is not asked, and that is the channel's own shape rather than a carve-out: a
        record hanging off a published record is PUBLISHED IN ITS OWN RIGHT by the same walk, so its members are
@@ -12129,10 +12217,10 @@ static JSValue js_absent_ask(JSContext *ctx, JSValueConst obj, JSAtom prop)
         return JS_UNINITIALIZED;
     base = JS_VALUE_GET_OBJ(obj);
     ask = (base == JS_VALUE_GET_OBJ(ctx->global_obj));
-    if (!ask && base->doc_built) {
-        /* A record the document built: publication is what says whether it is on the CHANNEL or is merely
-           an object an inline script happened to make and keep, and it is asked here rather than at the
-           store for the reason js_publish_document_namespace gives. */
+    if (!ask && js_object_is_document_record(base)) {
+        /* A record whose extent the document's bytes wrote: publication is what says whether it is on the
+           CHANNEL or is merely an object an inline script happened to make and keep, and it is asked here
+           rather than at the store for the reason js_publish_document_namespace gives. */
         if (!base->doc_namespace)
             js_publish_document_namespace(ctx);
         ask = base->doc_namespace;
@@ -31550,7 +31638,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                all: the copy of the question that OP_get_field deleted still lived here by
                                omission, answering `undefined` for a published record's absent `length` while
                                the same read spelled `x["length"]` forked. */
-                            if (unlikely(g_concolic.present != NULL) && unlikely(p->doc_built))
+                            if (unlikely(g_concolic.present != NULL) && unlikely(js_object_is_document_record(p)))
                                 goto get_length_slow_path;
                             val = js_dup(pr->u.value);
                             break;
@@ -31629,6 +31717,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = JS_NewObject(ctx);
             if (unlikely(JS_IsException(sp[-1])))
                 goto exception;
+            /* THE FIRST OF THE TWO GRANTS OF INJECTION-CHANNEL MEMBERSHIP — see js_document_record_grant for
+               the rule and for why it is granted by the operation rather than inferred at the allocation.
+               THIS opcode is the document's own bytes writing a record's extent: `window.gon={}`,
+               `var gon={a:1}`, `{...spread}` and a destructuring rest all reach it, and `b` is the bytecode
+               that is doing it, so the session-variant half of the page is asked about the code that is
+               actually deciding the member list rather than about whatever happened to be on the stack.
+               A record built any OTHER way — a platform constructor, `Object.create(null)`, `new Config()` —
+               is off the channel by construction and no site has to remember to exclude it. */
+            js_document_record_grant(ctx, sp[-1]);
             BREAK;
         CASE(OP_special_object):
             {
@@ -42218,15 +42315,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gobj = JS_VALUE_GET_OBJ(ctx->global_obj);
                 DCHECK(gobj->class_id != JS_CLASS_PROXY,
                        "the global object became a Proxy: the own-property answer above would skip its traps");
-                /* AND IT IS NOT A DOCUMENT-BUILT RECORD, which is what lets this opcode answer a hit at all.
-                   The field reads defer a hit on a `.doc_built` record to the generic walk (see OP_get_field);
-                   this one does not, because the base here is the GLOBAL OBJECT — allocated at realm creation
-                   with no inline script running, and skipped by js_publish_document_namespace besides — so a
-                   bare `parseInt` must not become an unknown. If the mark ever reached the global, every
-                   intrinsic a page names without `window.` would be answered from a slot this opcode read past
-                   the hook, and the two spellings of one read would disagree. `doc_namespace` is set only on a
-                   record that already carries `doc_built`, so this covers both. */
-                DCHECK(!gobj->doc_built,
+                /* AND IT IS NOT ON THE INJECTION CHANNEL, which is what lets this opcode answer a hit at all.
+                   The field reads defer a hit on a channel record to the generic walk (see OP_get_field);
+                   this one does not, because the base here is the GLOBAL OBJECT — nothing wrote its extent
+                   out of the document's bytes, so js_document_record_grant never names it, and the walk skips
+                   it besides — so a bare `parseInt` must not become an unknown. If the mark ever reached the
+                   global, every intrinsic a page names without `window.` would be answered from a slot this
+                   opcode read past the hook, and the two spellings of one read would disagree. `doc_namespace`
+                   is set only on a record that already carries `doc_built`, so this covers both. */
+                DCHECK(!js_object_is_document_record(gobj),
                        "the global object carries the document-built mark: a bare global name is read from "
                        "its own slot here while `window.x` is asked of the concolic hook at the generic walk, "
                        "so one read spelled two ways would answer two different things");
@@ -43573,7 +43670,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                that pre-filtered on the narrow bit would answer every first read of a record
                                concretely and the walk would never run for a program that only ever hits. One
                                bit test on a hit, and only for a host that installed the hook. */
-                            if (unlikely(g_concolic.present != NULL) && unlikely(p->doc_built))
+                            if (unlikely(g_concolic.present != NULL) && unlikely(js_object_is_document_record(p)))
                                 goto get_field_slow_path;
                             val = js_dup(pr->u.value);
                             break;
@@ -43667,7 +43764,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto get_field2_slow_path;
                             /* the hit half, exactly as OP_get_field states it: a document-built record's slot
                                is the server's answer for THIS visitor, so the generic walk decides it. */
-                            if (unlikely(g_concolic.present != NULL) && unlikely(p->doc_built))
+                            if (unlikely(g_concolic.present != NULL) && unlikely(js_object_is_document_record(p)))
                                 goto get_field2_slow_path;
                             val = js_dup(pr->u.value);
                             break;
@@ -97875,6 +97972,16 @@ static int json_parse_step(JSParseState *s, JSONParse *p)
             obj = JS_NewObject(ctx);
             if (JS_IsException(obj))
                 goto fail;
+            /* THE SECOND OF THE TWO GRANTS OF INJECTION-CHANNEL MEMBERSHIP — see js_document_record_grant.
+               A server dump rendered into the page as `window.__STATE__=JSON.parse("…")` decided its member
+               list in the DOCUMENT'S OWN BYTES exactly as the same dump written as an object literal does, so
+               it is the same fact and gets the same grant; the text is what chose the extent, and this is the
+               operation that turns that text into a record. Granted PER CONTAINER as the parse builds it, so
+               the whole tree is covered without a second walk over the result — and without an ambient
+               "a parse is running" flag, which a reviver that parks would carry into another flow.
+               js_document_record_grant asks whether the code that called for this parse is the session-variant
+               half of the page, so a BUNDLE `JSON.parse` of a fetched config is not on this channel. */
+            js_document_record_grant(ctx, obj);
             if (pr_cur)
                 json_parse_record_init_obj(ctx, pr_cur, obj);
             JSON_PUSH_FRAME(obj, 0);
