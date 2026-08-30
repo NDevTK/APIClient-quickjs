@@ -2340,7 +2340,7 @@ JS_EXTERN void JS_SetModuleLoaderFunc2(JSRuntime *rt,
                                        JSModuleCheckSupportedImportAttributes *module_check_attrs,
                                        void *opaque);
 
-/* HostLoadImportedModule (16.2.1.9) is permitted to complete ASYNCHRONOUSLY, and a browser's always does — a
+/* HostLoadImportedModule (16.2.1.10) is permitted to complete ASYNCHRONOUSLY, and a browser's always does — a
    module's source comes off the network. A loader that has the bytes returns the JSModuleDef as before; one
    that must fetch them calls this with a promise that settles with the module's SOURCE TEXT and then returns
    NULL WITHOUT throwing. The load finishes on that promise's reaction: the source is compiled under the

@@ -731,7 +731,7 @@ struct JSContext {
        that can push the promise as the opcode's RESULT — rejects it once the unwind has returned to the frame
        named in `sf`. NULL whenever no import coercion is in flight. */
     struct JSImportCap *pending_import_cap;
-    /* HostLoadImportedModule (16.2.1.9) is ASYNCHRONOUS, and a browser's always is — the module's source comes
+    /* HostLoadImportedModule (16.2.1.10) is ASYNCHRONOUS, and a browser's always is — the module's source comes
        off the network. A loader that cannot answer synchronously calls JS_ModuleLoadPending with a promise that
        settles with the SOURCE TEXT and returns NULL; this is the slot it hands it over in, read by the one
        caller that can wait (JS_LoadModuleInternal) immediately after the loader returns. JS_UNDEFINED whenever
@@ -63491,8 +63491,10 @@ static JSValue js_module_source_fulfilled(JSContext *ctx, JSValueConst this_val,
 
     /* ALREADY LOADED? Two flows exploring the same page park on the same specifier, and both resume with the
        same body — the loader ran once per flow because neither had finished when the other asked. Compiling it
-       twice would put a second record under one name. The module map is the load's memo (16.2.1.9 finishes a
-       load that another already completed by handing back the existing record), so this asks it first. */
+       twice would put a second record under one name. The module map is the load's memo (16.2.1.11
+       FinishLoadingImportedModule finishes a load that another already completed by handing back the existing
+       record — step 1.a asserts the record already in [[LoadedModules]] IS the one being finished), so this
+       asks it first. */
     name_atom = JS_ValueToAtom(ctx, func_data[2]);
     if (name_atom == JS_ATOM_NULL)
         return JS_EXCEPTION;
