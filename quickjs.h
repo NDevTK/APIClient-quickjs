@@ -1907,7 +1907,11 @@ JS_EXTERN void  JS_ObjStateFree(JSRuntime *rt, void *blob);
             caller's to state (JSConcolicAddOp below); the hook never guesses it.
      - cmp: propagation through == / === . A concolic operand yields a concolic BOOL carrying the {src,op,tok}
             constraint, so `if (x === 'admin')` FORKS instead of collapsing to a concrete false. is_neq flips
-            the recorded op.
+            the recorded op. WHICH EQUALITY is the caller's to state (JSConcolicEqOp below) for the SAME reason
+            `add` states its concatenation, and the reason is the same shape: 7.2.13 IsLooselyEqual and 7.2.14
+            IsStrictlyEqual DISAGREE — `"1" == 1` is true and `"1" === 1` is false — so a hook that must run
+            the comparison on the operands' concrete examples cannot do it without being told, and a hook that
+            merely RECORDS the predicate was recording two different predicates under one identity.
      - is:  the domain-carrying PREDICATE, and the reason the other two are ever reached. A concolic value is a
             real JSObject of a host-registered class, so an operator that asks the raw tag sees an ordinary
             object and coerces it: 7.1.1 then reads @@toPrimitive/valueOf off the concolic, whose exotic [[Get]]
@@ -1997,9 +2001,19 @@ typedef enum JSConcolicAddOp {
     JS_CONCOLIC_ADD_CONCAT,   /* 22.1.3.5's string-concatenation: the string arm, unconditionally */
 } JSConcolicAddOp;
 
+/* WHICH EQUALITY THE PROGRAM WROTE — the twin of JSConcolicAddOp, and it exists for the twin reason. One hook
+   serves both `==` (js_eq_slow) and `===` (js_strict_eq_slow) and was told only whether the result is negated,
+   so it could neither run the comparison on concrete examples nor keep the two predicates apart in its own
+   constraint key. The two algorithms genuinely differ at step 1: 7.2.14 IsStrictlyEqual returns false the
+   moment SameType(x, y) is false, and 7.2.13 IsLooselyEqual coerces instead. */
+typedef enum JSConcolicEqOp {
+    JS_CONCOLIC_EQ_LOOSE,     /* 7.2.13 IsLooselyEqual ( x, y ): the `==` and `!=` operators */
+    JS_CONCOLIC_EQ_STRICT,    /* 7.2.14 IsStrictlyEqual ( x, y ): the `===` and `!==` operators */
+} JSConcolicEqOp;
+
 typedef struct JSConcolicHooks {
     int (*add)(JSContext *ctx, JSValue *sp, JSConcolicAddOp op);
-    int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
+    int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq, JSConcolicEqOp op);
     int (*is)(JSValueConst v);
     JSValue (*absent)(JSContext *ctx, JSValueConst obj, JSAtom name);
     /* THE HIT ON A PUBLISHED RECORD — see the paragraph above. `holder` is the record the own data slot was

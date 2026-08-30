@@ -20395,7 +20395,9 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
     int res;
     uint32_t tag1, tag2;
 
-    if (g_concolic.cmp && g_concolic.cmp(ctx, sp, is_neq)) return 0;   /* forced-exec: concolic == -> concolic bool (forks) */
+    /* 7.2.13 IsLooselyEqual ( x, y ) — NAMED, because the hook has to run this comparison on the operands'
+       concrete examples and 7.2.14 answers differently for the same pair (`"1" == 1` versus `"1" === 1`). */
+    if (g_concolic.cmp && g_concolic.cmp(ctx, sp, is_neq, JS_CONCOLIC_EQ_LOOSE)) return 0;   /* forced-exec: concolic == -> concolic bool (forks) */
 
     op1 = sp[-2];
     op2 = sp[-1];
@@ -20710,7 +20712,8 @@ static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
                                        bool is_neq)
 {
     bool res;
-    if (g_concolic.cmp && g_concolic.cmp(ctx, sp, is_neq)) return 0;   /* forced-exec: concolic === -> concolic bool (forks) */
+    /* 7.2.14 IsStrictlyEqual ( x, y ) — see js_eq_slow's note for why the algorithm is named and not inferred. */
+    if (g_concolic.cmp && g_concolic.cmp(ctx, sp, is_neq, JS_CONCOLIC_EQ_STRICT)) return 0;   /* forced-exec: concolic === -> concolic bool (forks) */
     res = js_strict_eq(ctx, sp[-2], sp[-1]);
     JS_FreeValue(ctx, sp[-2]);
     JS_FreeValue(ctx, sp[-1]);
@@ -30696,7 +30699,9 @@ static int js_typeof_is_concolic(JSContext *ctx, JSValue *sp, JSAtom expected)
     pair[1] = JS_AtomToString(ctx, expected);
     /* The operand IS concolic (type_of answered), so the comparison hook owns this compare. */
     DCHECK(g_concolic.cmp != NULL, "a concolic typeof result with no comparison hook to decide it");
-    if (!g_concolic.cmp(ctx, pair + 2, /*is_neq*/false))
+    /* THE FUSED OPCODE IS A `===`. 13.5.3's `typeof` result is compared by the peephole against a string
+       literal with strict equality, so this states 7.2.14 exactly as the unfused path does. */
+    if (!g_concolic.cmp(ctx, pair + 2, /*is_neq*/false, JS_CONCOLIC_EQ_STRICT))
         DFAIL("the concolic comparison hook declined a concolic typeof result");
     JS_FreeValue(ctx, sp[-1]);
     sp[-1] = pair[0];
