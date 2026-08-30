@@ -546,9 +546,17 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 /* allow top-level await in normal script. JS_Eval() returns a
    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
 #define JS_EVAL_FLAG_ASYNC (1 << 7)
-/* INTERNAL: return the eval'd program as a CLOSURE instead of calling it, so the interpreter can dispatch it on the
-   trampoline chain. Without this the eval body runs in its own activation off the chain, and a loop inside it cannot
-   park for the scheduler (gen_state != flow base). */
+/* Return the compiled program as a CLOSURE instead of calling it, so the caller can dispatch it on the trampoline
+   chain. Without this the program body runs in its own activation off the chain, and a loop inside it cannot park
+   for the scheduler (gen_state != flow base) — which is why JS_EvalFunctionInternal DFAILs rather than running one.
+   IT IS A STATEMENT ABOUT EXECUTION MECHANICS AND NOTHING ELSE — who runs the body — and in particular it is NOT a
+   claim that the source is page-supplied text an eval is turning into code. That question is asked of the eval TYPE
+   (see js_eval_is_string_to_code_sink), because ECMAScript §19.2.1.2 HostEnsureCanCompileStrings is performed by
+   exactly two clauses, §19.2.1.1 PerformEval step 5 and §20.2.1.1.1 CreateDynamicFunction step 11, and those are
+   JS_EVAL_TYPE_DIRECT and JS_EVAL_TYPE_INDIRECT. The two were conflated once, and the cost was that HTML §8.1.4.4
+   "Calling scripts"'s run a classic script — a JS_EVAL_TYPE_GLOBAL program that announces no sink at all — could
+   not ask for a trampolinable closure without asserting it was an eval. So this flag is available to an embedder
+   compiling a `<script>` element's program, and JS_FlowNew is the same request made for a whole flow. */
 #define JS_EVAL_FLAG_TRAMP_CLOSURE (1 << 8)
 /* THIS PROGRAM'S SOURCE TEXT ARRIVED IN THE DOCUMENT'S OWN RESPONSE — an INLINE `<script>`. HTML §4.12.1 "The
    script element" splits a document's programs by exactly one attribute: `src` "denotes that instead of using

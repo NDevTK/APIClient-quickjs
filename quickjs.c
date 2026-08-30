@@ -7891,12 +7891,26 @@ static _Thread_local JSTimeTravelHooks g_time_travel = { NULL, NULL, NULL };
    offered to a program evaluation. Installed by JS_SetEvalSinkHook; NULL = no host is listening. */
 static _Thread_local JSEvalSinkFunc *g_eval_sink;
 /* THE SEAM'S COVERAGE, CONSUMED ONCE PER COMPILE, and it is an assertion rather than a piece of the mechanism.
-   JS_EVAL_FLAG_TRAMP_CLOSURE marks a program the PAGE is evaluating — 19.2.1's eval and 20.2.1.1.1's
-   CreateDynamicFunction, the two algorithms this file performs on a page-supplied source — and the two sites
-   that set that flag are exactly the two that announce first. A THIRD one added later without announcing would
-   fail SILENTLY and in the one direction that cannot be noticed: nothing breaks, the program runs, and a real
-   code-execution sink simply reports nothing for ever. So the flag and the announcement are asserted to arrive
-   together, at the one place every compile passes through. */
+   WHICH COMPILES IT COVERS IS A QUESTION ABOUT THE ALGORITHM, AND THE SPEC ANSWERS IT BY NAME. §19.2.1.2
+   HostEnsureCanCompileStrings ( calleeRealm, paramStrings, bodyString, direct ) is the hook a host is handed
+   precisely because a string is about to become running code, and exactly two clauses perform it: §19.2.1.1
+   PerformEval ( source, strictCaller, direct ) step 5, and §20.2.1.1.1 CreateDynamicFunction ( ctor, newTarget,
+   kind, paramArgs, bodyArg ) step 11, which passes `false` for `direct`. Their union is exactly "a direct eval
+   or an indirect one", so the @S JS-context sink is named by the eval TYPE and by nothing else.
+   IT USED TO BE KEYED ON JS_EVAL_FLAG_TRAMP_CLOSURE, WHICH ANSWERS A DIFFERENT QUESTION. That flag says who
+   RUNS the compiled body — hand the closure back so the caller trampolines it — a fact about execution
+   MECHANICS that says nothing whatever about where the source came from. The two agreed only because the two
+   algorithms above were the only ones that had ever wanted a closure, and a third kind of program then gets the
+   wrong answer in the expensive direction: HTML §8.1.4.4 "Calling scripts"'s run a classic script performs no
+   HostEnsureCanCompileStrings, so announcing a `<script>` element's program would report EVERY page script as a
+   code-execution sink — a fabricated finding, which propagates, because one bogus sink shapes the next
+   candidate. So provenance and mechanics are asked separately, and BOTH are asserted, at the one place every
+   compile passes through (JS_EvalInternal).
+   A COMPILE THAT RUNS NOTHING IS NOT A SINK EITHER, and that is the spec's own arithmetic rather than a
+   narrowing bolted on to keep an assert quiet: §20.2.1.1.1 performs the hook ONCE at step 11 and then parses
+   the parameter list and the body ALONE at steps 17-20 without performing it again (step 21's NOTE: "The
+   parameters and body are parsed separately to ensure that each is valid alone"). Those probes produce no
+   program, which is what JS_EVAL_FLAG_COMPILE_ONLY says here. */
 static _Thread_local bool g_eval_sink_announced;
 
 /* §19.2.1.1 PerformEval ( source, strictCaller, direct ) step 1's source ANNOUNCED, AND step 2's "If source is
@@ -47961,15 +47975,23 @@ JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, const char *fil
     /* …AND WHICH HALF OF THE DOCUMENT THIS PROGRAM IS (JS_EVAL_FLAG_INLINE_SCRIPT), which only the caller
        holding the `<script>` row can say. Threaded rather than dropped for the same reason strictness is: a
        flag the compile never sees is a fact the whole run then answers wrong, silently. */
-    JSValue bc = JS_Eval(ctx, src, len, filename ? filename : "<flow>",
-                         JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY |
+    /* JS_EVAL_FLAG_TRAMP_CLOSURE — the compiler's OWN way to say "hand the closure back, I will run the body
+       on the tramp", and this is a program that does exactly that. It was spelled by hand here — COMPILE_ONLY
+       and then js_closure(bc, NULL, NULL) — which is byte-for-byte what the flag's arm does for a program
+       whose eval type is not DIRECT (there `var_refs` and `sf` are both NULL), so the flag had two spellings
+       and one of them lived outside the compiler. That is the shape where the two drift and nothing says so.
+       IT IS ALSO WHAT MAKES THE FLAG'S MEANING CHECKABLE: JS_EVAL_TYPE_GLOBAL carrying TRAMP_CLOSURE is a
+       program the @S seam announces NOTHING for, so this call is the standing proof that asking for a
+       trampolinable closure is not a claim about provenance — the confusion that made a `<script>` element's
+       program impossible to compile at all. */
+    JSValue fn = JS_Eval(ctx, src, len, filename ? filename : "<flow>",
+                         JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TRAMP_CLOSURE |
                          (eval_flags & (JS_EVAL_FLAG_STRICT | JS_EVAL_FLAG_INLINE_SCRIPT)));
-    if (JS_IsException(bc)) { JS_FreeValue(ctx, bc); return NULL; }
-    /* COMPILE_ONLY yields raw JS_TAG_FUNCTION_BYTECODE — wrap it in a closure with the global scope (var_refs
-       NULL) exactly as JS_EvalFunctionInternal does, so it is a runnable JS_CLASS_BYTECODE_FUNCTION whose
-       prologue defines globals on execution. async_func_init then makes that frame preemptible. */
-    JSValue fn = js_closure(ctx, bc, NULL, NULL);   /* consumes bc */
-    if (JS_IsException(fn)) { JS_FreeValue(ctx, fn); return NULL; }
+    if (JS_IsException(fn)) return NULL;   /* compile error: the exception is already pending */
+    DCHECK(tramp_body_is_plain(fn),
+           "JS_FlowNew compiled a global program and got back something that is not a trampolinable bytecode "
+           "function — async_func_init is about to make a preemptible frame out of it, so a closure that is "
+           "not a plain body would be parked and rebuilt as a shape the resume path cannot restore");
     JSAsyncFunctionState *s = js_mallocz(ctx, sizeof(*s));
     if (!s) { JS_FreeValue(ctx, fn); return NULL; }
     if (async_func_init(ctx, s, fn, ctx->global_obj, 0, NULL)) { js_free(ctx, s); JS_FreeValue(ctx, fn); return NULL; }
@@ -71063,6 +71085,26 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
 
 #endif // QJS_DISABLE_PARSER
 
+/* IS THIS COMPILE THE STRING-TO-CODE STEP OF AN ALGORITHM THE @S SEAM MUST HAVE ANNOUNCED — a question about
+   PROVENANCE, answered by the eval TYPE. §19.2.1.2 HostEnsureCanCompileStrings names the set (see
+   g_eval_sink_announced): §19.2.1.1 PerformEval step 5 performs it with `direct` true for the spelling
+   §13.3.6.1 Runtime Semantics: Evaluation step 6.a.v reaches ("A CallExpression evaluation that executes step
+   6.a.v is a direct eval") and false for the indirect one, and §20.2.1.1.1 CreateDynamicFunction step 11
+   performs it with `direct` false. JS_EVAL_TYPE_DIRECT ∪ JS_EVAL_TYPE_INDIRECT is exactly that union.
+   JS_EVAL_TYPE_GLOBAL — HTML §8.1.4.4 "Calling scripts"'s classic script, and the embedder's own program —
+   performs it nowhere, which is the whole reason a page script must be able to compile announcing nothing. */
+static bool js_eval_is_string_to_code_sink(int flags)
+{
+    int eval_type = flags & JS_EVAL_TYPE_MASK;
+
+    /* §20.2.1.1.1 steps 17-20 re-parse the parameter list and the body alone, after the hook at step 11 and
+       without performing it again; js_dynfunc_check_halves is that parse and discards each result. A compile
+       that yields no program has offered a source to nothing. */
+    if (flags & JS_EVAL_FLAG_COMPILE_ONLY)
+        return false;
+    return eval_type == JS_EVAL_TYPE_DIRECT || eval_type == JS_EVAL_TYPE_INDIRECT;
+}
+
 /* the indirection is needed to make 'eval' optional */
 static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                const char *input, size_t input_len,
@@ -71073,21 +71115,48 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     /* THE @S SEAM'S COVERAGE, TAKEN HERE AND CONSUMED — see g_eval_sink_announced. Every compile passes this
        one line, so the question is asked once rather than at each of the sites that could forget to ask it. */
     bool announced = g_eval_sink_announced;
+    bool is_sink = js_eval_is_string_to_code_sink(flags);
 
     g_eval_sink_announced = false;
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
-    DCHECK(!(flags & JS_EVAL_FLAG_TRAMP_CLOSURE) || announced,
-           "a PAGE program reached compilation without passing the @S eval-sink seam — "
-           "JS_EVAL_FLAG_TRAMP_CLOSURE names a program 19.2.1 eval or 20.2.1.1.1 CreateDynamicFunction is "
-           "evaluating, and every one of them takes its program TEXT from js_eval_program_source — which "
-           "announces the source and decides 19.2.1.1 step 2 as one operation, so the text a compile holds "
-           "IS the announced source and the JS-context sink can be detected and a candidate's own bytes read "
-           "at the sink they are about to fire in. A site that compiles page source without going through it "
-           "fails SILENTLY: the program runs, nothing breaks, and a real code-execution sink reports nothing "
-           "for ever. Take the text from that operation at the new site — never relax this");
+    /* PROVENANCE, both ways round. The forward direction is the original invariant re-keyed off the flag and
+       onto the eval type; the reverse is new and is what the page-script compile makes necessary. */
+    DCHECK(!is_sink || announced,
+           "a program §19.2.1.2 HostEnsureCanCompileStrings covers reached compilation without passing the @S "
+           "eval-sink seam — this compile's eval TYPE is DIRECT or INDIRECT, which is exactly §19.2.1.1 "
+           "PerformEval and §20.2.1.1.1 CreateDynamicFunction, and both take their program TEXT from "
+           "js_eval_program_source, which announces the source and decides §19.2.1.1 step 2 as ONE operation. "
+           "So the text a compile holds IS the announced source, and the JS-context sink can be detected and a "
+           "candidate's own bytes read at the sink they are about to fire in. A site that compiles page source "
+           "without going through it fails SILENTLY: the program runs, nothing breaks, and a real "
+           "code-execution sink reports nothing for ever. The two sites that do go through it are "
+           "step_program_run and eval_direct_closure; take the text from that same operation at the new one — "
+           "never relax this");
+    DCHECK(is_sink || !announced,
+           "a compile that is NOT a code-execution sink consumed an @S announcement. js_eval_program_source "
+           "raises the latch for the compile IMMEDIATELY following it, so a program of any other eval type "
+           "arriving in between has EATEN the announcement, and the eval it belonged to then looks exactly "
+           "like a site that never announced — the failure lands on the innocent compile and names the wrong "
+           "one. This is the hole a page-script compile opens and the reason this direction is asserted at "
+           "all: HTML §8.1.4.4 \"Calling scripts\" legitimately carries JS_EVAL_FLAG_TRAMP_CLOSURE and "
+           "legitimately announces nothing, so it can now stand between an announcement and its own compile. "
+           "Keep the two adjacent, with no compile of any kind between them");
+    /* MECHANICS, asked of every program whatever its provenance: who RUNS the body. */
+    DCHECK((flags & JS_EVAL_FLAG_COMPILE_ONLY) ||
+           (flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE ||
+           (flags & JS_EVAL_FLAG_TRAMP_CLOSURE),
+           "a PROGRAM was compiled to be EVALUATED without asking for a trampolinable closure. A program body "
+           "is page code, and running it from C gives it an activation with no flow base, so a loop at its top "
+           "level would drive to completion; JS_EvalFunctionInternal is where that ends, and it DFAILs there "
+           "naming no call site, which is why the question is asked HERE where the flags — and therefore the "
+           "caller — are known. JS_EVAL_FLAG_TRAMP_CLOSURE is the answer. A MODULE is the other algorithm "
+           "rather than an exemption (a graph to load, link and evaluate, whose bodies are async functions "
+           "already on the flow seam), and COMPILE_ONLY produces no program to run. The reachable callers are "
+           "the JS_EvalInternal( sites in this file plus JS_EvalThis2, which is every embedder entry");
     (void)announced;
+    (void)is_sink;
     if (!rt->current_stack_frame) {
         JS_FreeValueRT(rt, ctx->error_back_trace);
         ctx->error_back_trace = JS_UNDEFINED;
@@ -77164,7 +77233,7 @@ static JSValue js_function_proto(JSContext *ctx, JSValueConst this_val,
 
 /* 20.2.1.1.1 CreateDynamicFunction step 18's `prefix ( parameters ) { body }`, assembled from arguments that are
    already STRINGS — so it runs nothing and cannot fail except on allocation. DYNSRC_PARAMS and DYNSRC_BODY are
-   the same assembly with the OTHER half empty; steps 20-23 parse each half on its own. */
+   the same assembly with the OTHER half empty; steps 17-20 parse each half on its own. */
 enum { DYNSRC_ALL, DYNSRC_PARAMS, DYNSRC_BODY };
 
 static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, JSValue *strs, int n, int mode)
@@ -77198,11 +77267,16 @@ static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, J
     return JS_EXCEPTION;
 }
 
-/* Steps 20-23: `parameters` and `body` are ALSO parsed on their OWN — the spec's own NOTE says it is "to ensure
-   that each is valid alone" — and that is the whole of what rejects a `new Function` whose two arguments are
-   the two halves of one block comment, which parse only once concatenated. Assembling each probe from the SAME
-   builder is what gives the parameter list the right goal for the kind (a generator's [+Yield], an async function's [+Await]) with no second
-   spelling of that mapping. Parsing runs none of the page's code, so this needs no trampoline. */
+/* §20.2.1.1.1 CreateDynamicFunction steps 17-20: `parameters` and `body` are ALSO parsed on their OWN — step
+   21's NOTE says it is "to ensure that each is valid alone" — and that is the whole of what rejects a
+   `new Function` whose two arguments are the two halves of one block comment, which parse only once
+   concatenated. (These used to be cited as steps 20-23, which are the whole-source parse's throw and the two
+   NOTEs before it; the numbers were checked against the spec text rather than recalled.) Assembling each probe
+   from the SAME builder is what gives the parameter list the right goal for the kind (a generator's [+Yield],
+   an async function's [+Await]) with no second spelling of that mapping. Parsing runs none of the page's code,
+   so this needs no trampoline — and it announces nothing at the @S seam, because §20.2.1.1.1 performs
+   §19.2.1.2 HostEnsureCanCompileStrings ONCE, at step 11, and not again for these probes. JS_EVAL_FLAG_COMPILE_ONLY
+   is what says so to js_eval_is_string_to_code_sink. */
 static int js_dynfunc_check_halves(JSContext *ctx, JSFunctionKindEnum func_kind, JSValue *strs, int n)
 {
     int mode;
