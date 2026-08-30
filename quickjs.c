@@ -48038,8 +48038,31 @@ static int clone_susp_frame(JSContext *ctx, JSAsyncFunctionState *cs, const JSAs
     cf->prev_frame = NULL;
     cf->is_call_root = of->is_call_root;
     cf->is_constructor = of->is_constructor;
-    cf->step_func = js_dup(of->step_func);
-    cf->step_this = js_dup(of->step_this);
+    /* THE BUILTIN THAT DROVE THE FRAME IS NOT CARRIED, AND THAT IS A DECISION ABOUT THE BORROW RATHER THAN
+       ABOUT THE COPY. `step_func`/`step_this` are BORROWED (see JSStackFrame.step_func), and the borrow is
+       sound at its one real writer for a STRUCTURAL reason: that writer fills a TrampFrame's OWN embedded sf,
+       whose cont_state IS the machine, so the frame is nested inside the lifetime of the state holding the
+       reference — which is also why a deep fork may carry it, the same arm having given the sibling its own
+       cloned state naming the same objects. A frame THIS function builds is a COROUTINE's — a flow base, an
+       async activation, a generator body — and a coroutine is exactly the callee that OUTLIVES the drive:
+       `[1,2].map(async f)` reaches ECMAScript §27.10.5.3 Await ( arg ), which suspends the activation and
+       resumes the caller, so §23.1.3.21 Array.prototype.map ( callback [ , thisArg ] ) takes the promise, runs
+       on to the next element and finishes — freeing the state — while the activation is still parked on a
+       reaction with no chain of its own (js_async_frame_clone asserts that emptiness). Carrying the value
+       would hand the sibling a borrow whose owner is gone; `js_dup`ing it — which is what stood here — takes a
+       reference on the builtin and its receiver that NOTHING in this file gives back, because a borrowed field
+       has no release site to give it back at.
+       So the absence is WRITTEN rather than left to the allocator, for the reason js_async_frame_clone's own
+       note gives about this very field: a zeroed JSValue is the INTEGER 0, and `!JS_IsUndefined` answers YES
+       for it, so an unwritten field here reports a driving builtin that was never there. The DCHECK is what
+       makes the day the precondition stops holding LOUD rather than a leak nothing measures. */
+    DCHECK(JS_IsUndefined(of->step_func) && JS_IsUndefined(of->step_this),
+           "clone_susp_frame: a coroutine activation names the builtin that drove it. That field is BORROWED "
+           "from a step state, and a step state does NOT outlive a coroutine — so neither carrying it nor "
+           "dup'ing it into the clone is sound. A step-driven coroutine callee that records its driver must "
+           "hold an OWNED reference, released by every coroutine teardown, and this clone must then take it "
+           "the way it takes the receiver two lines down");
+    cf->step_func = cf->step_this = JS_UNDEFINED;
     cs->this_val = js_dup(os->this_val);   /* the ONE reference, owned by the state … */
     cf->this_val = cs->this_val;           /* … and borrowed by the frame, exactly as async_func_init does */
     return 0;
@@ -49034,8 +49057,9 @@ JSValue *JS_FlowClone(JSContext *ctx, JSValue *flow) {
     /* ONE FRAME CLONE, NOT TWO. This arm used to build the frame itself, field by field, and it had already
        DRIFTED from the one clone_deep_flow uses: it never assigned `this_val` at all (so the clone's frame
        carried whatever js_mallocz left — the very "receiver reported as an integer" async_func_init's own
-       comment describes), and it dropped `step_func`/`step_this`, so a flow forked while a builtin drove it
-       lost that builtin from its stack traces. Neither was reachable by reading this function; both are
+       comment describes), and it left `step_func`/`step_this` unwritten, which is the same defect asked of a
+       different question: the int 0 js_mallocz leaves answers `!JS_IsUndefined` YES, so the clone claimed a
+       continuation-holding builtin was driving it when none ever was. Neither was reachable by reading this function; both are
        obvious the moment there is only one implementation of "clone a suspended frame". The two paths differ
        in exactly one thing — where the LIVE point is — and that is the parameter and the line below. */
     ptrdiff_t live = sf->cur_sp - sf->arg_buf;
