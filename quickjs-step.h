@@ -557,8 +557,9 @@ typedef struct JSStepHdr {
        The STAGE is what the algorithm already declares (JSTrampStepDef.steps) and it is exactly what tells two
        sites apart, because a machine that has not moved is at the site that parked. A request answered at a
        stage other than the one that asked is a resume continuing in a DIFFERENT STEP of the algorithm with
-       another step's value in hand — the loss §Time-travel calls a cap, and the one Streams §4.2.4's shutdown
-       shipped: the pipe fulfilled with its destination still locked and nothing said so.
+       another step's value in hand — the loss §Time-travel calls a cap, and the one the shutdown in Streams
+       §4.9.1 "Working with readable streams" shipped: the pipe fulfilled with its destination still locked
+       and nothing said so.
        ONE STAMP FOR THE THREE KEYED CURSORS rather than one each. They are in flight together only WITHIN one
        stage — Web IDL's record<> takes the key list and then reads each key — so an overlapping request issued
        at a DIFFERENT stage is refused where it is ISSUED, which names the machine that walked away from its
@@ -813,8 +814,9 @@ JS_EXTERN int step_construct_run(JSContext *ctx, uint8_t *phase, JSValue *cb, in
  * A request is TWO-PHASE: the stage that issues it is re-entered with its cursor at 1 and MUST reach the SAME
  * step_call_run / step_construct_run / step_getprop_run to collect the answer, because the cursor is what tells
  * that call site "you are the resume, take the value" rather than "ask". A stage that re-evaluates its decision
- * on the way back in can decide differently — Streams §4.2.4's shutdown did exactly that, since ISSUING the
- * close is what made WritableStreamCloseQueuedOrInFlight true, so the resume took the "already closing" branch
+ * on the way back in can decide differently — the shutdown in Streams §4.9.1 "Working with readable streams"
+ * did exactly that, since ISSUING the close is what made WritableStreamCloseQueuedOrInFlight true, so the
+ * resume took the "already closing" branch
  * and walked away from its own call. The cursor stayed at 1, the NEXT stage's request read it as a resume and
  * took the abandoned call's result as its own, and `writer.releaseLock()` was never called at all: the pipe
  * fulfilled with the destination still locked. Nothing said so, because the value a stage received was a REAL
