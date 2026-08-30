@@ -11059,13 +11059,29 @@ static int js_error_add_own(JSContext *ctx, JSValueConst obj, JSAtom prop, JSVal
     return 0;
 }
 
-/* `pstack`, when non-NULL, takes the rendered stack INSTEAD of installing it, and only Error.captureStackTrace
-   passes it. Installing is not one operation: the two arms below write an object the engine itself made — the
-   [[ErrorData]] slot of an Error, an own slot of a DOMException the arm has already checked has none — and
-   neither can throw or run page code, while captureStackTrace's target is ANY object the page names, so
-   installing there is a real [[DefineOwnProperty]] that can hit a Proxy trap or a non-configurable slot. Both
-   went through one JS_DefinePropertyValue, which is why building ANY error appeared to reach property
-   definition, and through it every throw. The capture and the render are shared; the install is the caller's. */
+/* `pstack`, when non-NULL, takes the RENDERED stack INSTEAD of installing it, and the tail of this function is
+   what makes that sentence true rather than a description of what its callers are trusted to do. Installing is
+   not one operation: the two arms below write an object the engine itself made — the [[ErrorData]] slot of an
+   Error, an own slot of a DOMException the arm has already checked has none — and neither can throw or run page
+   code, while a pstack caller's target is ANY object the page names, so installing there is a real
+   [[DefineOwnProperty]] that can hit a Proxy trap or a non-configurable slot. Both went through one
+   JS_DefinePropertyValue, which is why building ANY error appeared to reach property definition, and through it
+   every throw. The capture and the render are shared; the install is the caller's.
+   THAT SENTENCE WAS ONCE PROSE AND THE CODE DID THE OPPOSITE, which is the half of this comment worth keeping.
+   It claimed "the rendered stack" while the pstack arm handed over the UNRENDERED pending [prepare, callsites]
+   pair, and it named ONE caller as the only one passing pstack while a second — the dev diagnostic — passed it
+   too and had quietly grown its own copy of the render to compensate. So the comment asserted the invariant the
+   code broke, and the defect read as impossible from the one place a reader looks: `Error.captureStackTrace(o)`
+   defined that pair as a DATA property and `typeof o.stack` answered "object", an array where every engine
+   answers a string, with nothing to reject it because everything downstream simply does string work on an
+   array. It is the same defect the DOMException arm below already describes and fixes, one branch away — which
+   is the lesson: a prose invariant is only worth its DCHECK, and the arm that HAS one was right while the arm
+   beside it, covered by the same paragraph, was not.
+   SO WHAT MAY DEFER IS DECIDED BY THE SLOT AND NEVER BY THE CALLER. Exactly one shape can defer: an Error,
+   whose [[ErrorData]] the `stack` ACCESSOR renders on read — possibly through the page's Error.prepareStackTrace,
+   which is the page's function and needs a flow base this C activation does not have. Every other route out of
+   here is a DATA property, which by construction has nothing to defer TO, so it leaves rendered, and one DCHECK
+   below holds every such route to it. */
 static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                             JSValueConst filter_func, const char *filename,
                             int line_num, int col_num, int backtrace_flags,
@@ -11075,7 +11091,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     JSValue stack, prepare, saved_exception, error_obj;
     JSObject *p;
     JSFunctionBytecode *b;
-    bool backtrace_barrier, has_filter_func;
+    bool backtrace_barrier, has_filter_func, to_error_data, to_own_slot;
     JSRuntime *rt;
     JSCallSiteData csd[64];
     uint32_t i;
@@ -11240,28 +11256,32 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
     if (JS_IsUndefined(ctx->error_back_trace))
         ctx->error_back_trace = js_dup(stack);
-    if (pstack) {
-        *pstack = stack;                    /* the caller installs it; see this function's header */
-    } else if (can_store_error_stack(error_obj)) {
-        /* genuine Error instance: store as the [[ErrorData]] stack value */
-        p = JS_VALUE_GET_OBJ(error_obj);
-        cow_capture_obj(ctx, p);   /* forced-exec: [[ErrorData]] is the object's own state */
-        JS_FreeValue(ctx, p->u.object_data);
-        p->u.object_data = stack;
-    } else if (can_add_backtrace(error_obj)) {
-        /* DOMException and the like keep an own "stack" data PROPERTY, and a data property has no accessor to
-           render the pending [prepare, callsites] pair on first read — so what was stored was the PAIR, and
-           `new DOMException("x", "NotSupportedError").stack` answered an ARRAY where every engine answers a
-           STRING. Nothing rejects that; everything downstream simply does string work on an array. It cost a
-           whole WPT document: testharness keeps a failed test's `stack` and formats it, so ONE uncaught
-           DOMException in a test body left the harness unable to complete — 279 subtests of
-           dom/nodes/Document-createEvent.https.html reported as nothing at all, with no error anywhere naming
-           a type. The catch had worked; it was the reporting that could not.
-           THE DEFAULT RENDERING IS THE ANSWER HERE, for the reason JS_GetErrorStackString gives for the same
-           pair: this runs from build_backtrace, at CONSTRUCTION time, where Error.prepareStackTrace is the
-           page's function and there is no flow under this C activation to run it on. An Error defers that
-           decision to its accessor; a data property cannot defer anything, so it stores exactly what a read
-           with the hook unavailable produces. */
+
+    /* WHICH SLOT THIS TRACE IS ABOUT TO OCCUPY, asked ONCE, because the render below and the install below must
+       not be able to disagree about it. Two routes end in a DATA property and one ends in the deferring slot;
+       reading the predicates twice is how the render and the install come apart again. */
+    to_error_data = !pstack && can_store_error_stack(error_obj);
+    to_own_slot   = !pstack && !to_error_data && can_add_backtrace(error_obj);
+
+    /* THE DEFAULT RENDERING IS THE ANSWER FOR EVERY DATA PROPERTY, and it is one place because it is one
+       reason. This runs at CONSTRUCTION time, where Error.prepareStackTrace is the page's function and there is
+       no flow under this C activation to run it on — the argument JS_GetErrorStackString gives for the same
+       pair. An Error DEFERS that decision to its `stack` accessor; a data property cannot defer anything, so it
+       stores exactly what a read with the hook unavailable produces.
+       WHAT IT COST WHEN IT WAS THE DOMException ARM'S ALONE: `new DOMException("x","NotSupportedError").stack`
+       answered an ARRAY, testharness kept a failed test's `stack` and formatted it, and ONE uncaught
+       DOMException left the harness unable to complete — 279 subtests of one WPT document reported as nothing
+       at all, with no error anywhere naming a type. The catch had worked; it was the reporting that could not.
+       AND V8 PUTS captureStackTrace ON THIS SIDE OF THE LINE BY NAME, which is why the pstack route is not a
+       concession: `Error.captureStackTrace` has no normative definition at all (ECMA-262 §20.5.3 Properties of
+       the Error Prototype Object enumerates constructor/message/name/toString and no `stack`; §20.5.4
+       Properties of Error Instances gives [[ErrorData]] one specified use, identifying Error objects in
+       Object.prototype.toString and Error.isError), so its documentation IS its definition, and V8's "Stack
+       trace API" says of it: "Stack traces collected through Error.captureStackTrace are immediately collected,
+       FORMATTED, and attached to the given error object" — against the lazy path it describes separately, where
+       "the custom prepareStackTrace function is only called once the stack property of Error object is
+       accessed". Eager here is the API, not a narrowing of it. */
+    if (pstack || to_own_slot) {
         if (js_error_stack_is_pending(stack)) {
             JSValue sites = JS_GetPropertyUint32(ctx, stack, 1);
             JSValue rendered = JS_IsException(sites) ? JS_NULL : js_callsite_array_render(ctx, sites);
@@ -11269,9 +11289,28 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, stack);
             stack = JS_IsException(rendered) ? JS_NULL : rendered;
         }
+        /* THE HANDOVER IS THE SITE, not the read that trips over the result. A trace that leaves this function
+           for a DATA property has no accessor behind it to render anything, so it must ALREADY be text — and
+           the two routes that end in one are distinguished by `pstack`: non-NULL is the page-named target of
+           Error.captureStackTrace, NULL is a DOMException's own `stack` slot. Asserting it where the value is
+           handed over is what makes a THIRD such route fire here instead of surfacing as a page's TypeError on
+           a string method a hundred frames away, which is how this was found. */
         DCHECK(JS_IsString(stack) || JS_IsNull(stack),
-               "a DOMException's own `stack` is a data property, so it must already be the rendered string — "
-               "an unrendered pair there is an array where every consumer expects text");
+               "a stack leaving build_backtrace for a DATA property must already be the rendered string — an "
+               "unrendered [prepare, callsites] pair there is an array where every consumer expects text "
+               "(pstack non-NULL: Error.captureStackTrace's target; NULL: a DOMException's own `stack`)");
+    }
+
+    if (pstack) {
+        *pstack = stack;                    /* the caller installs it; see this function's header */
+    } else if (to_error_data) {
+        /* genuine Error instance: store as the [[ErrorData]] stack value — the ONE slot that defers, because
+           the `stack` accessor is what renders it, hook and all, on the flow that reads it. */
+        p = JS_VALUE_GET_OBJ(error_obj);
+        cow_capture_obj(ctx, p);   /* forced-exec: [[ErrorData]] is the object's own state */
+        JS_FreeValue(ctx, p->u.object_data);
+        p->u.object_data = stack;
+    } else if (to_own_slot) {
         js_error_add_own(ctx, error_obj, JS_ATOM_stack, stack,
                          JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     } else {
@@ -16388,28 +16427,25 @@ static void js_why_sanitize(char *dst, size_t n, const char *src)
 }
 
 /* THE FRAMES, RENDERED AND SAFE TO EMBED. build_backtrace CAPTURES frames and parks Error.prepareStackTrace
-   UNREAD (the accessor renders, this never calls it), and js_callsite_array_render is the DEFAULT rendering —
-   string work over CallSite records — so neither runs a byte of the page's code, which is what makes asking
-   for a trace legal on an assert path. */
+   UNREAD — it renders through js_callsite_array_render, the DEFAULT rendering, which is string work over
+   CallSite records and never the page's hook — so asking for a trace is legal on an assert path.
+   THE SECOND COPY OF THAT RENDER LIVED HERE AND IS GONE. A pstack caller took the unrendered pending pair and
+   each one rendered it for itself; this one did, Error.captureStackTrace did not, and the two disagreeing was
+   the whole bug. The render moved to the one place that decides which slot a trace is going into, so this
+   reads a string or nothing, and the array read that used to stand here — a [[Get]] on page-reachable data,
+   from an abort path — is not merely dead but one fewer way for a diagnostic to touch the document. */
 static void js_why_backtrace(JSContext *ctx, char *dst, size_t n)
 {
-    JSValue stack = JS_UNDEFINED, rendered = JS_UNDEFINED;
+    JSValue stack = JS_UNDEFINED;
     const char *trace = NULL;
 
     build_backtrace(ctx, JS_UNDEFINED, JS_UNDEFINED, NULL, 0, 0, 0, &stack);
-    if (js_error_stack_is_pending(stack)) {
-        JSValue sites = JS_GetPropertyUint32(ctx, stack, 1);
-        if (!JS_IsException(sites))
-            rendered = js_callsite_array_render(ctx, sites);
-        JS_FreeValue(ctx, sites);
-        if (JS_IsString(rendered))
-            trace = JS_ToCString(ctx, rendered);
-    }
+    if (JS_IsString(stack))
+        trace = JS_ToCString(ctx, stack);
     js_why_sanitize(dst, n, trace && trace[0] ? trace : NULL);
     if (!dst[0])
         snprintf(dst, n, "(no frames — the arrival is a host edge reached outside any JS activation)");
     if (trace) JS_FreeCString(ctx, trace);
-    JS_FreeValue(ctx, rendered);
     JS_FreeValue(ctx, stack);
 }
 #endif
