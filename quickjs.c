@@ -104637,9 +104637,15 @@ static void js_promise_resolve_function_mark(JSRuntime *rt, JSValueConst val,
    acquisition failure is.
    Which of the two functions this is comes from the CLASS, not from a def argument: one algorithm, two entry
    points, exactly as the C entry had it. */
+/* TWO SLOTS, BECAUSE THE VALUE STEP 2.f READS OFF AND THE VALUE STEP 2.i FULFILS WITH ARE NOT ALWAYS THE SAME
+   ONE. For every ordinary program they are: cb[0] and cb[1] hold the same resolution and this is one slot
+   spelled twice. They differ for exactly one resolution — the solver's unknown — and there the difference is
+   the whole of the fix at PRF_HEAD: the READ is performed on the concrete value the run observed, so the
+   prototype chain the page owns is the one that answers; the FULFIL keeps the unknown, so every later gate
+   over its members still forks. Collapsing them either way loses one of those two. */
 typedef struct JSPromiseResolveFn {
     JSStepHdr hdr;      /* MUST be first */
-    JSValue cb[1];      /* [resolution] — the operand of the `then` read */
+    JSValue cb[2];      /* [0] the operand of the `then` read; [1] the resolution step 2.i fulfils with */
 } JSPromiseResolveFn;
 _Static_assert(offsetof(JSPromiseResolveFn, hdr) == 0, "JSStepHdr must be first in JSPromiseResolveFn");
 
@@ -104690,7 +104696,9 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
     if (m->hdr.stage == PRF_HEAD) {
         JSValueConst resolution = step_arg(&m->hdr, 0);
         JS_FreeValue(ctx, cb_result);
-        m->cb[0] = JS_UNDEFINED;   /* before anything that can throw: the teardown frees what the state holds */
+        /* before anything that can throw: the teardown frees what the state holds */
+        m->cb[0] = JS_UNDEFINED;
+        m->cb[1] = JS_UNDEFINED;
         /* steps 2.a / 4.a: the pair fires ONCE, and [[AlreadyResolved]] is shared with its twin. */
         if (!s || s->presolved->already_resolved) return 0;
         js_promise_latch_resolved(ctx, m->hdr.func_obj, s);   /* steps 2.b-2.c / 4.b-4.c */
@@ -104705,14 +104713,72 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
             JS_FreeValue(ctx, err);
             return 0;
         }
+        /* STEPS 2.e AND 2.f ARE ASKED OF THE VALUE THE RUN OBSERVED, AND ASKING THEM OF THE SOLVER'S STAND-IN
+         * INSTEAD IS WHY AN AWAITED REPLY NEVER ARRIVED.
+         *
+         * An unknown is a real JSObject of the solver's own class, and that class is CALLABLE — a call the page
+         * WROTE over an unknown has to yield an unknown rather than end the program (`cookie.indexOf(…)`). Its
+         * exotic [[Get]] answers every name with another unknown, so `Get(resolution, "then")` answered a
+         * CALLABLE one for every unknown there has ever been, step 2.i took its true arm, and steps 2.j-2.l
+         * adopted the promise into a `then` this engine CANNOT RUN: calling an unknown yields an unknown and
+         * never invokes the resolving functions it was handed. The promise then never settles — not rejected,
+         * not fulfilled, no error, nothing parked. Every `.then(r => r.json()).then(…)` and every
+         * `await r.json()` stopped at the first reaction, which is the shape essentially every bundle reads a
+         * config with, and the whole reply-learning surface behind it was silently never reached.
+         *
+         * IT IS THE SAME DEFECT `typeof` ALREADY HAS A HOOK FOR, one predicate along: the branch was decided by
+         * the solver's REPRESENTATION rather than by the value. And it is the reply channel's version of what
+         * the published-state channel's key rule fixed for `%Symbol.toPrimitive%` — a key the LANGUAGE reads,
+         * missing on a record, answered as though the page had named it. The channel cannot tell those apart
+         * for `then`, which is an ordinary string a server may legitimately send, so the correction belongs
+         * HERE, at the one reader that knows the read is the language's.
+         *
+         * SO THE READ IS PERFORMED ON THE EXAMPLE — the concrete value this run computed by running the real
+         * codec on the real bytes. That is not a shortcut past the read: it is the read the spec describes,
+         * because the example is an ordinary object whose PROTOTYPE THE PAGE OWNS, so an
+         * `Object.prototype.then` gadget is reached and runs on the tramp exactly as step 2.f requires — where
+         * today it is unreachable, the exotic having answered before the chain was ever walked. What is
+         * fulfilled with stays the UNKNOWN (cb[1]), because handing the page the plain record would concretize
+         * every gate over its members and lose the surface behind them.
+         *
+         * AN EXAMPLE THAT IS NOT AN OBJECT IS STEP 2.e, over what the value IS: `text()`'s reply stands for a
+         * String, and a String fulfils without any `then` read at all.
+         *
+         * AND AN UNKNOWN WITH NO EXAMPLE IS A FORK THIS ENGINE HAS NOT BUILT. IsCallable over it is genuinely
+         * undetermined — a server's inline script can write a function into a record it publishes — so neither
+         * arm is contradicted, and §Solver-half's answer to that is that BOTH run. The adopt arm cannot run
+         * today, so it is named rather than guessed at. */
+        if (js_value_is_concolic(resolution)) {
+            JSValue ex;
+            DCHECK(g_concolic.example != NULL,
+                   "a host installed the concolic value class without JSConcolicHooks.example — the two are "
+                   "one table set by one JS_SetConcolicHooks call, so a resolution that IS unknown and can be "
+                   "asked for nothing would take 27.5.1.3 step 2.f's read on the stand-in and adopt the "
+                   "promise into a `then` this engine cannot call");
+            ex = g_concolic.example(ctx, resolution);
+            if (JS_IsUndefined(ex))
+                DFAIL("27.5.1.3 CreateResolvingFunctions ( toResolve ) step 2.i asked IsCallable of the `then` "
+                      "of an unknown carrying NO example: nothing this run observed decides whether the value "
+                      "is a thenable, and the arm that adopts it hands the promise's resolving functions to a "
+                      "callee this engine answers with another unknown — so that arm settles nothing, ever. "
+                      "Build the fork over step 2.i (solver/decide.h's outcome seam is the one a C step has), "
+                      "so the fulfil arm and the adopt arm are two flows rather than one silent hang");
+            if (!JS_IsObject(ex)) {
+                JS_FreeValue(ctx, ex);
+                return js_promise_resolvefn_settle(ctx, s, resolution, false);   /* step 2.e */
+            }
+            m->cb[0] = ex;
+        } else {
+            m->cb[0] = js_dup(resolution);
+        }
         m->hdr.stage = PRF_THEN;
-        m->cb[0] = js_dup(resolution);
+        m->cb[1] = js_dup(resolution);
         *out_cb = m->cb; *out_argc = (int)JS_ATOM_then;
         return 6;   /* GETPROP: step 2.f's Get(resolution, "then"), which is where the machine RESTS */
     }
     DCHECK(m->hdr.stage == PRF_THEN, "a promise resolving function has only the `then` read to wait on");
     {
-        JSValueConst resolution = m->cb[0];
+        JSValueConst resolution = m->cb[1];   /* what step 2.i fulfils with — never cb[0]'s read target */
         JSValue then = cb_result;
         if (JS_IsException(then)) {
             /* step 2.g: the read threw, and that abrupt completion REJECTS rather than propagating. */
@@ -104729,6 +104795,22 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
         {
             /* steps 2.j-2.l: the CALL is deferred to a job, so nothing user-written runs here. */
             JSValueConst args[3];
+            /* AND WHAT IS DEFERRED MUST BE SOMETHING THIS ENGINE CAN RUN TO A SETTLEMENT. §27.5.2.2
+               NewPromiseResolveThenableJob ( promiseToResolve, thenable, then ) hands `then` the promise's
+               ONLY resolving functions: after this enqueue nothing else can settle it. An unknown callee
+               answers with another unknown and calls neither, so adopting into one is not a slow path or a
+               partial implementation — it is a promise that never settles, and no flow is blocked, nothing is
+               parked, and the frontier drains reporting a clean run. The read above is performed on the value
+               the run observed precisely so this cannot arise from the resolution itself; it stays asserted
+               because a page's own `then` GETTER over unknown state can still answer one, and because the next
+               builtin that resolves a promise with an unknown must meet this line rather than this symptom. */
+            DCHECK(!js_value_is_concolic(then),
+                   "27.5.1.3 step 2.i answered IsCallable TRUE for a `then` that is the solver's unknown — "
+                   "§27.5.2.2 NewPromiseResolveThenableJob would hand this promise's only resolving functions "
+                   "to a callee that answers with another unknown and invokes neither, so the promise settles "
+                   "NEVER: no rejection, no error, no parked flow, and a frontier that drains reporting a "
+                   "complete run. Build the call of an unknown thenable as a fork over its two completions "
+                   "rather than letting the adopt arm stand");
             args[0] = s->promise;
             args[1] = resolution;
             args[2] = then;
@@ -104739,12 +104821,15 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
     }
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Only the resolution: a resolving function has no result of its
-   own — it settles the capability it closes over — so there is nothing a completion could hand out. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). Only the two operands of the `then` read: a resolving function
+   has no result of its own — it settles the capability it closes over — so there is nothing a completion could
+   hand out. BOTH slots are owned and both are listed: cb[0] is what step 2.f reads off and cb[1] is what step
+   2.i fulfils with, and for the one resolution where they differ the second is a dup nothing else holds. */
 static void js_promise_resolvefn_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSPromiseResolveFn *m = st;
     v->val(ctx, &m->cb[0]);
+    v->val(ctx, &m->cb[1]);
 }
 
 
