@@ -2065,6 +2065,17 @@ typedef struct JSConcolicHooks {
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
+/* CAN THE INJECTED-STATE CHANNEL NAME THIS KEY? The channel is a server writing a RECORD OF FIELDS into the
+   page (`window.gon={current_user_id:7}`), so its keys are strings and array indices; a SYMBOL is not on it.
+   The ENGINE gates on this before it asks `.absent`/`.present` at all, and it is EXPORTED because the host is
+   the channel's other end and composes a PATH out of the key — so the host ASSERTS the rule rather than
+   trusting it. Both halves are the mechanism: a gate with nothing checking it is a gate a later route goes
+   around in silence, and this one already was gone around once. §7.1.1 ToPrimitive ( input [ , preferredType ] )
+   step 1.a's `? GetMethod(input, %Symbol.toPrimitive%)` misses on EVERY object, so while the miss arm asked no
+   key rule, every object reachable through a global coerced to a callable unknown and step 1.b.vi threw
+   `TypeError` — a whole document's worth of statements lost to a read that looked like an operator bug. */
+JS_EXTERN bool JS_AtomIsPublishedName(JSRuntime *rt, JSAtom atom);
+
 /* APIClient @S — THE JS-CONTEXT CODE-EXECUTION SINK, ANNOUNCED BY THE ENGINE THAT OWNS IT.
  *
  * The other two sink classes belong to the HOST: a markup sink is `element.innerHTML` and a URL sink is a

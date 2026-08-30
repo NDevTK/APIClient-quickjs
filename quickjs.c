@@ -11985,8 +11985,24 @@ done:
    and array indices. A SYMBOL is not on that channel and must not be read as if it were: its path would be
    composed out of a description that is neither unique nor a name (`Symbol()` twice spells one path for two
    keys), and the well-known ones are the engine's own protocol, so answering @@toPrimitive or @@iterator with
-   an unknown replaces a slot the interpreter is about to CALL with a value that is not callable. */
-static bool js_atom_is_published_name(JSRuntime *rt, JSAtom atom)
+   an unknown replaces a slot the interpreter is about to CALL with a value that is not callable.
+   THAT LAST SENTENCE WAS TRUE OF THE HIT ARM AND OF NOTHING ELSE, AND THE MISS ARM COST THE COERCION SURFACE
+   FOR IT. This predicate arrived with the HIT half of the channel and was asked only there, while the MISS
+   half — older, and the arm every well-known-symbol read actually takes, since the engine's protocol keys are
+   exactly the ones no object holds — asked nothing. §7.1.1 ToPrimitive ( input [ , preferredType ] ) step 1.a
+   is `? GetMethod(input, %Symbol.toPrimitive%)`, which falls off the end of the prototype chain on EVERY
+   object; on the global and on any published record the channel then answered with a CALLABLE unknown, step
+   1.b.iv called it, and step 1.b.vi ("If result is not an Object, return result. Throw a TypeError") threw.
+   The reproduction is two tokens wide and worth keeping: `var b={}; 1 & b` and `1 & globalThis` both died
+   with `TypeError: toPrimitive`, so EVERY coercion of EVERY object a document reached through a global ended
+   that document — while the inline `1 & {}` beside it was fine, which is why the failure read as an operator
+   bug and sent readers into the coercion trampoline rather than into a property read.
+   So the ASK is one function per arm and the KEY RULE is one function under both (js_absent_ask /
+   js_present_ask below), and it is EXPORTED because the host is the channel's other end: absent.c composes a
+   PATH out of this key, so it asserts the rule rather than trusting it — a third base added to the ask later
+   (the §4.12.1 data block the miss arm's comment names) then carries the rule for free, and a route that
+   bypasses the ask fires in the host instead of arriving as a plausible member of a namespace. */
+bool JS_AtomIsPublishedName(JSRuntime *rt, JSAtom atom)
 {
     if (__JS_AtomIsTaggedInt(atom))
         return true;
@@ -12023,7 +12039,7 @@ static bool js_present_ask(JSContext *ctx, JSObject *holder, JSAtom prop, JSValu
        never filed, and wrap the concolics this engine mints in a second layer of themselves. */
     if (JS_VALUE_GET_TAG(held) == JS_TAG_OBJECT)
         return false;
-    if (!js_atom_is_published_name(ctx->rt, prop))
+    if (!JS_AtomIsPublishedName(ctx->rt, prop))
         return false;
     /* AND THE PUBLICATION IS ASKED HERE, WHICH THE MISS PATH'S COPY OF THIS COULD LEAVE TO SOMEBODY ELSE AND
        THIS ONE CANNOT. The walk runs lazily, off a read, and until this arm existed the only read that ran it
@@ -12039,6 +12055,68 @@ static bool js_present_ask(JSContext *ctx, JSObject *holder, JSAtom prop, JSValu
     if (!holder->doc_namespace)
         js_publish_document_namespace(ctx);
     return holder->doc_namespace;
+}
+
+/* §10.1.8.1 OrdinaryGet ( O, P, Receiver ) step 2.b — "If parent is null, return undefined" — AND THE TWO
+   BASES FOR WHICH THAT undefined WOULD BE A FABRICATION. The MISS half of the same channel js_present_ask
+   answers the HIT half of, written as its twin so the two cannot come apart: the key rule, the base rule and
+   the lazy publication are each stated ONCE for both, and a base added here is a base the key rule already
+   covers. It used to be an `if` inside JS_GetPropertyInternal's tail, which is exactly how it came to be the
+   arm with no key rule in it — see JS_AtomIsPublishedName for what that cost.
+   THE GLOBAL OBJECT, because a miss there is the same question a bare unresolved name asks, reached
+   through `window.` instead: server-injected app state is written onto the global, so `window.__FLAGS` and
+   `__FLAGS` are one read spelled two ways.
+   AND A RECORD THE DOCUMENT PUBLISHED into that namespace, because a server does not only write globals it
+   may leave out entirely — far more often it writes `window.gon={}` and then the handful of fields THIS
+   visitor is entitled to, and every field the bundle reads and the server did not write is exactly the
+   same unknown wearing a present parent. Restricting the rule to the global was not a narrower reading of
+   it: `gon.*`, `__INITIAL_STATE__.*`, `__NUXT__.*` and `__APOLLO_STATE__.*` are all records whose FIELDS
+   are read off a parent the document did write.
+   WHAT IS STILL OUT OF REACH, NAMED SO IT IS NOT MISTAKEN FOR A DECISION: a server that ships its state as
+   a `<script type="application/json">` DATA BLOCK — HTML §4.12.1 "The script element": "Setting the
+   attribute to any other value means that the script is a data block, which is not processed by the user
+   agent, but instead by author script or other tools" — and lets the BUNDLE parse it. That record is
+   built by bundle code out of document bytes, so nothing here marks it — the document-built bit is set
+   from the code that is running, and a `JSON.parse` in the bundle is bundle code however server-rendered
+   its input was. Reaching it needs the DOCUMENT'S OWN TEXT to be a provenance a value can carry from the
+   DOM through the parse, which is a different mechanism from this one and not a wider setting of it.
+   AND IT DOES NOT ASK WHO IS READING, which is the one narrowing that looks principled and is not. It is
+   tempting to say a channel needs both ends — a session-VARIANT producer and a session-INVARIANT consumer
+   — and to answer `undefined` when an inline script reads a record its own document published. But the
+   fact the answer turns on is WHOSE CHOICE THE EXTENT WAS, and that was the server's whichever half of the
+   document reads it: `window.__FLAGS={theme}` followed on the next line by `if(__FLAGS.admin)` is a gate
+   over state the server would have written for a logged-in visitor, and suppressing it buries the admin
+   code exactly as answering `undefined` on the global did. A reader test would also make the mechanism's
+   own fixtures unreachable — a one-document fixture has no external half — which is the tell that it is a
+   cost heuristic wearing an argument. §solver: err toward MORE exploration; the WFQ starves the arm that
+   emits nothing.
+   Returns the unknown, or JS_UNINITIALIZED for "this read is not on the channel" — never JS_UNDEFINED, which
+   is a legitimate ANSWER a host may compose and would be indistinguishable from a refusal. */
+static JSValue js_absent_ask(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+    JSObject *base;
+    bool ask;
+
+    if (likely(g_concolic.absent == NULL) || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return JS_UNINITIALIZED;
+    /* THE KEY RULE, ASKED BEFORE THE BASE AND FOR THE SAME REASON THE HIT ARM ASKS IT: a well-known symbol is
+       the ENGINE's protocol and not the server's channel, and it is the key that misses on EVERY object, so
+       this arm is the one that meets it. Cheap, and it is what makes a third base free. */
+    if (!JS_AtomIsPublishedName(ctx->rt, prop))
+        return JS_UNINITIALIZED;
+    base = JS_VALUE_GET_OBJ(obj);
+    ask = (base == JS_VALUE_GET_OBJ(ctx->global_obj));
+    if (!ask && base->doc_built) {
+        /* A record the document built: publication is what says whether it is on the CHANNEL or is merely
+           an object an inline script happened to make and keep, and it is asked here rather than at the
+           store for the reason js_publish_document_namespace gives. */
+        if (!base->doc_namespace)
+            js_publish_document_namespace(ctx);
+        ask = base->doc_namespace;
+    }
+    if (!ask)
+        return JS_UNINITIALIZED;
+    return g_concolic.absent(ctx, obj, prop);
 }
 
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
@@ -12257,52 +12335,12 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     if (unlikely(throw_ref_error)) {
         return JS_ThrowReferenceErrorNotDefined(ctx, prop);
     }
-    /* §10.1.8.1 OrdinaryGet step 2.b — "If parent is null, return undefined" — AND THE TWO BASES FOR WHICH
-       THAT undefined WOULD BE A FABRICATION.
-       THE GLOBAL OBJECT, because a miss there is the same question a bare unresolved name asks, reached
-       through `window.` instead: server-injected app state is written onto the global, so `window.__FLAGS` and
-       `__FLAGS` are one read spelled two ways.
-       AND A RECORD THE DOCUMENT PUBLISHED into that namespace, because a server does not only write globals it
-       may leave out entirely — far more often it writes `window.gon={}` and then the handful of fields THIS
-       visitor is entitled to, and every field the bundle reads and the server did not write is exactly the
-       same unknown wearing a present parent. Restricting the rule to the global was not a narrower reading of
-       it: `gon.*`, `__INITIAL_STATE__.*`, `__NUXT__.*` and `__APOLLO_STATE__.*` are all records whose FIELDS
-       are read off a parent the document did write.
-       WHAT IS STILL OUT OF REACH, NAMED SO IT IS NOT MISTAKEN FOR A DECISION: a server that ships its state as
-       a `<script type="application/json">` DATA BLOCK — HTML §4.12.1 "The script element": "Setting the
-       attribute to any other value means that the script is a data block, which is not processed by the user
-       agent, but instead by author script or other tools" — and lets the BUNDLE parse it. That record is
-       built by bundle code out of document bytes, so nothing here marks it — the document-built bit is set
-       from the code that is running, and a `JSON.parse` in the bundle is bundle code however server-rendered
-       its input was. Reaching it needs the DOCUMENT'S OWN TEXT to be a provenance a value can carry from the
-       DOM through the parse, which is a different mechanism from this one and not a wider setting of it.
-       AND IT DOES NOT ASK WHO IS READING, which is the one narrowing that looks principled and is not. It is
-       tempting to say a channel needs both ends — a session-VARIANT producer and a session-INVARIANT consumer
-       — and to answer `undefined` when an inline script reads a record its own document published. But the
-       fact the answer turns on is WHOSE CHOICE THE EXTENT WAS, and that was the server's whichever half of the
-       document reads it: `window.__FLAGS={theme}` followed on the next line by `if(__FLAGS.admin)` is a gate
-       over state the server would have written for a logged-in visitor, and suppressing it buries the admin
-       code exactly as answering `undefined` on the global did. A reader test would also make the mechanism's
-       own fixtures unreachable — a one-document fixture has no external half — which is the tell that it is a
-       cost heuristic wearing an argument. §solver: err toward MORE exploration; the WFQ starves the arm that
-       emits nothing. */
-    if (g_concolic.absent && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
-        JSObject *base = JS_VALUE_GET_OBJ(obj);
-        bool ask = (base == JS_VALUE_GET_OBJ(ctx->global_obj));
-
-        if (!ask && base->doc_built) {
-            /* A record the document built: publication is what says whether it is on the CHANNEL or is merely
-               an object an inline script happened to make and keep, and it is asked here rather than at the
-               store for the reason js_publish_document_namespace gives. */
-            if (!base->doc_namespace)
-                js_publish_document_namespace(ctx);
-            ask = base->doc_namespace;
-        }
-        if (ask) {
-            JSValue a = g_concolic.absent(ctx, obj, prop);
-            if (!JS_IsUninitialized(a))
-                return a;
-        }
+    /* §10.1.8.1 OrdinaryGet ( O, P, Receiver ) step 2.b, and the two bases on which that `undefined` is a
+       fabrication — js_absent_ask, which is the HIT arm's twin and shares its key rule. */
+    {
+        JSValue a = js_absent_ask(ctx, obj, prop);
+        if (!JS_IsUninitialized(a))
+            return a;
     }
     return JS_UNDEFINED;
 }
@@ -45793,11 +45831,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        unresolvable, because its ReferenceError names the component to write. Only a plain
                        VALUE read asks: `typeof`, `delete` and a Reference are defined on an unresolvable one
                        and answer without needing to know what it would have held. */
-                    if (wop == OP_get_var && g_concolic.absent) {
-                        /* THE BASE IS THE GLOBAL OBJECT, and stating it is not a formality: the hook answers
+                    if (wop == OP_get_var) {
+                        /* THE BASE IS THE GLOBAL OBJECT, and stating it is not a formality: the ask answers
                            for two bases and the platform-name suppression belongs to exactly this one. An
-                           unresolvable Reference is a miss whose last link WAS the global record. */
-                        JSValue cv = g_concolic.absent(ctx, ctx->global_obj, atom);
+                           unresolvable Reference is a miss whose last link WAS the global record.
+                           THROUGH THE ASK AND NOT PAST IT. An identifier is a string atom, so this site's key
+                           is on the channel by construction — which is exactly the kind of "true today" that
+                           made the property-read arm the one with no key rule in it. There is one ask; a
+                           second spelling of its conditions here is a second thing to keep in step. */
+                        JSValue cv = js_absent_ask(ctx, ctx->global_obj, atom);
                         if (!JS_IsUninitialized(cv)) {
                             js_with_has_free(ctx, wh);
                             *sp++ = cv;
