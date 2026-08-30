@@ -12311,6 +12311,82 @@ static JSValue js_absent_ask(JSContext *ctx, JSValueConst obj, JSAtom prop)
     return g_concolic.absent(ctx, obj, prop);
 }
 
+/* THE INTERFACE'S OWN NAME, FOR AN ASSERT THAT WOULD OTHERWISE NAME A HUNDRED COMPONENTS AT ONCE.
+   The accessor assertions below identify a read by the RECEIVER's class and the HOLDER's class, and that
+   argument holds only while a component has a JSClassID of its own. It does not hold for the shape a Web IDL
+   interface normally has here: an interface prototype object is an ORDINARY object, so its class is `Object`,
+   and every interface built on a shared substrate shares the substrate's class on the instance side too. The
+   measured case is Web IDL §3.9 Legacy platform objects' indexed getter — one `IndexedProperties` class backs
+   ten interfaces (FileList, DOMStringList, NodeList, HTMLCollection, NamedNodeMap, DOMTokenList, DOMRectList,
+   MediaList, CSSRuleList, StyleSheetList), each of which puts `length` on its own prototype — so a C read of
+   `length` on any of them printed receiver `IndexedProperties`, holder `Object`, and ten unrelated components
+   were one indistinguishable line. That is precisely the defect the `name`-on-four-objects comment below
+   describes, reproduced one layer along inside the message written to prevent it.
+   SO THE CLASS STRING IS ASKED, BECAUSE WEB IDL PUTS THE IDENTITY THERE. §3 JavaScript binding states that an
+   object with a class string "must, at the time it is created, have a property whose name is the
+   %Symbol.toStringTag% symbol with PropertyDescriptor{[[Writable]]: false, [[Enumerable]]: false,
+   [[Configurable]]: true, [[Value]]: classString}", and §3.7.3 Interface prototype object states that "the
+   class string of an interface prototype object is the interface's qualified name". So the holder of an IDL
+   accessor carries the name of the one component that installed it, and the receiver's prototype carries the
+   name of the interface the instance implements.
+   IT RUNS NO PAGE CODE, AND EVERY CLAUSE HERE IS WHAT MAKES THAT TRUE rather than a hope. This is an abort
+   path: a diagnostic that reached the page would re-enter the very walk that is aborting, and the crash would
+   then report a state its own reporting created. So the slot is read the way the assert below already tells
+   its reader to read one — off the shape, never through a [[Get]]. find_own_property is a hash lookup in the
+   shape and calls nothing; a Proxy holds no own properties at all, so one answers "absent" here without its
+   trap running; a property that is not a plain data slot (an accessor, a var_ref, an autoinit) is REFUSED and
+   said so rather than instantiated or called; and the walk is ONE step to the prototype and no further,
+   because every interface prototype on a chain carries its OWN tag and a second step would report an ancestor
+   interface's name as this object's — a wrong answer, not a partial one.
+   AND THE DESCRIPTOR IS CHECKED, BECAUSE THE PROPERTY IS [[Configurable]]. A page can redefine it, which would
+   make this an authoritative-sounding wrong address — the failure this project calls worse than none. §3's
+   descriptor is exactly { configurable } with writable and enumerable false, so a tag whose flags are not that
+   one is reported as redefined and the reader knows to trust the file:line and the class names instead.
+   DEV-ONLY, like every one of its callers: it exists to give an abort an address, and a release build has no
+   abort to give one to. */
+#if APICLIENT_DEV
+static const char *js_why_class_string(JSContext *ctx, JSObject *p, char *buf, size_t n)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSString *str;
+    uint32_t i;
+    int step;
+
+    (void)ctx;
+    if (!p)
+        return "(not an object)";
+    for (step = 0; step < 2; step++, p = p->shape->proto) {
+        if (!p)
+            return "(no %Symbol.toStringTag% on it or its prototype)";
+        prs = find_own_property(&pr, p, JS_ATOM_Symbol_toStringTag);
+        if (!prs)
+            continue;
+        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            return "(its %Symbol.toStringTag% is not a data property — NOT READ, because reading one from an "
+                   "abort path would run the page's code)";
+        if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_STRING)
+            return "(its %Symbol.toStringTag% is not a plain string value, so it is not a Web IDL class "
+                   "string — a rope is refused here too rather than flattened, because flattening allocates "
+                   "on a path that is already aborting)";
+        str = JS_VALUE_GET_STRING(pr->u.value);
+        if (str->is_wide_char)
+            return "(its %Symbol.toStringTag% is not ASCII, so it is not a Web IDL qualified name)";
+        /* string_get, not a direct str8 index: a NORMAL, a SLICE and an INDIRECT string all answer through it
+           and none of them allocates or calls anything. */
+        for (i = 0; i < str->len && i + 1 < n; i++)
+            buf[i] = (char)string_get(str, (int)i);
+        buf[i] = '\0';
+        /* §3's descriptor is { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: true }. */
+        if ((prs->flags & (JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE)) != JS_PROP_CONFIGURABLE)
+            snprintf(buf + i, n - i, " [REDEFINED — not §3's class-string descriptor, so this name is the "
+                                     "page's claim rather than the engine's]");
+        return buf;
+    }
+    return "(no %Symbol.toStringTag% on it or its prototype)";
+}
+#endif /* APICLIENT_DEV — js_why_class_string */
+
 /* THE ONE PLACE A READ THAT REACHES THE PAGE'S CODE IS DISCOVERED, so `file`/`line` are the READER's — captured
    by the macro over every public spelling (see the contract above JS_GetPropertyAt in quickjs.h). They are read
    only by the two assertions in the accessor arms, which a release build compiles out; the parameters stay in
@@ -12417,6 +12493,16 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                            WHICH-OF-THE-TWO is DIAGNOSTIC ONLY: tramp_accessor_getter walks own slot and
                            prototypes with one rule and routes either the same way, so nothing about the route
                            turns on it. It is the identification that turns on it, which is why both are named.
+                           AND THE TWO CLASSES ARE NOT ENOUGH, WHICH IS THE SAME DEFECT ONE LAYER ALONG. A Web
+                           IDL interface prototype object is an ORDINARY object, so its class is `Object` for
+                           every interface in the engine, and an instance built on a shared substrate carries
+                           the substrate's class rather than its own — so the pair narrows to one component
+                           only where a component has a JSClassID to itself. Measured on §3.9 Legacy platform
+                           objects' indexed getter: ONE `IndexedProperties` class backs ten interfaces, each
+                           with `length` on its own `Object`-classed prototype, so a C read of `length` on any
+                           of them printed one identical line for ten unrelated files. The CLASS STRING is what
+                           separates them — see js_why_class_string, which reads §3's %Symbol.toStringTag% off
+                           the shape and runs none of the page's code.
                            AND THE CALLER IS IN THE REPORT NOW, WHICH IT COULD HAVE BEEN ALL ALONG. The line
                            that stood here said it could not be — "the wasm stack is function indices" — and
                            that is a claim about the NATIVE stack, which nothing here was ever going to walk.
@@ -12428,30 +12514,36 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         {
                             char pbuf[ATOM_GET_STR_BUF_SIZE], hbuf[ATOM_GET_STR_BUF_SIZE];
                             char rbuf[ATOM_GET_STR_BUF_SIZE], why[4096];
+                            char rtag[128], htag[128];
                             char frames[2048], site[320];
                             JSRuntime *rt0 = ctx->rt;
                             const char *rcls = "a primitive";
                             bool routed = (file == js_read_site_routed);
-                            if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+                            JSObject *robj = JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT
+                                             ? JS_VALUE_GET_OBJ(obj) : NULL;
+                            if (robj)
                                 rcls = JS_AtomGetStr(ctx, rbuf, sizeof(rbuf),
-                                                     rt0->class_array[JS_VALUE_GET_OBJ(obj)->class_id].class_name);
+                                                     rt0->class_array[robj->class_id].class_name);
                             if (routed)
                                 snprintf(site, sizeof site, "%s (%s:%d)", js_read_site_routed, __FILE__, line);
                             else
                                 snprintf(site, sizeof site, "%s:%d", file ? file : "(no call site)", line);
                             js_why_backtrace(ctx, frames, sizeof frames);
                             snprintf(why, sizeof why,
-                                     "A property READ reached a getter for `%s` on %s (the accessor is held by "
-                                     "%s), asked for by the C READER at %s. §10.1.8.1 OrdinaryGet ( obj, "
-                                     "propertyKey, receiver ) step 7 is `Return ? Call(getter, receiver)` — the "
+                                     "A property READ reached a getter for `%s` on %s / %s (the accessor is "
+                                     "held by %s / %s), asked for by the C READER at %s. §10.1.8.1 OrdinaryGet "
+                                     "( obj, propertyKey, receiver ) step 7 is `Return ? Call(getter, "
+                                     "receiver)` — the "
                                      "page's function, and a C activation has no flow base under it, so a loop "
                                      "in that body drives to completion instead of parking. This is a "
                                      "capability this engine does not have rather than a case to handle; the "
                                      "C-drives-JS body was DELETED, not left behind an assert. %s The page's "
                                      "call into this reader: %s",
                                      JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop), rcls,
+                                     js_why_class_string(ctx, robj, rtag, sizeof rtag),
                                      JS_AtomGetStr(ctx, hbuf, sizeof(hbuf),
                                                    rt0->class_array[p->class_id].class_name),
+                                     js_why_class_string(ctx, p, htag, sizeof htag),
                                      site,
                                      routed
                                      ? "SO THIS IS NOT AN UNROUTED READER: the opcode already asked "
@@ -12570,6 +12662,7 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                 {
                                     char why[4096], frames[2048], site[320];
                                     char pbuf[ATOM_GET_STR_BUF_SIZE], hbuf[ATOM_GET_STR_BUF_SIZE];
+                                    char htag[128];
                                     bool routed = (file == js_read_site_routed);
                                     if (routed)
                                         snprintf(site, sizeof site, "%s (%s:%d)",
@@ -12578,8 +12671,12 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                         snprintf(site, sizeof site, "%s:%d",
                                                  file ? file : "(no call site)", line);
                                     js_why_backtrace(ctx, frames, sizeof frames);
+                                    /* THE CLASS STRING IS HERE FOR THE SAME REASON IT IS IN THE SHAPE-SLOT ARM,
+                                       and this arm needs it MORE: an exotic class is a SUBSTRATE, so one class
+                                       name here stands for every interface built on it by construction rather
+                                       than by accident. */
                                     snprintf(why, sizeof why,
-                                             "An exotic [[GetOwnProperty]] answered `%s` on %s with an "
+                                             "An exotic [[GetOwnProperty]] answered `%s` on %s / %s with an "
                                              "ACCESSOR and the read is being performed from C, asked for by "
                                              "the C READER at %s. §10.1.8.1 OrdinaryGet ( obj, propertyKey, "
                                              "receiver ) step 7 calls that getter and a C activation has no "
@@ -12590,6 +12687,7 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                              JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop),
                                              JS_AtomGetStr(ctx, hbuf, sizeof(hbuf),
                                                            ctx->rt->class_array[p->class_id].class_name),
+                                             js_why_class_string(ctx, p, htag, sizeof htag),
                                              site,
                                              routed
                                              ? "SO THIS IS NOT AN UNROUTED READER: the opcode already asked "
@@ -13654,10 +13752,37 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
         /* ASSERTED, not claimed. This is a C-side [[GetOwnProperty]] on every level of the chain, so a Proxy
            anywhere on it runs the page's getOwnPropertyDescriptor trap with no flow base. The routed
            [[HasProperty]] is a GP_HAS request; a caller reaching HERE with a proxied receiver is one that
-           still has to route, and this is where it says so rather than hanging. */
-        DCHECK(p->class_id != JS_CLASS_PROXY,
-               "JS_HasProperty walked onto a Proxy from C — route that caller onto the GP_HAS request before "
-               "its trap runs with no flow base");
+           still has to route, and this is where it says so rather than hanging.
+           WHICH `x in y` IT WAS is in the message, for the reason the read and write arms both state at
+           length: this is one line reachable from every C membership test in the tree, and "route that caller"
+           with no object in it is an instruction over hundreds of spellings. The proxy is named by the level
+           of the chain it sits at, which is what distinguishes a proxied RECEIVER from a proxied prototype —
+           a difference that decides whether the fix is at the caller or at whoever installed the prototype. */
+#if APICLIENT_DEV
+        if (unlikely(p->class_id == JS_CLASS_PROXY)) {
+            char pbuf[ATOM_GET_STR_BUF_SIZE], rbuf[ATOM_GET_STR_BUF_SIZE];
+            char rtag[128], frames[2048], why[4096];
+            JSObject *robj = JS_VALUE_GET_OBJ(obj);
+
+            js_why_backtrace(ctx, frames, sizeof frames);
+            snprintf(why, sizeof why,
+                     "A membership test for `%s` walked onto a Proxy from C. The test started on %s / %s and "
+                     "the Proxy is %s the receiver. §7.3.11 HasProperty ( obj, propertyKey ) is `Return ? "
+                     "obj.[[HasProperty]](propertyKey)`, and a Proxy's is §10.5.7 [[HasProperty]] ( "
+                     "propertyKey ), whose step 7 is `Let boolTrapResult be ToBoolean(? Call(trap, handler, "
+                     "<< target, propertyKey >>))` and whose step 5 already reaches the page through "
+                     "`GetMethod(handler, \"has\")` "
+                     "— the page's function, and a C activation has no flow base under it. ROUTE THE CALLER "
+                     "onto the GP_HAS request, which is the same one the `in` opcode issues. %s",
+                     JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop),
+                     JS_AtomGetStr(ctx, rbuf, sizeof(rbuf),
+                                   ctx->rt->class_array[robj->class_id].class_name),
+                     js_why_class_string(ctx, robj, rtag, sizeof rtag),
+                     p == robj ? "ITSELF" : "on its PROTOTYPE CHAIN, not",
+                     frames);
+            DFAIL(why);
+        }
+#endif
         /* JS_GetOwnPropertyInternal can free the prototype */
         js_dup(JS_MKPTR(JS_TAG_OBJECT, p));
         ret = JS_GetOwnPropertyInternal(ctx, NULL, p, prop);
@@ -14201,19 +14326,75 @@ void JS_DeleteOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop)
            "entry through cow_capture_bytes");
 }
 
+/* `prop` and `holder` are here ONLY so the abort has an address in it, and they are the write side's half of
+   what the read side already carries. The old message was the whole of it — "call_setter ran a setter from C
+   — route this write onto the tramp chain" — one line, identical at three call sites, over every property of
+   every object in the engine: a correct spec fact and a correct instruction with nothing to apply either to.
+   A reader who obeyed it had to read every C writer in the tree to find which write it meant.
+   NAMED RESIDUAL — WHAT IS STILL MISSING IS THE C WRITER'S OWN file:line, AND THE NEXT DIFF IS THE ONE THAT
+   BUILDS IT. The read path threads `file`/`line` from a macro over every public spelling of JS_GetProperty*
+   (see the contract above JS_GetPropertyAt in quickjs.h); JS_SetProperty* has no such plumbing, so the write
+   that reached here is identified by WHAT it wrote and WHOSE, and not by WHERE. That next diff is the same
+   shape as the read side's: a JS_SetPropertyAt macro pair in quickjs.h and the parameter threaded down through
+   JS_SetPropertyInternal2 to here. HOW ITS ABSENCE SHOWS: this abort fires with the property, both classes and
+   both class strings filled in, and the js_why_backtrace tail bottoms out in the page's frames with no C
+   file:line anywhere in the report — so the component is named and the line inside it is not. */
 static int call_setter(JSContext *ctx, JSObject *setter,
-                       JSValueConst this_obj, JSValue val, int flags)
+                       JSValueConst this_obj, JSAtom prop, JSObject *holder, JSValue val, int flags)
 {
+    /* Read only by the assertion below, which a release build compiles out; the parameters stay in the
+       signature there so ONE argument list serves both builds — the same shape as the read side's file/line. */
+    (void)prop; (void)holder;
     if (likely(setter)) {
         /* THE SETTER RUNS PAGE CODE. Running it from here gives it a C activation with no flow base, so a loop
            in the setter body drives to completion; the write OPCODES route it onto the tramp chain as a 1-arg
            method call, the same way the read opcodes route a getter. The JS_CallFree that used to be here was
            measured over the whole corpus behind a DCHECK and never reached, so it is deleted rather than kept
            as a fallback for whatever the routing misses.
-           The no-setter arm below is not a fallback at all — it is 10.1.9.2 step 4.e's TypeError, which runs no
-           user code and belongs exactly here. */
+           The no-setter arm below is not a fallback at all, and its citation was WRONG in a way worth stating
+           because a wrong number reads as authoritative: it said "10.1.9.2 step 4.e's TypeError", and
+           §10.1.9.2 OrdinarySetWithOwnDescriptor ( obj, propertyKey, value, receiver, ownDesc ) has no step
+           4.e and does not throw at all — its step 5 is "If setter is undefined, return false". The TypeError
+           is §7.3.4 Set ( obj, propertyKey, value, throw ) step 2, "If success is false and throw is true,
+           throw a TypeError exception", which is exactly what the JS_PROP_THROW test below is. It runs no user
+           code and belongs exactly here. */
         JS_FreeValue(ctx, val);
-        DFAIL("call_setter ran a setter from C — route this write onto the tramp chain");
+#if APICLIENT_DEV
+        {
+            char pbuf[ATOM_GET_STR_BUF_SIZE], rbuf[ATOM_GET_STR_BUF_SIZE], hbuf[ATOM_GET_STR_BUF_SIZE];
+            char rtag[128], htag[128], frames[2048], why[4096];
+            JSObject *robj = JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(this_obj) : NULL;
+            const char *rcls = "a primitive";
+
+            DCHECK(prop != JS_ATOM_NULL,
+                   "call_setter was handed no property atom — every call site has one in hand and passing it "
+                   "is what stops this abort naming the whole engine at once");
+            if (robj)
+                rcls = JS_AtomGetStr(ctx, rbuf, sizeof(rbuf),
+                                     ctx->rt->class_array[robj->class_id].class_name);
+            js_why_backtrace(ctx, frames, sizeof frames);
+            snprintf(why, sizeof why,
+                     "A property WRITE reached a setter for `%s` on %s / %s (the accessor is held by %s / %s) "
+                     "and it is being performed from C. §10.1.9.2 OrdinarySetWithOwnDescriptor ( obj, "
+                     "propertyKey, value, receiver, ownDesc ) step 6 is `Perform ? Call(setter, receiver, "
+                     "<< value >>)` — the page's "
+                     "function, and a C activation has no flow base under it, so a loop in that body drives to "
+                     "completion instead of parking. This is a capability this engine does not have rather "
+                     "than a case to handle; the C-drives-JS body was DELETED, not left behind an assert. "
+                     "ROUTE THE WRITE: the write opcodes hand the setter to the tramp chain as a 1-arg method "
+                     "call, which is the same request Reflect.set issues. There is no C file:line in this "
+                     "report because JS_SetProperty* does not yet carry one — see the residual above "
+                     "call_setter. The page's call into this writer: %s",
+                     JS_AtomGetStr(ctx, pbuf, sizeof(pbuf), prop), rcls,
+                     js_why_class_string(ctx, robj, rtag, sizeof rtag),
+                     holder ? JS_AtomGetStr(ctx, hbuf, sizeof(hbuf),
+                                            ctx->rt->class_array[holder->class_id].class_name)
+                            : "(no holder passed)",
+                     js_why_class_string(ctx, holder, htag, sizeof htag),
+                     frames);
+            DFAIL(why);
+        }
+#endif
         JS_ThrowTypeError(ctx, "setter");
         return -1;
     } else {
@@ -14626,7 +14807,7 @@ retry:
             DCHECK(prop == JS_ATOM_length, "prop == JS_ATOM_length");
             return set_array_length(ctx, p, val, flags);
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
-            return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
+            return call_setter(ctx, pr->u.getset.setter, this_obj, prop, p1, val, flags);
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
             /* JS_PROP_WRITABLE is always true for variable
                references, but they are write protected in module name
@@ -14716,7 +14897,7 @@ retry:
                                     setter = NULL;
                                 else
                                     setter = JS_VALUE_GET_OBJ(desc.setter);
-                                ret = call_setter(ctx, setter, this_obj, val, flags);
+                                ret = call_setter(ctx, setter, this_obj, prop, p1, val, flags);
                                 JS_FreeValue(ctx, desc.getter);
                                 JS_FreeValue(ctx, desc.setter);
                                 return ret;
@@ -14748,7 +14929,7 @@ retry:
         prs = find_own_property(&pr, p1, prop);
         if (prs) {
             if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
-                return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
+                return call_setter(ctx, pr->u.getset.setter, this_obj, prop, p1, val, flags);
             } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
                 /* Instantiate property and retry (potentially useless) */
                 if (JS_AutoInitProperty(ctx, p1, prop, pr, prs))
