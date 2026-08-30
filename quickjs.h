@@ -1537,6 +1537,13 @@ JS_EXTERN JSPromiseStateEnum JS_PromiseState(JSContext *ctx,
                                              JSValueConst promise);
 JS_EXTERN JSValue JS_PromiseResult(JSContext *ctx, JSValueConst promise);
 JS_EXTERN bool JS_IsPromise(JSValueConst val);
+/* A promise already settled with `value`, for an embedder with a completion and no capability to hand it to.
+   NARROWED IN THIS FORK, AND THE NARROWING IS THE WHOLE OF WHAT AN EMBEDDER MUST KNOW: a rejection takes any
+   value, and a resolution takes any value that is NOT an Object. A resolution WITH one is refused, because
+   27.5.4.7.1 PromiseResolve step 1.a reads `constructor` off a promise and 27.5.1.3 step 2.f reads `then` off a
+   thenable — the page's code either way, and a C activation has no flow base to run it on. An embedder holding
+   an object settles it from a step machine through the flow instead; there is no C route and refusing is how
+   that stays true. */
 JS_EXTERN JSValue JS_NewSettledPromise(JSContext *ctx, bool is_reject, JSValueConst value);
 
 JS_EXTERN JSValue JS_NewSymbol(JSContext *ctx, const char *description, bool is_global);

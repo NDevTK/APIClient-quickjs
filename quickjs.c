@@ -103482,6 +103482,12 @@ bool JS_IsPromise(JSValueConst val)
     return JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_PROMISE;
 }
 
+/* See the declaration for the contract. THIS IS UPSTREAM'S ENTRY AND IT STAYS ONE: the fork is a minimal
+   quickjs-ng delta, and an export upstream publishes is not the fork's to withdraw — an embedder built against
+   quickjs-ng would lose a symbol over a narrowing that costs it nothing on every value it can still pass. What
+   the narrowing DOES cost is stated where an embedder reads it, rather than surfacing two calls away as a
+   DFAIL inside js_promise_resolve_native, which is the only reason a caller-less-looking export here needs any
+   prose at all: its contract is no longer upstream's. */
 JSValue JS_NewSettledPromise(JSContext *ctx, bool is_reject, JSValueConst value)
 {
     return js_promise_resolve_native(ctx, ctx->promise_ctor, 1, &value, is_reject);
