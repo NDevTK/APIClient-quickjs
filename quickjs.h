@@ -1930,6 +1930,29 @@ JS_EXTERN void  JS_ObjStateFree(JSRuntime *rt, void *blob);
             that `obj` is one of the two before it asks; a host that cannot NAME the base it was handed is a
             host whose registry disagrees with the engine's mark, which is a defect rather than a miss.
             Returns the concolic value, or JS_UNINITIALIZED to leave the read exactly as it was.
+     - present: THE OTHER HALF OF THE SAME QUESTION, and the half without which .absent's own rule is false of
+            the case it names. .absent is asked at the END of the walk, so it can only ever see a member the
+            record does NOT hold — and a server that sends `window.__FLAGS={admin:false}` holds it. That read
+            hits §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 3, "If IsDataDescriptor(propertyDesc)
+            is true, return propertyDesc.[[Value]]", and answering `false` concretely decides `if (__FLAGS.admin)`
+            for the whole program: the admin arm is never forked and every endpoint behind it is lost, which is
+            EXACTLY the loss .absent exists to prevent, reached through a present slot instead of a missing one.
+            The extent of that record was the server's choice against THIS visitor's credentials, so what it
+            holds is a LOADED CONFIG and not a program constant: opaque for control flow, carrying the bytes the
+            server sent as its EXAMPLE. Which is why it is a hook and not a value the engine invents — the
+            engine has the slot, the host has the path the member is read by and the value class that carries
+            both facts at once.
+            ASKED FOR ONE BASE ONLY: a record the document PUBLISHED (.doc_namespace). NOT the global object,
+            whose HIT is normally a builtin — `parseInt`, `Object`, `document` — so .absent's own miss predicate
+            (`base == global || published`) is a WRONG predicate for a hit and is deliberately not reused: under
+            it every intrinsic the page touched would become symbolic. `holder` is the record the slot was found
+            ON, which is what the path names, so a record read through an inheriting receiver still reports
+            under the name it was published at. `value` is BORROWED. Returns the concolic value — and the caller
+            then drops its own reference to the held value — or JS_UNINITIALIZED to leave the read exactly as it
+            was, which the host answers for a member the SERVER'S CHANNEL does not carry (an object-valued one:
+            a child record is published in its own right and its own members are asked, and minting a fresh
+            value per read would answer `a.b === a.b` false and hand the path registry an address it never
+            filed).
      - publish: the document's INLINE half handing a RECORD to its EXTERNAL half, which is the one channel a
             server has for injecting per-visitor state into a bundle it ships unchanged to everybody. Called
             once per record, with the PARENT it is being published under (the global object, or a record
@@ -1979,6 +2002,9 @@ typedef struct JSConcolicHooks {
     int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq);
     int (*is)(JSValueConst v);
     JSValue (*absent)(JSContext *ctx, JSValueConst obj, JSAtom name);
+    /* THE HIT ON A PUBLISHED RECORD — see the paragraph above. `holder` is the record the own data slot was
+       found on and `value` is what it holds, BORROWED. */
+    JSValue (*present)(JSContext *ctx, JSValueConst holder, JSAtom name, JSValueConst value);
     /* THE DOCUMENT PUBLISHING A RECORD INTO THE GLOBAL NAMESPACE — see the paragraph above. `parent` is the
        global object or a record already published under it; both are BORROWED. Installing this is what makes
        the engine mark records at all, so a host that wants neither half installs neither. */

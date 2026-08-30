@@ -11980,6 +11980,67 @@ done:
     js_free(ctx, work);
 }
 
+/* IS THIS KEY A NAME A SERVER PUBLISHED A MEMBER UNDER? The publication channel is a document writing a RECORD
+   OF FIELDS — `window.gon={current_user_id:7}`, a JSON dump rendered into the page — so its keys are strings
+   and array indices. A SYMBOL is not on that channel and must not be read as if it were: its path would be
+   composed out of a description that is neither unique nor a name (`Symbol()` twice spells one path for two
+   keys), and the well-known ones are the engine's own protocol, so answering @@toPrimitive or @@iterator with
+   an unknown replaces a slot the interpreter is about to CALL with a value that is not callable. */
+static bool js_atom_is_published_name(JSRuntime *rt, JSAtom atom)
+{
+    if (__JS_AtomIsTaggedInt(atom))
+        return true;
+    return rt->atom_array[atom]->atom_type == JS_ATOM_TYPE_STRING;
+}
+
+/* §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 3, "If IsDataDescriptor(propertyDesc) is true,
+   return propertyDesc.[[Value]]" — ON A RECORD THE DOCUMENT PUBLISHED, where returning it CONCRETELY is the
+   same loss the miss path exists to prevent.
+   The tail of this function answers a MISS on such a record symbolically, because a field the server did not
+   write for this visitor is unknown rather than `undefined`. A field it DID write is unknown in exactly the
+   same way and for the same reason: `window.__FLAGS={admin:false}` is what the server renders for a
+   logged-OUT visitor, and `false` is a fact about this session rather than about the program, so deciding
+   `if (__FLAGS.admin)` with it deletes the admin arm and every endpoint behind it. That is §solver's trust
+   boundary stated for the case it names: a loaded config is opaque for control flow and still carries its
+   loaded value as the EXAMPLE.
+   ONE BASE, AND IT IS NOT THE MISS PATH'S. The miss asks `base == global || published`, and on a HIT the
+   global's answer is normally a BUILTIN — so reusing that predicate would turn `parseInt`, `Object` and every
+   intrinsic the page touches into an unknown. A published record's own slots are the server's, and its
+   prototype's are Object.prototype's, so the holder is asked and not the receiver.
+   WHAT IS OUT OF REACH, NAMED SO IT IS NOT MISTAKEN FOR A DECISION: a server-written SCALAR global,
+   `window.isAdmin=false`. `doc_built` is set by the OBJECT allocator, so a scalar written straight onto the
+   global carries no mark at all and there is nothing here to ask about — the missing piece is a MARK on that
+   store, not a wider predicate here, and widening this one to reach it would have to catch every builtin on
+   the global to do it. */
+static bool js_present_ask(JSContext *ctx, JSObject *holder, JSAtom prop, JSValueConst held)
+{
+    if (likely(g_concolic.present == NULL) || !holder->doc_built)
+        return false;
+    /* An OBJECT-valued member is not asked, and that is the channel's own shape rather than a carve-out: a
+       record hanging off a published record is PUBLISHED IN ITS OWN RIGHT by the same walk, so its members are
+       already asked one level down, and its address is what absent.c's registry is keyed by. Minting a fresh
+       unknown per read would answer `gon.user === gon.user` false, hide that registry's key behind a value it
+       never filed, and wrap the concolics this engine mints in a second layer of themselves. */
+    if (JS_VALUE_GET_TAG(held) == JS_TAG_OBJECT)
+        return false;
+    if (!js_atom_is_published_name(ctx->rt, prop))
+        return false;
+    /* AND THE PUBLICATION IS ASKED HERE, WHICH THE MISS PATH'S COPY OF THIS COULD LEAVE TO SOMEBODY ELSE AND
+       THIS ONE CANNOT. The walk runs lazily, off a read, and until this arm existed the only read that ran it
+       was one that MISSED — which the case this hook is for never performs: `window.__FLAGS={admin:false}`
+       followed by `if (__FLAGS.admin)` resolves the global by an own-slot HIT and the member by an own-slot
+       HIT, so nothing on that program's path ever falls off a prototype chain and the record would stay
+       unpublished for ever while every one of its members read concretely. The walk is entered here for the
+       same reason and at the same cost the miss path states: publication is what says whether a record the
+       document BUILT is on the server's channel or is merely an object an inline script made and kept, and a
+       remembered "not a namespace" is a negative that silently expires the moment the bundle attaches it.
+       It is asked LAST — after the cheap bit test, the primitive test and the name test — so a record that
+       could not be answered anyway never pays for it. */
+    if (!holder->doc_namespace)
+        js_publish_document_namespace(ctx);
+    return holder->doc_namespace;
+}
+
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                       JSAtom prop, JSValueConst this_obj,
                                       bool throw_ref_error)
@@ -12099,6 +12160,15 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     continue;
                 }
             } else {
+                /* THE HIT HALF of the two this read answers — see js_present_ask for which base is asked and
+                   why it is not the miss path's. `pr->u.value` is BORROWED across the hook: the slot holds the
+                   reference and `obj` holds `p`, and the hook allocates but runs none of the page's code, so
+                   nothing can drop either. */
+                if (unlikely(js_present_ask(ctx, p, prop, pr->u.value))) {
+                    JSValue s = g_concolic.present(ctx, JS_MKPTR(JS_TAG_OBJECT, p), prop, pr->u.value);
+                    if (!JS_IsUninitialized(s))
+                        return s;
+                }
                 return js_dup(pr->u.value);
             }
         }
@@ -31411,6 +31481,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             /* found */
                             if (unlikely(prs->flags & JS_PROP_TMASK))
                                 goto get_length_slow_path;
+                            /* `x.length` IS the same [[Get]] as `x.f` and owes the same two answers — see
+                               OP_get_field. A record the document built can hold a `length` the server chose
+                               (a rendered list's size gates the code that reads it), and it can equally be
+                               missing one; neither is this opcode's to decide, so both fall into the
+                               generic walk. The miss arm below was the OTHER half of this and had no route at
+                               all: the copy of the question that OP_get_field deleted still lived here by
+                               omission, answering `undefined` for a published record's absent `length` while
+                               the same read spelled `x["length"]` forked. */
+                            if (unlikely(g_concolic.present != NULL) && unlikely(p->doc_built))
+                                goto get_length_slow_path;
                             val = js_dup(pr->u.value);
                             break;
                         }
@@ -31420,6 +31500,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         p = p->shape->proto;
                         if (!p) {
+                            if (unlikely(g_concolic.absent != NULL))
+                                goto get_length_slow_path;
                             val = JS_UNDEFINED;
                             break;
                         }
@@ -42075,6 +42157,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 gobj = JS_VALUE_GET_OBJ(ctx->global_obj);
                 DCHECK(gobj->class_id != JS_CLASS_PROXY,
                        "the global object became a Proxy: the own-property answer above would skip its traps");
+                /* AND IT IS NOT A DOCUMENT-BUILT RECORD, which is what lets this opcode answer a hit at all.
+                   The field reads defer a hit on a `.doc_built` record to the generic walk (see OP_get_field);
+                   this one does not, because the base here is the GLOBAL OBJECT — allocated at realm creation
+                   with no inline script running, and skipped by js_publish_document_namespace besides — so a
+                   bare `parseInt` must not become an unknown. If the mark ever reached the global, every
+                   intrinsic a page names without `window.` would be answered from a slot this opcode read past
+                   the hook, and the two spellings of one read would disagree. `doc_namespace` is set only on a
+                   record that already carries `doc_built`, so this covers both. */
+                DCHECK(!gobj->doc_built,
+                       "the global object carries the document-built mark: a bare global name is read from "
+                       "its own slot here while `window.x` is asked of the concolic hook at the generic walk, "
+                       "so one read spelled two ways would answer two different things");
                 prs = find_own_property(&pr, gobj, atom);
                 if (prs && (prs->flags & JS_PROP_TMASK) == 0) {
                     *sp++ = js_dup(pr->u.value);
@@ -43406,6 +43500,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             /* found */
                             if (unlikely(prs->flags & JS_PROP_TMASK))
                                 goto get_field_slow_path;
+                            /* A HIT ON A RECORD THE DOCUMENT BUILT IS NOT THIS OPCODE'S TO ANSWER EITHER —
+                               the same rule as the miss below, one arm over. What the server wrote into
+                               `__FLAGS` is this visitor's state and not the program's constant, and answering
+                               it here would decide the gate over it. Whether that record is PUBLISHED, what
+                               its member is read by, and which of its slots are on the channel at all take a
+                               heap walk, a registry and a path; they live at the generic walk, so the read
+                               FALLS INTO IT rather than carrying a second copy of the question that can be
+                               behind. The bit tested is the BROADER of the two on purpose: `doc_namespace` is
+                               established BY that walk, and the walk is entered from the read — so an opcode
+                               that pre-filtered on the narrow bit would answer every first read of a record
+                               concretely and the walk would never run for a program that only ever hits. One
+                               bit test on a hit, and only for a host that installed the hook. */
+                            if (unlikely(g_concolic.present != NULL) && unlikely(p->doc_built))
+                                goto get_field_slow_path;
                             val = js_dup(pr->u.value);
                             break;
                         }
@@ -43495,6 +43603,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         if (prs) {
                             /* found */
                             if (unlikely(prs->flags & JS_PROP_TMASK))
+                                goto get_field2_slow_path;
+                            /* the hit half, exactly as OP_get_field states it: a document-built record's slot
+                               is the server's answer for THIS visitor, so the generic walk decides it. */
+                            if (unlikely(g_concolic.present != NULL) && unlikely(p->doc_built))
                                 goto get_field2_slow_path;
                             val = js_dup(pr->u.value);
                             break;
