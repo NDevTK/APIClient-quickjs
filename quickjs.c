@@ -7899,16 +7899,62 @@ static _Thread_local JSEvalSinkFunc *g_eval_sink;
    together, at the one place every compile passes through. */
 static _Thread_local bool g_eval_sink_announced;
 
-/* 19.2.1.1 step 1's source, ANNOUNCED before step 2 tests it for a String — the whole of what this file says
-   about an @S sink, and it says it unconditionally: the non-string arm is where an unknown external input is
-   DETECTED and the string arm is where a candidate run's concrete payload is READ, so a seam that announced
-   only one of them would have exactly half a search.
-   The latch is raised only for a String, because only a String goes on to be compiled. */
-static void js_eval_sink_announce(JSContext *ctx, JSValueConst src)
+/* §19.2.1.1 PerformEval ( source, strictCaller, direct ) step 1's source ANNOUNCED, AND step 2's "If source is
+   not a String, return source" DECIDED — ONE operation that every algorithm evaluating a page-supplied source
+   goes through, returning the program TEXT (owned) or JS_UNINITIALIZED for step 2's non-string arm.
+   THEY ARE ONE DECISION BECAUSE THE LATCH SAYS SO. `g_eval_sink_announced` means "this source is going on to be
+   compiled", which is precisely what step 2 answers, and the two were spelled apart — the announcement testing
+   for a String and each caller testing again — so they agreed only by both being the same test. The moment one
+   of them stopped meaning the other, the latch would be raised for a source nothing compiles or dropped for one
+   something does, and JS_EvalInternal's assert reads it either way without being able to tell.
+   THE ANNOUNCEMENT IS UNCONDITIONAL AND IS NOT THE ALTERNATIVE TO RUNNING THE PROGRAM. It happens for every
+   source, before this decides anything: the non-string arm is where an unknown external input is DETECTED and
+   the string arm is where a candidate run's concrete payload is READ, so a seam that announced only one of them
+   would have exactly half a search. A tainted program is therefore announced as a JS-context sink AND executed,
+   which is a browser doing its job while the solver watches — and is the only arrangement in which the sink's
+   own bytes can be observed firing.
+   A CONCOLIC CARRYING A STRING EXAMPLE IS A SOURCE. That is §solver rather than a courtesy: the triple is
+   (provenance, domain, example) and every operator runs the REAL operation on the concrete — `+` really
+   concatenates the examples, and eval really compiles and runs them. Answering step 2's non-string arm for one
+   is the double fidelity bug §solver names when a builtin's result is special-cased to bare opaque, and the
+   capability it costs is the headline one: `fetch(u).then(r => r.text()).then(eval)` is a lazy chunk, its body
+   is the app's own trusted same-origin program text, and giving a reply a source identity so a branch over it
+   can fork must not thereby stop it being a program. The PROGRAM'S completion is then the program's own,
+   concrete, because eval is a control transfer and not a value transform of its operand — what a reply teaches
+   is what its code DOES, and §Attacker-sources wants a trusted reply's fields concrete anyway. */
+static bool js_value_is_concolic(JSValueConst v);
+
+static JSValue js_eval_program_source(JSContext *ctx, JSValueConst src)
 {
+    JSValue text = JS_UNINITIALIZED;
+
     if (g_eval_sink)
         g_eval_sink(ctx, src);
-    g_eval_sink_announced = JS_IsString(src);
+    if (JS_IsString(src)) {
+        text = js_dup(src);
+    } else if (js_value_is_concolic(src)) {
+        /* JSConcolicHooks.example "Returns JS_UNDEFINED when the operand carries no example yet" — and an
+           example of any other type is a value whose program text nobody has, which is step 2's arm exactly as
+           a number written in the source position would be.
+           THE HOOK IS ASSERTED PRESENT RATHER THAN GUARDED WITH `&&`, because the two fields come from one
+           table set by one call: `.is` answering yes while `.example` is absent is a half-written producer,
+           and a `&&` there would answer "this source carries no example" for every program the engine could
+           have run — a missing producer turned into a plausible datum, which is the one shape §Offensive
+           programming says never to spell as a default. */
+        JSValue ex;
+        DCHECK(g_concolic.example != NULL,
+               "a host installed the concolic value class without JSConcolicHooks.example — the two are one "
+               "table set by one JS_SetConcolicHooks call, so a source that IS concolic and can be asked for "
+               "nothing means the table was written half way, and every page program carried by an unknown "
+               "value would silently take 19.2.1.1 step 2's unevaluated arm");
+        ex = g_concolic.example(ctx, src);
+        if (JS_IsString(ex))
+            text = ex;
+        else
+            JS_FreeValue(ctx, ex);
+    }
+    g_eval_sink_announced = !JS_IsUninitialized(text);
+    return text;
 }
 
 /* 7.1.1 ToPrimitive is defined over ORDINARY objects. A CONCOLIC operand is not one: it is the solver's value
@@ -22937,21 +22983,22 @@ static int step_program_run(JSContext *ctx, JSStepHdr *h, JSContext *realm, JSVa
                             JSValue *pout, JSValue **out_cb, int *out_argc, int origin_flags)
 {
     if (h->prog_phase == PROG_PH_START) {
-        JSValue clo;
+        JSValue clo, text;
         const char *str;
         size_t len;
         JS_FreeValue(ctx, in);
-        /* THE @S JS-CONTEXT SINK, for every algorithm that reaches this sub-sequence: the INDIRECT eval
-           (19.2.1), CreateDynamicFunction (20.2.1.1.1) and ShadowRealm.prototype.evaluate. Announced before
-           step 2 because step 2's non-string arm is exactly where an unknown external input lands — see
-           JSEvalSinkFunc. The direct-eval spellings announce at eval_direct_closure, which is their own
-           convergence point; those are two algorithms, not one with a fallback. */
-        js_eval_sink_announce(ctx, src);
-        if (!JS_IsString(src)) {
+        /* THE @S JS-CONTEXT SINK AND §19.2.1.1's step 2, for every algorithm that reaches this sub-sequence:
+           the INDIRECT eval (19.2.1), CreateDynamicFunction (20.2.1.1.1) and ShadowRealm.prototype.evaluate.
+           Both halves belong to js_eval_program_source and neither is re-decided here — the direct-eval
+           spellings reach the same operation from eval_direct_closure, which is a DIFFERENT algorithm
+           (13.3.6.1's caller scope) sharing this one step, not a fallback for it. */
+        text = js_eval_program_source(ctx, src);
+        if (JS_IsUninitialized(text)) {
             *pout = js_dup(src);   /* 19.2.1.1 step 2: a non-string source is the result, unevaluated */
             return 0;
         }
-        str = JS_ToCStringLen(ctx, &len, src);
+        str = JS_ToCStringLen(ctx, &len, text);
+        JS_FreeValue(ctx, text);
         if (!str)
             return -1;
         /* NO CALLER FRAME, and that is what INDIRECT means: 19.2.1.1 evaluates in the GLOBAL environment, so
@@ -26886,12 +26933,12 @@ static JSObject *tramp_exotic_accessor(JSContext *ctx, const JSPropertyDescripto
     return f;
 }
 /* DIRECT eval — 19.2.1.1 PerformEval for the two spellings the compiler emits, `eval(x)` and `eval(...arr)`.
-   BOTH hand their source here, String or not, and that is now the whole point of the function: step 2 ("If
-   source is not a String, return source") was written out at EACH opcode and a THIRD time inside JS_EvalObject,
-   so one operation decided one spec step in three places. It is decided once, here — beside the @S
-   announcement, which has to see the non-string arm because that arm is precisely where unknown external input
-   lands and where the JS-context sink is DETECTED (see JSEvalSinkFunc). JS_EvalObject was that third copy and
-   its only caller was this line, so it is gone rather than left as a second way to spell the same step.
+   BOTH hand their source here, String or not, and that is the whole point of the function: step 2 ("If source
+   is not a String, return source") was written out at EACH opcode and a THIRD time inside JS_EvalObject, so
+   one operation decided one spec step in three places. JS_EvalObject was that third copy and its only caller
+   was this line, so it is gone rather than left as a second way to spell the same step; the two opcodes now
+   converge here, and here asks js_eval_program_source — which the INDIRECT eval asks too, so the step has one
+   answer for both algorithms and the @S announcement that has to precede it cannot be reached without it.
    The program is compiled to a CLOSURE and never run here: the eval'd body must run on THIS tramp chain so a
    loop inside it parks for the scheduler exactly like one in any other function, where a JS_CallFree would give
    it an activation off the chain with no base to park into. The plainness ASSERT lives here rather than at each
@@ -26906,7 +26953,7 @@ static JSObject *tramp_exotic_accessor(JSContext *ctx, const JSPropertyDescripto
    19.2.1.1 where a NULL can only be reported. */
 static JSValue eval_direct_closure(JSContext *ctx, JSStackFrame *caller_sf, JSValueConst src, int scope_idx)
 {
-    JSValue clo;
+    JSValue clo, text;
     const char *str;
     size_t len;
 
@@ -26914,10 +26961,11 @@ static JSValue eval_direct_closure(JSContext *ctx, JSStackFrame *caller_sf, JSVa
            "a direct eval was compiled without the frame of the body that is running it — this function is "
            "reached only from OP_eval and OP_apply_eval, both of which are executing a bytecode body and hold "
            "that frame in a register, so there is no shape of this call that legitimately has none");
-    js_eval_sink_announce(ctx, src);
-    if (!JS_IsString(src))
+    text = js_eval_program_source(ctx, src);
+    if (JS_IsUninitialized(text))
         return JS_UNINITIALIZED;
-    str = JS_ToCStringLen(ctx, &len, src);
+    str = JS_ToCStringLen(ctx, &len, text);
+    JS_FreeValue(ctx, text);
     if (unlikely(!str))
         return JS_EXCEPTION;
     clo = JS_EvalInternal(ctx, JS_UNDEFINED, str, len, "<input>", 1,
@@ -70314,11 +70362,12 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     DCHECK(!(flags & JS_EVAL_FLAG_TRAMP_CLOSURE) || announced,
            "a PAGE program reached compilation without passing the @S eval-sink seam — "
            "JS_EVAL_FLAG_TRAMP_CLOSURE names a program 19.2.1 eval or 20.2.1.1.1 CreateDynamicFunction is "
-           "evaluating, and every one of them announces its source first (js_eval_sink_announce) so the "
-           "JS-context sink can be detected and a candidate's own bytes read at the sink they are about to "
-           "fire in. A site that compiles page source without announcing fails SILENTLY: the program runs, "
-           "nothing breaks, and a real code-execution sink reports nothing for ever. Announce at the new "
-           "site — never relax this");
+           "evaluating, and every one of them takes its program TEXT from js_eval_program_source — which "
+           "announces the source and decides 19.2.1.1 step 2 as one operation, so the text a compile holds "
+           "IS the announced source and the JS-context sink can be detected and a candidate's own bytes read "
+           "at the sink they are about to fire in. A site that compiles page source without going through it "
+           "fails SILENTLY: the program runs, nothing breaks, and a real code-execution sink reports nothing "
+           "for ever. Take the text from that operation at the new site — never relax this");
     (void)announced;
     if (!rt->current_stack_frame) {
         JS_FreeValueRT(rt, ctx->error_back_trace);
