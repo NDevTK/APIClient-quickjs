@@ -71907,6 +71907,40 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
     return -1;
 }
 
+/* HasOwnProperty FOR AN ARRAY'S INDEX, reaching no user code — the gate HTML §2.7.3
+   StructuredSerializeInternal ( value, forStorage [ , memory ] ) puts in front of its element read, and the one
+   thing that decides whether the read below is an operation the standard performs at all.
+   IT IS EXACT RATHER THAN CONSERVATIVE, and the two representations are why it is written out. A FAST array
+   holds its elements densely and cannot carry an index in its shape — putting one out of range is what converts
+   it away from that representation — so `idx < count` IS own-ness there, and `length` may still run past `count`
+   (`[].length = 10` keeps the fast form with no elements at all), which is exactly the case that used to walk.
+   A SLOW array keeps its indices as ordinary shape slots, so the general own lookup answers, and it reaches
+   nothing: JS_CLASS_ARRAY installs no exotic get_own_property hook (ARGUMENTS, MAPPED_ARGUMENTS, STRING,
+   MODULE_NS and PROXY are the classes that do), and no Array carries a var_ref, so the -1 arm is unreachable
+   and asserted rather than folded into the false answer — an absent element and a failed question must never
+   be the same answer here, because one of them silently serialises a hole where a value was. */
+static bool bcw_array_has_own_index(JSContext *ctx, JSValueConst arr, uint32_t idx)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(arr);
+    JSAtom atom;
+    int r;
+
+    DCHECK(JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT && p->class_id == JS_CLASS_ARRAY,
+           "the bytecode writer's element gate was handed something that is not an Array — §2.7.3's Array arm "
+           "is reached through JS_WriteObjectTag's class dispatch, which sends every other class elsewhere, and "
+           "OrdinaryGetOwnProperty is only the right question because the receiver is an Array exotic object");
+    if (p->fast_array)
+        return idx < p->u.array.count;
+    atom = JS_NewAtomUInt32(ctx, idx);
+    CHECK(atom != JS_ATOM_NULL, "OOM interning an array index for a structured clone's element gate");
+    r = JS_GetOwnPropertyInternal(ctx, NULL, p, atom);
+    JS_FreeAtom(ctx, atom);
+    DCHECK(r >= 0, "an Array's own-index lookup reported an abrupt completion — the only arm of "
+                   "JS_GetOwnPropertyInternal2 that can is a module namespace's uninitialised var_ref, and an "
+                   "Array has none, so this would mean the class dispatch let another class through");
+    return r > 0;
+}
+
 static int JS_WriteArray(BCWriterState *s, JSValueConst obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
@@ -72320,9 +72354,39 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
                 uint32_t idx = it.i++;
                 if (bcw_push(s, it))            /* the cursor, advanced */
                     goto fail;
-                val = JS_GetPropertyUint32(s->ctx, it.val, idx);
-                if (JS_IsException(val))
-                    goto fail;
+                /* HTML §2.7.3 StructuredSerializeInternal ( value, forStorage [ , memory ] ), the deep arm the
+                   Array case falls into: "for each key in ! EnumerableOwnProperties(value, key): If !
+                   HasOwnProperty(value, key) is true: Let inputValue be ? value.[[Get]](key, value)". THE GATE
+                   IS THE FIRST HALF OF THAT SENTENCE AND THIS WALK DID NOT HAVE IT — it read every index in
+                   0..length-1 through [[Get]], and a [[Get]] on an index the array does not own WALKS THE
+                   PROTOTYPE. So `Object.prototype[50] = 'x'; structuredClone(a)` on any array whose length runs
+                   past its elements serialised `'x'` AS THE ARRAY'S ELEMENT — a value the standard appends
+                   nothing for — and an ACCESSOR there ran the page's getter from a C activation with no flow
+                   base under it, which is the abort that named this line. Both are one missing question.
+                   THE READ THAT REMAINS IS THE ONE THE STANDARD PERFORMS, and it is still a [[Get]]: an own
+                   enumerable index whose slot is an accessor invokes that getter, by the sentence above, so
+                   this site's remaining abort is a real capability and not a wrong read — see the residual on
+                   the else arm. */
+                if (bcw_array_has_own_index(s->ctx, it.val, idx)) {
+                    val = JS_GetPropertyUint32(s->ctx, it.val, idx);
+                    if (JS_IsException(val))
+                        goto fail;
+                } else {
+                    /* RESIDUAL — narrower than §2.7.3 and CORRECT for what it does, so there is nothing here to
+                       crash on. WHAT IS NOT COVERED: the standard appends NOTHING for a non-own index, so the
+                       deserialised array has a HOLE there; this writes `undefined`, because the wire format is
+                       positional — JS_WriteArray emits `length` and then exactly `length` values, and the
+                       reader (BC_TAG_ARRAY -> BCR_ARRAY) reconstructs by that count, so skipping a slot would
+                       desynchronise it and read the next element's bytes as this one's. WHAT THE NEXT DIFF
+                       BUILDS: §2.7.3's own shape, which is a [[Length]] beside a List of {[[Key]], [[Value]]}
+                       records — the writer emits a count of PRESENT entries with each key, the reader
+                       CreateDataProperty's at that key, and both the hole and an array's non-index own
+                       enumerable keys (`a.foo = 1`, which EnumerableOwnProperties covers and this arm cannot
+                       reach at all) fall out of the same change. HOW ITS ABSENCE SHOWS: `1 in structuredClone(
+                       [0,,2])` is true here and false in a browser, and `Object.keys(structuredClone([0,,2]))`
+                       has three entries rather than two. */
+                    val = JS_UNDEFINED;
+                }
                 if (bcw_push(s, bcw_val(val, true)))
                     goto fail;
             } else if (it.flag) {
