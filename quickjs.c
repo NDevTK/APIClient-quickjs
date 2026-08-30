@@ -30760,6 +30760,39 @@ _Static_assert(__atomic_always_lock_free(sizeof(g_flow_yield_req), 0),
 #define FLOW_YIELD_REQUEST(kind) FLOW_YIELD_SET((kind) + 1)
 void JS_RequestFlowYield(void) { FLOW_YIELD_REQUEST(JS_PREEMPT_HOST); }
 
+/* THE WORK THE RUNNING FLOW HAS RETIRED — the ONE quantity in this interpreter that is a function of the
+ * flow's own path and of nothing else, which is what makes it the thing a virtual clock may be built on.
+ *
+ * IT IS A COUNTER AND IT IS NOT A BUDGET, and the distinction is the whole of why it is allowed to exist next
+ * to a yield request whose own comment says "It is NOT a counter: nothing here counts opcodes and nothing
+ * bounds a flow". That sentence is about the REQUEST, and it stays true: nothing below compares this number to
+ * anything, nothing branches on it, and no value of it makes any flow run less far. It is READ by the host
+ * that measures modelled time (JSFlowControlHooks.work) and by nobody else. The instant something here decides
+ * from it, it is a step cap and it is banned.
+ *
+ * COUNTED AT DISPATCH, WHICH IS WHAT MAKES A PARKED-AND-RESUMED RUN COUNT THE SAME TOTAL AS AN UNINTERRUPTED
+ * ONE. The poll branches out of DISPATCH BEFORE `opcode = *pc++`, so the opcode a park suspends in front of is
+ * not counted here and is counted exactly once when `restart:` re-dispatches it. Counting after the handler
+ * instead would need a site per opcode — the shape sf->cur_pc's eighty-two hand-written stores already
+ * demonstrated the failure of — and would count the in-flight opcode twice across a park, which is a total
+ * that depends on WHERE the flow was preempted. That is precisely what §Time-travel-resume's razor forbids.
+ *
+ * THREAD-LOCAL FOR THE REASON THE REQUEST IS: run-test262 drives many tests on parallel OS threads, and a
+ * shared counter would attribute one thread's work to another's flow. local-exec for a DIFFERENT reason than
+ * the request's — no signal handler touches this — namely that it is incremented at EVERY opcode, and the
+ * general-dynamic model would put a __tls_get_addr call in the dispatch. Plain, not atomic: the polling thread
+ * is its only reader and its only writer.
+ *
+ * ZEROED WHEN THE SCHEDULER SWITCHES A FLOW IN (JS_FlowDiscardRetiredWork), which is what makes "the count
+ * handed over is the RUNNING flow's own" true rather than merely intended. Two things can be standing in it at
+ * a switch and neither belongs to the incoming flow: work the HOST retired between two flows, and the residue
+ * of an outgoing flow that FINISHED (a flow that parks banks at the poll first, so its residue is zero). Both
+ * are discarded rather than banked — a finished flow's clock is not read again, and host time is not any
+ * flow's time. */
+static _Thread_local uint64_t g_flow_work_retired __attribute__((tls_model("local-exec"))) = 0;
+#define FLOW_WORK_RETIRE()  (g_flow_work_retired++)
+void JS_FlowDiscardRetiredWork(void) { g_flow_work_retired = 0; }
+
 /* FEATURE-ENGAGEMENT COUNTERS — the honest anti-fake-green instrument. A test passing proves the RESULT is
    spec-correct; it does NOT prove the time-travel feature ever RAN on that test's logic. So we count, per YIELD
    POLL WHERE THE POLICY SAID PARK: g_flow_preempt_requested (the scheduler wanted this flow suspended here) vs
@@ -31715,6 +31748,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
    frame is already hot in, on the same trade the yield poll above takes.
    Placed AFTER the fetch so `cur_pc - 1` lands on the opcode's own byte, and after the yield poll so a park —
    which stores its resume point itself — is not overwritten by a dispatch that never happens. */
+/* AND THE WORK THIS FLOW HAS RETIRED, beside it and on the same two terms — see g_flow_work_retired for why
+   the count is a fact about the FLOW's path rather than about the machine, and why it is a counter and not a
+   budget. It is placed on the far side of the poll for exactly the reason `cur_pc` is: a dispatch that never
+   happens must not be counted, because the opcode a park suspends in front of is re-dispatched on resume and
+   would otherwise be paid for twice — a total that depends on where the preempt landed. */
     __extension__ static const void * const dispatch_table[256] = {
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
 #define def(id, size, n_pop, n_push, f)
@@ -31738,6 +31776,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                              if (unlikely(FLOW_YIELD_READ())) goto do_yield_poll;    \
                              opcode = *pc++;                                         \
                              sf->cur_pc = pc;                                         \
+                             FLOW_WORK_RETIRE();                                      \
                              goto *dispatch_table[opcode]; } while (0)
 #define SWITCH(pc)      DISPATCH();
 #define CASE(op)        case_ ## op
@@ -42592,12 +42631,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* THE ONE PLACE THE INTERPRETER ASKS WHETHER TO PARK. Reached from DISPATCH, so pc names the opcode
                about to run, sp is the operand stack top and sf is the running frame — the state do_preempt
                records and `restart:` resumes into, at EVERY opcode rather than at the three the page's shape
-               used to supply. Nothing counts and nothing is bounded here: this runs only because something
-               RAISED a request, and what to do about it is the scheduler's one policy on the far side of the
-               hook.
+               used to supply. Nothing is bounded here: this runs only because something RAISED a request, and
+               what to do about it is the scheduler's one policy on the far side of the hook.
                The request is consumed FIRST. Clearing it after the ask would leave it standing across a park and
                make the resumed flow re-ask at its first opcode — a second consultation nobody requested, and the
-               one way this could spin. */
+               one way this could spin.
+               AND THE WORK RETIRED SINCE THE LAST POLL IS BANKED SECOND, BEFORE THE POLICY IS ASKED — which is
+               an ordering requirement and not a preference: a flow that parks here banks the work it did to
+               REACH this point, so its own clock carries it and the flow that runs next does not. Handing over
+               after the ask would leave that work standing in the counter across the park, where the next
+               switch-in discards it as nobody's; handing it over from anywhere else would need a site per call
+               shape, and the whole reason the poll is at DISPATCH is that a site per shape is a site that can
+               be forgotten. This is also the ONLY place the count is read, which is what keeps it a counter
+               rather than a budget: nothing here compares it, and no value of it changes what any flow does.
+               BATCHING AT THE POLL RATHER THAN AT EVERY OPCODE COSTS NOTHING, and the reason is the clock's
+               accumulate-exactly rule (core/timing/event_loop.h): the moment is a base plus an EXACT integer
+               count divided once at the read, so it is a pure function of the TOTAL and not of how the total
+               was split. Floating-point addition is not associative, so a clock that folded each batch in as
+               it arrived would answer differently for a run that polled twice and a run that polled two
+               hundred times over the same opcodes — and the poll count is a fact about the machine (the
+               quantum's asynchronous raise lands on an already-raised byte or a clear one). Exact, the split
+               is invisible. */
             {
                 int ykind = (int)FLOW_YIELD_READ() - 1;
                 FLOW_YIELD_SET(0);
@@ -42609,8 +42663,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    suspend, so the offer is answered by taking it back rather than by asking a policy about a
                    flow that does not exist. A request raised there (or left standing by a flow that finished) is
                    dropped HERE and nowhere else, which is what makes a stale request lossless. */
-                if (unlikely(g_flow_base_gen != NULL) && g_flow_control.preempt != NULL &&
-                    g_flow_control.preempt(ykind)) {
+                if (unlikely(g_flow_base_gen != NULL)) {
+                  /* THE SAME CONDITION ANSWERS BOTH QUESTIONS, and that is why the bank sits inside it rather
+                     than beside it: work retired with no flow base is work no timeline performed, and the
+                     clock it would move is the SHARED BASELINE — where it moves every sibling's moment and
+                     every later flow's time origin by an amount none of their own paths produced. The host's
+                     own advance asserts that at its origin (event_loop_work_advance's `flow_running()`); this
+                     is the call site satisfying it rather than working around it.
+                     The hook is INSTALLED WITH THE PREEMPT POLICY, in one registration by one owner, because
+                     the two have one lifetime: a scheduler session is exactly the span in which a flow is
+                     running the interpreter. A second registration would be a second thing to keep in step.
+                     AND A POLL AT WHICH NOTHING WAS RETIRED IS NOT AN ADVANCE OF ZERO, IT IS THE ABSENCE OF
+                     ONE — the receiver says so at its own origin (`units > 0`: "a zero-unit advance is a call
+                     the seam should not have made"). It is not a rare shape either: the switch-in discards the
+                     count, so a flow resumed with a HOST request already standing reaches its very first
+                     dispatch having retired nothing, and an asynchronous raise landing between a poll and the
+                     next dispatch does the same. Reporting nothing is what the seam has to say there. */
+                  if (g_flow_control.work != NULL && g_flow_work_retired != 0) {
+                      uint64_t units = g_flow_work_retired;
+                      g_flow_work_retired = 0;
+                      g_flow_control.work(ctx, units);
+                  }
+                  if (g_flow_control.preempt != NULL && g_flow_control.preempt(ykind)) {
                     FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
                     if (likely(gen_state == g_flow_base_gen)) {
                         FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
@@ -42624,6 +42698,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (gen_state == NULL)
                         DFAIL("preempted in a NON-coroutine activation (gen_state NULL): its C entry never became a flow base — route that caller onto the tramp chain");
                     DFAIL("preempted in a coroutine activation that is not the flow base: give that resume path a resume-as-flow driver (park + resume job), never drive to completion");
+                  }
                 }
             }
             BREAK;

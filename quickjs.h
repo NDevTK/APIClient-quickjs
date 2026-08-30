@@ -1677,9 +1677,12 @@ JS_EXTERN void JS_SetMemoryReclaimHook(JSRuntime *rt, JSMemoryReclaimFunc *cb, v
    callback freed something, i.e. whether the caller should retry its own allocation. */
 JS_EXTERN int JS_ReclaimMemory(JSRuntime *rt, size_t wanted);
 
-/* APIClient forced-execution FLOW-CONTROL hooks — the scheduler's control over interpreter execution: the three
-   points where the forced-exec engine steers a running flow. One concern, one owner (the scheduler), one
-   registration (JS_SetFlowControlHooks); not optional, a NULL argument crashes.
+/* APIClient forced-execution FLOW-CONTROL hooks — the scheduler's control over interpreter execution: the
+   points at which the forced-exec engine steers a running flow, plus the one OBSERVATION of it whose lifetime
+   is the same (`work`, below, and its own note says why it lives here). Each member is documented beside its
+   declaration; a COUNT of them stated here would be one more thing to keep true, and it was already false.
+   One concern, one owner (the scheduler), one registration (JS_SetFlowControlHooks); not optional, a NULL
+   argument crashes.
      - branch:  the frame-agnostic branch decision. Returns the arm (0/1) to take when branching on a concolic
                 value (the hook forks the OTHER arm as a sibling flow; arm | 0x100 additionally requests a
                 frame-snapshot fork), or -1 if the value is not concolic (fall through to the normal ToBool).
@@ -1754,8 +1757,49 @@ typedef struct JSFlowControlHooks {
    cross-instance read needing the flow suspended. */
 #define JS_PREEMPT_HOST     3
     int  (*preempt)(int kind);
+    /* THE WORK THE RUNNING FLOW HAS RETIRED since this hook last saw it, in OPCODES — reported at the yield
+     * poll, immediately BEFORE `preempt` is asked, so a flow that parks there has already banked the work it
+     * did to reach that point. `units` is never 0 — a poll at which nothing was retired reports nothing rather
+     * than an advance of zero, which is a real shape and not a corner (a flow resumed with a host request
+     * already standing reaches its first dispatch having retired nothing). Nothing in the interpreter reads
+     * the number back.
+     *
+     * IT IS AN OBSERVATION AND NOT A CONTROL, which is the one thing that could be misread from its home in
+     * this struct. It is HERE because its correctness is a lifetime property it shares with `preempt` and with
+     * nothing else: the count is only attributable while a scheduler is running flows, so the hook must be
+     * installed and removed with the policy, by the same owner, in the same registration. Two registrations
+     * would be two things that have to agree, and the day they disagreed the symptom would be one flow's work
+     * on another flow's clock — a wrong number, silently.
+     *
+     * WHY THE UNIT IS OPCODES RETIRED AND NOT ONE OF THE TWO QUANTITIES BESIDE IT. An agent-global work total
+     * (forks + flows + jobs + switches) moves because a SIBLING forked, so a flow's own reading would depend
+     * on what else the frontier was doing; the count of times this poll was REACHED is a fact about the
+     * machine, since the cooperative quantum raises the request asynchronously and "last raise wins" means a
+     * raise landing on an already-raised byte adds no poll while one landing on a clear byte adds one.
+     * Opcodes retired is neither: it is what this flow DID, in the order its own bytecode says, identical on
+     * every schedule and across a park.
+     *
+     * WHICH IS WHAT MAKES IT A CLOCK. This engine has no wall clock to wait on and must not acquire one — a
+     * real clock is a function of the machine and the load average, so every timestamp under it would be a
+     * disagreement the solver differential reports as a scheduling bug, and a flow parked to the cold tier
+     * would resume into a clock that moved without it. HIGH RESOLUTION TIME Level 3 §2.1 Clocks asks of the
+     * monotonic clock only that it never decrease and that it exist within one execution of the user agent;
+     * matching real-world time is what all clocks "attempt", explicitly not what they achieve.
+     *
+     * THE CONSUMER MUST ACCUMULATE IT EXACTLY and divide once at the read, never fold each batch into a
+     * floating-point moment as it arrives: addition is not associative, so a folded moment would depend on how
+     * the batches were SPLIT, and the split is the schedule-dependent poll count above. */
+    void (*work)(JSContext *ctx, uint64_t units);
 } JSFlowControlHooks;
 JS_EXTERN void JS_SetFlowControlHooks(const JSFlowControlHooks *hooks);
+/* THROW AWAY the retired-work count standing in the interpreter, attributing it to nobody — called by the
+   scheduler where it switches a flow IN, which is the last instant at which anything standing there is by
+   construction NOT the incoming flow's. Two things can be standing and neither is: work the HOST retired
+   between two flows, and the residue of a flow that FINISHED without parking (one that parks banks at the poll
+   first, so its residue is zero). A finished flow's clock is never read again and host time is no flow's time,
+   so both are discarded rather than banked — which is what makes "the count `work` receives is the running
+   flow's own" a property of the mechanism instead of a hope about call order. */
+JS_EXTERN void JS_FlowDiscardRetiredWork(void);
 
 /* APIClient TIME-TRAVEL (record/replay) hooks — the RECORD boundary of the COW time-travel executor.
    A flow's live state is (shared baseline ∘ its per-flow COW delta); rewinding a flow reverses that delta,
