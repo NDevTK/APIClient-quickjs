@@ -51535,6 +51535,15 @@ typedef struct JSJsonReviver {
        unknown with this source's identity — so a later branch still forks and a later sink still solves for
        `location.hash` rather than for a string that happened to be lying around. */
     JSValue unknown;
+    /* THE PROBE'S RECORDED COMPLETION — which of §25.5.2 JSON.parse ( text [ , reviver ] )'s two completions the
+       REAL codec reaches on this source's EXAMPLE, computed by the JP_PROBE stage and read once, at the ask.
+       IT IS GUARDED BY A PHASE AND NOT BY A SENTINEL VALUE, which is the same correction JSStepHdr::fork_real
+       carries and for the same reason: this state is js_mallocz'd, and zero is a LEGAL completion
+       (JP_OUTCOME_VALUE), so a slot nobody wrote would read as the positive claim "a real session parses this".
+       `probe_phase` is what a zeroed state reads as instead — PROBE_PH_START, "nothing has been recorded" — and
+       the ask DCHECKs it is PROBE_PH_DONE before it reads the completion beside it. */
+    uint8_t probe_phase;
+    int probe_real;
 } JSJsonReviver;
 
 typedef struct JSOpCode {
@@ -84002,7 +84011,10 @@ static const JSTrampStepDef js_import_opts_def  = {
 /* Declared where the machine is; the definition names it here. */
 static const char *const js_json_str_steps[];
 static const JSTrampStepDef js_json_str_def      = { sizeof(JSJsonStr), js_json_str_step, js_json_str_fini, 0, .visit = js_json_str_visit,
-                       .algorithm = "25.5.2 JSON.stringify",
+                       /* §25.5.4 and not §25.5.2, which is JSON.parse and is what the machine one screen up
+                          declares — two `.algorithm` labels claiming one section made every §25.5.2 citation
+                          in this file read as misattributed, the parse's correct ones included. */
+                       .algorithm = "25.5.4 JSON.stringify ( value [ , replacer [ , space ] ] )",
                        .steps = js_json_str_steps };
 static const char *const js_ta_slice_steps[];
 static const JSTrampStepDef js_ta_slice_def     = { sizeof(JSTASlice), js_ta_slice_step, js_ta_slice_fini, 0, .visit = js_ta_slice_visit,
@@ -98447,18 +98459,37 @@ static JSONParseRecord *jr_child_pr(JSContext *ctx, JSONParseRecord *holder_pr, 
    25.5.1 steps 2-3: START the parse. The tokenizer (jps) and the frame stack (jp) live ON THE MACHINE from here
    until js_json_parse_finish or js_json_parse_abandon, which is the whole point: every completed value in
    between is a place the flow can park with its position in the text intact. */
+
+/* PUT THE TOKENIZER AND THE FRAME STACK ON THE MACHINE, over `text_str`, with `pr_root` the reviver's record or
+   NULL when nothing is collecting one. Both parses this machine can run go through it — §25.5.2 step 2's parse
+   of the text the algorithm returns a value for, and JP_PROBE's parse of an unknown source's EXAMPLE — because
+   they are ONE parse driven from one place, differing only in what they do with the value at the end. A second
+   copy of these six lines is how the probe would come to accept a text the real parse rejects. */
+static int js_json_parse_state_start(JSContext *ctx, JSJsonReviver *s, JSONParseRecord *pr_root)
+{
+    size_t len;
+
+    /* text_str is ALREADY step 1's string, so nothing here can run user code or fail on a coercion. */
+    DCHECK(JS_IsString(s->text_str), "the JSON parse was handed a text that step 1's ToString had not produced");
+    DCHECK(!s->parsing && s->text == NULL, "a JSON parse was started on a machine already holding one");
+    s->text = JS_ToCStringLen(ctx, &len, s->text_str);
+    if (!s->text)
+        return -1;
+    js_parse_init(ctx, &s->jps, s->text, len, "<input>", 1);
+    s->jp.resume = JPR_START;
+    s->jp.pr_root = pr_root;
+    s->parsing = 1;
+    if (json_next_token(&s->jps))
+        return -1;
+    return 0;
+}
+
 static int js_json_parse_begin(JSContext *ctx, JSJsonReviver *s)
 {
     JSValueConst reviver = step_arg(&s->hdr, 1);
     JSONParseRecord *pr1 = NULL;
-    size_t len;
     int size = 0, i;
 
-    /* text_str is ALREADY step 1's string, so nothing here can run user code or fail on a coercion. */
-    DCHECK(JS_IsString(s->text_str), "the JSON parse was handed a text that step 1's ToString had not produced");
-    s->text = JS_ToCStringLen(ctx, &len, s->text_str);
-    if (!s->text)
-        return -1;
     if (JS_IsFunction(ctx, reviver)) {
         s->reviver = reviver;
         for (i = 0; i < 5; i++) s->cb_args[i] = JS_UNDEFINED;
@@ -98473,13 +98504,7 @@ static int js_json_parse_begin(JSContext *ctx, JSJsonReviver *s)
     } else {
         s->early = 1;   /* no reviver: once the parse is done there is no JS re-entry at all */
     }
-    js_parse_init(ctx, &s->jps, s->text, len, "<input>", 1);
-    s->jp.resume = JPR_START;
-    s->jp.pr_root = pr1;
-    s->parsing = 1;
-    if (json_next_token(&s->jps))
-        return -1;
-    return 0;
+    return js_json_parse_state_start(ctx, s, pr1);
 }
 
 /* The parse reported DONE: take its value, enforce the EOF, and seed the reviver walk from it. */
@@ -98534,10 +98559,12 @@ static void js_json_parse_abandon(JSContext *ctx, JSJsonReviver *s)
    DFS invariant below cannot fall behind the phases the walk actually uses. */
 #define JR_PHASE_MAX 6
 
-/* THE STAGES OF 25.5.1. The prologue no longer has a stage of its own: it built the state and moved straight on,
-   so it rested at no step and a resumption landing there would have freed cb_result (which is what the base64
-   machine did). Its state-building is guarded by str_phase instead, exactly as every other coercing prologue in
-   this file guards its own.
+/* THE STAGES OF §25.5.2 JSON.parse ( text [ , reviver ] ).
+   A STAGE THAT BUILDS STATE GUARDS ITS BUILDING WITH A PHASE, never with the stage alone. A stage is where a
+   resumption LANDS, so a resume re-enters the stage's first line; a builder that ran again there would free the
+   incoming cb_result a second time (which is what the base64 machine did) and overwrite the fields it had
+   already filled. Every coercing prologue in this file guards its own with str_phase, and JP_PROBE below guards
+   its own with probe_phase for the same reason and in the same shape.
    Steps 2-8 are one stage because they are one operation to this engine — the parse — and it is the stage that
    YIELDS, so a resume falls straight back into json_parse_step at the character it stopped on. */
 /* THE FIRST STAGE IS A REST POINT AND THAT IS WHY IT IS A STAGE. `text` may be UNKNOWN EXTERNAL INPUT, and
@@ -98546,7 +98573,22 @@ static void js_json_parse_abandon(JSContext *ctx, JSJsonReviver *s)
    an OUTCOME FORK while the substrate decides which one this flow is and snapshots a sibling for the other.
    Every ordinary JSON.parse passes straight through it without resting, exactly as a string argument passes
    through JP_TOSTRING without one. */
+/* …AND THE STAGE AHEAD OF IT IS THE ONE THAT ANSWERS THE FORK'S QUESTION, WHICH IS A PARSE AND THEREFORE WORK.
+   Deciding WHICH completion a session carrying the real bytes reaches is not a comparison and not a shape test:
+   §25.5.2.1 ParseJSON ( text ) step 1 states the condition as "if StringToCodePoints(text) is not a valid JSON
+   text as specified in ECMA-404", so the only thing that answers it is the ECMA-404 grammar, and the only
+   honest way to ask that grammar is to RUN THE PARSER — §Solver-half's rule that an example propagates because
+   the engine runs the real op, and §JS-engine-encoding-builtin's ban on hand-rolling JSON, are the same
+   sentence read from two directions.
+   SO THE ANSWER COSTS A PARSE OF THE EXAMPLE, AND A PARSE IS UNBOUNDED WORK. That is exactly the reason it is
+   a STAGE and not a C span inside the ask: it runs on this machine's own tokenizer and frame stack, so it
+   YIELDS at every completed value like JP_PARSE does and a flow can park inside it with its position in the
+   example intact. Driven to completion from inside the ask instead, it was one span the scheduler could not
+   preempt — a document whose unknown text carries a large learned reply body as its example bought a
+   cooperative quantum's worth of overrun for one declaration. */
 #define JSONPARSE_STAGES(X) \
+    X(JP_PROBE,    "§25.5.2 JSON.parse step 2 (ParseJSON over the unknown text's EXAMPLE: which completion a " \
+                   "session carrying the real bytes reaches)") \
     X(JP_UNKNOWN,  "§25.5.2 JSON.parse step 1 (text is unknown external input: both completions feasible)") \
     X(JP_TOSTRING, "§25.5.2 JSON.parse step 1 (jsonString is ToString(text))") \
     X(JP_PARSE,    "§25.5.2 JSON.parse steps 2-8 (parseResult is ParseJSON(jsonString), unfiltered its value)") \
@@ -98600,128 +98642,194 @@ static int js_json_throw_unknown(JSContext *ctx)
    the one this fork already implements, since `JSON.rawJSON` is built here. */
 enum { JP_OUTCOME_VALUE = 0, JP_OUTCOME_THROW = 1 };
 
-/* WHICH OF THOSE TWO COMPLETIONS DOES §25.5.2 JSON.parse ( text [ , reviver ] ) REACH ON THIS OPERAND'S
- * EXAMPLE — the machine's own declaration for the outcome fork below, and JS_OUTCOME_REAL_UNSTATED when it
- * has none to make. It decides which arm the forking flow KEEPS and whether the arm a flow ends on is FORCED,
- * which is the one thing an outcome fork could not say about a request the way a bytecode branch already does.
+/* THE PROBE'S CURSOR. PROBE_PH_START is what a js_mallocz'd state already reads as — "nothing recorded" — so a
+   completion slot nobody wrote can never be mistaken for the claim that a real session parses this text. */
+enum { PROBE_PH_START = 0, PROBE_PH_PARSE, PROBE_PH_DONE };
+
+/* THE MODEL'S OWN THROW, TAKEN OUT OF THE CONTEXT — or propagated when it is not §25.5.2.1 ParseJSON ( text )
+ * step 1's SyntaxError.
  *
- * IT RUNS THE REAL CODEC ON THE REAL BYTES, WHICH IS THE ONLY WAY THIS QUESTION MAY BE ANSWERED. §Solver-half:
- * the example propagates because the engine RUNS the real op, and a recorded transform-expression over the
- * value cannot see what the parser sees. So this parses — the same parser, through the same
- * JS_ParseJSON_internal every other embedder parse goes through — and reports what that parse DID. Nothing
- * here inspects a shape, a length, a leading character or a source name: `json_text_may_start_with` above is a
- * DOMAIN test that prunes an infeasible arm and is a different question, asked of a value this has no example
- * for.
- *
- * A NON-STRING EXAMPLE IS "CANNOT SAY", AND IT IS THE SAME LINE THE ARM BELOW DRAWS. §25.5.2 JSON.parse
- * ( text [ , reviver ] ) step 1 is `? ToString(text)`, so an example that is not already a String would have
- * to be coerced before the parse — and this machine's parse arm refuses exactly that (it takes the example
- * only `if (JS_IsString(example))`). Declaring a completion from a coercion the arm would not perform would
- * make the declaration and the arm two answers to one question.
- *
- * A FAILURE THAT IS NOT §25.5.2.1's SyntaxError IS NOT A COMPLETION OF ANYTHING AND IS PROPAGATED. The parse's
- * only defined abrupt completion is that SyntaxError; anything else is an allocation failure, and turning one
- * into "the real session throws" would be a claim about the page's value made out of this process's memory
- * pressure. The SyntaxError itself is the MODEL's throw and may not be left standing in the context — the same
- * rule js_concolic_derive states one screen up, for the same reason: a stale pending exception is read by the
- * next thing that asks for one.
- *
- * NAMED RESIDUAL — THE PROBE PARSE IS ONE NON-PARKABLE C SPAN. The machine's OWN parse of the same text
- * (js_json_parse_begin plus the JP_PARSE stage) yields once per completed value so a flow can park inside it;
- * this one drives JS_ParseJSON_internal to completion, which is that entry's documented embedder behaviour and
- * is correct for the answer but is a span the scheduler cannot preempt. WHAT THE NEXT DIFF BUILDS is a probe
- * STAGE ahead of JP_UNKNOWN that runs the example through the machine's own incremental parser and its own
- * park points, and hands the recorded completion to the ask. HOW ITS ABSENCE SHOWS: a flow that offers no rest
- * point between the fork's ask and its answer, so a cooperative quantum overruns by the time it takes to parse
- * one example — visible on a document whose unknown text carries a large learned reply body as its example. */
-static int json_parse_real_completion(JSContext *ctx, JSValueConst text, int *real)
+ * A FAILURE THAT IS NOT THAT SyntaxError IS NOT A COMPLETION OF ANYTHING. The parse's only defined abrupt
+ * completion is that SyntaxError; anything else this parser can raise is an allocation failure, and turning
+ * one into "the real session throws" would be a claim about the page's value made out of this process's memory
+ * pressure. The SyntaxError itself belongs to the MODEL run and may not be left standing in the context — the
+ * same rule js_concolic_derive states, for the same reason: a stale pending exception is read by the next
+ * thing that asks for one.
+ * Returns 1 when it took a SyntaxError, 0 when it left something else pending for the caller to propagate. */
+static int json_probe_take_syntax_error(JSContext *ctx)
 {
-    JSValue ex, v, e, proto;
-    const char *buf;
-    size_t len;
+    JSValue e, proto;
     bool syn;
 
-    *real = JS_OUTCOME_REAL_UNSTATED;
-    ex = g_concolic.example ? g_concolic.example(ctx, text) : JS_UNDEFINED;
-    if (!JS_IsString(ex)) {
-        JS_FreeValue(ctx, ex);
-        return 0;
-    }
-    buf = JS_ToCStringLen(ctx, &len, ex);
-    JS_FreeValue(ctx, ex);
-    if (!buf)
-        return -1;
-    v = JS_ParseJSON_internal(ctx, buf, len, "<input>", NULL);
-    JS_FreeCString(ctx, buf);
-    if (!JS_IsException(v)) {
-        JS_FreeValue(ctx, v);
-        *real = JP_OUTCOME_VALUE;
-        return 0;
-    }
+    DCHECK(JS_HasException(ctx), "the JSON probe parse failed and left no completion value behind");
     e = JS_GetException(ctx);
     proto = JS_GetPrototype(ctx, e);
     syn = js_same_value(ctx, proto, ctx->native_error_proto[JS_SYNTAX_ERROR]);
     JS_FreeValue(ctx, proto);
     if (!syn) {
         JS_Throw(ctx, e);
-        return -1;
+        return 0;
     }
     JS_FreeValue(ctx, e);
-    *real = JP_OUTCOME_THROW;
-    return 0;
+    return 1;
+}
+
+/* THE PROBE IS OVER: release everything it built and leave the machine owning NOTHING.
+ * It is not js_json_parse_abandon, which releases a parse the flow was PARKED inside; this releases one that
+ * RAN TO ITS ANSWER, so its frame stack is already gone (json_parse_step frees it on both its terminating
+ * returns) and what is left is the completed value, the token and the source text. Emptying the machine is the
+ * point rather than a tidy-up: the ask one stage below snapshots the SIBLING, and its DCHECK says in as many
+ * words that the snapshot has to be taken before the machine owns anything. */
+static void json_probe_end(JSContext *ctx, JSJsonReviver *s)
+{
+    DCHECK(s->jp.st == NULL && s->jp.sp == 0,
+           "the JSON probe finished with parse frames still standing — json_parse_step frees its own stack on "
+           "both terminating returns, so a live frame here is a third exit nothing releases");
+    JS_FreeValue(ctx, s->jp.val);
+    s->jp.val = JS_NULL;
+    free_token(&s->jps, &s->jps.token);
+    s->parsing = 0;
+    if (s->text) { JS_FreeCString(ctx, s->text); s->text = NULL; }
+    JS_FreeValue(ctx, s->text_str);
+    s->text_str = JS_UNDEFINED;
 }
 
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSJsonReviver *s = st;
     int r;
-    if (s->hdr.stage == JP_UNKNOWN) {
+    if (s->hdr.stage == JP_PROBE) {
         JSValueConst text = step_arg(&s->hdr, 0);
-        if (s->hdr.fork_phase == FORK_PH_ASK) {
-            /* EVERY owned field before the first thing that can throw — and on this stage the first thing that
-               can throw is the fork's own SyntaxError arm, so the emptying runs BEFORE the ask rather than
-               after it. The failure path tears the state down through fini, which frees exactly what the state
-               holds, so a field left unwritten is read as whatever the allocation happened to contain.
-               It is also what the SIBLING's snapshot carries: the clone is taken AT the ask, so this leaves it
-               holding a machine that owns nothing, and the sibling re-enters at that ask and answers it from
-               its OWN decision vector. The sibling re-runs this, which is idempotent because it assigns only
-               empty values and nothing has been assigned yet — asserted below rather than assumed. */
+        if (s->probe_phase == PROBE_PH_START) {
+            /* EVERY owned field before the first thing that can throw — and on THIS stage the first thing that
+               can throw is the probe parse itself, so the emptying is the first thing the machine does. The
+               failure path tears the state down through fini, which frees exactly what the state holds, so a
+               field left unwritten is read as whatever the allocation happened to contain.
+               THE EMPTYING LIVES HERE AND NOT AT THE ASK BECAUSE THE PROBE RUNS FIRST AND OWNS THINGS. It used
+               to sit one stage below, where it was reached before anything had been built; a stage that starts
+               a parse ahead of it would have had its tokenizer, its source text and its example overwritten
+               with empty values while the allocations they named went unreleased. */
             JS_FreeValue(ctx, cb_result);
             cb_result = JS_UNDEFINED;
             s->root = JS_UNDEFINED; s->result = JS_UNDEFINED; s->text_str = JS_UNDEFINED;
             s->unknown = JS_UNDEFINED;
             s->early = 0; s->text = NULL; s->pr = NULL; s->stack = NULL; s->sp = 0; s->cap = 0;
             s->parsing = 0;
+            s->probe_real = JS_OUTCOME_REAL_UNSTATED;
+            s->probe_phase = PROBE_PH_DONE;   /* …unless the branch below finds an example to run */
+            if (g_concolic.is && g_concolic.is(text)) {
+                /* A NON-STRING EXAMPLE IS "CANNOT SAY", AND IT IS THE SAME LINE THE PARSE ARM DRAWS. §25.5.2
+                   JSON.parse ( text [ , reviver ] ) step 1 is `? ToString(text)`, so an example that is not
+                   already a String would have to be coerced before the parse — and the parse arm below refuses
+                   exactly that (it takes the example only `if (JS_IsString(example))`). Declaring a completion
+                   from a coercion the arm would not perform would make the declaration and the arm two answers
+                   to one question. */
+                JSValue example = g_concolic.example ? g_concolic.example(ctx, text) : JS_UNDEFINED;
+                if (JS_IsString(example)) {
+                    s->text_str = example;
+                    s->probe_phase = PROBE_PH_PARSE;
+                    /* NO PARSE RECORD AND NO REVIVER: the probe wants the COMPLETION, not the value, and
+                       §25.5.2 step 9's InternalizeJSONProperty runs on the arm the fork keeps rather than on
+                       the question that chooses it. Running the reviver here would call the page's function
+                       once per node for a walk no completion of the algorithm performs. */
+                    if (js_json_parse_state_start(ctx, s, NULL)) {
+                        /* the tokenizer refused the very first token — §25.5.2.1 ParseJSON ( text ) step 1's
+                           SyntaxError, reached before json_parse_step ever runs, and a completion of the probe
+                           like any other. */
+                        if (!json_probe_take_syntax_error(ctx)) {
+                            json_probe_end(ctx, s);
+                            return -1;
+                        }
+                        s->probe_real = JP_OUTCOME_THROW;
+                        json_probe_end(ctx, s);
+                        s->probe_phase = PROBE_PH_DONE;
+                    }
+                } else {
+                    JS_FreeValue(ctx, example);
+                }
+            }
+        }
+        if (s->probe_phase == PROBE_PH_PARSE) {
+            /* THE REST POINT, one offer per completed value — the same back-edge JP_PARSE hands the scheduler,
+               because it is the same parser stepped the same way. A YIELD returns with the stage still JP_PROBE
+               and this phase still PROBE_PH_PARSE, so the resume falls straight back in here and continues at
+               the exact character it stopped on. */
+            JS_FreeValue(ctx, cb_result);
+            cb_result = JS_UNDEFINED;
+            r = json_parse_step(&s->jps, &s->jp);
+            if (r > 0)
+                return JS_STEP_YIELD;
+            if (r < 0) {
+                if (!json_probe_take_syntax_error(ctx)) {
+                    json_probe_end(ctx, s);
+                    return -1;
+                }
+                s->probe_real = JP_OUTCOME_THROW;
+            } else {
+                /* §25.5.2.1 ParseJSON ( text ) step 1 asks whether the WHOLE text is a valid JSON text as
+                   specified in ECMA-404, so a parse that completed a value and left data behind it has not
+                   answered yes — `{}x` is the same SyntaxError as `x`. It is recorded rather than raised: the
+                   probe reports a completion, and the only throw the page may see is the one the fork's THROW
+                   arm raises for itself. */
+                s->probe_real = (s->jps.token.val == TOK_EOF) ? JP_OUTCOME_VALUE : JP_OUTCOME_THROW;
+            }
+            json_probe_end(ctx, s);
+            s->probe_phase = PROBE_PH_DONE;
+        }
+        DCHECK(s->probe_phase == PROBE_PH_DONE,
+               "JSON.parse left its probe stage without recording a completion — the ask one stage below reads "
+               "that slot, and a phase short of DONE is the one state in which it holds nothing");
+        s->hdr.stage = JP_UNKNOWN;
+    }
+    if (s->hdr.stage == JP_UNKNOWN) {
+        JSValueConst text = step_arg(&s->hdr, 0);
+        if (s->hdr.fork_phase == FORK_PH_ASK) {
+            /* The SIBLING's snapshot is taken AT the ask, so it re-enters here rather than at JP_PROBE and its
+               `cb_result` is the driver's, owed a release exactly as the first entry's was. What it does NOT
+               have to redo is the emptying: the clone was taken with the machine owning nothing, which is what
+               this asserts rather than assumes. */
+            JS_FreeValue(ctx, cb_result);
+            cb_result = JS_UNDEFINED;
+            DCHECK(JS_IsUndefined(s->root) && JS_IsUndefined(s->result) && JS_IsUndefined(s->text_str)
+                   && JS_IsUndefined(s->unknown) && !s->early && s->text == NULL && s->pr == NULL
+                   && s->stack == NULL && s->sp == 0 && s->cap == 0 && !s->parsing,
+                   "JSON.parse reached its outcome fork owning state — the probe one stage above releases what "
+                   "it built precisely so the sibling's snapshot is taken of a machine that owns nothing");
         }
         if (g_concolic.is && g_concolic.is(text)) {
             int arm, real = JS_OUTCOME_REAL_UNSTATED;
-            DCHECK(s->pr == NULL && s->stack == NULL && s->text == NULL && !s->parsing,
-                   "JSON.parse reached its outcome fork with state already built — the sibling's snapshot has "
-                   "to be taken before the machine owns anything");
             if (!json_text_may_start_with(g_concolic.lead ? g_concolic.lead(text) : 0)) {
                 /* THE PARSE ARM IS INFEASIBLE and is pruned rather than forked. The component that owns this
                    source declares what the browser's delivery guarantees — a fragment is empty or begins with
                    `#` — and neither an empty text nor one beginning with `#` is a JSON text, so §25.5.2.1
                    ParseJSON ( text ) step 1 throws for EVERY value the domain permits. That is V8's answer to
                    `JSON.parse(location.hash)` and it is reached here the same way V8 reaches it: by the
-                   grammar, not by a special case. */
+                   grammar, not by a special case.
+                   THE DOMAIN AND THE EXAMPLE ARE TWO WITNESSES TO ONE FACT, so they are checked against each
+                   other where both are in hand. The example is a member of the domain, so a domain that admits
+                   no JSON text cannot carry an example the REAL parser accepted — and if it does, the source's
+                   component is declaring a prefix its own deliveries do not honour, which would silently prune
+                   an arm the page really reaches. */
+                DCHECK(s->probe_real != JP_OUTCOME_VALUE,
+                       "a source declared a leading character no JSON text may begin with, and the REAL parser "
+                       "then accepted that same source's example — the domain and the example disagree, and "
+                       "the domain is about to delete a completion the example proves feasible");
                 JS_FreeValue(ctx, cb_result);
                 return js_json_throw_unknown(ctx);
             }
             /* THE DECLARATION, MADE ON THE ENTRY THAT ASKS. JP_OUTCOME_VALUE / JP_OUTCOME_THROW above name the
-               two completions and json_parse_real_completion says which one the REAL codec reaches on this
-               source's example — so the flow that carries the example keeps that arm and the sibling holding
-               the other is FORCED, which is what an outcome fork previously could not say about the requests
-               built behind it.
+               two completions and the JP_PROBE stage recorded which one the REAL codec reaches on this source's
+               example — so the flow that carries the example keeps that arm and the sibling holding the other
+               is FORCED, which is what an outcome fork previously could not say about the requests built behind
+               it.
                ONLY ON THE ASK, because that is the only entry a declaration is read on: step_fork_run consults
                `real` in FORK_PH_ASK and the FORK_PH_ANSWERED re-entry is the DELIVERY of a decision already
-               taken. Probing there would parse one example a second time to fill a slot with no reader — and
-               the probe is a parse, not a comparison. The sibling's snapshot is taken AT the ask, so it
-               re-enters in FORK_PH_ASK and makes its own declaration from its own view of the example. */
-            if (s->hdr.fork_phase == FORK_PH_ASK && json_parse_real_completion(ctx, text, &real) < 0) {
-                JS_FreeValue(ctx, cb_result);
-                return -1;
-            }
+               taken. Reading it there would state a completion into a slot with no reader.
+               THE SIBLING INHERITS THE RECORDING RATHER THAN REPEATING IT. Its snapshot is taken AT the ask, so
+               it re-enters here with the probe already DONE and its recorded completion copied — which is the
+               same answer over the same example, computed once instead of once per arm. */
+            if (s->hdr.fork_phase == FORK_PH_ASK)
+                real = s->probe_real;
             r = step_fork_run(ctx, &s->hdr, text, "JSON.parse", 2, real, &arm);
             if (r) { JS_FreeValue(ctx, cb_result); return r; }
             if (arm == JP_OUTCOME_THROW) {
@@ -98739,7 +98847,18 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
                text and the ordinary parse (and the ordinary reviver walk) runs on it. The value handed back to
                the page is that result carried by an unknown derived from `text`; fini does that in one place.
                With no example there is nothing concrete to parse, and the completion is an unknown with no
-               example — which is honest, not a stub: the domain is "some JSON value" and nothing narrows it. */
+               example — which is honest, not a stub: the domain is "some JSON value" and nothing narrows it.
+
+               NAMED RESIDUAL — THE VALUE ARM PARSES THE EXAMPLE A SECOND TIME. JP_PROBE has already run the
+               real parser over these exact bytes to declare the completion, and this arm runs it again to
+               produce the value, so a flow on the value arm pays two parses of one example. Both are parkable,
+               so nothing here is a cap; what it costs is CPU. WHAT THE NEXT DIFF BUILDS is the handover: the
+               probe keeps its parsed value and its parse record instead of releasing them in json_probe_end,
+               and this arm adopts them — which requires js_json_reviver_visit to declare the tokenizer and the
+               frame stack it does not name today, because the ask between the two clones the machine for the
+               sibling and a memcpy'd `text` would be freed twice. HOW ITS ABSENCE SHOWS: the parse time for an
+               unknown text's example is exactly double the parse time for the same bytes handed to JSON.parse
+               concretely — measurable on a document whose unknown text carries a large learned reply body. */
             JSValue example = g_concolic.example ? g_concolic.example(ctx, text) : JS_UNDEFINED;
             s->unknown = js_dup(text);
             if (JS_IsString(example)) {
