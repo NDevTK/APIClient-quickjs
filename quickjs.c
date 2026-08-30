@@ -382,7 +382,7 @@ struct JSRuntime {
 
     /* HTML 8.1.7's TWO QUEUES, which are not one queue with two kinds of entry in it. `job_list` is the
        MICROTASK queue — promise reactions, queueMicrotask, thenable resolution, dynamic-import continuations.
-       `task_list` holds the platform's TASK SOURCES: HTML 8.6's timer task source, a queued event fire, a
+       `task_list` holds the platform's TASK SOURCES: HTML 8.7 "Timers"'s timer task source, a queued event fire, a
        delivered network reply. The event loop runs ONE task and then performs a MICROTASK CHECKPOINT, which
        drains every microtask — including ones the microtasks themselves enqueue — before the next task begins.
        A single FIFO gets that backwards the moment a task and a microtask are outstanding together, and it did:
@@ -419,7 +419,7 @@ struct JSRuntime {
        unique across both queues, the baseline list AND whatever the enqueue hook's owner is holding; that
        uniqueness is exactly what JS_RemoveQueuedTask asserts when it refuses to find one handle twice. */
     uint64_t next_task_handle;
-    /* FINALIZATION-REGISTRY ENTRIES WHOSE TARGET HAS DIED, waiting to become cleanup jobs. 9.13's
+    /* FINALIZATION-REGISTRY ENTRIES WHOSE TARGET HAS DIED, waiting to become cleanup jobs. §9.9.4.1's
        HostEnqueueFinalizationRegistryCleanupJob is the HOST's, "at some future time" — V8 posts it from the GC
        epilogue — and this list is that seam. Enqueueing it where the target is freed instead put allocation
        inside object teardown: js_malloc fails, JS_ThrowOutOfMemory throws, the throw frees the previous
@@ -3311,9 +3311,10 @@ static int js_enqueue(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueCons
  * (js_enqueue offers it, and takes the default when it declines); the baseline list is only what an OWNERLESS
  * callback does when there is no scheduler to offer it to yet. What distinguishes a callback that will be
  * adopted from one that will not is the ALGORITHM QUEUEING IT, which only the caller knows, so the caller
- * states it: this entry is for the user agent's own edges (JS_EnqueueCallJob/JS_EnqueueCallTask), and §9.13's
- * FinalizationRegistry cleanup job — whose only driver in this engine is an embedder's JS_IsJobPending /
- * JS_ExecutePendingJob, which is the owner by construction — goes to js_enqueue directly instead.
+ * states it: this entry is for the user agent's own edges (JS_EnqueueCallJob/JS_EnqueueCallTask), and
+ * §9.9.4.1 "HostEnqueueFinalizationRegistryCleanupJob"'s cleanup job — whose only driver in this engine is
+ * an embedder's JS_IsJobPending / JS_ExecutePendingJob, which is the owner by construction — goes to
+ * js_enqueue directly instead.
  *
  * Returns 0 when the callback is queued somewhere it will run, -1 on allocation failure. */
 static int js_enqueue_platform_call(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv,
@@ -74234,8 +74235,8 @@ static JSValue js_coerce1_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* HTML §8.6's queueMicrotask: "queue a microtask to invoke callback". The callback is PAGE CODE — the case that
-   proves it is `queueMicrotask(() => { for(;;) x++; })` — and it ran inside js_microtask_job's JS_Call, a C
+/* HTML §8.8 "Microtask queuing"'s queueMicrotask: "queue a microtask to invoke callback". The callback is
+   PAGE CODE — the case that proves it is `queueMicrotask(() => { for(;;) x++; })` — and it ran inside js_microtask_job's JS_Call, a C
    activation with no flow base under it, so the loop had nothing to park into and drove to completion. The
    engine already has the replacement, built for exactly this: JS_EnqueueCallJob queues `func(...args)` as a
    CALL-ROOT FLOW, so the callback is preemptible, forkable and parkable like every other flow. The C job body
@@ -103817,7 +103818,8 @@ typedef struct JSReactionFlow {
          phase 1 — the LAST call of the flow: its RESULT is not observable and is discarded, and its THROW is
                    the flow's completion — returned to the job pump, which is the host's report-an-exception
                    edge. js_settle_as_flow and host_call_job are both whole flows of this shape; a host callback
-                   that throws is reported exactly as HTML §8.6's queueMicrotask and 9.13's cleanup callback
+                   that throws is reported exactly as HTML §8.8's queueMicrotask and ECMAScript §9.12
+                   "CleanupFinalizationRegistry"'s cleanup callback
                    require, rather than being handed to a capability that does not exist. */
     uint8_t phase;
 } JSReactionFlow;
@@ -104496,7 +104498,7 @@ static JSValue host_call_job(JSContext *ctx, int argc, JSValueConst *argv)
 /* `is_platform` SAYS WHICH ALGORITHM IS QUEUEING, and it is the caller's to state because nothing here can
    derive it. TRUE is the user agent's own edges — the two public entries below — whose callback belongs to a
    flow's timeline and which the user agent may reach while it is still CREATING the Document, so an ownerless
-   one is BASELINE work (js_enqueue_platform_call). FALSE is §9.13's FinalizationRegistry cleanup job, whose
+   one is BASELINE work (js_enqueue_platform_call). FALSE is §9.9.4.1's FinalizationRegistry cleanup job, whose
    only driver in this engine is an embedder's JS_IsJobPending / JS_ExecutePendingJob: that pump asked for the
    work and is standing there to run it, so the runtime's own queue is where it belongs and parking it for a
    flow that may never exist would strand it — JS_IsJobPending does not report the baseline list, by design.
@@ -104533,8 +104535,8 @@ static JSTaskHandle js_enqueue_call(JSContext *ctx, JSValueConst func, int argc,
     return handle;
 }
 
-/* §9.13's CLEANUP CALLBACK AS A CALL-ROOT FLOW — the same job shape the two platform entries below queue, and
-   deliberately NOT through the platform route. See js_enqueue_call's `is_platform`. */
+/* §9.12 "CleanupFinalizationRegistry"'s CLEANUP CALLBACK AS A CALL-ROOT FLOW — the same job shape the two
+   platform entries below queue, and deliberately NOT through the platform route. See js_enqueue_call's `is_platform`. */
 static void js_enqueue_cleanup_call(JSContext *ctx, JSValueConst func, JSValueConst held)
 {
     js_enqueue_call(ctx, func, 1, &held, false, false);
@@ -114641,8 +114643,9 @@ static void js_finrec_free(JSRuntime *rt, JSFinRecEntry *fre)
     js_free_rt(rt, fre);
 }
 
-/* Empty the runtime's parked-cleanup list — see JSRuntime::finrec_pending. With `enqueue`, this is where 9.13's
-   HostEnqueueFinalizationRegistryCleanupJob happens: outside any teardown, where allocating is ordinary, driven
+/* Empty the runtime's parked-cleanup list — see JSRuntime::finrec_pending. With `enqueue`, this is where
+   §9.9.4.1 "HostEnqueueFinalizationRegistryCleanupJob" happens: outside any teardown, where allocating is
+   ordinary, driven
    by the two functions that ask what work is pending, so a target that died since the last question is answered
    by the next one. Without it, the entries are simply released, which is all a runtime teardown can do. */
 static void js_finrec_drain(JSRuntime *rt, bool enqueue)
@@ -114653,7 +114656,7 @@ static void js_finrec_drain(JSRuntime *rt, bool enqueue)
         JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
         list_del(&fre->link);
         if (enqueue) {
-            /* 9.13's cleanup callback is PAGE CODE — `new FinalizationRegistry(h => { while (h) {} })` — and it
+            /* §9.12's cleanup callback is PAGE CODE — `new FinalizationRegistry(h => { while (h) {} })` — and it
                ran inside js_finrec_job's JS_Call, a C activation with no flow base under it. It queues as a
                CALL-ROOT FLOW like every other page callback, so it is preemptible and parkable; the C job body
                is deleted with the conversion. Same list, same FIFO position, so the cleanup job's place among

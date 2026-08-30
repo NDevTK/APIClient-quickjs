@@ -1587,7 +1587,7 @@ typedef uint64_t JSTaskHandle;
    waits on the runtime for the first flow to adopt it, like the task below. */
 JS_EXTERN JSTaskHandle JS_EnqueueCallJob(JSContext *ctx, JSValueConst func, int argc, JSValueConst *argv);
 /* THE SAME, ON A TASK SOURCE rather than the microtask queue — HTML 8.1.7's other half. A platform edge that
-   the spec words as "queue a task" (8.6's timer task source, a queued event fire, a delivered reply) uses this
+   the spec words as "queue a task" (8.7 "Timers"'s timer task source, a queued event fire, a delivered reply) uses this
    one, and the event loop will not begin it until every microtask outstanding has run. Choosing the wrong one
    is not a performance detail: it reorders what the page observes.
    IT MAY ALSO BE CALLED BEFORE THERE IS A FRONTIER: the user agent queues a task whenever it likes, including
@@ -2137,7 +2137,7 @@ JS_EXTERN bool JS_AtomIsPublishedName(JSRuntime *rt, JSAtom atom);
  * source") tests it, and BOTH arms are announced because those two arms are the sink's two halves:
  *   - the NON-STRING arm is where the sink is DETECTED. Unknown external input is an object of the solver's
  *     value class, so `eval(location.hash)` takes step 2 and returns unevaluated — this engine can compile no
- *     program because the unknown names none, exactly as HTML 8.6's string-handler arm cannot.
+ *     program because the unknown names none, exactly as HTML 8.7 "Timers"'s string-handler arm cannot.
  *   - the STRING arm is where an @S CANDIDATE is read. A candidate re-run substitutes a concrete payload at
  *     the source, so the page's own concatenations and filters build a real string, and the detector must see
  *     the very bytes that are about to be compiled — to scan them per ECMAScript 12 for the lexical state the
