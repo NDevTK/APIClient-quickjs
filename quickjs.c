@@ -83664,7 +83664,7 @@ static const JSTrampStepDef js_array_toSorted_def = { sizeof(JSArraySort), js_ar
 /* Declared where the machine is; the definition names it here. */
 static const char *const js_json_parse_steps[];
 static const JSTrampStepDef js_json_parse_def    = { sizeof(JSJsonReviver), js_json_parse_vstep, js_json_parse_vfini, 0, .visit = js_json_reviver_visit,
-                       .algorithm = "25.5.1 JSON.parse",
+                       .algorithm = "25.5.2 JSON.parse ( text [ , reviver ] )",
                        .steps = js_json_parse_steps };
 static const char *const js_for_in_steps[];
 static const JSTrampStepDef js_for_in_def       = { sizeof(JSForIn), js_for_in_step, js_for_in_fini, 0, .visit = js_for_in_visit,
@@ -98541,15 +98541,16 @@ static void js_json_parse_abandon(JSContext *ctx, JSJsonReviver *s)
    Steps 2-8 are one stage because they are one operation to this engine — the parse — and it is the stage that
    YIELDS, so a resume falls straight back into json_parse_step at the character it stopped on. */
 /* THE FIRST STAGE IS A REST POINT AND THAT IS WHY IT IS A STAGE. `text` may be UNKNOWN EXTERNAL INPUT, and
-   over such a text 25.5.1 has two feasible completions — step 8's value and step 2's SyntaxError — so the
-   machine rests here on an OUTCOME FORK while the substrate decides which one this flow is and snapshots a
-   sibling for the other. Every ordinary JSON.parse passes straight through it without resting, exactly as a
-   string argument passes through JP_TOSTRING without one. */
+   over such a text §25.5.2 JSON.parse ( text [ , reviver ] ) has two feasible completions — its step 2's
+   normal completion and the SyntaxError of §25.5.2.1 ParseJSON ( text ) step 1 — so the machine rests here on
+   an OUTCOME FORK while the substrate decides which one this flow is and snapshots a sibling for the other.
+   Every ordinary JSON.parse passes straight through it without resting, exactly as a string argument passes
+   through JP_TOSTRING without one. */
 #define JSONPARSE_STAGES(X) \
-    X(JP_UNKNOWN,  "25.5.1 step 1 (text is unknown external input: parse and throw are both feasible)") \
-    X(JP_TOSTRING, "25.5.1 step 1 (jsonString is ToString(text))") \
-    X(JP_PARSE,    "25.5.1 steps 2-8 (jsonString is parsed as a JSON text; unfiltered is its value)") \
-    X(JP_WALK,     "25.5.1 step 9.d (InternalizeJSONProperty(root, rootName, reviver))")
+    X(JP_UNKNOWN,  "§25.5.2 JSON.parse step 1 (text is unknown external input: both completions feasible)") \
+    X(JP_TOSTRING, "§25.5.2 JSON.parse step 1 (jsonString is ToString(text))") \
+    X(JP_PARSE,    "§25.5.2 JSON.parse steps 2-8 (parseResult is ParseJSON(jsonString), unfiltered its value)") \
+    X(JP_WALK,     "§25.5.2 JSON.parse step 9 (InternalizeJSONProperty(root, rootName, reviver, snapshot))")
 enum { JSONPARSE_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_json_parse_steps[] = { JSONPARSE_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -98577,13 +98578,97 @@ static bool json_text_may_start_with(int c)
     return false;
 }
 
-/* 25.5.1 step 2's SyntaxError over a text this engine does not have. It is a REAL throw — the page's own
-   `catch` runs and everything behind it is reached, which is the whole reason this completion is an arm rather
-   than a value. The message invents no position, because there is no text to have one in. */
+/* §25.5.2.1 ParseJSON ( text ) step 1's SyntaxError over a text this engine does not have. It is a REAL
+   throw — the page's own `catch` runs and everything behind it is reached, which is the whole reason this
+   completion is an arm rather than a value. The message invents no position, because there is no text to have
+   one in. */
 static int js_json_throw_unknown(JSContext *ctx)
 {
     JS_ThrowSyntaxError(ctx, "unexpected token in JSON");
     return -1;
+}
+
+/* THE TWO COMPLETIONS THIS MACHINE DECLARES FEASIBLE OVER AN UNKNOWN TEXT. 0 is the VALUE — ECMAScript
+   §25.5.2 JSON.parse ( text [ , reviver ] ) step 2's normal completion — and 1 is the THROW, §25.5.2.1
+   ParseJSON ( text ) step 1's SyntaxError. The value comes first because outcome 0 is what a run with no
+   forking policy takes, and a candidate re-fire on its way to a sink must not be diverted into a throw it did
+   not choose.
+   THE NUMBER MOVED AND THE TITLE IS WHY THIS IS STILL FINDABLE. Comments elsewhere in this machine give
+   JSON.parse the number an earlier edition had, and that number now belongs to §25.5.1 JSON.isRawJSON ( obj );
+   the parse's SyntaxError also moved out of JSON.parse's own step list into the ParseJSON abstract operation.
+   Verified against the standard's text rather than recalled — and the same edition that renumbered these is
+   the one this fork already implements, since `JSON.rawJSON` is built here. */
+enum { JP_OUTCOME_VALUE = 0, JP_OUTCOME_THROW = 1 };
+
+/* WHICH OF THOSE TWO COMPLETIONS DOES §25.5.2 JSON.parse ( text [ , reviver ] ) REACH ON THIS OPERAND'S
+ * EXAMPLE — the machine's own declaration for the outcome fork below, and JS_OUTCOME_REAL_UNSTATED when it
+ * has none to make. It decides which arm the forking flow KEEPS and whether the arm a flow ends on is FORCED,
+ * which is the one thing an outcome fork could not say about a request the way a bytecode branch already does.
+ *
+ * IT RUNS THE REAL CODEC ON THE REAL BYTES, WHICH IS THE ONLY WAY THIS QUESTION MAY BE ANSWERED. §Solver-half:
+ * the example propagates because the engine RUNS the real op, and a recorded transform-expression over the
+ * value cannot see what the parser sees. So this parses — the same parser, through the same
+ * JS_ParseJSON_internal every other embedder parse goes through — and reports what that parse DID. Nothing
+ * here inspects a shape, a length, a leading character or a source name: `json_text_may_start_with` above is a
+ * DOMAIN test that prunes an infeasible arm and is a different question, asked of a value this has no example
+ * for.
+ *
+ * A NON-STRING EXAMPLE IS "CANNOT SAY", AND IT IS THE SAME LINE THE ARM BELOW DRAWS. §25.5.2 JSON.parse
+ * ( text [ , reviver ] ) step 1 is `? ToString(text)`, so an example that is not already a String would have
+ * to be coerced before the parse — and this machine's parse arm refuses exactly that (it takes the example
+ * only `if (JS_IsString(example))`). Declaring a completion from a coercion the arm would not perform would
+ * make the declaration and the arm two answers to one question.
+ *
+ * A FAILURE THAT IS NOT §25.5.2.1's SyntaxError IS NOT A COMPLETION OF ANYTHING AND IS PROPAGATED. The parse's
+ * only defined abrupt completion is that SyntaxError; anything else is an allocation failure, and turning one
+ * into "the real session throws" would be a claim about the page's value made out of this process's memory
+ * pressure. The SyntaxError itself is the MODEL's throw and may not be left standing in the context — the same
+ * rule js_concolic_derive states one screen up, for the same reason: a stale pending exception is read by the
+ * next thing that asks for one.
+ *
+ * NAMED RESIDUAL — THE PROBE PARSE IS ONE NON-PARKABLE C SPAN. The machine's OWN parse of the same text
+ * (js_json_parse_begin plus the JP_PARSE stage) yields once per completed value so a flow can park inside it;
+ * this one drives JS_ParseJSON_internal to completion, which is that entry's documented embedder behaviour and
+ * is correct for the answer but is a span the scheduler cannot preempt. WHAT THE NEXT DIFF BUILDS is a probe
+ * STAGE ahead of JP_UNKNOWN that runs the example through the machine's own incremental parser and its own
+ * park points, and hands the recorded completion to the ask. HOW ITS ABSENCE SHOWS: a flow that offers no rest
+ * point between the fork's ask and its answer, so a cooperative quantum overruns by the time it takes to parse
+ * one example — visible on a document whose unknown text carries a large learned reply body as its example. */
+static int json_parse_real_completion(JSContext *ctx, JSValueConst text, int *real)
+{
+    JSValue ex, v, e, proto;
+    const char *buf;
+    size_t len;
+    bool syn;
+
+    *real = JS_OUTCOME_REAL_UNSTATED;
+    ex = g_concolic.example ? g_concolic.example(ctx, text) : JS_UNDEFINED;
+    if (!JS_IsString(ex)) {
+        JS_FreeValue(ctx, ex);
+        return 0;
+    }
+    buf = JS_ToCStringLen(ctx, &len, ex);
+    JS_FreeValue(ctx, ex);
+    if (!buf)
+        return -1;
+    v = JS_ParseJSON_internal(ctx, buf, len, "<input>", NULL);
+    JS_FreeCString(ctx, buf);
+    if (!JS_IsException(v)) {
+        JS_FreeValue(ctx, v);
+        *real = JP_OUTCOME_VALUE;
+        return 0;
+    }
+    e = JS_GetException(ctx);
+    proto = JS_GetPrototype(ctx, e);
+    syn = js_same_value(ctx, proto, ctx->native_error_proto[JS_SYNTAX_ERROR]);
+    JS_FreeValue(ctx, proto);
+    if (!syn) {
+        JS_Throw(ctx, e);
+        return -1;
+    }
+    JS_FreeValue(ctx, e);
+    *real = JP_OUTCOME_THROW;
+    return 0;
 }
 
 static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -98609,25 +98694,37 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
             s->parsing = 0;
         }
         if (g_concolic.is && g_concolic.is(text)) {
-            int arm;
+            int arm, real = JS_OUTCOME_REAL_UNSTATED;
             DCHECK(s->pr == NULL && s->stack == NULL && s->text == NULL && !s->parsing,
                    "JSON.parse reached its outcome fork with state already built — the sibling's snapshot has "
                    "to be taken before the machine owns anything");
             if (!json_text_may_start_with(g_concolic.lead ? g_concolic.lead(text) : 0)) {
                 /* THE PARSE ARM IS INFEASIBLE and is pruned rather than forked. The component that owns this
                    source declares what the browser's delivery guarantees — a fragment is empty or begins with
-                   `#` — and neither an empty text nor one beginning with `#` is a JSON text, so 25.5.1 step 2
-                   throws for EVERY value the domain permits. That is V8's answer to `JSON.parse(location.hash)`
-                   and it is reached here the same way V8 reaches it: by the grammar, not by a special case. */
+                   `#` — and neither an empty text nor one beginning with `#` is a JSON text, so §25.5.2.1
+                   ParseJSON ( text ) step 1 throws for EVERY value the domain permits. That is V8's answer to
+                   `JSON.parse(location.hash)` and it is reached here the same way V8 reaches it: by the
+                   grammar, not by a special case. */
                 JS_FreeValue(ctx, cb_result);
                 return js_json_throw_unknown(ctx);
             }
-            /* TWO COMPLETIONS: 0 is step 8's value and 1 is step 2's SyntaxError. The value comes first
-               because outcome 0 is what a run with no forking policy takes, and a candidate re-fire on its way
-               to a sink must not be diverted into a throw it did not choose. */
-            r = step_fork_run(ctx, &s->hdr, text, "JSON.parse", 2, JS_OUTCOME_REAL_UNSTATED, &arm);
+            /* THE DECLARATION, MADE ON THE ENTRY THAT ASKS. JP_OUTCOME_VALUE / JP_OUTCOME_THROW above name the
+               two completions and json_parse_real_completion says which one the REAL codec reaches on this
+               source's example — so the flow that carries the example keeps that arm and the sibling holding
+               the other is FORCED, which is what an outcome fork previously could not say about the requests
+               built behind it.
+               ONLY ON THE ASK, because that is the only entry a declaration is read on: step_fork_run consults
+               `real` in FORK_PH_ASK and the FORK_PH_ANSWERED re-entry is the DELIVERY of a decision already
+               taken. Probing there would parse one example a second time to fill a slot with no reader — and
+               the probe is a parse, not a comparison. The sibling's snapshot is taken AT the ask, so it
+               re-enters in FORK_PH_ASK and makes its own declaration from its own view of the example. */
+            if (s->hdr.fork_phase == FORK_PH_ASK && json_parse_real_completion(ctx, text, &real) < 0) {
+                JS_FreeValue(ctx, cb_result);
+                return -1;
+            }
+            r = step_fork_run(ctx, &s->hdr, text, "JSON.parse", 2, real, &arm);
             if (r) { JS_FreeValue(ctx, cb_result); return r; }
-            if (arm) {
+            if (arm == JP_OUTCOME_THROW) {
                 /* the THROW completion, raised for real so the page's own `catch` runs and whatever is behind
                    it is reached — which is the whole reason this is an arm and not a value. */
                 JS_FreeValue(ctx, cb_result);
