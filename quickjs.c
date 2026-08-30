@@ -22423,12 +22423,13 @@ static int step_strop_run(JSContext *ctx, JSStepHdr *h, JSValueConst options, JS
     return -1;
 }
 
-/* PromiseResolve(%Promise%, x), 27.5.4.7, as a SUB-SEQUENCE. TWO of its steps are the page's code and
-   js_promise_resolve_native performs both from C: the `constructor` READ on an x that is already a promise (an
-   accessor or a Proxy supplies it — return-suspendedStart-broken-promise.js defines exactly that), and the
-   capability's RESOLVE, which reads `.then` off a THENABLE x. That C route is sound only for a caller with
-   nowhere to suspend, which is why the comment on it names its remaining callers rather than guarding them; a
-   machine uses this instead.
+/* 27.5.4.7.1 PromiseResolve ( ctor, resolution ) with ctor = %Promise%, as a SUB-SEQUENCE. TWO of its steps are
+   the page's code, and both are reachable through the one condition "resolution is an Object": step 1.a's
+   `constructor` READ on a resolution that is already a promise (an accessor or a Proxy supplies it —
+   return-suspendedStart-broken-promise.js defines exactly that), and step 3's RESOLVE, whose resolving function
+   reads `then` off a thenable (27.5.1.3 step 2.f). js_promise_resolve_native performed the first from C and
+   handed the second to the resolving function's C entry; it now REFUSES an Object resolution outright, so this
+   is the only implementation of either and there is no route left to choose between.
    `pout` is written EXACTLY ONCE, on the return-0 exit, like every other sub-sequence: the promise exists before
    the resolve request parks, so holding it in the caller's local would lose it across the suspension — it lives
    in cb[3] instead, which the caller already owns for the duration. `cb` is a 4-slot buffer the CALLER lends and
@@ -22442,7 +22443,7 @@ static int step_promiseresolve_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase,
 
     if (*phase == PRR_START) {
         if (!JS_GetOpaque(x, JS_CLASS_PROMISE))
-            goto build;                    /* step 3: not a promise, so no `constructor` read at all */
+            goto build;                    /* step 1 is skipped: not a promise, so no `constructor` read */
         *phase = PRR_CTOR;
         r = step_getprop_run(ctx, h, x, JS_ATOM_constructor, in, &ctorv, out_cb, out_argc);
         in = JS_UNDEFINED;                 /* consumed either way */
@@ -22457,7 +22458,7 @@ static int step_promiseresolve_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase,
         {
             bool same = js_same_value(ctx, ctorv, ctx->promise_ctor);
             JS_FreeValue(ctx, ctorv);
-            if (same) { *phase = PRR_START; *pout = js_dup(x); return 0; }   /* step 2.b: x IS the answer */
+            if (same) { *phase = PRR_START; *pout = js_dup(x); return 0; }   /* step 1.b: x IS the answer */
         }
     build:
         JS_FreeValue(ctx, in);
@@ -22467,12 +22468,22 @@ static int step_promiseresolve_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase,
         cb[0] = JS_UNDEFINED;
         cb[1] = funcs[0];
         cb[2] = js_dup(x);
-        JS_FreeValue(ctx, funcs[1]);       /* step 4 calls resolve only; reject is never reachable from here */
+        JS_FreeValue(ctx, funcs[1]);       /* step 3 calls resolve only; reject is never reachable from here */
         *phase = PRR_RESOLVE;
         *out_cb = cb; *out_argc = 1;
         return 3;
     }
     DCHECK(*phase == PRR_RESOLVE, "PromiseResolve resumed in an unknown phase");
+    /* AN ABRUPT DELIVERY HERE WOULD BE SWALLOWED BY THE LINE BELOW, so it is asserted rather than tolerated: a
+       machine that declares catches_abrupt is re-entered with JS_EXCEPTION for ANY failure of its request, and
+       this answering path takes cb[3] as the answer whatever arrived. Step 3's Call is on the capability's own
+       resolving function, which is the NATIVE one (step 2 built it without a Construct) and settles rather than
+       throwing — so an exception reaching here is the DISPATCH having failed, and taking a promise over a live
+       throw is how that becomes invisible. */
+    DCHECK(!JS_IsException(in),
+           "PromiseResolve's step 3 Call completed ABRUPTLY — its callee is the native capability's resolving "
+           "function, which settles and never throws, so this delivery came from a failed dispatch and the "
+           "answer below would hand out a promise over a live exception");
     JS_FreeValue(ctx, cb[1]); cb[1] = JS_UNDEFINED;
     JS_FreeValue(ctx, cb[2]); cb[2] = JS_UNDEFINED;
     JS_FreeValue(ctx, in);                 /* resolve's result is discarded */
@@ -86345,7 +86356,13 @@ typedef struct JSDisposeAsync {
     int n;                              /* its length */
     int i;                              /* the cursor: n-1 while the first call is in flight, then the chain build */
     JSValue result;                     /* the promise this builtin returns, on every path (owned) */
-    JSValue cb[3];                      /* the first dispose method's [this, method, arg] */
+    JSValue cb[4];                      /* the first dispose method's [this, method, arg], then reused as
+                                           step_promiseresolve_run's 4-slot buffer, OWNED here */
+    JSValue pr_x;                       /* owned: the resolution PromiseResolve is running over. The sub-run
+                                           BORROWS x across a park (step_getprop_begin puts it in cb_coerce
+                                           unowned), so the value the dispose method returned has to be held by
+                                           this machine for the whole of it */
+    uint8_t pr_phase;                   /* step_promiseresolve_run's */
 } JSDisposeAsync;
 static const JSTrampStepDef js_dispose_async_def;
 /* One link of that chain: `await`-then-dispose-the-next. Its dispose method is the page's code too, so the
@@ -86353,7 +86370,9 @@ static const JSTrampStepDef js_dispose_async_def;
 typedef struct JSAsyncDisposeLink {
     JSStepHdr hdr;
     JSValue result;
-    JSValue cb[3];
+    JSValue cb[4];       /* the dispose method's [this, method, arg], then step_promiseresolve_run's buffer */
+    JSValue pr_x;        /* owned across the sub-run, for the reason JSDisposeAsync::pr_x is */
+    uint8_t pr_phase;    /* step_promiseresolve_run's */
 } JSAsyncDisposeLink;
 static const JSTrampStepDef js_async_dispose_link_def;
 /* GetDisposeMethod's sync fallback on an ASYNC stack: call the object's %Symbol.dispose% and DISCARD its
@@ -102933,14 +102952,21 @@ static JSValue js_async_dispose_rethrow(JSContext *ctx, JSValueConst this_val,
 /* ONE link of disposeAsync's chain: dispose this resource, then Await its result. `func_data` is
    [value, method, hint] and the magic says whether a previous link already failed (so this one's completion is a
    SuppressedError). The dispose method is the page's code, so it is a CALL request rather than a JS_Call — the
-   closure declares itself a step machine and the job pump's reaction dispatch drives it on the tramp. */
+   closure declares itself a step machine and the job pump's reaction dispatch drives it on the tramp.
+   AND SO IS THE AWAIT THAT FOLLOWS IT, which is the half this machine used to perform from C: the value the
+   method returned is the page's OBJECT, and 27.5.4.7.1 over it reads `constructor` and then `then`. It runs as
+   step_promiseresolve_run on this same flow. */
 /* ONE list expanded twice; not in the published edition, so named rather than numbered - see DISPSYNC_STAGES. */
 #define ADLINK_STAGES(X) \
     X(ADL_ENTRY, "proposal-explicit-resource-management DisposeResources' async chain, one link entered: " \
                  "the dispatch of Call(method, value) for this resource, or Await(undefined) when it has none") \
     X(ADL_DONE,  "proposal-explicit-resource-management DisposeResources' async chain, one link's method " \
                  "settled: its value becomes the next link's Await, and a throw becomes the completion - " \
-                 "wrapped in a SuppressedError when this link already carries one")
+                 "wrapped in a SuppressedError when this link already carries one") \
+    X(ADL_AWAIT, "proposal-explicit-resource-management DisposeResources' async chain, one link's Await -> " \
+                 "27.5.4.7.1 PromiseResolve ( ctor, resolution ) steps 1-4 (this link CARRIES an error, so " \
+                 "the method's value is awaited before it is re-raised; step 1.a's Get(resolution, " \
+                 "\"constructor\") and the resolving function's Get(resolution, \"then\") are the page's code)")
 enum { ADLINK_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_async_dispose_link_steps[] = { ADLINK_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -102961,6 +102987,11 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
            computed — so the slot carries the same "no operand yet" sentinel the header uses for its own, and
            the fini asserts every normal return wrote over it. */
         s->result = JS_UNINITIALIZED;
+        /* EVERY OWNED SLOT IS PLACED BEFORE THE FIRST OPERATION THAT CAN THROW, because the failure path tears
+           this state down through the visit, which frees exactly what the state holds. */
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
+        s->pr_x = JS_UNDEFINED;
         if (JS_IsUndefined(method)) {
             /* a null/undefined resource on an async stack still performs Await(undefined) */
             if (!has_prev_err) {
@@ -102970,9 +103001,7 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
             JS_Throw(ctx, js_dup(step_arg(&s->hdr, 0)));
             return -1;
         }
-        s->cb[0] = JS_UNDEFINED;
         s->cb[1] = js_dup(method);
-        s->cb[2] = JS_UNDEFINED;
         switch (hint) {
         case JS_DISPOSE_HINT_ADOPT: s->cb[2] = js_dup(rec->data[0]); *out_argc = 1; break;
         case JS_DISPOSE_HINT_DEFER:                                  *out_argc = 0; break;
@@ -102981,33 +103010,46 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
         *out_cb = s->cb;
         return 3;
     }
-    DCHECK(s->hdr.stage == ADL_DONE, "an async dispose link resumed in an unknown stage");
-    if (JS_IsException(cb_result)) {
-        JSValue new_err = JS_GetException(ctx);
-        if (has_prev_err) {
-            JSValue se = js_new_suppressed_error(ctx, new_err, step_arg(&s->hdr, 0), 0);
-            JS_FreeValue(ctx, new_err);
-            if (JS_IsException(se))
+    if (s->hdr.stage == ADL_DONE) {
+        /* the dispose call is over, so its operands are dead — and the PromiseResolve below reuses this buffer,
+           so they are released HERE rather than left for the teardown. */
+        JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cb[1]); s->cb[1] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cb[2]); s->cb[2] = JS_UNDEFINED;
+        if (JS_IsException(cb_result)) {
+            JSValue new_err = JS_GetException(ctx);
+            if (has_prev_err) {
+                JSValue se = js_new_suppressed_error(ctx, new_err, step_arg(&s->hdr, 0), 0);
+                JS_FreeValue(ctx, new_err);
+                if (JS_IsException(se))
+                    return -1;
+                JS_Throw(ctx, se);
                 return -1;
-            JS_Throw(ctx, se);
+            }
+            JS_Throw(ctx, new_err);
             return -1;
         }
-        JS_Throw(ctx, new_err);
-        return -1;
-    }
-    if (!has_prev_err) {
-        s->result = cb_result;   /* the next link awaits it */
-        return 0;
-    }
-    {
+        if (!has_prev_err) {
+            s->result = cb_result;   /* the next link awaits it */
+            return 0;
+        }
         /* Await the method's result, then re-raise the error this link is carrying (wrapped, if the method's own
-           completion suppresses it). */
+           completion suppresses it). The Await's PromiseResolve reads `constructor` off a promise and `then` off
+           a thenable — both the page's code — so it is a SUB-SEQUENCE on this flow, and the stage moves here
+           because a keyed request may not span a stage boundary (see step_keyed_inflight). */
+        s->pr_x = cb_result;
+        cb_result = JS_UNDEFINED;
+        s->pr_phase = PRR_START;
+        s->hdr.stage = ADL_AWAIT;
+    }
+    DCHECK(s->hdr.stage == ADL_AWAIT, "an async dispose link resumed in an unknown stage");
+    {
         JSValueConst prev_err = step_arg(&s->hdr, 0);
         JSValue ret_promise, resolve_fn, reject_fn, then_args[2];
-        ret_promise = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&cb_result), 0);
-        JS_FreeValue(ctx, cb_result);
-        if (JS_IsException(ret_promise))
-            return -1;
+        int r = step_promiseresolve_run(ctx, &s->hdr, &s->pr_phase, s->pr_x, &ret_promise, s->cb,
+                                        cb_result, out_cb, out_argc);
+        if (r) return r;
+        JS_FreeValue(ctx, s->pr_x); s->pr_x = JS_UNDEFINED;
         /* THE ARITY IS THE READ, DECLARED. The fulfilment spelling reads no operand and declares none; the
            rejection spelling reads argv[0] and therefore declares 1, which is what makes js_call_c_function_data
            pad the slot for a call that supplies nothing. */
@@ -103028,12 +103070,15 @@ static int js_async_dispose_link_step(JSContext *ctx, void *st, JSValue cb_resul
     }
 }
 
-/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The link's promise and its request buffer. */
+/* WHAT THIS MACHINE OWNS (JSTrampStepDef.visit). The link's promise, its request buffer — which the dispose
+   call and the Await's PromiseResolve share — and the resolution that sub-run borrows across a park. */
 static void js_async_dispose_link_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSAsyncDisposeLink *s = st;
+    int i;
     v->val(ctx, &s->result);
-    v->val(ctx, &s->cb[0]); v->val(ctx, &s->cb[1]); v->val(ctx, &s->cb[2]);
+    for (i = 0; i < 4; i++) v->val(ctx, &s->cb[i]);
+    v->val(ctx, &s->pr_x);
 }
 
 static JSValue js_async_dispose_link_fini(JSContext *ctx, void *st, bool take_result)
@@ -103099,6 +103144,10 @@ static void js_dispose_async_drop(JSContext *ctx, JSDisposeAsync *s, int from)
     }
 }
 
+/* The settles that reach NO page code: a rejection (27.5.1.3 step 4.d is RejectPromise and nothing else) and a
+   resolution with undefined (step 2.e is FulfillPromise). The METHOD's value is not one of them and does not
+   come through here — it runs 27.5.4.7.1 as a sub-sequence on the flow; js_promise_resolve_native asserts the
+   difference at its own door rather than trusting this call site to remember it. */
 static JSValue js_dispose_async_settled(JSContext *ctx, JSValue v, int is_reject)
 {
     JSValue p = js_promise_resolve_native(ctx, ctx->promise_ctor, 1, vc(&v), is_reject);
@@ -103114,7 +103163,11 @@ static JSValue js_dispose_async_settled(JSContext *ctx, JSValue v, int is_reject
     X(DAS_CHAIN, "proposal-explicit-resource-management AsyncDisposableStack.prototype.disposeAsync, the chain " \
                  "built: the remaining resources are linked LIFO, each link Awaiting the one above it") \
     X(DAS_FIRST, "proposal-explicit-resource-management DisposeResources step 3, the TOP resource: " \
-                 "Call(method, value) - its settlement is what the rest of the chain is attached to")
+                 "Call(method, value) - its settlement is what the rest of the chain is attached to") \
+    X(DAS_RESOLVE, "proposal-explicit-resource-management DisposeResources step 3, the TOP resource's VALUE -> " \
+                   "27.5.4.7.1 PromiseResolve ( ctor, resolution ) steps 1-4 (the settled promise the chain " \
+                   "hangs off; step 1.a's Get(resolution, \"constructor\") and the resolving function's " \
+                   "Get(resolution, \"then\") are the page's code)")
 enum { DASYNC_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_dispose_async_steps[] = { DASYNC_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -103127,6 +103180,11 @@ static int js_dispose_async_step(JSContext *ctx, void *st, JSValue cb_result, JS
         JSDisposableResource *top;
         JS_FreeValue(ctx, cb_result);
         s->hdr.stage = DAS_CHAIN;
+        /* EVERY OWNED SLOT IS PLACED BEFORE THE FIRST OPERATION THAT CAN THROW — the settle below allocates,
+           and its failure path tears this state down through the visit, which frees what the state holds. */
+        s->cb[0] = JS_UNDEFINED; s->cb[1] = JS_UNDEFINED;
+        s->cb[2] = JS_UNDEFINED; s->cb[3] = JS_UNDEFINED;
+        s->pr_x = JS_UNDEFINED;
         if (!ds) {
             /* every failure of this builtin is a REJECTION, never a throw */
             s->result = js_dispose_async_settled(ctx, JS_GetException(ctx), 1);
@@ -103152,7 +103210,7 @@ static int js_dispose_async_step(JSContext *ctx, void *st, JSValue cb_result, JS
             JSValue method = top->method, value = top->value;
             top->method = JS_UNDEFINED;
             top->value = JS_UNDEFINED;
-            s->cb[0] = JS_UNDEFINED; s->cb[1] = method; s->cb[2] = JS_UNDEFINED;
+            s->cb[1] = method;
             switch (top->hint) {
             case JS_DISPOSE_HINT_ADOPT: s->cb[2] = value;                        *out_argc = 1; break;
             case JS_DISPOSE_HINT_DEFER: JS_FreeValue(ctx, value);                *out_argc = 0; break;
@@ -103168,15 +103226,43 @@ static int js_dispose_async_step(JSContext *ctx, void *st, JSValue cb_result, JS
         cb_result = JS_UNDEFINED;
         s->result = js_dispose_async_settled(ctx, JS_UNDEFINED, 0);
         if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; js_dispose_async_drop(ctx, s, s->i - 1); return -1; }
-    } else {
-        DCHECK(s->hdr.stage == DAS_FIRST, "disposeAsync resumed in an unknown stage");
+    } else if (s->hdr.stage == DAS_FIRST) {
+        /* the dispose call is over, so its operands are dead — and the PromiseResolve below reuses this buffer,
+           so they are released HERE rather than left for the teardown. */
+        JS_FreeValue(ctx, s->cb[0]); s->cb[0] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cb[1]); s->cb[1] = JS_UNDEFINED;
+        JS_FreeValue(ctx, s->cb[2]); s->cb[2] = JS_UNDEFINED;
         /* the first dispose method returned or threw; either way it starts the chain as a SETTLED promise */
-        if (JS_IsException(cb_result))
+        if (JS_IsException(cb_result)) {
+            /* a REJECTION reaches no page code at all — 27.5.1.3 step 4.d is RejectPromise and nothing else —
+               so it stays the C algorithm the settle helper already is. */
             s->result = js_dispose_async_settled(ctx, JS_GetException(ctx), 1);
-        else
-            s->result = js_dispose_async_settled(ctx, cb_result, 0);
-        if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; js_dispose_async_drop(ctx, s, s->i - 1); return -1; }
+            if (JS_IsException(s->result)) { s->result = JS_UNDEFINED; js_dispose_async_drop(ctx, s, s->i - 1); return -1; }
+            s->hdr.stage = DAS_CHAIN;
+        } else {
+            /* THE METHOD'S VALUE IS THE PAGE'S OBJECT. PromiseResolve over it reads `constructor` (step 1.a)
+               and, through the capability's resolving function, `then` (27.5.1.3 step 2.f) — both an accessor
+               or a Proxy trap away from being the page's code, and a C activation has no flow base for them. So
+               it is a SUB-SEQUENCE on this flow, and the stage moves because a keyed request may not span a
+               stage boundary (see step_keyed_inflight). */
+            s->pr_x = cb_result;
+            cb_result = JS_UNDEFINED;
+            s->result = JS_UNDEFINED;
+            s->pr_phase = PRR_START;
+            s->hdr.stage = DAS_RESOLVE;
+        }
     }
+    if (s->hdr.stage == DAS_RESOLVE) {
+        int r = step_promiseresolve_run(ctx, &s->hdr, &s->pr_phase, s->pr_x, &s->result, s->cb,
+                                        cb_result, out_cb, out_argc);
+        if (r) {
+            if (r < 0) js_dispose_async_drop(ctx, s, s->i - 1);
+            return r;
+        }
+        JS_FreeValue(ctx, s->pr_x); s->pr_x = JS_UNDEFINED;
+        s->hdr.stage = DAS_CHAIN;
+    }
+    DCHECK(s->hdr.stage == DAS_CHAIN, "disposeAsync reached its chain build in an unknown stage");
     s->i--;
 
     for (; s->i >= 0; s->i--) {
@@ -103226,10 +103312,12 @@ static void js_dispose_async_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSDisposeAsync *s = st;
     int live = s->i + 1 < s->n ? s->i + 1 : s->n;
+    int i;
     v->val(ctx, &s->result);
     v->array(ctx, (void **)&s->res, sizeof(JSDisposableResource), live < 0 ? 0 : live, s->n,
              js_disposable_resource_visit);
-    v->val(ctx, &s->cb[0]); v->val(ctx, &s->cb[1]); v->val(ctx, &s->cb[2]);
+    for (i = 0; i < 4; i++) v->val(ctx, &s->cb[i]);
+    v->val(ctx, &s->pr_x);
 }
 
 static JSValue js_dispose_async_fini(JSContext *ctx, void *st, bool take_result)
@@ -104531,7 +104619,7 @@ static void js_promise_resolve_function_mark(JSRuntime *rt, JSValueConst val,
    "then")`, which on a thenable with an accessor or a Proxy is the page's code — and `res(thenable)` inside an
    executor is the ordinary way to reach it. The class `call` hook read it with JS_GetProperty, so a looping
    `then` getter had no flow base.
-   The read's ABRUPT completion is a VALUE here, not an unwind: step 9 catches it and rejects. That needs no new
+   The read's ABRUPT completion is a VALUE here, not an unwind: step 2.g catches it and rejects. That needs no new
    mechanism — a request's exception is delivered to the machine as its cb_result, the same way a consumer's
    acquisition failure is.
    Which of the two functions this is comes from the CLASS, not from a def argument: one algorithm, two entry
@@ -104544,12 +104632,14 @@ _Static_assert(offsetof(JSPromiseResolveFn, hdr) == 0, "JSStepHdr must be first 
 
 /* WHICH STEP OF THE PAIR EACH STAGE RESTS AT. ONE machine, TWO algorithms — which of them this is comes from the
    CLASS, so one list names both and the reject half simply never reaches the second stage.
-   THE STEP NUMBERS IN THIS MACHINE WERE ALL ONE LOW: the comments said 6, 7, 8, 9, 11 and 12 for what ES2025
-   numbers 7, 8, 9, 10, 12 and 13-15 — the numbering of a much older edition, carried forward. A stage that
-   DECLARES its step is checked by the driver at every rest; a comment is checked by nobody, which is the whole
-   argument for the declaration and is what this pass keeps finding.
+   THE STAGE LABELS AND THE COMMENTS BESIDE THEM DISAGREED FOR A WHOLE EDITION, and that is the argument for the
+   declaration in one sentence. CreateResolvingFunctions builds resolveSteps and rejectSteps as ABSTRACT
+   CLOSURES under steps 2 and 4, so their own steps are LETTERED (2.a-2.m, 4.a-4.e) — there is no flat 1-15 list
+   to be one low against any more. The labels here were moved to that lettering; every comment in the body was
+   left behind at the flat numbering of the edition before it, and each of them read as authoritative. A stage
+   that DECLARES its step is checked by the driver at every rest; a comment is checked by nobody.
    The second stage names a RANGE because the machine rests inside the only page-visible operation in it: the
-   `then` read parks here, and steps 10-15 that follow run no user code at all — the thenable's `then` is
+   `then` read parks here, and steps 2.g-2.m that follow run no user code at all — the thenable's `then` is
    ENQUEUED as a job rather than called. */
 #define PRF_STAGES(X) \
     X(PRF_HEAD, "27.5.1.3 steps 4.a-4.d / steps 2.a-2.f (the pair fires ONCE; a reject settles here, and " \
@@ -104588,13 +104678,13 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
         JSValueConst resolution = step_arg(&m->hdr, 0);
         JS_FreeValue(ctx, cb_result);
         m->cb[0] = JS_UNDEFINED;   /* before anything that can throw: the teardown frees what the state holds */
-        /* steps 5-6: the pair fires ONCE, and [[AlreadyResolved]] is shared with its twin. */
+        /* steps 2.a / 4.a: the pair fires ONCE, and [[AlreadyResolved]] is shared with its twin. */
         if (!s || s->presolved->already_resolved) return 0;
-        js_promise_latch_resolved(ctx, m->hdr.func_obj, s);
+        js_promise_latch_resolved(ctx, m->hdr.func_obj, s);   /* steps 2.b-2.c / 4.b-4.c */
         if (is_reject || !JS_IsObject(resolution))
-            return js_promise_resolvefn_settle(ctx, s, resolution, is_reject);   /* 27.5.1.3 step 4.d / step 2.f */
+            return js_promise_resolvefn_settle(ctx, s, resolution, is_reject);   /* 27.5.1.3 step 4.d / step 2.e */
         if (js_same_value(ctx, resolution, s->promise)) {
-            /* step 7: resolving a promise with itself is a TypeError that REJECTS it, not a raise. */
+            /* step 2.d: resolving a promise with itself is a TypeError that REJECTS it, not a raise. */
             JSValue err;
             JS_ThrowTypeError(ctx, "promise self resolution");
             err = JS_GetException(ctx);
@@ -104605,26 +104695,26 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
         m->hdr.stage = PRF_THEN;
         m->cb[0] = js_dup(resolution);
         *out_cb = m->cb; *out_argc = (int)JS_ATOM_then;
-        return 6;   /* GETPROP: step 9's Get(resolution, "then"), which is where the machine RESTS */
+        return 6;   /* GETPROP: step 2.f's Get(resolution, "then"), which is where the machine RESTS */
     }
     DCHECK(m->hdr.stage == PRF_THEN, "a promise resolving function has only the `then` read to wait on");
     {
         JSValueConst resolution = m->cb[0];
         JSValue then = cb_result;
         if (JS_IsException(then)) {
-            /* step 10: the read threw, and that abrupt completion REJECTS rather than propagating. */
+            /* step 2.g: the read threw, and that abrupt completion REJECTS rather than propagating. */
             JSValue err = JS_GetException(ctx);
             js_promise_resolvefn_settle(ctx, s, err, true);
             JS_FreeValue(ctx, err);
             return 0;
         }
         if (!JS_IsFunction(ctx, then)) {
-            /* step 12: a non-callable thenAction means this is not a thenable — fulfil with it. */
+            /* step 2.i: a non-callable thenAction means this is not a thenable — fulfil with it. */
             JS_FreeValue(ctx, then);
             return js_promise_resolvefn_settle(ctx, s, resolution, false);
         }
         {
-            /* steps 13-15: the CALL is deferred to a job, so nothing user-written runs here. */
+            /* steps 2.j-2.l: the CALL is deferred to a job, so nothing user-written runs here. */
             JSValueConst args[3];
             args[0] = s->promise;
             args[1] = resolution;
@@ -104648,7 +104738,7 @@ static void js_promise_resolvefn_visit(JSContext *ctx, void *st, JSStepVisit *v)
 static const JSTrampStepDef js_promise_resolvefn_def = {
     sizeof(JSPromiseResolveFn), js_promise_resolvefn_step, NULL, 0,
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
-    .catches_abrupt = 1   /* step 10: a throwing `then` read REJECTS, it does not propagate */,
+    .catches_abrupt = 1   /* step 2.g: a throwing `then` read REJECTS, it does not propagate */,
     .visit = js_promise_resolvefn_visit,
     .algorithm = "27.5.1.3 CreateResolvingFunctions ( toResolve ) -- its rejectSteps / resolveSteps closures",
     .steps = js_promise_resolvefn_steps
@@ -104667,49 +104757,37 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
 
     /* Reached only by a JS_Call from C — every call that goes through the interpreter's convergence point is the
        step machine above, and every settle that used to JS_Call from here was converted to reach one: the
-       promise-reaction settle, the async function's, an async FUNCTION's Await and an async GENERATOR's. What is
-       left here is the part of 27.5.1.3's resolveSteps that runs no page code at all; the `then` READ is the one step that
-       can, and a C activation has no flow base for it — so a caller that still needs it CRASHES here naming
-       itself, instead of running page code off the chain. */
+       promise-reaction settle, the async function's, an async FUNCTION's Await and an async GENERATOR's.
+       WHAT IS LEFT IS THE PREFIX OF 27.5.1.3's resolveSteps THAT RUNS NO PAGE CODE — steps 2.a-2.e and, on the
+       reject side, 4.a-4.d. Step 2.f's Get(resolution, "then") begins the half that can, and everything after
+       it (2.g-2.l) only ever ran because 2.f had already been performed from C.
+       THERE IS NO PREDICATE HERE ANY MORE, AND THAT IS THE POINT. It used to ask whether THIS resolution's
+       `then` read reaches an accessor or a Proxy, and run steps 2.f-2.l from C when it did not — which is a
+       fallback selector by the only test that matters: delete the step machine and the question stops meaning
+       anything. So the second implementation is gone and the question with it; an OBJECT resolution is one
+       shape, routed to the machine, and a C caller that arrives with one CRASHES naming itself. */
     s = p->u.promise_function_data;
-    if (!s || s->presolved->already_resolved)
+    if (!s || s->presolved->already_resolved)   /* steps 2.a / 4.a: the pair fires ONCE */
         return JS_UNDEFINED;
     is_reject = p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION;
     resolution = argc > 0 ? argv[0] : JS_UNDEFINED;
-    if (!is_reject && !js_same_value(ctx, resolution, s->promise)
-        && js_read_is_page_code(ctx, resolution, JS_ATOM_then)) {
-        DFAIL("a promise resolving function reached its C entry with a thenable whose `then` READ is page "
-              "code — hand that caller's call out and place it on a flow, as every settle and Await now do");
-        return JS_EXCEPTION;
-    }
-    js_promise_latch_resolved(ctx, func_obj, s);
+    js_promise_latch_resolved(ctx, func_obj, s);   /* steps 2.b-2.c / 4.b-4.c */
     if (is_reject || !JS_IsObject(resolution)) {
-        fulfill_or_reject_promise(ctx, s->promise, resolution, is_reject);
+        fulfill_or_reject_promise(ctx, s->promise, resolution, is_reject);   /* step 4.d / step 2.e */
     } else if (js_same_value(ctx, resolution, s->promise)) {
+        /* step 2.d: resolving a promise with itself is a TypeError that REJECTS it, not a raise. */
         JSValue error;
         JS_ThrowTypeError(ctx, "promise self resolution");
         error = JS_GetException(ctx);
         fulfill_or_reject_promise(ctx, s->promise, error, true);
         JS_FreeValue(ctx, error);
     } else {
-        /* the read reaches no user code (the walk above proved it), so it is a plain C read here — a different
-           algorithm from the request, not a fallback to one. */
-        JSValue then = JS_GetProperty(ctx, resolution, JS_ATOM_then);
-        if (JS_IsException(then)) {
-            JSValue error = JS_GetException(ctx);
-            fulfill_or_reject_promise(ctx, s->promise, error, true);
-            JS_FreeValue(ctx, error);
-        } else if (!JS_IsFunction(ctx, then)) {
-            JS_FreeValue(ctx, then);
-            fulfill_or_reject_promise(ctx, s->promise, resolution, false);
-        } else {
-            JSValueConst args[3];
-            args[0] = s->promise;
-            args[1] = resolution;
-            args[2] = then;
-            JS_EnqueueJob(ctx, js_promise_resolve_thenable_job, 3, args);
-            JS_FreeValue(ctx, then);
-        }
+        DFAIL("a promise resolving function reached its C entry with an OBJECT resolution — 27.5.1.3 step 2.f's "
+              "Get(resolution, \"then\") is the page's code whenever an accessor or a Proxy answers it, and a C "
+              "activation has no flow base to run that on: hand that caller's call out and place it on a flow, "
+              "as every settle and Await now do");
+        return JS_ThrowTypeError(ctx, "promise resolving function: unrouted OBJECT resolution (no off-tramp "
+                                      "implementation of steps 2.f-2.l exists)");
     }
     return JS_UNDEFINED;
 }
@@ -104894,11 +104972,17 @@ void JS_MarkPromiseHandled(JSContext *ctx, JSValueConst promise)
     s->is_handled = true;
 }
 
-/* PromiseResolve(C, x) with the NATIVE constructor, which is what every C-INTERNAL caller passes (a job's
-   settlement, an await, module evaluation). With C = %Promise% the whole of 27.5.4.7 is unobservable — the
-   capability is built without a Construct and the resolving function is the engine's own — so this is a
-   DIFFERENT ALGORITHM with no user code in it, not a fallback for the machine. The DCHECK is what keeps it that:
-   a species constructor reaching here would be the C drive the machine exists to remove. */
+/* 27.5.4.7.1 PromiseResolve ( ctor, resolution ) FOR A RESOLUTION THAT IS NOT AN OBJECT, which is a DIFFERENT
+   ALGORITHM and not a fast path: with ctor = %Promise% step 2's NewPromiseCapability performs no Construct, and
+   a non-Object resolution takes 27.5.1.3's resolveSteps straight to step 2.e's FulfillPromise — or, for a
+   rejection, to step 4.d's RejectPromise. No user code anywhere in it.
+   BOTH OF ITS PAGE-CODE STEPS ARE REFUSED HERE, at the door, because both are reachable through the SAME
+   condition and a caller cannot tell them apart from outside: step 1.a's Get(resolution, "constructor") on a
+   promise, and the resolving function's Get(resolution, "then") on any other object. This function used to
+   perform the first from C behind a comment naming a caller — and that caller no longer exists, which is
+   exactly why the answer is a crash at the site rather than a survey of the call graph.
+   The machine that DOES perform it is step_promiseresolve_run, a sub-sequence any flow-bearing step machine
+   parks in; the async-dispose chain and its Await take it. */
 static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor,
                                          int argc, JSValueConst *argv, int magic)
 {
@@ -104907,20 +104991,13 @@ static JSValue js_promise_resolve_native(JSContext *ctx, JSValueConst ctor,
     DCHECK(js_same_value(ctx, ctor, ctx->promise_ctor),
            "PromiseResolve with a non-native constructor reached the C route — perform it as the Promise.resolve "
            "step machine (a DELEGATE request) instead of driving its Construct from here");
-    if (!is_reject && JS_GetOpaque(argv[0], JS_CLASS_PROMISE)) {
-        /* PromiseResolve's `constructor` READ, and it is PAGE CODE whenever the promise carries an accessor or
-           a proxy for it (return-suspendedStart-broken-promise.js defines exactly that). The two Awaits that
-           could be converted spell this read out themselves and CRASH on that case; this route cannot yet,
-           because its callers cannot suspend where they call from. The one that reaches the case is
-           js_async_generator_completed_return, through js_async_generator_pre — converting it means `pre` itself
-           becomes suspendable, which is a change to the drive loop's shape rather than another placement of the
-           split, and is why it is named here instead of guarded. */
-        JSValue c2 = JS_GetProperty(ctx, argv[0], JS_ATOM_constructor);
-        bool is_same;
-        if (JS_IsException(c2)) return c2;
-        is_same = js_same_value(ctx, c2, ctor);
-        JS_FreeValue(ctx, c2);
-        if (is_same) return js_dup(argv[0]);
+    if (!is_reject && JS_IsObject(argv[0])) {
+        DFAIL("PromiseResolve reached its C entry with an OBJECT resolution — 27.5.4.7.1 step 1.a's "
+              "Get(resolution, \"constructor\") and 27.5.1.3 step 2.f's Get(resolution, \"then\") are both the "
+              "page's code, and a C activation has no flow base for them: run step_promiseresolve_run on a "
+              "flow, as DisposeResources' async chain and its Await do");
+        return JS_ThrowTypeError(ctx, "PromiseResolve: unrouted OBJECT resolution (no off-tramp "
+                                      "implementation exists)");
     }
     result_promise = js_new_promise_capability(ctx, resolving_funcs, ctor);
     if (JS_IsException(result_promise)) return result_promise;
