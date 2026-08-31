@@ -30397,11 +30397,18 @@ typedef struct JSTASlice {
    One machine now, the shape the JSON.parse reviver already takes: a frame per SerializeJSONProperty
    invocation, every page-code point a request, and the recursion in an explicit stack.
 
-   The frame boundary is 25.5.2.2's, not the C body's. SerializeJSONProperty OWNS the `Get(holder, key)` that
-   produces its value, so a child frame reads ITSELF; and it writes its OWN separator and quoted key
-   (SJ_PREAMBLE), because whether it writes anything at all is decided by steps 2-10, which only the child has
-   run. The C body inverted that — the parent called js_json_check and inspected what came back — which is
-   exactly why the check and the serialization had to be two functions. */
+   The frame boundary is §25.5.4.2 SerializeJSONProperty ( state, key, holder )'s, not the C body's. That
+   algorithm OWNS the `Get(holder, key)` that produces its value, so a child frame reads ITSELF; and it writes
+   its OWN separator and quoted key (SJ_PREAMBLE), because whether it writes anything at all is decided by
+   steps 2-11, which only the child has run. The C body inverted that — the parent called js_json_check and
+   inspected what came back — which is exactly why the check and the serialization had to be two functions.
+
+   THE NUMBERS IN THIS MACHINE ARE §25.5.4's AND WERE §25.5.2's, WHICH IS JSON.parse. JSON.rawJSON added
+   §25.5.3, so JSON.stringify moved to §25.5.4 and every sub-algorithm with it; the `.algorithm` label was
+   corrected and the body citations were not, so each of them went on resolving to a REAL section about the
+   parse. A number that resolves to the wrong algorithm is worse than none, and nothing mechanical catches it —
+   citegen resolves a number and can only check a TITLE the citation states — so every citation here now states
+   the section's own title beside its number. */
 
 typedef struct JSSJFrame {
     JSValue holder;        /* SerializeJSONProperty's holder (owned) */
@@ -30424,20 +30431,20 @@ typedef struct JSSJFrame {
 } JSSJFrame;
 
 enum {
-    SJ_GET = 0,        /* 25.5.2.2 step 1: Get(holder, key) */
+    SJ_GET = 0,        /* §25.5.4.2 SerializeJSONProperty step 1: Get(holder, key) */
     SJ_GOT,            /* ...its value arrived */
     SJ_TOJSON_GOT,     /* step 2.a: the `toJSON` read arrived */
-    SJ_TOJSON_CALLED,  /* step 2.b: its call returned */
-    SJ_REPLACER_CALLED,/* step 3: the replacer call returned */
-    SJ_UNWRAP_STR,     /* step 4.b: a [[StringData]] ToString is in flight */
-    SJ_UNWRAP_NUM,     /* step 4.a: a [[NumberData]] ToNumber is in flight */
+    SJ_TOJSON_CALLED,  /* step 2.b.i: its call returned */
+    SJ_REPLACER_CALLED,/* step 3.a: the replacer call returned */
+    SJ_UNWRAP_STR,     /* step 4.c: a [[StringData]] ToString is in flight */
+    SJ_UNWRAP_NUM,     /* step 4.b: a [[NumberData]] ToNumber is in flight */
     SJ_PREAMBLE,       /* the value is settled: write this node's separator and key */
-    SJ_ARR_LEN,        /* 25.5.2.4 step 3: LengthOfArrayLike is in flight */
-    SJ_KEYS,           /* 25.5.2.5 step 3: the enumerable-key cursor is in flight */
+    SJ_ARR_LEN,        /* §25.5.4.6 SerializeJSONArray step 6: LengthOfArrayLike is in flight */
+    SJ_KEYS,           /* §25.5.4.5 SerializeJSONObject step 6.a: the enumerable-key cursor is in flight */
     SJ_LOOP,           /* walking children */
 };
 
-/* the prologue's own cursor — 25.5.2.1 steps 3 and 4, both of which run the page's code */
+/* the prologue's own cursor — §25.5.4 JSON.stringify steps 5 and 6, both of which run the page's code */
 enum {
     SJP_START = 0,
     SJP_RLEN,          /* LengthOfArrayLike(replacer) is in flight */
@@ -30445,7 +30452,7 @@ enum {
     SJP_RSTR,          /* ToString of a Number/String-wrapper element is in flight */
     SJP_SPACE,         /* a wrapper `space` is being unwrapped */
     SJP_SPACE_NUM,     /* ...its ToNumber half */
-    SJP_GAP,           /* the coercions are done; state.Gap is computed from a primitive */
+    SJP_GAP,           /* the coercions are done; state.[[Gap]] is computed from a primitive */
 };
 
 typedef struct JSJsonStr {
@@ -30460,6 +30467,22 @@ typedef struct JSJsonStr {
     uint32_t nplist, nplist_cap;
     JSSJFrame *frames; int sp, cap;
     StringBuffer b;
+    /* THE UNKNOWN THIS SERIALIZATION STANDS ON — the FIRST value the walk met that was unknown external input
+       (owned; JS_UNDEFINED = none, which is unambiguous because a concolic is an Object). §25.5.4.2's steps 2,
+       4 and 5-11 are a TYPE dispatch, and §solver forbids answering one from the carrier's REPRESENTATION, so
+       an unknown is taken here and the whole JSON text becomes an unknown String derived from it. One operand
+       and not a list: §22.1.2.1 String.fromCharCode already sets the rule for a result built out of several
+       possibly-unknown parts — derive from the first, keep every part's bytes in the EXAMPLE.
+       IT IS VISITED, unlike JSStepHdr's `unknown_operand`, and the difference is lifetime: that field is live
+       only across the return that names it, while this one is live for the whole walk and therefore across
+       every suspension, park and fork the walk has. A field a fork does not dup is a reference the sibling
+       never took. */
+    JSValue unknown;
+    /* ...AND WHETHER THE TEXT IS STILL A VALUE THE PAGE COMPUTES. An unknown with no example serializes to
+       nothing at all (§25.5.4.2 step 12's undefined drops the member), so the text is then a string the page
+       never produces and the derived value must carry NO example — §@H's rule that only a determined value
+       becomes concrete, and the same answer js_str_fromcharcode_example gives an exampleless code unit. */
+    uint8_t exampleless;
     uint8_t b_live;        /* the buffer holds an allocation, so it owes a free */
     uint8_t pro;           /* SJP_* */
     int64_t pn, pi;        /* the replacer array's length and cursor */
@@ -100345,9 +100368,75 @@ static void sj_pop(JSContext *ctx, JSJsonStr *s)
     js_sj_frame_visit(ctx, f, (JSStepVisit *)&js_step_visit_free);
 }
 
-/* state.PropertyList's append, 25.5.2.1 step 3.b.iv: the key joins unless an equal one is already there.
-   Comparing ATOMS performs that SameValue on strings once, at interning, instead of per element. `atom` is
-   CONSUMED either way. */
+/* AN UNKNOWN IN A SERIALIZATION POSITION, TAKEN BEFORE ANYTHING BRANCHES ON ITS TYPE.
+ *
+ * §25.5.4.2 SerializeJSONProperty ( state, key, holder ) decides everything by TYPE — step 2 "If value is an
+ * Object or value is a BigInt", step 4 "If value is an Object", step 11 "If value is an Object and
+ * IsCallable(value) is false" — and §solver's rule for `typeof` over unknown input is that the engine must not
+ * answer from the host object's REPRESENTATION. It answered from it here, and the representation says
+ * "function": the value class installs a `.call` handler so a page can write `document.cookie.indexOf(...)`,
+ * which makes JS_IsFunction true, which makes step 11 false and step 12 "Return undefined" the answer. So an
+ * unknown MEMBER was dropped from the object entirely and an unknown ROOT made JSON.stringify return
+ * undefined — the taint deleted, silently, with a plausible concrete string left in its place for
+ * `fetch(url, { body: JSON.stringify(cfg) })` to send.
+ *
+ * CLAUDE.md's §C-stack names this builtin and this branch by hand, and the answer it states is to yield the
+ * opaque ITSELF — taint preserved, never a de-tainting placeholder. A JSON text is a String, so yielding the
+ * opaque means the RESULT is an unknown String carrying this operand's source — which
+ * is what sj_finish builds — and the walk continues over this unknown's own EXAMPLE so that the derived value
+ * carries the JSON the concrete really serializes to. That is §solver's only sound way for an example to
+ * propagate: the engine RUNS the real operation on the concrete. It runs it ONCE, in this same walk, rather
+ * than in a second pass — a second pass would re-run the page's `toJSON`, its replacer and every accessor a
+ * second time, and their side effects with them.
+ *
+ * `pv` is the settled value slot (a frame's, or the prologue's `space`), owned by the caller and REPLACED.
+ * It answers nothing back: every caller's next act is the spec step it was about to take, which now reads a
+ * real value whatever this did, and a return value no caller reads is a second contract to keep correct. */
+static void sj_take_unknown(JSContext *ctx, JSJsonStr *s, JSValue *pv)
+{
+    JSValue ex = js_concolic_operand(ctx, *pv);   /* UNINITIALIZED when *pv is not unknown input */
+
+    if (JS_IsUninitialized(ex))
+        return;
+    DCHECK(!(g_concolic.is && g_concolic.is(ex)),
+           "an unknown's EXAMPLE is itself unknown external input — an example rides the concrete value the "
+           "interpreter really produced, so a producer has attached a derivation where a datum belongs, and "
+           "the walk below would take it as a serializable object");
+    if (JS_IsUndefined(s->unknown))
+        s->unknown = js_dup(*pv);
+    if (JS_IsUndefined(ex))
+        s->exampleless = 1;
+    JS_FreeValue(ctx, *pv);
+    *pv = ex;
+}
+
+/* THE RESULT, ONCE THE WALK HAS PRODUCED ITS TEXT. `text` is what the serialization built with every unknown
+   standing on its own example, and it is CONSUMED. With no unknown met it IS the answer; with one, the answer
+   is the derived unknown String and `text` is its example — or no example at all, when some unknown had no
+   concrete to contribute and the text is therefore a string no run of this page produces. */
+static JSValue sj_finish(JSContext *ctx, JSJsonStr *s, JSValue text)
+{
+    JSValue c;
+
+    if (JS_IsUndefined(s->unknown))
+        return text;
+    if (s->exampleless) {
+        JS_FreeValue(ctx, text);
+        text = JS_UNDEFINED;
+    }
+    c = js_concolic_derive(ctx, s->unknown, "JSON.stringify", text);
+    DCHECK(!JS_IsUninitialized(c),
+           "the concolic derivation declined an operand this machine had already recognised as unknown "
+           "external input — the value semantics were installed without the builtin-derivation hook");
+    JS_FreeValue(ctx, s->unknown);
+    s->unknown = JS_UNDEFINED;
+    return c;
+}
+
+/* state.[[PropertyList]]'s append, §25.5.4 JSON.stringify ( value [ , replacer [ , space ] ] ) step 5.b.ii.4.7
+   — "If item is not undefined and propertyList does not contain item, then" — so the key joins unless an equal
+   one is already there. Comparing ATOMS performs that SameValue on strings once, at interning, instead of per
+   element. `atom` is CONSUMED either way. */
 static int sj_plist_add(JSContext *ctx, JSJsonStr *s, JSAtom atom)
 {
     uint32_t k;
@@ -100364,8 +100453,18 @@ static int sj_plist_add(JSContext *ctx, JSJsonStr *s, JSAtom atom)
     return 0;
 }
 
-/* 25.5.2.1 steps 3-7. `in` is the previous request's answer, owned. 0 = the prologue is complete, a step code =
-   the caller must return it, -1 = threw. */
+/* §25.5.4 JSON.stringify ( value [ , replacer [ , space ] ] ) steps 5-9. `in` is the previous request's answer,
+   owned. 0 = the prologue is complete, a step code = the caller must return it, -1 = threw.
+   NAMED RESIDUAL — AN UNKNOWN `replacer` IS TAKEN AS THE CALLABLE ARM AND THE ARRAY ARM IS NOT EXPLORED.
+   WHAT IS NOT COVERED: step 5's two arms, 5.a "If IsCallable(replacer) is true" and 5.b's IsArray, are a TYPE
+   dispatch over a value whose type is unknown; JS_IsFunction answers true off this value class's `.call`
+   handler, so the callable arm is DECIDED. WHAT THE NEXT DIFF BUILDS: a fork over step 5's arms, so the
+   PropertyList world is a sibling flow of the replacer-function world. WHY THIS IS NARROW AND NOT WRONG: the
+   arm taken calls the unknown at every node, each call answers with a derivation of it (SJ_REPLACER_CALLED
+   takes that at `unwrap:`), so the result is an unknown String carrying the replacer's own source either way —
+   what the unexplored arm would change is only which concrete example the text carries. HOW ITS ABSENCE WOULD
+   SHOW: `JSON.stringify(cfg, unknownReplacer)` reports an @H body shape with no example where the array arm
+   would have produced one built out of the named members. */
 static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **out_cb, int *out_argc)
 {
     JSValueConst replacer = step_arg(&s->hdr, 1);
@@ -100414,8 +100513,9 @@ static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValu
             if (step_getprop_done(ctx, &s->hdr, JS_ATOM_NULL, in, &v) < 0) { in = JS_UNDEFINED; return -1; }
             in = JS_UNDEFINED;
             s->pi++;
-            /* 25.5.2.1 step 3.b.iii: a String or a Number is the item; an Object with [[StringData]] or
-               [[NumberData]] is ToString'd, which is the page's code; anything else is skipped. */
+            /* §25.5.4 steps 5.b.ii.4.4 to 5.b.ii.4.6: a String or a Number is the item; an Object with
+               [[StringData]] or [[NumberData]] is ToString'd, which is the page's code; anything else is
+               skipped. */
             if (JS_IsString(v) || JS_IsNumber(v)) {
                 JSAtom at;
                 v = JS_ToStringFree(ctx, v);   /* a string or a primitive number: nothing to run */
@@ -100454,7 +100554,12 @@ static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValu
         }
 
         case SJP_SPACE:
-            /* 25.5.2.1 step 4: a wrapper `space` is unwrapped, which runs the page's toString/valueOf. */
+            /* §25.5.4 step 6: a wrapper `space` is unwrapped, which runs the page's toString/valueOf. Its
+               "If space is an Object" and steps 7-8's "If space is a Number" / "is a String" are the same TYPE
+               dispatch SerializeJSONProperty makes, so an unknown `space` is taken here for the same reason —
+               left to fall through, it matched neither and the gap silently became the empty String, which is
+               a DECIDED answer to how much whitespace an unknown asks for. */
+            sj_take_unknown(ctx, s, &s->space);
             if (JS_VALUE_GET_TAG(s->space) == JS_TAG_OBJECT) {
                 JSObject *p = JS_VALUE_GET_OBJ(s->space);
                 if (p->class_id == JS_CLASS_NUMBER) { s->pro = SJP_SPACE_NUM; continue; }
@@ -100477,6 +100582,17 @@ static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValu
             in = JS_UNDEFINED;
             if (r != 0) return r;
             JS_FreeValue(ctx, s->space);
+            /* THE CONVERSION BOUNDARY BELOW OWES C A REAL NUMBER, so an unknown reaching it aborts the
+               document — see JS_ToNumberInternal's object arm. It cannot: §7.1.1 ToPrimitive is a step machine
+               whose delivery gate admits a coercion method's result only where that result is not an Object,
+               and this value class IS an Object,
+               so a `valueOf` answering with unknown input is rejected as non-primitive and the walk ends in
+               §7.1.1.1 OrdinaryToPrimitive's TypeError instead. Asserted rather than assumed, because the day
+               that gate learns about this class is the day this line starts receiving one. */
+            DCHECK(!(g_concolic.is && g_concolic.is(prim)),
+                   "§25.5.4 step 6.a's ToNumber was handed unknown external input by §7.1.1 ToPrimitive — the "
+                   "conversion boundary owes C a real number, so this needs a derived answer here and not a "
+                   "conversion");
             s->space = JS_ToNumberFree(ctx, prim);
             if (JS_IsException(s->space)) { s->space = JS_UNDEFINED; return -1; }
             s->pro = SJP_GAP;
@@ -100486,7 +100602,7 @@ static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValu
         default:
             DCHECK(s->pro == SJP_GAP, "the JSON.stringify prologue resumed in no phase");
             JS_FreeValue(ctx, in);
-            /* 25.5.2.1 steps 5-7. `space` is a primitive by now, so nothing here runs. */
+            /* §25.5.4 steps 7-9. `space` is a primitive by now, so nothing here runs. */
             if (JS_IsNumber(s->space)) {
                 int n;
                 if (JS_ToInt32Clamp(ctx, &n, s->space, 0, 10, 0)) return -1;
@@ -100514,8 +100630,9 @@ static int js_json_str_prologue(JSContext *ctx, JSJsonStr *s, JSValue in, JSValu
     }
 }
 
-/* A container node's separator strings and its place on the cycle stack, 25.5.2.4/25.5.2.5 step 4. Nothing here
-   runs the page's code, so it is one block rather than a phase. */
+/* A container node's separator strings and its place on the cycle stack — §25.5.4.6 SerializeJSONArray
+   ( state, value ) / §25.5.4.5 SerializeJSONObject ( state, value ) steps 2 and 4. Nothing here runs the page's
+   code, so it is one block rather than a phase. */
 static int sj_open_container(JSContext *ctx, JSJsonStr *s, JSSJFrame *f)
 {
     f->indent1 = JS_ConcatString(ctx, js_dup(f->indent), js_dup(s->gap));
@@ -100534,7 +100651,8 @@ static int sj_open_container(JSContext *ctx, JSJsonStr *s, JSSJFrame *f)
     return 0;
 }
 
-/* 25.5.2.2 steps 5-9 on a value that is not a serializable object: write it. `val` is CONSUMED. */
+/* §25.5.4.2 SerializeJSONProperty steps 5-10 on a value that is not a serializable object: write it. `val` is
+   CONSUMED. */
 static int sj_write_primitive(JSContext *ctx, JSJsonStr *s, JSValue val)
 {
     switch (JS_VALUE_GET_NORM_TAG(val)) {
@@ -100560,12 +100678,22 @@ static int sj_write_primitive(JSContext *ctx, JSJsonStr *s, JSValue val)
     return string_buffer_concat_value_free(&s->b, val) < 0 ? -1 : 0;
 }
 
-/* Does SerializeJSONProperty write anything for this value? 25.5.2.2's steps 5-11 answer it, and step 11's
-   "return undefined" is the whole of the no. A callable object and a Symbol are the two kinds that reach it. */
+/* Does SerializeJSONProperty write anything for this value? §25.5.4.2's steps 5-11 answer it, and step 12's
+   "Return undefined." is the whole of the no. A callable object and a Symbol are the two kinds that reach it. */
 static int sj_writes(JSContext *ctx, JSValueConst val)
 {
     switch (JS_VALUE_GET_NORM_TAG(val)) {
     case JS_TAG_OBJECT:
+        /* AND UNKNOWN EXTERNAL INPUT IS NOT ONE OF THEM, which is what sj_take_unknown guarantees two phases
+           earlier. Step 11's IsCallable is answered from the OBJECT, and this value class carries a `.call`
+           handler so a page can write `x.indexOf(...)` over an unknown — so an unknown arriving here answers
+           "callable", takes step 12, and is dropped from the output with its taint. That is the bug this
+           assert makes impossible to reintroduce: a new route into the walk that forgets the take would be
+           silent, and silence here is a deleted attacker source. */
+        DCHECK(!(g_concolic.is && g_concolic.is(val)),
+               "unknown external input reached §25.5.4.2 SerializeJSONProperty's type dispatch — step 11's "
+               "IsCallable answers TRUE for this value class's carrier, so the member would be dropped and its "
+               "provenance with it; the value is taken at sj_take_unknown before any step branches on it");
         return !JS_IsFunction(ctx, val);
     case JS_TAG_STRING: case JS_TAG_STRING_ROPE: case JS_TAG_INT: case JS_TAG_FLOAT64:
     case JS_TAG_BOOL: case JS_TAG_NULL: case JS_TAG_SHORT_BIG_INT: case JS_TAG_BIG_INT:
@@ -100590,16 +100718,22 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
 
         switch (f->phase) {
         case SJ_GET:
-            /* 25.5.2.2 step 1: `Let value be ? Get(holder, key)`. The root's holder is the engine-built
-               wrapper, but every deeper one is the page's object — an accessor, or a Proxy whose `get` trap the
-               C body ran with no flow base. */
+            /* §25.5.4.2 SerializeJSONProperty step 1: "Let value be ? Get(holder, key)." The root's holder is
+               the engine-built wrapper, but every deeper one is the page's object — an accessor, or a Proxy
+               whose `get` trap the C body ran with no flow base. */
             f->phase = SJ_GOT;
             return step_getprop_begin(ctx, &s->hdr, f->holder, JS_DupAtom(ctx, f->key_atom), out_cb, out_argc);
 
         case SJ_GOT:
             if (step_getprop_done(ctx, &s->hdr, f->key_atom, in, &f->val) < 0) { in = JS_UNDEFINED; return -1; }
             in = JS_UNDEFINED;
-            /* step 2: `If value is an Object or a BigInt, let toJSON be ? GetV(value, "toJSON")`. */
+            /* BEFORE STEP 2, because step 2 is the first thing that branches on the value's TYPE — and reading
+               `toJSON` off an unknown is not a harmless miss: this value class answers every read with a
+               derivation, so the read minted a `{src}.toJSON` injection identity the page never wrote and the
+               call over it recorded a `toJSON(key)` string predicate the page never performed. */
+            sj_take_unknown(ctx, s, &f->val);
+            /* step 2: "If value is an Object or value is a BigInt, then" 2.a "Let toJSON be
+               ? GetV(value, "toJSON")." */
             if (JS_IsObject(f->val) || JS_IsBigInt(f->val)) {
                 f->phase = SJ_TOJSON_GOT;
                 return step_getprop_begin(ctx, &s->hdr, f->val, JS_DupAtom(ctx, JS_ATOM_toJSON),
@@ -100617,8 +100751,8 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
                 f->phase = SJ_REPLACER_CALLED;
                 goto replacer;
             }
-            /* step 2.b: `Set value to ? Call(toJSON, value, « key »)`. The machine holds the callee across the
-               call; the receiver and the key belong to the frame, which outlives it. */
+            /* step 2.b.i: "Set value to ? Call(toJSON, value, « key »)." The machine holds the callee across
+               the call; the receiver and the key belong to the frame, which outlives it. */
             s->pv = fn;
             s->cb_args[0] = f->val;   /* borrowed: the frame holds the receiver */
             s->cb_args[1] = s->pv;
@@ -100637,8 +100771,8 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             goto replacer;
 
         replacer:
-            /* step 3: `If state.[[ReplacerFunction]] is not undefined, set value to
-               ? Call(state.[[ReplacerFunction]], holder, « key, value »)`. Arriving here with the phase already
+            /* step 3: "If state.[[ReplacerFunction]] is not undefined, then" 3.a "Set value to
+               ? Call(state.[[ReplacerFunction]], holder, « key, value »)." Arriving here with the phase already
                set is what makes the no-replacer case a fallthrough rather than a second copy of step 4. */
             if (JS_IsFunction(ctx, step_arg(&s->hdr, 1))) {
                 s->cb_args[0] = f->holder;                       /* borrowed: the frame holds it */
@@ -100657,7 +100791,14 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             goto unwrap;
 
         unwrap:
-            /* step 4: unwrap a Number/String/Boolean/BigInt wrapper. The first two run the page's code. */
+            /* THE OTHER TWO WAYS AN UNKNOWN ARRIVES IN A VALUE POSITION: the page's own `toJSON` ANSWERED with
+               one (step 2.b.i), or its replacer did (step 3.a). Both callbacks RAN — their emits and side
+               effects have already happened, which is what §C-stack requires — and only the type dispatch
+               below is short-circuited. Taken here rather than at each of the two arms because both converge
+               on this label, and step 4 is the first thing past them that reads the value's class. */
+            sj_take_unknown(ctx, s, &f->val);
+            /* step 4: "If value is an Object, then" — unwrap a RawJSON/Number/String/Boolean/BigInt wrapper
+               (4.a to 4.e). The [[NumberData]] and [[StringData]] arms run the page's code. */
             if (JS_VALUE_GET_TAG(f->val) == JS_TAG_OBJECT) {
                 JSObject *p = JS_VALUE_GET_OBJ(f->val);
                 if (p->class_id == JS_CLASS_STRING) { f->phase = SJ_UNWRAP_STR; continue; }
@@ -100665,9 +100806,10 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
                 if (p->class_id == JS_CLASS_BOOLEAN || p->class_id == JS_CLASS_BIG_INT) {
                     set_value(ctx, &f->val, js_dup(p->u.object_data));
                 } else if (p->class_id == JS_CLASS_RAWJSON) {
-                    /* JSON.rawJSON's object is null-prototyped, of a class only that builtin creates, and its
-                       one property is a non-configurable non-writable data property — so this read reaches no
-                       accessor and no trap. Asserted rather than assumed. */
+                    /* step 4.a.i: "Let rawJSON be ! Get(value, "rawJSON")." JSON.rawJSON's object is
+                       null-prototyped, of a class only that builtin creates, and its one property is a
+                       non-configurable non-writable data property — so this read reaches no accessor and no
+                       trap, which is what the `!` in that step asserts. Asserted rather than assumed. */
                     JSValue raw;
                     DCHECK(!js_read_is_page_code(ctx, f->val, JS_ATOM_rawJSON),
                            "a rawJSON object's own property became reachable page code — route the read");
@@ -100698,6 +100840,15 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             in = JS_UNDEFINED;
             if (r != 0) return r;
             JS_FreeValue(ctx, f->val);
+            /* THE SAME BOUNDARY THE PROLOGUE'S ToNumber ASSERTS AT, for the same reason and by the same
+               argument: §7.1.1 ToPrimitive's step machine delivers only a result that is not an Object, and
+               this value class IS an Object, so a `valueOf` on a [[NumberData]] wrapper that answers with
+               unknown input is rejected as non-primitive and §7.1.1.1 OrdinaryToPrimitive throws instead of
+               handing one here. A conversion here would abort the document. */
+            DCHECK(!(g_concolic.is && g_concolic.is(prim)),
+                   "§25.5.4.2 step 4.b's ToNumber was handed unknown external input by §7.1.1 ToPrimitive — the "
+                   "conversion boundary owes C a real number, so this needs a derived answer here and not a "
+                   "conversion");
             f->val = JS_ToNumberFree(ctx, prim);
             if (JS_IsException(f->val)) { f->val = JS_UNDEFINED; return -1; }
             f->phase = SJ_PREAMBLE;
@@ -100707,17 +100858,20 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
         case SJ_PREAMBLE: {
             /* The value is settled, so whether this node writes anything is finally known — and THAT decides
                the separator, the quoted key and, for an array element, the literal `null` that stands in for an
-               unserializable one (25.5.2.4 step 6.c). A parent cannot make that decision, which is why the
-               preamble belongs to the child. */
+               unserializable one (§25.5.4.6 SerializeJSONArray step 8.b). A parent cannot make that decision,
+               which is why the preamble belongs to the child. */
             int writes = sj_writes(ctx, f->val);
             JSSJFrame *par = (s->sp >= 2) ? &s->frames[s->sp - 2] : NULL;
             if (!par) {
-                /* the root: an unserializable value is JSON.stringify's undefined result. */
-                if (!writes) { sj_pop(ctx, s); s->result = JS_UNDEFINED; return 0; }
+                /* the root: an unserializable value is JSON.stringify's undefined result — and an unknown
+                   root's result is the derived unknown, whose example is that same undefined (no String, so
+                   no example), never a concrete `undefined` that would state the page produces one. */
+                if (!writes) { sj_pop(ctx, s); s->result = sj_finish(ctx, s, JS_UNDEFINED); return 0; }
             } else if (par->is_array) {
                 if (par->i > 0) string_buffer_putc8(&s->b, ',');
                 string_buffer_concat_value(&s->b, par->sep);
                 if (!writes) {
+                    /* §25.5.4.6 SerializeJSONArray step 8.b.i: "Append "null" to partial." */
                     if (string_buffer_concat_value_free(&s->b, JS_NULL) < 0) return -1;
                     goto child_done;
                 }
@@ -100737,7 +100891,8 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
                 JSValue v = f->val;
                 f->val = JS_UNDEFINED;
                 /* a rawJSON payload IS the serialization: its text is spliced in unquoted, which is the whole
-                   point of the proposal and the one value that skips 25.5.2.2's step 6 QuoteJSONString. */
+                   point of the proposal and the one value that skips §25.5.4.2 step 8's
+                   §25.5.4.3 QuoteJSONString ( value ). */
                 if (f->raw) {
                     if (string_buffer_concat_value_free(&s->b, v) < 0) return -1;
                 } else if (sj_write_primitive(ctx, s, v) < 0) {
@@ -100745,7 +100900,8 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
                 }
                 goto child_done;
             }
-            /* step 10: a serializable object. 25.5.2.4 / 25.5.2.5 open here. */
+            /* step 11: "If value is an Object and IsCallable(value) is false, then" — a serializable object.
+               §25.5.4.6 SerializeJSONArray / §25.5.4.5 SerializeJSONObject open here. */
             if (js_internal_array_includes(ctx, s->stack, f->val)) {
                 JS_ThrowTypeError(ctx, "circular reference");
                 return -1;
@@ -100758,7 +100914,8 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             if (f->is_array) { f->phase = SJ_ARR_LEN; continue; }
             string_buffer_putc8(&s->b, '{');
             if (s->plist) {
-                /* 25.5.2.5 step 2: PropertyList replaces the enumeration entirely. */
+                /* §25.5.4.5 SerializeJSONObject step 5: "If state.[[PropertyList]] is not undefined, then"
+                   5.a "Let keys be state.[[PropertyList]]." — it replaces the enumeration entirely. */
                 f->plist = 1;
                 f->nkeys = s->nplist;
                 f->phase = SJ_LOOP;
@@ -100787,7 +100944,9 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             r = js_enum_keys_run(ctx, f->ek, in, out_cb, out_argc);
             in = JS_UNDEFINED;
             if (r != 0) return r;
-            js_enum_keys_keep_enumerable(ctx, f->ek);   /* 25.5.2.5 step 3 is EnumerableOwnPropertyNames */
+            /* §25.5.4.5 step 6.a is "Let keys be ? EnumerableOwnProperties(value, key)." — the ENUMERABLE
+               half is this filter and not the key walk that produced the list. */
+            js_enum_keys_keep_enumerable(ctx, f->ek);
             f->keys = js_malloc(ctx, sizeof(JSAtom) * (f->ek->kept ? f->ek->kept : 1));
             if (!f->keys) return -1;
             /* the survivors MOVE to the frame; the cursor keeps its array only to free what it dropped. */
@@ -100806,7 +100965,8 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             JSAtom at;
             int64_t nchild = f->is_array ? f->len : (int64_t)f->nkeys;
             if (f->i >= nchild) {
-                /* the closing bracket, 25.5.2.4 step 7 / 25.5.2.5 step 7 */
+                /* the closing bracket — §25.5.4.6 SerializeJSONArray steps 9-10 / §25.5.4.5 SerializeJSONObject
+                   steps 9-10, whose 10.b builds the pretty-printed form out of state.[[Indent]] */
                 bool any = f->is_array ? (f->len > 0) : (f->has_content != 0);
                 if (any && !JS_IsEmptyString(s->gap)) {
                     string_buffer_putc8(&s->b, '\n');
@@ -100843,7 +101003,13 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
             if (s->sp == 0) {
                 s->result = string_buffer_end(&s->b);
                 s->b_live = 0;
-                return JS_IsException(s->result) ? -1 : 0;
+                if (JS_IsException(s->result)) return -1;
+                /* §25.5.4 step 13's result. The text is what the walk built with every unknown standing on its
+                   own example, so where one was met the answer is the DERIVED unknown String and this text is
+                   its example — the JSON the concrete really serializes to, produced by running the real
+                   algorithm rather than by predicting it. */
+                s->result = sj_finish(ctx, s, s->result);
+                return 0;
             }
             s->frames[s->sp - 1].i++;
             continue;
@@ -100853,15 +101019,20 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
     return -1;
 }
 
-/* THE STAGES OF 25.5.2. Two of them carry a sub-cursor rather than splitting further, and each is a sub-sequence
-   of ONE step in the sense JSStepHdr's len_phase is: `pro` walks the replacer array's element reads inside steps
-   5-8, and the FRAME STACK walks 25.5.2.1's recursion inside step 12 — a recursive walk's position is a stack and
-   not a number, so the stage says which step the machine is inside and the frames say where in it. Both are
-   visited, so both park and fork with the machine. */
+/* THE STAGES OF §25.5.4 JSON.stringify ( value [ , replacer [ , space ] ] ). Two of them carry a sub-cursor
+   rather than splitting further, and each is a sub-sequence of ONE step in the sense JSStepHdr's len_phase is:
+   `pro` walks the replacer array's element reads inside step 5.b.ii.4, and the FRAME STACK walks §25.5.4.2
+   SerializeJSONProperty's recursion inside step 13 — a recursive walk's position is a stack and not a number,
+   so the stage says which step the machine is inside and the frames say where in it. Both are visited, so both
+   park and fork with the machine.
+   A LABEL HERE IS HALF THE IDENTITY OF A DERIVED UNKNOWN (js_step_unknown_result composes
+   "<algorithm> @ <label>"), so these strings are not decoration: two stages sharing one would let a branch over
+   one coercion decide a branch over another. */
 #define JSONSTR_STAGES(X) \
-    X(JSONSTR_STATE,    "25.5.2 steps 1-4 (stack, indent, PropertyList and ReplacerFunction begin empty)") \
-    X(JSONSTR_PROLOGUE, "25.5.2 steps 5-8 (ReplacerFunction or PropertyList from replacer; gap from space)") \
-    X(JSONSTR_WALK,     "25.5.2 step 12 (SerializeJSONProperty(state, the empty String, wrapper))")
+    X(JSONSTR_STATE,    "25.5.4 steps 1-4 and 10-12 (stack, indent, PropertyList and ReplacerFunction begin " \
+                        "empty; the `{ \"\": value }` wrapper and the JSON Serialization Record)") \
+    X(JSONSTR_PROLOGUE, "25.5.4 steps 5-9 (ReplacerFunction or PropertyList from replacer; gap from space)") \
+    X(JSONSTR_WALK,     "25.5.4 step 13 (SerializeJSONProperty(state, the empty String, wrapper))")
 enum { JSONSTR_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_json_str_steps[] = { JSONSTR_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -100870,9 +101041,9 @@ static int js_json_str_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
     JSJsonStr *s = st;
     int r;
 
-    /* steps 9-11's wrapper is built HERE, before steps 5-8: OrdinaryObjectCreate and CreateDataPropertyOrThrow on
-       an object no page code can reach run nothing and are observable nowhere, and building it with the rest of
-       the state is what lets the walk have ONE entry rather than an entry and a root special case. */
+    /* steps 10-12's wrapper is built HERE, before steps 5-9: OrdinaryObjectCreate and CreateDataPropertyOrThrow
+       on an object no page code can reach run nothing and are observable nowhere, and building it with the rest
+       of the state is what lets the walk have ONE entry rather than an entry and a root special case. */
     if (s->hdr.stage == JSONSTR_STATE) {
         JSValue wrapper;
         JSSJFrame *root;
@@ -100881,13 +101052,18 @@ static int js_json_str_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         cb_result = JS_UNDEFINED;
         s->stack = JS_UNDEFINED; s->gap = JS_UNDEFINED; s->result = JS_UNDEFINED;
         s->pv = JS_UNDEFINED; s->space = JS_UNDEFINED;
+        /* js_mallocz ZEROES the state and a zeroed JSValue is tag 0 (int 0), not UNDEFINED — so the unknown
+           this serialization stands on is placed explicitly like every other owned slot above. */
+        s->unknown = JS_UNDEFINED;
         s->empty = js_empty_string(ctx->rt);
         string_buffer_init(ctx, &s->b, 0);
         s->b_live = 1;
         s->stack = JS_NewArray(ctx);
         if (JS_IsException(s->stack)) { s->stack = JS_UNDEFINED; return -1; }
-        /* 25.5.2.1 step 11: the root holder is `{ "": value }`, engine-built. Its Get is a request like every
-           other one — the walk has one entry, not an entry and a special case for the root. */
+        /* §25.5.4 steps 10-11: "Let wrapper be OrdinaryObjectCreate(%Object.prototype%)." then "Perform
+           ! CreateDataPropertyOrThrow(wrapper, the empty String, value)." — the root holder is `{ "": value }`,
+           engine-built. Its Get is a request like every other one, so the walk has one entry rather than an
+           entry and a special case for the root. */
         wrapper = JS_NewObject(ctx);
         if (JS_IsException(wrapper)) return -1;
         if (JS_DefinePropertyValue(ctx, wrapper, JS_ATOM_empty_string,
@@ -100928,6 +101104,7 @@ static void js_json_str_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->empty);
     v->val(ctx, &s->pv);
     v->val(ctx, &s->space);
+    v->val(ctx, &s->unknown);
     v->val(ctx, &s->result);
 }
 
