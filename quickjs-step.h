@@ -1113,12 +1113,14 @@ JS_EXTERN int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, con
  *
  * RESIDUAL — WHAT IS NOT COVERED. The array-callback walk (every/some/filter and their %TypedArray% twins) is
  * the only consumer. Every other C body that coerces a value the PAGE produced still answers from §7.1.2's own
- * steps and therefore takes `true` for unknown input: the Array find family (find/findIndex/findLast/
- * findLastIndex), the Iterator helper `filter` predicate, the eager iterator terminals (`some`/`every`/`find`
- * over an iterator), and the internal-method booleans a Proxy trap returns ([[Has]], [[Set]],
- * [[DefineOwnProperty]], [[PreventExtensions]], [[SetPrototypeOf]], [[IsExtensible]]).
+ * steps and therefore takes `true` for unknown input: the find family (Array find/findIndex/findLast/
+ * findLastIndex and their four %TypedArray% twins — EIGHT builtins sharing one machine, which is the number
+ * that matters, since routing the machine covers all of them), the Iterator helper `filter` predicate, the
+ * eager iterator terminals (`some`/`every`/`find` over an iterator), and the internal-method booleans a Proxy
+ * trap returns ([[Has]], [[Set]], [[DefineOwnProperty]], [[PreventExtensions]], [[SetPrototypeOf]],
+ * [[IsExtensible]]).
  *
- * WHAT THE NEXT DIFF BUILDS. The find family alone is routable as this one was: its state begins with a
+ * WHAT THE NEXT DIFF BUILDS. The find machine alone is routable as this one was: its state begins with a
  * JSStepHdr, so it needs a held-operand field of its own (JSArrayEvery.test's shape and sentinel) and its
  * predicate-test branch calling this. The two ITERATOR families are NOT — their records carry no JSStepHdr at
  * all, so they have no fork seam to reach and the diff that covers them is the one that gives them one; naming
