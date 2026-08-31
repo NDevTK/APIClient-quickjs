@@ -928,6 +928,19 @@ typedef struct JSClassExoticMethods {
        every caller is a capture at the head of a write, so a class that reached the page here would run it
        with no flow base and in the middle of recording a baseline. */
     JSValueConst (*forwarded_object)(JSContext *ctx, JSValueConst obj, JSAtom prop);
+    /* THE CLASS'S OWN [[PreventExtensions]] — the one internal method a class could not previously override at
+       all, because JS_PreventExtensions consulted the class for nothing and simply cleared `extensible`.
+       WHAT NEEDS IT: Web IDL §3.9.5 [[PreventExtensions]] is "return false", full stop — its own note says
+       "this keeps legacy platform objects extensible by making [[PreventExtensions]] fail for them" — so
+       `Object.freeze(el.classList)` is 7.3.15 SetIntegrityLevel step 2 failing, which Object.freeze and
+       Object.seal turn into a TypeError and Reflect.preventExtensions reports. Without the hook the freeze
+       SUCCEEDED and the object silently stopped accepting the properties the spec says it always accepts.
+       IT IS PER OBJECT AND NOT A FLAG ON THE CLASS, because a class need not be a legacy platform object for
+       all of its instances: a CSSRule is one only when it is the `@keyframes` rule that carries the indexed
+       getter, and a boolean beside the hooks could not say so.
+       Returns 0 to REFUSE (the caller's false), 1 to let the ordinary prevent-extensions proceed, or -1 with an
+       exception pending. It runs NO PAGE CODE — every caller reaches it from C. */
+    int (*prevent_extensions)(JSContext *ctx, JSValueConst obj);
 } JSClassExoticMethods;
 
 typedef void JSClassFinalizer(JSRuntime *rt, JSValueConst val);
@@ -991,6 +1004,15 @@ JS_EXTERN int JS_SetGlobalClass(JSContext *ctx, JSClassID class_id);
    from the atom's TEXT would both allocate on a lookup-miss path and re-derive a rule the engine already owns
    ("01" and "1e2" are not indices). Writes *pval on true. */
 JS_EXTERN bool JS_AtomIsIndex(JSContext *ctx, uint32_t *pval, JSAtom atom);
+/* AN INTERNAL METHOD'S REFUSAL, IN THE CALLER'S OWN MODE — the answer an exotic [[DefineOwnProperty]] or
+   [[Set]] must give when the spec says "return false", which is NOT the same observable in every caller.
+   Object.defineProperty turns a false into 7.3.8 DefinePropertyOrThrow's TypeError, an assignment turns one
+   into 13.15 Assignment Operators' TypeError ONLY IN STRICT CODE, and Reflect.defineProperty /
+   Reflect.set / a sloppy assignment report the false as a value. quickjs carries that distinction in `flags`
+   (JS_PROP_THROW, JS_PROP_THROW_STRICT) and resolves it against the running frame's strictness — both of
+   which are internal, so a hook in another translation unit can see neither and has no way to spell the
+   spec's one-word answer. Returns false, or -1 with a TypeError pending. */
+JS_EXTERN int JS_RefuseOrThrowTypeError(JSContext *ctx, int flags, const char *msg);
 JS_EXTERN bool JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id);
 /* Returns the class name or JS_ATOM_NULL if `id` is not a registered class. Must be freed with JS_FreeAtom. */
 JS_EXTERN JSAtom JS_GetClassName(JSRuntime *rt, JSClassID class_id);

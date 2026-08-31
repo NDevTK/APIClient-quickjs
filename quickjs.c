@@ -11537,6 +11537,16 @@ static int JS_PRINTF_FORMAT_ATTR(3, 4) JS_ThrowTypeErrorOrFalse(JSContext *ctx, 
     }
 }
 
+/* THE SAME DECISION, FOR AN EXOTIC HOOK DEFINED OUTSIDE THIS FILE — see quickjs.h. The function above is
+   static and `is_strict_mode` reads ctx->rt->current_stack_frame, which is not reachable through the public
+   header either, so a class implementing [[DefineOwnProperty]] or [[Set]] in another translation unit could
+   test JS_PROP_THROW and nothing else — which answers Object.defineProperty correctly and answers
+   `'use strict'; o[0] = 1` with a silent false where 13.15 Assignment Operators throws. */
+int JS_RefuseOrThrowTypeError(JSContext *ctx, int flags, const char *msg)
+{
+    return JS_ThrowTypeErrorOrFalse(ctx, flags, "%s", msg);
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
@@ -13881,6 +13891,18 @@ int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
        into 7.3.15's TypeError, Reflect.preventExtensions reports it. */
     if (unlikely(is_typed_array(p->class_id)) && !typed_array_is_fixed_length(p))
         return false;
+    /* THE CLASS'S OWN ANSWER, where it has one — see JSClassExoticMethods.prevent_extensions. Web IDL §3.9.5
+       [[PreventExtensions]] refuses for every legacy platform object, and there was no route by which a class
+       could say so, so `Object.freeze` on one of them succeeded. Asked BEFORE the capture, because a refusal
+       changes nothing and a delta entry for a write that did not happen is a baseline nobody's unapply owes. */
+    if (unlikely(p->is_exotic)) {
+        const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
+        if (em && em->prevent_extensions) {
+            int r = em->prevent_extensions(ctx, obj);
+            if (r <= 0)
+                return r;
+        }
+    }
     cow_capture_obj(ctx, p);   /* forced-exec: `Object.freeze(shared)` in one flow was permanent for every sibling */
     p->extensible = false;
     return true;
