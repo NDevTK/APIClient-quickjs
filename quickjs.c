@@ -35660,7 +35660,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNDEFINED;
                     goto do_step_step;
                 }
-                DCHECK(st == 3, "step builtin: unknown step code");
+                /* THE CODE AND THE MACHINE ARE PART OF THE ASSERT, not decoration on it. This is the END of the
+                   driver's dispatch chain, and every step machine in the tree converges here — so "unknown step
+                   code" alone states a correct fact and an instruction with NO OBJECT: the reader is standing at
+                   one line reachable from every step def there is, with nothing saying which machine returned
+                   what. That is the shape CLAUDE.md's count-the-call-sites test names, and the count is not
+                   marginal; it is every `JS_CFUNC_STEP_DEF` in this file.
+                   MEASURED, AND IT COST A WHOLE LANE-SESSION: a sort machine leaked JS_STEP_UNKNOWN into a stage
+                   that routed five other codes, and establishing WHICH code had arrived took a reading of the
+                   machine because the crash would not say. The abort was then attributed to an innocent commit.
+                   One integer in the message is the whole difference between a bisect and a read.
+                   `.algorithm` is a static string naming the SPEC operation and no bundle can redefine it. The
+                   accessor beside it is dev-only because it exists where the struct is still incomplete; here it
+                   is complete, so the field is read directly — and guarded, because a def may declare none and
+                   `%s` of NULL is undefined behaviour rather than a diagnosis. */
+                DCHECKF(st == 3,
+                        "the step machine for %s returned step code %d at stage %u, which this driver does not "
+                        "route — route the code here, or answer it inside the machine",
+                        (h->def != NULL && h->def->algorithm != NULL)
+                            ? h->def->algorithm : "(a step def that declares no algorithm)",
+                        st, (unsigned)h->stage);
                 call_argv = (JSValueConst *)&cb[2];
                 call_argc = cbn; tramp_first = -2; tramp_is_tail = 0;
                 cd_outer = stt; cd_outer_kind = CONT_STEP;
@@ -90236,7 +90255,14 @@ static int js_array_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
             *out_cb = s->cb_args; *out_argc = 2;
             return JS_STEP_CALL;
         }
-        DCHECK(r == 0, "the merge reported a step code this stage does not route");
+        /* WHICH CODE — the remedy here is to route one, and a routing instruction with no code in it names an
+           action with no object. js_array_sort_step's contract above is EXHAUSTIVE (-1, 0, 1, 5, JS_STEP_YIELD)
+           and JS_STEP_UNKNOWN is deliberately not on it: all three of this algorithm's coercion sites — the
+           comparator's ToNumber and the default ordering's two ToStrings — answer it THEMSELVES, because
+           §23.1.3.30.2 CompareArrayElements ( x, y, comparator )'s result is an ORDERING and an unknown one
+           carries nothing forward. So a code arriving here is one of those three having stopped answering, and
+           the integer is what says which question was asked. */
+        DCHECKF(r == 0, "the merge reported step code %d, which this stage does not route", r);
         if (s->hdr.arg) {
             /* the sorted list goes into A from here on, and A is what the machine yields */
             JS_FreeValue(ctx, s->obj);
