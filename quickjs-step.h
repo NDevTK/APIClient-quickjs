@@ -965,8 +965,13 @@ JS_EXTERN bool JS_IsSharedBufferSource(JSValueConst obj);
    buffer-source brand test comes first. */
 JS_EXTERN bool JS_IsDetachedBufferSource(JSValueConst obj);
 
-/* %IteratorPrototype%. Web IDL §3.7.10 states that the ITERATOR PROTOTYPE OBJECT of an `iterable<>` interface
-   has %IteratorPrototype% as its [[Prototype]] — that inheritance is what gives `headers.keys()` the whole
+/* %IteratorPrototype%. Web IDL §3.7.9.2 Iterator prototype object states that the ITERATOR PROTOTYPE OBJECT of
+   an `iterable<>` interface has it as its [[Prototype]] ("The [[Prototype]] internal slot of an iterator
+   prototype object must be %Iterator.prototype%" — the spec spells the intrinsic the ES2025 way; the engine's
+   own name for it is this function's). NOT §3.7.10, which is "Asynchronous iterable declarations" and whose
+   step 2 asserts a definition reaching it "does not have an indexed property getter or an iterable
+   declaration" — that number belongs to the pair below, at §3.7.10.2, and had been written here instead.
+   That inheritance is what gives `headers.keys()` the whole
    iterator-helper surface (`@@iterator` returning this, `take`, `drop`, `map`) without the component defining
    one member of it. A host component cannot reach the intrinsic from outside: it is neither a global nor
    reachable by name, and the only script-level route is
@@ -974,8 +979,11 @@ JS_EXTERN bool JS_IsDetachedBufferSource(JSValueConst obj);
    assertion performs, so deriving it that way from C would be checking the engine against itself. Dup'd. */
 JS_EXTERN JSValue JS_GetIteratorPrototype(JSContext *ctx);
 
-/* %AsyncIteratorPrototype%, for the same reason and with less of a workaround available: Web IDL §3.7.11 makes
-   it the [[Prototype]] of every `async iterable<>` interface's iterator prototype object, and unlike
+/* %AsyncIteratorPrototype%, for the same reason and with less of a workaround available: Web IDL §3.7.10.2
+   Asynchronous iterator prototype object makes it the [[Prototype]] of every `async iterable<>` interface's
+   asynchronous iterator prototype object ("The [[Prototype]] internal slot of an asynchronous iterator
+   prototype object must be %AsyncIteratorPrototype%"). This read §3.7.11 until it was checked against the
+   fetched text: §3.7.11 is "Maplike declarations" and says nothing about any of this. And unlike
    %IteratorPrototype% there is no script-level walk to it at all from a host that has no async generator to
    hand. Dup'd. */
 JS_EXTERN JSValue JS_GetAsyncIteratorPrototype(JSContext *ctx);
