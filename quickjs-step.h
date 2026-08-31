@@ -83,17 +83,22 @@ struct JSStepVisit {
     void (*reexec)(JSContext *ctx, struct REExecContext *ec, uint8_t **capture);
 };
 
-/* THE HOST-FACING DOOR IS NOT OPEN YET, AND THIS IS WHERE IT GOES.
-   A browser component under engine/host/browser cannot declare a step machine: JS_CFUNC_STEP_DEF is public in
-   quickjs.h but the STEPDEF_* ids it takes index js_tramp_step_defs[], a static table in this file, and
-   JSTrampStepDef / JSStepHdr / JSStepVisit / step_getprop_run are all internal to it. So every Web IDL
-   attribute read a component performs is forced to be a JS_GetPropertyStr from C — which is exactly what the
-   twelve internal-method entries abort on, and core/fetch/fetch.c hit it on `fetch(new Proxy({url:"/q"},…))`
-   the first time it ran.
-   Opening it is: this struct plus JSStepHdr, JSStepVisit and the step_*_run request helpers move to a public
-   quickjs-step.h, and js_tramp_step_defs gains a runtime tail so JS_RegisterStepDef can hand a host component
-   an id past STEPDEF_COUNT. Until then a component handles what it can read without touching the page's
-   objects and DFAILs on the rest at its own name. */
+/* A MACHINE'S DECLARATION. A host component writes one of these and hands it to JS_RegisterStepDef, which
+   returns an id PAST STEPDEF_COUNT — the runtime tail beside the engine's own static table (see the
+   host_step_defs note further down, and JS_NewStepClosure for the closure form a component mints its callable
+   with). Everything the declaration names is in this header for that reason.
+
+   THIS PARAGRAPH USED TO SAY THE DOOR WAS SHUT — "THE HOST-FACING DOOR IS NOT OPEN YET", that a component
+   "cannot declare a step machine", and that "until then a component handles what it can read without touching
+   the page's objects and DFAILs on the rest at its own name". It listed three things opening it would take,
+   and all three are how the tree already stands. That is the removal-announcement shape CLAUDE.md's
+   §A-SCAR-IS-NOT-A-WOUND names as the worst kind of stale claim: every other kind sends the reader to look,
+   and a claim that a capability is ABSENT tells them not to. It is left here as a correction rather than
+   deleted, because the reader who re-derives "only quickjs.c can write one" from the STEPDEF_* enum is the
+   reader who will re-introduce the C-side JS_GetPropertyStr this door exists to end. The rule that made it
+   necessary is unchanged and is why a component must reach for this: a Web IDL attribute read performed with
+   JS_GetPropertyStr from C is page code running with no flow base under it, which is what the internal-method
+   entries abort on. */
 typedef struct JSTrampStepDef {
     size_t   size;
     int     (*step)(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
