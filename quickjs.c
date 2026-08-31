@@ -23062,13 +23062,18 @@ static int step_setprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
     return 0;
 }
 
-/* THE SAME WRITE WITH 7.3.4 Set ( O, P, V, Throw )'s FLAG FALSE — `O.[[Set]](key, value, O)`, whose boolean is
- * DISCARDED rather than turned into a TypeError, so it is request 14 and not the Set(O,P,V,true) above. The
- * receiver is O, which is what 7.3.4 states ("Let success be ? O.[[Set]](P, V, O)"); only the answer differs.
- * On a Proxy it is the `set` trap, and on an accessor it is the setter, exactly as request 8 is.
+/* THE SAME WRITE WITH ECMAScript §7.3.4 Set ( obj, propertyKey, value, throw )'s FLAG FALSE — the receiver's
+ * own [[Set]], whose boolean is DISCARDED rather than turned into a TypeError, so it is request 14 and not
+ * the throwing form above. The receiver is the OBJECT, which is what §7.3.4 states ("Let success be ?
+ * obj.[[Set]](propertyKey, value, obj)"); only the answer differs. On a Proxy it is the `set` trap, and on an
+ * accessor it is the setter, exactly as request 8 is.
+ * THE PARAMETER NAMES ARE THE STANDARD'S CURRENT ONES. This paragraph cited the heading as `Set ( O, P, V,
+ * Throw )` and quoted `Let success be ? O.[[Set]](P, V, O)`, and ECMAScript renamed those parameters — so the
+ * quotation named a sentence that occurs nowhere in the specification while the NUMBER stayed right, which is
+ * the one shape a section-number checker cannot see.
  *
  * IT IS EXPORTED AND ITS THROWING TWIN IS NOT, because the caller that needed a keyed write from OUTSIDE the
- * engine needed THIS one: Web IDL § 3.7.6 Attributes' create-an-attribute-setter step 4.5.8.4 is "Perform
+ * engine needed THIS one: Web IDL §3.7.6 Attributes' create-an-attribute-setter step 4.5.8.4 is "Perform
  * ? Set(Q, forwardId, V, false)" — the [PutForwards] forwarding, whose whole point is that a target refusing
  * the write is not an error the forwarding invents. Handing that caller the throwing form would have been the
  * near-miss that reads correct: it agrees for every Q whose forwarded member is an accessor with a setter, and
@@ -112167,10 +112172,10 @@ JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
                                       JS_CLASS_UINT8C_ARRAY + type);
 }
 
-/* THE UNDERLYING BUFFER OF A BUFFER SOURCE. Web IDL § 3.2.26 Buffer source types names the concept and states
+/* THE UNDERLYING BUFFER OF A BUFFER SOURCE. Web IDL §3.2.26 Buffer source types names the concept and states
    it in two steps: a buffer type instance IS its own underlying buffer, and a view's is its
    [[ViewedArrayBuffer]]. The two predicates below are the whole of its clientele, and each of them is asked
-   only of a value § 3.2.26's own brand test has already accepted — so the tail is CHECK_FAIL and not a DCHECK:
+   only of a value §3.2.26's own brand test has already accepted — so the tail is CHECK_FAIL and not a DCHECK:
    what stands past it is a read of `u.typed_array` on an object whose union holds something else, which is a
    type confusion and must not proceed in release either. */
 static JSArrayBuffer *js_buffer_source_buffer(JSValueConst obj)
@@ -112178,7 +112183,7 @@ static JSArrayBuffer *js_buffer_source_buffer(JSValueConst obj)
     JSObject *p;
 
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        CHECK_FAIL("a buffer-source predicate was given a primitive — Web IDL § 3.2.26 Buffer source types "
+        CHECK_FAIL("a buffer-source predicate was given a primitive — Web IDL §3.2.26 Buffer source types "
                    "brand-tests V before it asks either question of the buffer under it");
     p = JS_VALUE_GET_OBJ(obj);
     if (p->class_id == JS_CLASS_ARRAY_BUFFER || p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER)
@@ -112186,27 +112191,27 @@ static JSArrayBuffer *js_buffer_source_buffer(JSValueConst obj)
     if (is_typed_array(p->class_id) || p->class_id == JS_CLASS_DATAVIEW)
         return p->u.typed_array->buffer->u.array_buffer;
     CHECK_FAIL("a buffer-source predicate was given an object that is neither a buffer nor a view — those are "
-               "the only two kinds Web IDL § 3.2.26 Buffer source types admits, and its brand test runs first");
+               "the only two kinds Web IDL §3.2.26 Buffer source types admits, and its brand test runs first");
 }
 
-/* ECMAScript § 25.1.3.9 IsFixedLengthArrayBuffer ( arrayBuffer ), asked of the underlying buffer — which is
-   exactly how Web IDL § 3.2.26 Buffer source types asks it: of V for an ArrayBuffer, of V.[[ViewedArrayBuffer]]
+/* ECMAScript §25.1.3.9 IsFixedLengthArrayBuffer ( arrayBuffer ), asked of the underlying buffer — which is
+   exactly how Web IDL §3.2.26 Buffer source types asks it: of V for an ArrayBuffer, of V.[[ViewedArrayBuffer]]
    for a DataView or a typed array. ONE function therefore answers every arm of that conversion and the binding
    layer performs no walk of its own.
-   § 25.1.3.9 is two lines — "If arrayBuffer has an [[ArrayBufferMaxByteLength]] internal slot, return false.
+   §25.1.3.9 is two lines — "If arrayBuffer has an [[ArrayBufferMaxByteLength]] internal slot, return false.
    Return true." — and this engine's slot is `max_byte_length`, absent as a negative, which is precisely what
-   array_buffer_is_resizable reads. § 25.1.3.9 takes "an ArrayBuffer or a SharedArrayBuffer", so a GROWABLE
+   array_buffer_is_resizable reads. §25.1.3.9 takes "an ArrayBuffer or a SharedArrayBuffer", so a GROWABLE
    SharedArrayBuffer is not fixed-length either and this answers for one without a second test.
-   NO CONTEXT AND NO THROW, because § 3.2.26 asks its questions BEFORE any detach or bounds test — it has
+   NO CONTEXT AND NO THROW, because §3.2.26 asks its questions BEFORE any detach or bounds test — it has
    none — so a detached or out-of-bounds view must still get an answer here rather than an exception. */
 bool JS_IsFixedLengthBufferSource(JSValueConst obj)
 {
     return !array_buffer_is_resizable(js_buffer_source_buffer(obj));
 }
 
-/* ECMAScript's IsSharedArrayBuffer over the same underlying buffer, for Web IDL § 3.2.26's OTHER refusal — the
-   step that precedes the fixed-length one in each of its four conversions. § 4.2 BufferSource says in its own
-   note that [AllowShared] "cannot be used with BufferSource as ArrayBuffer does not support it", and § 4.1
+/* ECMAScript's IsSharedArrayBuffer over the same underlying buffer, for Web IDL §3.2.26's OTHER refusal — the
+   step that precedes the fixed-length one in each of its four conversions. §4.2 BufferSource says in its own
+   note that [AllowShared] "cannot be used with BufferSource as ArrayBuffer does not support it", and §4.1
    ArrayBufferView carries no extended attribute at all, so at both of this fork's declared buffer-source
    positions the refusal is unconditional. */
 bool JS_IsSharedBufferSource(JSValueConst obj)
@@ -112214,18 +112219,19 @@ bool JS_IsSharedBufferSource(JSValueConst obj)
     return js_buffer_source_buffer(obj)->shared;
 }
 
-/* ECMAScript's IsDetachedBuffer over the same underlying buffer — the THIRD question Web IDL § 3.2.26 Buffer
+/* ECMAScript's IsDetachedBuffer over the same underlying buffer — the THIRD question Web IDL §3.2.26 Buffer
    source types asks of it, and the one that had no answer. Its two conversions above are refusals; this one is
    a POSITIVE STATEMENT inside an algorithm that produces a value: "get a copy of the bytes held by the buffer
-   source" reads the view's window in its steps 1-4 and then, in step 5, "If IsDetachedBuffer(jsArrayBuffer) is
-   true, then return the empty byte sequence".
+   source" reads the view's window in its step 5 ("Set offset to jsBufferSource.[[ByteOffset]]", "Set length
+   to jsBufferSource.[[ByteLength]]") and then, in step 7, "If IsDetachedBuffer(jsArrayBuffer) is true, then
+   return the empty byte sequence".
    IT EXISTS BECAUSE THE WINDOW IS WHAT CANNOT BE READ FIRST. An embedder's only route from a VIEW to its
    buffer is JS_GetArrayBufferView, which refuses an out-of-bounds view — and a detached buffer makes every
-   view over it out of bounds — so a caller performing that algorithm reached an EXCEPTION at step 3 for the
-   input step 5 defines the answer to. The ArrayBuffer arm hid it: JS_GetBufferBytes answers NULL with a zero
+   view over it out of bounds — so a caller performing that algorithm reached an EXCEPTION at step 5 for the
+   input step 7 defines the answer to. The ArrayBuffer arm hid it: JS_GetBufferBytes answers NULL with a zero
    length for a detached buffer, so `digest(alg, detachedBuffer)` hashed the empty message correctly while
    `digest(alg, viewOntoDetachedBuffer)` aborted, and the abort named the brand test rather than the detach.
-   NO CONTEXT AND NO THROW, exactly as its two siblings state and for the same reason: § 3.2.26's algorithms
+   NO CONTEXT AND NO THROW, exactly as its two siblings state and for the same reason: §3.2.26's algorithms
    have no detach test of their own to gate this behind, so a detached or out-of-bounds view must still be able
    to be ASKED. The brand test comes first, and anything else is fatal at the call. */
 bool JS_IsDetachedBufferSource(JSValueConst obj)
@@ -112234,9 +112240,11 @@ bool JS_IsDetachedBufferSource(JSValueConst obj)
 }
 
 /* THE VIEW'S BYTE LENGTH AS THE SPEC COMPUTES IT, WHICH IS NOT ALWAYS `ta->length`. A length-tracking view has
-   [[ByteLength]] = auto, and ECMAScript § 10.4.5.12 TypedArrayByteLength and § 25.3.1.3 GetViewByteLength both
-   turn on that one line — "If obj.[[ByteLength]] is not auto, return obj.[[ByteLength]]" — and derive the
-   answer from the BUFFER otherwise. `ta->length` is this engine's [[ByteLength]] slot and it is written ONCE,
+   [[ByteLength]] = auto, and ECMAScript §10.4.5.12 TypedArrayByteLength ( taRecord ) and §25.3.1.3
+   GetViewByteLength ( viewRecord ) both turn on that one line — §10.4.5.12's is "If obj.[[ByteLength]] is not
+   auto, return obj.[[ByteLength]]" and §25.3.1.3's names its own local, "If view.[[ByteLength]] is not auto,
+   return view.[[ByteLength]]" — and derive the answer from the BUFFER otherwise.
+   `ta->length` is this engine's [[ByteLength]] slot and it is written ONCE,
    by typed_array_init; for a track_rab view it is therefore a record of the buffer's size at the instant the
    view was constructed and nothing else. js_array_buffer_update_typed_arrays maintains `p->u.array.count` for
    a typed array and `ta->length` for a DataView, and does not touch a typed array's.
@@ -112254,16 +112262,16 @@ static size_t js_buffer_view_byte_length(JSObject *p)
     if (!ta->track_rab)
         return ta->length;
     if (p->class_id == JS_CLASS_DATAVIEW) {
-        /* § 25.3.1.3's last two steps, over the buffer's CURRENT length — and NOT `ta->length`, which the
+        /* §25.3.1.3's last two steps, over the buffer's CURRENT length — and NOT `ta->length`, which the
            resize hook leaves alone when the offset lands exactly ON the new end (`ta->offset < len` is false
            there) while dataview_is_oob admits that same view (`ta->offset > byte_length` is false). */
         abuf = ta->buffer->u.array_buffer;
         DCHECK((int64_t)ta->offset <= (int64_t)abuf->byte_length,
-               "§ 25.3.1.3 GetViewByteLength opens by asserting the view is not out of bounds, and every caller "
+               "§25.3.1.3 GetViewByteLength opens by asserting the view is not out of bounds, and every caller "
                "has run dataview_is_oob — a view whose offset is past its own buffer reached the length anyway");
         return (size_t)((int64_t)abuf->byte_length - (int64_t)ta->offset);
     }
-    /* § 10.4.5.12 over § 10.4.5.13 TypedArrayLength's result: the element COUNT is the slot this engine keeps
+    /* §10.4.5.12 over §10.4.5.13 TypedArrayLength's result: the element COUNT is the slot this engine keeps
        live across a resize, so the byte length is that count scaled by the element size. */
     return (size_t)p->u.array.count << typed_array_size_log2(p->class_id);
 }
@@ -112287,7 +112295,7 @@ JSValue JS_GetArrayBufferView(JSContext *ctx, JSValueConst obj, size_t *pbyte_of
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
     ta = p->u.typed_array;
     if (pbyte_offset) *pbyte_offset = ta->offset;
-    /* § 10.4.5.12 / § 25.3.1.3 rather than the [[ByteLength]] slot — see js_buffer_view_byte_length. */
+    /* §10.4.5.12 / §25.3.1.3 rather than the [[ByteLength]] slot — see js_buffer_view_byte_length. */
     if (pbyte_length) *pbyte_length = js_buffer_view_byte_length(p);
     return js_dup(JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
 }
@@ -112310,7 +112318,7 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
     ta = p->u.typed_array;
     if (pbyte_offset)
         *pbyte_offset = ta->offset;
-    /* § 10.4.5.12 TypedArrayByteLength rather than the [[ByteLength]] slot — see js_buffer_view_byte_length.
+    /* §10.4.5.12 TypedArrayByteLength rather than the [[ByteLength]] slot — see js_buffer_view_byte_length.
        The same defect as the one next door and reached by a different door: a length-tracking view handed to
        an embedder through THIS export carried the stale window just as readily. */
     if (pbyte_length)
