@@ -1566,6 +1566,19 @@ JS_EXTERN JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_fun
    flag is to attach a reaction, which is a different, observable operation: it queues a job. */
 JS_EXTERN void JS_MarkPromiseHandled(JSContext *ctx, JSValueConst promise);
 
+/* READ [[PromiseIsHandled]]. The write above has no reader, and the spec steps that need one read the flag at a
+   DIFFERENT TIME from the one that set it, which is why attaching a reaction cannot answer the question.
+   HTML §8.1.4.7 Unhandled promise rejections step 4.1.1 re-checks it inside the task its checkpoint queued, so
+   a promise that got a handler between the two is not reported; step 4.1.4 checks it AGAIN after the
+   `unhandledrejection` listeners have run, to decide whether the promise joins that global's outstanding
+   rejected promises weak set.
+   NOT THE TRACKER'S `is_handled` ARGUMENT. That one names the EDGE the host is being told about, and it arrives
+   BEFORE the flag is written — a host reading this inside the tracker's handle arm reads `false`. Do not use
+   one to stand in for the other.
+   ITS ARGUMENT IS A PROMISE: [[PromiseIsHandled]] is a slot only a promise has, so a non-promise is a caller
+   error rather than a value with a false answer, and it aborts rather than answering. */
+JS_EXTERN bool JS_IsPromiseHandled(JSContext *ctx, JSValueConst promise);
+
 /* CALL `func(value)` AS A CALL-ROOT FLOW — the base a promise reaction runs on — rather than as a C activation.
    A trusted-host reply is delivered by calling something, and JS_Call from the host's pump has no flow base, so
    a page's `then` getter or a loop inside its handler drives to completion there. Every host delivery uses this.

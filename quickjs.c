@@ -106881,6 +106881,19 @@ void JS_MarkPromiseHandled(JSContext *ctx, JSValueConst promise)
     s->is_handled = true;
 }
 
+/* See the declaration: the READ twin of the write above. It reports the SLOT and nothing else — in particular
+   it is NOT the rejection tracker's `is_handled` argument, which is the EDGE and is delivered by
+   call_promise_rejection_tracker BEFORE either writer sets the flag (perform_promise_then's tail and
+   js_promise_set_handled both write after they notify). A host reading this from inside the handle arm
+   therefore reads `false`, which is correct and is why the two are not interchangeable. */
+bool JS_IsPromiseHandled(JSContext *ctx, JSValueConst promise)
+{
+    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    (void)ctx;
+    DCHECK(s != NULL, "a spec step asked whether something that is not a promise is handled");
+    return s->is_handled;
+}
+
 /* 27.5.4.7.1 PromiseResolve ( ctor, resolution ) FOR A RESOLUTION THAT IS NOT AN OBJECT, which is a DIFFERENT
    ALGORITHM and not a fast path: with ctor = %Promise% step 2's NewPromiseCapability performs no Construct, and
    a non-Object resolution takes 27.5.1.3's resolveSteps straight to step 2.e's FulfillPromise — or, for a
