@@ -735,13 +735,45 @@ JS_EXTERN JSValueConst JS_StepClosureData(const JSStepHdr *h, int i);
  * result computed out of a string nobody has is a result nobody has, and it keeps `src` and `root` so a branch
  * over it still forks and an @S candidate still injects at the source that fed it.
  *
- * A MACHINE WITH A MORE PRECISE ANSWER STATES IT AT ITS OWN SITE, BEFORE THE COERCION, and several already do
- * — String.prototype.concat folds an unknown piece through the `+` hook so the known literals survive, the
- * Error constructor defines the derived unknown as `message` and CARRIES ON building the error object,
- * parseInt/parseFloat and RegExp name their own operation. Those are not a fallback this selects against:
- * they are the algorithm's own semantics, and they run first because they are IN the algorithm. This is what
- * an algorithm with nothing better to say completes as, and there is nothing left for it to fall back TO. */
+ * A MACHINE WITH A MORE PRECISE ANSWER STATES IT AT ITS OWN SITE, and several already do — String.prototype.
+ * concat folds an unknown piece through the `+` hook so the known literals survive, the Error constructor
+ * defines the derived unknown as `message` and CARRIES ON building the error object, parseInt/parseFloat and
+ * RegExp name their own operation. Those are not a fallback this selects against: they are the algorithm's own
+ * semantics, and they run first because they are IN the algorithm. This is what an algorithm with nothing
+ * better to say completes as, and there is nothing left for it to fall back TO.
+ *
+ * THAT ANSWER IS GIVEN IN ONE OF TWO PLACES, AND WHICH ONE IS DECIDED BY THE VALUE, NOT BY TASTE. The four
+ * above ask BEFORE the coercion, because the operand they are looking at is the one the page handed them. A
+ * machine whose operand may become unknown ONLY PART-WAY THROUGH the coercion cannot ask there: `cmp()` may
+ * return an ordinary object whose `valueOf` answers with unknown external input, and §7.1.1 ToPrimitive
+ * ( input [ , preferredType ] ) is what discovers that — one hop after the pre-check would have run. Such a
+ * machine answers WHEN THE SUB-SEQUENCE REPORTS, by consuming JS_STEP_UNKNOWN instead of returning it, which
+ * is the ONE site both ways in converge on. It then owns the parked operand, and STEP_UNKNOWN_ANSWERED is how
+ * it gives it back. A pre-check ALONE is not a narrower version of this — it is a hole with a crash in it. */
 #define JS_STEP_UNKNOWN 24
+
+/* THIS SITE ANSWERED THE COERCION ITSELF — release the operand JS_STEP_UNKNOWN parked, because the driver
+ * never sees the code and so never takes it. Use it ONLY where the machine's own answer does not need the
+ * unknown: §23.1.3.30.2 CompareArrayElements ( x, y, comparator )'s result is an ORDERING and not a value the
+ * sort returns, so an unknown one carries nothing forward and the elements keep their own provenance. A
+ * machine whose answer must PRESERVE the taint does not use this — it takes the operand the way
+ * js_str_replace's forwarding site does, or lets the driver derive the completion.
+ *
+ * A MACRO RATHER THAN A FUNCTION so the DCHECK stamps the site that gave the answer. Its remedy — go and look
+ * at what handed this step code out, because a coercion sub-sequence did not — names an action with no object
+ * the moment every caller reports one shared line. (No quotation marks anywhere in this block: the audit reads
+ * a quoted run under a citation as a claim about the SECTION, and this tree's own prose in quotes lands in the
+ * same bucket a fabricated sentence does, with nothing mechanical to separate them.) */
+#define STEP_UNKNOWN_ANSWERED(ctx_, h_) do {                                                            \
+        JSStepHdr *step_unk_h_ = (h_);                                                                  \
+        DCHECK(!JS_IsUninitialized(step_unk_h_->unknown_operand),                                        \
+               "this site answered a coercion's JS_STEP_UNKNOWN with a value of its own while the "     \
+               "machine is standing on no unknown operand — the operand is parked by the coercion "     \
+               "sub-sequence and by nothing else, so the step code being answered here came from "      \
+               "somewhere that never asked the question");                                              \
+        JS_FreeValue(ctx_, step_unk_h_->unknown_operand);                                                \
+        step_unk_h_->unknown_operand = JS_UNINITIALIZED;                                                 \
+    } while (0)
 
 /* The machine's own arguments, borrowed. Out-of-range reads undefined, which is what the IDL's optional
    arguments mean at this level. */

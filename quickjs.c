@@ -89941,7 +89941,10 @@ static int js_array_sort_collect(JSContext *ctx, JSArraySort *s, JSValue in, JSV
 /* Drive the merge by ONE ELEMENT. It returns JS_STEP_YIELD once an element has moved (the scheduler is offered
    the frontier before the next one), 1 when a comparison of the page's comparator is due (out_args = the two
    element values), 5 when a default-ordering ToString is, 0 when the sort is complete, -1 on exception.
-   `res` (owned) is the answer to whichever of those the previous entry asked for, or JS_UNDEFINED. */
+   `res` (owned) is the answer to whichever of those the previous entry asked for, or JS_UNDEFINED.
+   THAT LIST IS EXHAUSTIVE, AND JS_STEP_UNKNOWN IS NOT ON IT — both of this algorithm's coercions are over an
+   ORDERING, so both answer it here (see the two collapse sites below) rather than handing it out. That is what
+   js_array_sort_vstep's "a step code this stage does not route" is entitled to assume. */
 static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSValueConst out_args[2],
                               JSValue **out_cb, int *out_argc)
 {
@@ -89964,7 +89967,29 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
         }
         rc = step_tofloat64_run(ctx, &s->hdr, s->cmpres, res, &v, out_cb, out_argc);
         res = JS_UNDEFINED;
-        if (rc) return rc < 0 ? -1 : rc;
+        /* A COMPARATOR THAT ANSWERED WITH UNKNOWN EXTERNAL INPUT ORDERS NOTHING, AND THE SPEC ALREADY HAS A
+           NAME FOR THAT ANSWER. ECMAScript §23.1.3.30.2 CompareArrayElements ( x, y, comparator ) step 4.b is
+           "If result is NaN, return +0𝔽." — a comparator result that carries no ordering is +0𝔽 — and
+           §23.1.3.30.1 SortIndexedProperties ( obj, length, sortCompare, holes ) says of a run whose comparator
+           is not a consistent one: "The sort order is implementation-defined if sortCompare is not a consistent
+           comparator for the elements of items.", where consistency requires of the returned v that
+           "Furthermore, v is a Number, and v is not NaN." An unknown is not a Number this engine holds, so the
+           order is the implementation's to choose, and +0𝔽 is the choice that keeps the MOST: that section's
+           own stability condition, "And for all non-negative integers j and k such that j < k < itemCount, if
+           ℝ(sortCompare(old[j], old[k])) = 0, then π(j) < π(k); i.e., the sort is stable.", pins the result to
+           the identity permutation, so every element survives with its own example and its own provenance.
+           Deriving the MACHINE's completion from the operand instead — which is what returning the code does —
+           would make `arr.sort(cmp)` an unknown ARRAY, and then `fetch(arr[0].url)` has lost a URL the run had
+           computed, to say something about an ordering nobody reads.
+           THE COMPARATOR STILL RAN: it was called, its emits and its side effects happened, and its own
+           `valueOf` ran too if it returned an object. Only the meaningless fork is removed. `v = 0` rather than
+           a branch of its own, so the collapse and step 4.b's NaN leave through the ONE predicate below. */
+        if (rc == JS_STEP_UNKNOWN) {
+            STEP_UNKNOWN_ANSWERED(ctx, &s->hdr);
+            v = 0;
+        } else if (rc) {
+            return rc < 0 ? -1 : rc;
+        }
         JS_FreeValue(ctx, s->cmpres); s->cmpres = JS_UNDEFINED;
         s->pending = 0;
         /* step 4.b: a NaN result is +0𝔽, which a stable sort keeps in original order. `v <= 0` is FALSE for NaN,
@@ -90021,21 +90046,41 @@ static int js_array_sort_step(JSContext *ctx, JSArraySort *s, JSValue res, JSVal
                     if (!ap->str) {
                         rc = step_tostring_run(ctx, &s->hdr, ap->val, res, &s->coerced, out_cb, out_argc);
                         res = JS_UNDEFINED;
-                        if (rc) return rc < 0 ? -1 : rc;
-                        ap->str = JS_VALUE_GET_STRING(s->coerced);
-                        s->coerced = JS_UNDEFINED;
+                        if (rc == JS_STEP_UNKNOWN) STEP_UNKNOWN_ANSWERED(ctx, &s->hdr);
+                        else if (rc) return rc < 0 ? -1 : rc;
+                        else {
+                            ap->str = JS_VALUE_GET_STRING(s->coerced);
+                            s->coerced = JS_UNDEFINED;
+                        }
                     }
                     s->cmp_ph = 1;
                 }
                 if (!bp->str) {
                     rc = step_tostring_run(ctx, &s->hdr, bp->val, res, &s->coerced, out_cb, out_argc);
                     res = JS_UNDEFINED;
-                    if (rc) return rc < 0 ? -1 : rc;
-                    bp->str = JS_VALUE_GET_STRING(s->coerced);
-                    s->coerced = JS_UNDEFINED;
+                    if (rc == JS_STEP_UNKNOWN) STEP_UNKNOWN_ANSWERED(ctx, &s->hdr);
+                    else if (rc) return rc < 0 ? -1 : rc;
+                    else {
+                        bp->str = JS_VALUE_GET_STRING(s->coerced);
+                        s->coerced = JS_UNDEFINED;
+                    }
                 }
                 s->cmp_ph = 0;
-                cmp = js_string_compare(ap->str, bp->str);
+                /* THE SAME COLLAPSE THE COMPARATOR BRANCH MAKES, and reached the same way: an element that IS
+                   unknown external input has no String for §23.1.3.30.2 CompareArrayElements ( x, y,
+                   comparator ) steps 5-6 to produce, so steps 7-10's two IsLessThan tests decide nothing and
+                   the algorithm's own last step decides it instead — step 11 is "Return +0𝔽." NULL here means
+                   exactly that and nothing else: a ToString that SUSPENDS returns above, and one that
+                   SUCCEEDS fills the slot, so the only way past both blocks with an empty `str` is the
+                   sub-sequence having reported the operand unknown. That is why no flag rides the state — the
+                   condition is already recorded in the thing it is about, and a flag would be a second copy
+                   of it that a suspension between the two coercions could disagree with.
+                   BOTH ToStrings STILL RUN. §23.1.3.30.2 step 6 is the page's code whenever y is an ordinary
+                   object with a `toString`, and an unknown x is no reason to skip it; the collapse removes the
+                   COMPARISON, never a call the algorithm makes. The pos tiebreak below then carries it to the
+                   stable order §23.1.3.30.1 SortIndexedProperties ( obj, length, sortCompare, holes ) requires
+                   of a zero comparison, which is where the element's own example and provenance survive. */
+                cmp = (ap->str && bp->str) ? js_string_compare(ap->str, bp->str) : 0;
                 if (cmp == 0)
                     cmp = (ap->pos > bp->pos) - (ap->pos < bp->pos);
                 if (cmp <= 0) sort_slot_move(&dst[s->k++], &src[s->l++]);
@@ -113465,7 +113510,22 @@ static int js_ta_sort_vstep(JSContext *ctx, void *st, JSValue cb_result, JSValue
             }
             rc = step_tofloat64_run(ctx, &s->hdr, s->cmpres, cb_result, &v, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
-            if (rc) return rc < 0 ? -1 : rc;
+            /* THE SAME COLLAPSE Array.prototype.sort's merge makes, for the same reason and one section over:
+               ECMAScript §23.2.4.8 CompareTypedArrayElements ( x, y, comparator ) step 2.b is "If result is
+               NaN, return +0𝔽.", so a comparator result carrying no ordering already has +0𝔽 as its answer,
+               and §23.1.3.30.1 SortIndexedProperties ( obj, length, sortCompare, holes ) — which step 7 of
+               §23.2.3.29 %TypedArray%.prototype.sort ( comparator ) invokes — makes the order
+               implementation-defined for an inconsistent comparator and stable for a zero comparison. Handing
+               the code out instead completed the WHOLE sort as a derived unknown, which is worse here than in
+               the Array case: every element of a typed array is a real Number the engine read out of the
+               buffer, so the unknown would replace a list of concrete values with one that has none.
+               The comparator ran; only the fork over its meaningless result is removed. */
+            if (rc == JS_STEP_UNKNOWN) {
+                STEP_UNKNOWN_ANSWERED(ctx, &s->hdr);
+                v = 0;
+            } else if (rc) {
+                return rc < 0 ? -1 : rc;
+            }
             JS_FreeValue(ctx, s->cmpres); s->cmpres = JS_UNDEFINED;
             s->pending = 0;
             /* step 2.b: a NaN v is +0, and a stable sort keeps the earlier element for +0 — which asking
