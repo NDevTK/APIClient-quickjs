@@ -2170,6 +2170,20 @@ typedef struct JSConcolicHooks {
        does at the one sub-sequence all of them share. Two hooks would be two names for one derivation; these
        are two derivations, and their shapes say so (`String(x)` versus `x.<operation>()`). */
     JSValue (*to_str)(JSContext *ctx, JSValueConst v);
+    /* §7.1.2 ToBoolean ( arg ) OVER UNKNOWN INPUT, answered by the OPERATOR for the same reason .arith and
+       .to_str are: the conversion boundary underneath owes C a real boolean and has only one to give. §7.1.2
+       has no ToPrimitive step, so the C answer for an unknown is whatever its REPRESENTATION is — and a
+       concolic is an ordinary JS_TAG_OBJECT, which JS_ToBoolFree answers `true` for. That is not a coarse
+       answer, it is a DECIDED one: it deletes an arm before any OP_if can fork it, and the arm it deletes is
+       the one behind every `if (!user.isAdmin) return;` a bundle writes.
+       `negate` IS A PARAMETER AND NOT A SECOND HOOK, because §13.5.7 Logical NOT Operator ( ! ) is §7.1.2
+       with the answer complemented and nothing else — its §13.5.7.1 Runtime Semantics: Evaluation is four
+       steps of which one is the coercion and two are the complement, so there is one derivation with a
+       polarity and never two derivations. So `!x` and
+       `Boolean(x)` reach one implementation and `!!x` composes back to `Boolean(x)`'s own predicate rather
+       than to a third one. Passing 1 asks for the complement.
+       Returns JS_UNINITIALIZED when the operand is not concolic. */
+    JSValue (*to_bool)(JSContext *ctx, JSValueConst v, int negate);
     /* `obj[x]` with an UNKNOWN key. Not a coercion of the operand — a lookup that names no particular slot, so
        the read yields a concolic derived from the base and the key's source. JS_UNINITIALIZED = not concolic. */
     JSValue (*key_read)(JSContext *ctx, JSValueConst obj, JSValueConst key);

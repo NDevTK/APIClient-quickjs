@@ -44400,6 +44400,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue op1;
 
                 op1 = sp[-1];
+                /* §13.5.7.1 Runtime Semantics: Evaluation OVER UNKNOWN INPUT — step 2's
+                   `Let oldValue be ToBoolean(? GetValue(expr))`, whose complement steps 3 and 4 return. The
+                   COERCION is the whole of the operator, so the operator is what must answer it for an
+                   unknown. Without this the coercion below decides it: JS_ToBoolFree answers `true`
+                   for every JS_TAG_OBJECT and a concolic is one, so `!unknown` is the concrete `false` HERE,
+                   and the OP_if_false that follows sees a plain boolean with nothing for branch_arm_fork to
+                   fork. The arm behind the guard is not explored badly, it does not exist — §Solver-half's
+                   "where the domain permits both outcomes BOTH arms run" is false of the commonest gate shape
+                   a real bundle writes, and nothing crashes to say so. */
+                if (g_concolic.to_bool) {
+                    JSValue t = g_concolic.to_bool(ctx, op1, 1);
+                    if (!JS_IsUninitialized(t)) {
+                        JS_FreeValue(ctx, op1);
+                        sp[-1] = t;
+                        BREAK;
+                    }
+                }
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1) != 0;
                 } else {
@@ -92224,7 +92241,39 @@ static const JSCFunctionListEntry js_number_proto_funcs[] = {
 static JSValue js_boolean_ctor_body(JSContext *ctx, JSValueConst obj_, int argc, JSValueConst *argv)
 {
     JSValue obj = unsafe_unconst(obj_);
-    JSValue val = js_bool(JS_ToBool(ctx, argv[0]));
+    JSValue val;
+
+    /* STEP 1'S ToBoolean OVER UNKNOWN INPUT — the SECOND caller of §7.1.2 at operator level, and the same
+       answer OP_lnot's is: JS_ToBool below answers `true` for every JS_TAG_OBJECT, so `Boolean(unknown)` is
+       the concrete `true` and `if (Boolean(x))` has one arm. `!!x` and `Boolean(x)` are the same predicate and
+       reach the same hook with negate 0, so they compose to ONE constraint entry rather than two.
+       THE CONSTRUCT FORM DERIVES THE WRAPPER WHOLE, exactly as `new String(unknown)` does and for the same
+       reason: step 4's [[BooleanData]] is read back by js_thisBooleanValue off the slot's TAG, so there is no
+       slot representation for an unknown, and storing one would make `new Boolean(x).valueOf()` throw. `obj`
+       is ours on that arm, so it is given back before the derivation replaces it. */
+    if (g_concolic.is && g_concolic.is(argv[0])) {
+        JSValue c;
+        if (JS_IsUndefined(obj)) {
+            /* A CHECK AND NOT A DCHECK, AND THE PROMOTION IS THIS LINE'S. The hook set is one struct with one
+               installer, so `is` answering yes while `to_bool` is absent is the engine's own logic being
+               wrong — a DCHECK by category. But this line is the only dereference of that pointer in a
+               RELEASE build, where a DCHECK is compiled out: the choice there is between a named abort and a
+               segfault, and the state it would segfault on is one where every predicate behind this call has
+               already been answered concretely. That is the data-integrity case, so it is fatal in both. */
+            CHECK(g_concolic.to_bool != NULL,
+                  "§7.1.2 ToBoolean's own hook is absent while unknown-input value semantics are installed — "
+                  "the hook set is one struct and a plain Boolean(x) has no other answer, so proceeding would "
+                  "decide every gate behind it concretely");
+            return g_concolic.to_bool(ctx, argv[0], 0);   /* step 2: the call form IS the primitive */
+        }
+        c = js_concolic_derive(ctx, argv[0], "new Boolean", JS_UNDEFINED);
+        DCHECK(!JS_IsUninitialized(c),
+               "new Boolean(unknown external input) declined an operand this engine had already recognised as "
+               "unknown — the value semantics were installed without their derivation hook");
+        JS_FreeValue(ctx, obj);
+        return c;
+    }
+    val = js_bool(JS_ToBool(ctx, argv[0]));
     if (JS_IsUndefined(obj))
         return val;                        /* step 2: the call form IS the primitive */
     JS_SetObjectData(ctx, obj, val);       /* step 4; consumes val, leaves obj ours */
