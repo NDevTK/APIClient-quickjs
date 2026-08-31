@@ -1091,7 +1091,7 @@ typedef struct JSFunctionBytecode {
        same reason it is a bit on the BYTECODE rather than a flag somebody sets around an evaluation: an inline
        script's function can be called back from the bundle an hour of scheduler time later, across parks,
        awaits and flow switches, and the answer must still be the one its SOURCE decides. Its one reader is
-       js_document_record_grant, which is where JSObject.doc_built is handed out.
+       js_document_container_grant, which is where JSObject.doc_built is handed out.
        See JS_EVAL_FLAG_INLINE_SCRIPT for what the two halves are and why they differ. */
     uint8_t from_inline_script : 1;
     /* XXX: 1 bit available */
@@ -1525,11 +1525,18 @@ struct JSObject {
     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
-    /* APIClient forced-exec: THE DOCUMENT'S OWN BYTES WROTE THIS RECORD'S EXTENT — the half of the page the
+    /* APIClient forced-exec: THE DOCUMENT'S OWN BYTES WROTE THIS CONTAINER'S EXTENT — the half of the page the
        server re-renders for every request decided which members exist — so the extent was chosen against THIS
-       VISITOR'S CREDENTIALS rather than by the program, and a member it does not hold is unknown rather than
-       `undefined`.
-       IT IS GRANTED, NEVER INFERRED, and js_document_record_grant is the one place that grants it. Read that
+       VISITOR'S CREDENTIALS rather than by the program.
+       THAT IS ONE OF THE CHANNEL'S TWO QUESTIONS AND NOT BOTH OF THEM, which is why this bit is read through
+       two predicates. It decides whether the publication walk may DESCEND through the container and NAME what
+       is inside it, and a LIST answers it yes. Whether a member the container does not hold is the server's
+       SILENCE — unknown rather than `undefined` — is the other question, and a list answers that one no
+       (§10.4.2 Array Exotic Objects: its `length` is greater than every own index, so the document that wrote
+       the list said how long it is). The first question is js_object_is_document_container's and the second
+       is js_object_is_document_record's; one bit answering both is what left every record inside a server
+       dump's lists unreachable.
+       IT IS GRANTED, NEVER INFERRED, and js_document_container_grant is the one place that grants it. Read that
        function for why the fact is the EXTENT'S AUTHOR and not the allocation: this bit used to be set by the
        object ALLOCATOR for any ordinary object born while an inline script was somewhere on the stack, which
        is a proxy that answers the same for `window.gon={}` and for `new Event("go")` — and a platform object
@@ -8295,9 +8302,9 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     /* THE ALLOCATION DECIDES NOTHING ABOUT THE INJECTION CHANNEL, AND BOTH BITS ARE CLEARED AT BIRTH FOR THE
        SAME REASON. The host keys a published record by its ADDRESS with no reference held, which is sound only
        because a fresh object at a recycled address cannot claim to be published — or to be a document record —
-       until something says so, and the two things that say so are js_document_record_grant and the walk it
+       until something says so, and the two things that say so are js_document_container_grant and the walk it
        feeds. This line used to ask which half of the page was on the STACK, which is a question about the
-       allocation rather than about the record: read js_document_record_grant for why the extent's AUTHOR is
+       allocation rather than about the record: read js_document_container_grant for why the extent's AUTHOR is
        the fact and the allocator could not see it. */
     p->doc_built = 0;
     p->doc_namespace = 0;
@@ -12078,7 +12085,7 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
  * host's own C, which is neither half.
  *
  * IT ANSWERS WHICH HALF IS RUNNING AND NOTHING ELSE, which is the whole of what it is FOR and the whole of what
- * it may be asked. Its one caller is js_document_record_grant, at a site that already knows a record's extent
+ * it may be asked. Its one caller is js_document_container_grant, at a site that already knows a record's extent
  * is being written; asking it at an ALLOCATION instead — where nothing knows what is being built — is the
  * proxy that put every platform object on the injection channel. */
 static bool js_running_code_is_inline_script(JSRuntime *rt)
@@ -12124,13 +12131,34 @@ static bool js_running_code_is_inline_script(JSRuntime *rt)
  * place lets a flow run past a missing capability and report a surface it never reached, which is the same
  * loss this whole file exists to prevent, arriving through the other end of the channel.
  *
- * SO THE GRANT IS A POSITIVE ACT BY THE OPERATION THAT WROTE THE EXTENT, and there are exactly two of them:
- * the OBJECT-LITERAL opcode running inline-script bytecode, and `JSON.parse` of text an inline script handed
- * it (a server dump rendered into the page as `window.__STATE__=JSON.parse("…")` is the same fact as the same
- * dump written as a literal). Both are the document's bytes deciding a member list. Nothing else grants, so
- * every platform object, every Web IDL dictionary and every record a C builtin composes is off the channel BY
- * CONSTRUCTION — including the one the next platform component adds, which is the point: an exclusion rule
- * would have had to be REMEMBERED there, and the failure of forgetting it is silent.
+ * SO THE GRANT IS A POSITIVE ACT BY THE OPERATION THAT WROTE THE EXTENT, and every one of them is a LITERAL
+ * OF THE DOCUMENT'S OWN TEXT: the OBJECT-LITERAL opcode and the LIST opcode running inline-script bytecode,
+ * and the two container cases of a `JSON.parse` of text an inline script handed it (a server dump rendered
+ * into the page as `window.__STATE__=JSON.parse("…")` is the same fact as the same dump written as a
+ * literal). Each is the document's bytes deciding a member list. Nothing else grants, so every platform
+ * object, every Web IDL dictionary and every record a C builtin composes is off the channel BY CONSTRUCTION —
+ * including the one the next platform component adds, which is the point: an exclusion rule would have had to
+ * be REMEMBERED there, and the failure of forgetting it is silent.
+ *
+ * AND A LIST IS SUCH A CONTAINER, WHICH THIS GRANT REFUSED FOR A REASON THAT BELONGS TO A DIFFERENT QUESTION.
+ * `window.__STATE__={"users":[{"id":1}]}` is ONE literal and ONE server's choice, and the element record in it
+ * is granted here in its own right — but the ARRAY between them was not, and the walk below descends only
+ * through granted containers, so it stopped at `users` and every field of every element answered §10.1.8.1
+ * OrdinaryGet ( O, P, Receiver ) step 2.b's `undefined`. That is the DOMINANT shape of the thing this channel
+ * exists for — `__NEXT_DATA__`, `__NUXT__`, `__INITIAL_STATE__` and `gon` are trees of records inside lists —
+ * and it was lost to ONE BIT ANSWERING TWO QUESTIONS. They are: DID THE DOCUMENT'S BYTES WRITE THIS
+ * CONTAINER'S EXTENT, which decides whether the walk may DESCEND through it and name what is inside, and which
+ * a list answers YES; and IS A MEMBER THIS CONTAINER DOES NOT HOLD THE SERVER'S SILENCE, which decides whether
+ * a READ of it is asked of the channel, and which a list answers NO. So `doc_built` is the first question and
+ * js_object_is_document_record asks the second on top of it.
+ *
+ * WHAT A LIST GRANT CAN COST IS A NAME AND NEVER AN ANSWER, which is why its precision matters less than this
+ * one's and is worth stating rather than leaving to be re-derived. OP_array_from serves the array literal, a
+ * spread call's argument list and a destructuring rest, and only the first is unambiguously the document
+ * writing a list; the other two copy an extent from a SOURCE. But descent publishes nothing this grant has not
+ * already admitted in its own right, so a list granted too generously can only cause a record that IS on the
+ * channel to be named by the path it was reached at. `[...document.querySelectorAll("a")]` in an inline script
+ * is granted and publishes nothing at all: a platform object is not a container this grants.
  *
  * WHAT THAT NARROWING COSTS, NAMED RATHER THAN DISCOVERED. A record an inline script builds some OTHER way —
  * `Object.create(null)`, `new Config()`, `Object.fromEntries(…)` — is no longer on the channel, so a read that
@@ -12139,13 +12167,13 @@ static bool js_running_code_is_inline_script(JSRuntime *rt)
  * on an object that has a real answer, which throws nothing and is read as state. Both defects that ended a
  * document this session were the second direction, so where this rule is uncertain it refuses.
  *
- * `v` is borrowed. Ordinary-object-ness is ASSERTED and not filtered: both grant sites build the record
- * themselves, so a non-ordinary object here is a third site that has not read this comment. */
-static void js_document_record_grant(JSContext *ctx, JSValueConst v)
+ * `v` is borrowed. The container KIND is ASSERTED and not filtered: every grant site builds the container
+ * itself, so anything else here is a further site that has not read this comment. */
+static void js_document_container_grant(JSContext *ctx, JSValueConst v)
 {
     JSObject *p;
 
-    /* No host has declared the channel: every conformance runner pays one bit test at the two grant sites and
+    /* No host has declared the channel: every conformance runner pays one bit test at the grant sites and
        nothing else — the frame walk this used to do per ALLOCATION is gone. */
     if (likely(g_concolic.publish == NULL))
         return;
@@ -12153,45 +12181,120 @@ static void js_document_record_grant(JSContext *ctx, JSValueConst v)
         return;
     DCHECK(JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT,
            "the injection channel was offered membership for something that is not an object — a grant names "
-           "the RECORD whose extent was just written, and a primitive has no extent to have been chosen");
+           "the CONTAINER whose extent was just written, and a primitive has no extent to have been chosen");
     p = JS_VALUE_GET_OBJ(v);
-    DCHECK(p->class_id == JS_CLASS_OBJECT,
-           "a grant named a record that is not an ordinary object. An Array states its own extent as `length` "
-           "and a Function or a Date is not a record of fields at all, and a PLATFORM object's extent is Web "
-           "IDL §3.8's rather than the document's — so a third grant site has been added for something whose "
-           "member list the document's bytes did not write");
+    DCHECK(p->class_id == JS_CLASS_OBJECT || p->class_id == JS_CLASS_ARRAY,
+           "a grant named something that is neither a record nor a list. A Function or a Date is not a "
+           "container of members at all, and a PLATFORM object's extent is Web IDL §3.8's rather than the "
+           "document's — so a further grant site has been added for something whose member list the "
+           "document's bytes did not write");
     DCHECK(!p->doc_namespace,
-           "a record was granted channel membership AFTER the walk had already published it — the two bits "
-           "only ever go 0 -> 1 and the publication composes the path this record's members are reported "
+           "a container was granted channel membership AFTER the walk had already published it — the two bits "
+           "only ever go 0 -> 1 and the publication composes the path this container's members are reported "
            "under, so a grant arriving second means the walk published something it had not yet been told was "
-           "a document record");
+           "a document container");
     p->doc_built = true;
 }
 
-/* IS THIS RECORD ON THE SERVER'S INJECTION CHANNEL — the ONE membership question, asked by the WALK that
-   publishes and by BOTH arms that read, and by the interpreter fast paths that decide whether a hit may be
-   answered inline. That is the same treatment the KEY rule got one question along, and for the same reason:
-   the key rule arrived on one arm and the arm without it answered every well-known symbol with a callable
-   unknown, so a rule that decides an answer belongs in one function under every site that needs the answer,
-   not in a condition each site spells for itself.
-   The assert is the half that makes it a contract rather than an accessor: membership is handed out by
-   js_document_record_grant alone, so every consumer is entitled to the grant's own precondition and a bit
+/* DID THE DOCUMENT'S OWN BYTES WRITE THIS CONTAINER'S EXTENT — the first of the channel's two questions, and
+   the one the WALK asks, because it decides whether a container may be DESCENDED through and what is inside it
+   NAMED. The assert is the half that makes it a contract rather than an accessor: membership is handed out by
+   js_document_container_grant alone, so every consumer is entitled to the grant's own precondition and a bit
    that arrived some other way says so HERE, at a reader, rather than turning up as a member of a namespace
    that answers a Web IDL member with an unknown. */
-static bool js_object_is_document_record(JSObject *p)
+static bool js_object_is_document_container(JSObject *p)
 {
-    DCHECK(!p->doc_built || p->class_id == JS_CLASS_OBJECT,
-           "a record on the injection channel is not an ordinary object — js_document_record_grant is the "
-           "only thing that grants membership and it asserts ordinary-object-ness at the grant, so this bit "
-           "was set by something that is not the grant");
+    DCHECK(!p->doc_built || p->class_id == JS_CLASS_OBJECT || p->class_id == JS_CLASS_ARRAY,
+           "a container on the injection channel is neither a record nor a list — js_document_container_grant "
+           "is the only thing that grants membership and it asserts the container kind at the grant, so this "
+           "bit was set by something that is not the grant");
     return p->doc_built;
 }
 
-/* THE DOCUMENT'S PUBLISHED NAMESPACE — every record whose EXTENT THE DOCUMENT'S OWN BYTES WROTE
- * (js_document_record_grant is what decides that, and it is the only thing that does) that is REACHABLE FROM
- * THE GLOBAL OBJECT through such records, named by the path it is reachable at. That is the one channel a
- * server has for injecting per-visitor state into a bundle it ships to everybody unchanged, and every half of
- * the sentence is load-bearing.
+/* IS A MEMBER THIS CONTAINER DOES NOT HOLD THE SERVER'S SILENCE — the SECOND question, asked by BOTH arms that
+   read and by the interpreter fast paths that decide whether a hit may be answered inline. That is the same
+   treatment the KEY rule got one question along, and for the same reason: the key rule arrived on one arm and
+   the arm without it answered every well-known symbol with a callable unknown, so a rule that decides an
+   answer belongs in one function under every site that needs the answer, not in a condition each site spells
+   for itself.
+   A LIST ANSWERS NO, and that is the whole of the difference between the two questions. ECMAScript §10.4.2
+   Array Exotic Objects: "The value of the "length" property is numerically greater than the name of every own
+   property whose name is an array index" — so the document that wrote `{"users":[{"id":1}]}` STATED how many
+   elements the list has, and `users[7]` is answered by the list rather than left unsaid by the server. Its
+   `length` is the same fact and is equally the document's, so a hit on it is the program's constant and not
+   this visitor's state. A record has no such self-description: `gon={}` says nothing whatever about the
+   twenty-three fields the bundle reads, which is why the channel exists at all. */
+static bool js_object_is_document_record(JSObject *p)
+{
+    return js_object_is_document_container(p) && p->class_id == JS_CLASS_OBJECT;
+}
+
+/* ONE MEMBER OF A CONTAINER THE DOCUMENT WROTE, offered to the walk below. Returns false only for the
+   worklist's own allocation failure, which is the one thing that ends the walk early.
+   IT IS ONE FUNCTION BECAUSE A CONTAINER HAS TWO KINDS OF MEMBER AND EXACTLY ONE RULE. A record's fields and a
+   slow list's holes live in the SHAPE; a fast list's elements live in `u.array` and have no shape property at
+   all — two storages, and every question below (the key rule, the global, membership, the mark, the
+   publication order) is identical for both. Asked once per storage at the caller, this rule would be the KEY
+   RULE's own defect one level up: a rule stated twice is a rule one of the two sites is added without.
+   THE KEY RULE, ASKED WHERE MEMBERSHIP IS DECIDED. The two read arms ask it of the key being READ; this asks
+   it of the key a container is REACHED BY, which is the prior question — whether the container is on the
+   channel at all. The difference in what skipping it costs is the whole reason it belongs here: a mis-named
+   member answers one read wrongly, while a record published through a key no server can write becomes a
+   namespace, after which BOTH arms apply the key rule perfectly correctly to that record's own string-keyed
+   fields and every one of them answers with an unknown. Nothing then looks like a channel bug.
+   An INTERNAL SLOT — ECMAScript §6.1.7.2 Object Internal Methods and Internal Slots, which Web IDL §3.8
+   "Platform objects implementing interfaces" makes a platform object's brand — is exactly that shape in this
+   engine: a record of named fields hung off a PRIVATE SYMBOL (engine/host/browser/core/idl_slots.h). So a walk
+   that descends through a symbol turns every platform object an inline script leaves on the global into a
+   namespace. (The number this paragraph used to carry, §3.7.3, is "Interface prototype object" and says
+   nothing about slots — a citation nobody could look up read as one nobody needed to.)
+   Measured: `var e = new Event("go")` published its slot record, so `e.type` and `e.eventPhase` answered with
+   unknowns spelled `{e.eventSlots.type}` (a provenance composed out of a symbol's DESCRIPTION, which is
+   neither unique nor a name), `e.defaultPrevented` answered TRUE on an event nothing had cancelled, and DOM
+   §2.7 Interface EventTarget's dispatchEvent(event) method step 1 — "If event's dispatch flag is set, or if
+   its initialized flag is not set, then throw an InvalidStateError DOMException" — threw on the FIRST dispatch
+   of a freshly constructed event. A symbol is not a name a server published a member under, and it is not a
+   name this walk may reach one through either. */
+static bool js_publish_document_member(JSContext *ctx, JSObject ***work, int *n, int *cap,
+                                       JSObject *parent, JSObject *global, JSAtom name, JSValueConst v)
+{
+    JSObject *c;
+
+    if (!JS_AtomIsPublishedName(ctx->rt, name))
+        return true;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return true;
+    c = JS_VALUE_GET_OBJ(v);
+    /* `window.self`, `window.top` and a page's own `window.app=window` all put the global object inside the
+       graph; nothing granted it channel membership, so the test beside this already excludes it, and this says
+       so where a reader would otherwise have to reason it out. */
+    if (c == global || !js_object_is_document_container(c) || c->doc_namespace)
+        return true;
+    if (*n == *cap) {
+        int ncap = *cap ? *cap * 2 : 8;
+        JSObject **w = js_realloc(ctx, *work, sizeof(*w) * (size_t)ncap);
+        /* OUT OF MEMORY LEAVES A SHALLOWER NAMESPACE, NOT A BROKEN ONE: nothing below has been marked or
+           published, so the engine's mark and the host's registry still agree exactly, and the next miss walks
+           again. The exception is dropped because this is a READ's bookkeeping, not the read — the property
+           answer owes the page nothing about it. */
+        if (!w) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return false;
+        }
+        *work = w;
+        *cap = ncap;
+    }
+    c->doc_namespace = true;
+    g_concolic.publish(ctx, JS_MKPTR(JS_TAG_OBJECT, parent), name, v);
+    (*work)[(*n)++] = c;
+    return true;
+}
+
+/* THE DOCUMENT'S PUBLISHED NAMESPACE — every container whose EXTENT THE DOCUMENT'S OWN BYTES WROTE
+ * (js_document_container_grant is what decides that, and it is the only thing that does) that is REACHABLE
+ * FROM THE GLOBAL OBJECT through such containers, named by the path it is reachable at. That is the one
+ * channel a server has for injecting per-visitor state into a bundle it ships to everybody unchanged, and
+ * every half of the sentence is load-bearing.
  *
  * WHY THIS IS NOT "EVERY MISSING PROPERTY". §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 2.b's
  * `undefined` is the right answer almost everywhere, because almost everywhere the PROGRAM decided the extent:
@@ -12207,17 +12310,23 @@ static bool js_object_is_document_record(JSObject *p)
  * a walk from the global object, and a record that was never attached to it is never published however it was
  * built.
  *
- * WHY IT DESCENDS ONLY THROUGH RECORDS THE DOCUMENT'S BYTES WROTE. A server dump is a tree written as one
+ * WHY IT DESCENDS ONLY THROUGH CONTAINERS THE DOCUMENT'S BYTES WROTE. A server dump is a tree written as one
  * literal (`window.__STATE__={"user":{"id":1}}`), so a one-level rule would leave every nested record answering
  * `undefined` for fields a logged-in visitor's tree carried. But the global reaches the whole heap, so the
  * descent has to stop somewhere, and the honest stop is the document's own tree: a bundle record that happens
  * to contain a document record is reached by a path the BUNDLE composed, not by a name the server published.
  * That also keeps the walk proportional to what the document injected rather than to the heap.
  *
+ * AND A LIST IS ONE OF THOSE CONTAINERS, which is a fact about the DESCENT and not about the ask —
+ * js_object_is_document_record is where the two questions part. A server's tree is records inside lists inside
+ * records (`{"users":[{"id":1}]}`), so a walk that stops at every list stops at the first one and leaves the
+ * whole subtree under it answering `undefined`. It descends through a list's ELEMENTS, which is the same
+ * member question its fields ask and is asked by the same function.
+ *
  * THE WALK IS ITERATIVE because a server's tree is as deep as the server chose and the C stack is a non-limit
- * in this engine, and the PUBLICATION MARK is its own visited set, so a cycle terminates and no record is
- * published twice. Parents are published before their children, which is what lets the host compose a child's
- * path out of its parent's.
+ * in this engine, and the PUBLICATION MARK is its own visited set, so a cycle terminates and no container is
+ * published twice — including a list that holds itself, which is one `JSON.parse` reviver away. Parents are
+ * published before their children, which is what lets the host compose a child's path out of its parent's.
  *
  * THE WORKLIST HOLDS RAW `JSObject *` AND THAT IS AN ARGUMENT, not an oversight: js_trigger_gc is called from
  * exactly one place in this file — the OBJECT allocator — and nothing this walk or the host's hook does
@@ -12242,63 +12351,45 @@ static void js_publish_document_namespace(JSContext *ctx)
         int i;
 
         for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
-            JSObject *c;
-
             if (prs->atom == JS_ATOM_NULL)
                 continue;
-            /* THE KEY RULE, ASKED WHERE MEMBERSHIP IS DECIDED. The two arms below ask it of the key being
-               READ; this asks it of the key a record is REACHED BY, which is the prior question — whether
-               the record is on the channel at all. The difference in what skipping it costs is the whole
-               reason it belongs here: a mis-named member answers one read wrongly, while a record published
-               through a key no server can write becomes a namespace, after which BOTH arms apply the key
-               rule perfectly correctly to that record's own string-keyed fields and every one of them
-               answers with an unknown. Nothing then looks like a channel bug.
-               An INTERNAL SLOT — ECMAScript §6.1.7.2 Object Internal Methods and Internal Slots, which Web
-               IDL §3.8 "Platform objects implementing interfaces" makes a platform object's brand — is
-               exactly that shape in this engine: a record of named fields hung off a PRIVATE SYMBOL
-               (engine/host/browser/core/idl_slots.h). So a walk that descends through a symbol turns every
-               platform object an inline script leaves on the global into a namespace. (The number this
-               paragraph used to carry, §3.7.3, is "Interface prototype object" and says nothing about
-               slots — a citation nobody could look up read as one nobody needed to.)
-               Measured: `var e = new Event("go")` published its slot record, so `e.type` and `e.eventPhase`
-               answered with unknowns spelled `{e.eventSlots.type}` (a provenance composed out of a symbol's
-               DESCRIPTION, which is neither unique nor a name), `e.defaultPrevented` answered TRUE on an
-               event nothing had cancelled, and DOM §2.7 Interface EventTarget's dispatchEvent(event) method
-               step 1 — "If event's dispatch flag is set, or if its initialized flag is not set, then throw
-               an InvalidStateError DOMException" — threw on the FIRST dispatch of a freshly constructed
-               event. A symbol is not a name a server published a member under, and it is not a name this
-               walk may reach one through either. */
-            if (!JS_AtomIsPublishedName(ctx->rt, prs->atom))
-                continue;
-            /* An accessor, a var ref or an autoinit slot holds no record here: reading it RUNS something, and
-               what it would answer is not a value the document wrote into this tree. */
+            /* An accessor, a var ref or an autoinit slot holds no container here: reading it RUNS something,
+               and what it would answer is not a value the document wrote into this tree. Asked at this
+               storage and not in the member rule because it is a fact about the SHAPE — a fast list's
+               elements have no flags to ask it of. */
             if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
                 continue;
-            if (JS_VALUE_GET_TAG(p->prop[i].u.value) != JS_TAG_OBJECT)
-                continue;
-            c = JS_VALUE_GET_OBJ(p->prop[i].u.value);
-            /* `window.self`, `window.top` and a page's own `window.app=window` all put the global object
-               inside the graph; nothing granted it channel membership, so the test below already excludes it,
-               and this says so where a reader would otherwise have to reason it out. */
-            if (c == global || !js_object_is_document_record(c) || c->doc_namespace)
-                continue;
-            if (n == cap) {
-                int ncap = cap ? cap * 2 : 8;
-                JSObject **w = js_realloc(ctx, work, sizeof(*w) * (size_t)ncap);
-                /* OUT OF MEMORY LEAVES A SHALLOWER NAMESPACE, NOT A BROKEN ONE: nothing below has been marked
-                   or published, so the engine's mark and the host's registry still agree exactly, and the next
-                   miss walks again. The exception is dropped because this is a READ's bookkeeping, not the
-                   read — the property answer owes the page nothing about it. */
-                if (!w) {
-                    JS_FreeValue(ctx, JS_GetException(ctx));
+            if (!js_publish_document_member(ctx, &work, &n, &cap, p, global, prs->atom, p->prop[i].u.value))
+                goto done;
+        }
+        /* THE SECOND STORAGE. A list the document wrote holds its elements in `u.array` while it is dense, and
+           in the SHAPE the moment a hole or a non-index key converts it — so both loops are the same list on
+           two different days and the shape loop above already covers the converted one.
+           THE CONTAINER KIND IS ASSERTED HERE RATHER THAN FILTERED FOR, because `fast_array` is also set for
+           `arguments` and for every typed array and a test that quietly skipped those would be a filter past
+           a broken invariant: nothing but the global and a GRANTED container is ever on this worklist, and the
+           grant admits only a record or a list. A day this fires is a day something else was granted. */
+        DCHECK(p == global || js_object_is_document_container(p),
+               "the publication walk reached an object the grant never admitted — every entry on the worklist "
+               "is a container js_document_container_grant named, so a stranger here means the descent test "
+               "and the grant disagree about what is on the channel");
+        if (p->fast_array) {
+            uint32_t k;
+
+            DCHECK(p->class_id == JS_CLASS_ARRAY,
+                   "a container on the injection channel keeps element storage and is not a list — "
+                   "`arguments` and every typed array also carry `fast_array`, and neither is a container "
+                   "this channel grants");
+            /* §10.4.2 Array Exotic Objects bounds the index: `count` is the element storage's own length,
+               which the struct declares as <= 2^31-1, so every index is a tagged-integer atom and no atom is
+               interned — which is what keeps this walk's raw-`JSObject *` worklist sound. */
+            DCHECK(p->u.array.count <= JS_ATOM_MAX_INT,
+                   "a document-written list is longer than the tagged-integer atom space, so its elements "
+                   "cannot be named without interning an atom — which this walk's unrooted worklist forbids");
+            for (k = 0; k < p->u.array.count; k++)
+                if (!js_publish_document_member(ctx, &work, &n, &cap, p, global,
+                                                __JS_AtomFromUInt32(k), p->u.array.u.values[k]))
                     goto done;
-                }
-                work = w;
-                cap = ncap;
-            }
-            c->doc_namespace = true;
-            g_concolic.publish(ctx, JS_MKPTR(JS_TAG_OBJECT, p), prs->atom, p->prop[i].u.value);
-            work[n++] = c;
         }
         if (n == 0)
             break;
@@ -12339,6 +12430,15 @@ bool JS_AtomIsPublishedName(JSRuntime *rt, JSAtom atom)
     return rt->atom_array[atom]->atom_type == JS_ATOM_TYPE_STRING;
 }
 
+/* WHICH OF THE TWO KEY KINDS THE RULE ABOVE ADMITS — see quickjs.h for why a host may not answer this from the
+   key's spelling. It is the engine's own canonicalisation and not a test over characters: an array index is
+   interned AS an integer atom (JS_NewAtom folds a canonical numeric string into one), so "0" and 0 are one
+   key and "01" is a name, and the tag is that decision already made. */
+bool JS_AtomIsIndexName(JSAtom atom)
+{
+    return __JS_AtomIsTaggedInt(atom);
+}
+
 /* §10.1.8.1 OrdinaryGet ( obj, propertyKey, receiver ) step 3, "If IsDataDescriptor(propertyDesc) is true,
    return propertyDesc.[[Value]]" — ON A RECORD THE DOCUMENT PUBLISHED, where returning it CONCRETELY is the
    same loss the miss path exists to prevent.
@@ -12354,7 +12454,7 @@ bool JS_AtomIsPublishedName(JSRuntime *rt, JSAtom atom)
    intrinsic the page touches into an unknown. A published record's own slots are the server's, and its
    prototype's are Object.prototype's, so the holder is asked and not the receiver.
    WHAT IS OUT OF REACH, NAMED SO IT IS NOT MISTAKEN FOR A DECISION: a server-written SCALAR global,
-   `window.isAdmin=false`. Channel membership is a fact about a RECORD — js_document_record_grant grants it to
+   `window.isAdmin=false`. Channel membership is a fact about a RECORD — js_document_container_grant grants it to
    the thing whose extent the document's bytes wrote — and a scalar is not a record, so there is nothing here
    to ask about. The missing piece is a mark on that STORE, not a wider predicate here, and widening this one
    to reach it would have to catch every builtin on the global to do it. */
@@ -32540,15 +32640,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = JS_NewObject(ctx);
             if (unlikely(JS_IsException(sp[-1])))
                 goto exception;
-            /* THE FIRST OF THE TWO GRANTS OF INJECTION-CHANNEL MEMBERSHIP — see js_document_record_grant for
-               the rule and for why it is granted by the operation rather than inferred at the allocation.
+            /* A GRANT OF INJECTION-CHANNEL MEMBERSHIP — see js_document_container_grant for the rule and for
+               why it is granted by the operation rather than inferred at the allocation.
                THIS opcode is the document's own bytes writing a record's extent: `window.gon={}`,
                `var gon={a:1}`, `{...spread}` and a destructuring rest all reach it, and `b` is the bytecode
                that is doing it, so the session-variant half of the page is asked about the code that is
                actually deciding the member list rather than about whatever happened to be on the stack.
                A record built any OTHER way — a platform constructor, `Object.create(null)`, `new Config()` —
                is off the channel by construction and no site has to remember to exclude it. */
-            js_document_record_grant(ctx, sp[-1]);
+            js_document_container_grant(ctx, sp[-1]);
             BREAK;
         CASE(OP_special_object):
             {
@@ -32896,6 +32996,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp -= call_argc;
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
+                /* A GRANT OF INJECTION-CHANNEL MEMBERSHIP — the LIST half, and see js_document_container_grant
+                   for why a list is a container the walk descends through and never a record whose miss is
+                   the server's silence. A server's state tree is records inside LISTS (`{"users":[{…}]}`), so
+                   without this the walk stopped at the first `[` and every field of every element answered
+                   §10.1.8.1 OrdinaryGet ( O, P, Receiver ) step 2.b's `undefined`.
+                   This opcode also builds a spread call's argument list and a destructuring rest, which copy
+                   an extent from a SOURCE rather than writing one — named at the grant, where the reason that
+                   costs a NAME and never an ANSWER is stated. */
+                js_document_container_grant(ctx, ret_val);
                 *sp++ = ret_val;
             }
             BREAK;
@@ -43231,12 +43340,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 /* AND IT IS NOT ON THE INJECTION CHANNEL, which is what lets this opcode answer a hit at all.
                    The field reads defer a hit on a channel record to the generic walk (see OP_get_field);
                    this one does not, because the base here is the GLOBAL OBJECT — nothing wrote its extent
-                   out of the document's bytes, so js_document_record_grant never names it, and the walk skips
+                   out of the document's bytes, so js_document_container_grant never names it, and the walk skips
                    it besides — so a bare `parseInt` must not become an unknown. If the mark ever reached the
                    global, every intrinsic a page names without `window.` would be answered from a slot this
                    opcode read past the hook, and the two spellings of one read would disagree. `doc_namespace`
                    is set only on a record that already carries `doc_built`, so this covers both. */
-                DCHECK(!js_object_is_document_record(gobj),
+                DCHECK(!js_object_is_document_container(gobj),
                        "the global object carries the document-built mark: a bare global name is read from "
                        "its own slot here while `window.x` is asked of the concolic hook at the generic walk, "
                        "so one read spelled two ways would answer two different things");
@@ -99336,16 +99445,16 @@ static int json_parse_step(JSParseState *s, JSONParse *p)
             obj = JS_NewObject(ctx);
             if (JS_IsException(obj))
                 goto fail;
-            /* THE SECOND OF THE TWO GRANTS OF INJECTION-CHANNEL MEMBERSHIP — see js_document_record_grant.
+            /* A GRANT OF INJECTION-CHANNEL MEMBERSHIP — see js_document_container_grant.
                A server dump rendered into the page as `window.__STATE__=JSON.parse("…")` decided its member
                list in the DOCUMENT'S OWN BYTES exactly as the same dump written as an object literal does, so
                it is the same fact and gets the same grant; the text is what chose the extent, and this is the
                operation that turns that text into a record. Granted PER CONTAINER as the parse builds it, so
                the whole tree is covered without a second walk over the result — and without an ambient
                "a parse is running" flag, which a reviver that parks would carry into another flow.
-               js_document_record_grant asks whether the code that called for this parse is the session-variant
+               js_document_container_grant asks whether the code that called for this parse is the session-variant
                half of the page, so a BUNDLE `JSON.parse` of a fetched config is not on this channel. */
-            js_document_record_grant(ctx, obj);
+            js_document_container_grant(ctx, obj);
             if (pr_cur)
                 json_parse_record_init_obj(ctx, pr_cur, obj);
             JSON_PUSH_FRAME(obj, 0);
@@ -99364,6 +99473,11 @@ static int json_parse_step(JSParseState *s, JSONParse *p)
             arr = JS_NewArray(ctx);
             if (JS_IsException(arr))
                 goto fail;
+            /* THE LIST HALF OF THE SAME GRANT, and it is granted here for the identical reason the object
+               case above is: the container the text names is the container the walk must be able to descend
+               through, and a dump's records live inside its lists. Skipping it would leave the object grant
+               above answering for a tree the walk cannot reach past the first `[`. */
+            js_document_container_grant(ctx, arr);
             if (pr_cur)
                 json_parse_record_init_array(ctx, pr_cur, arr);
             JSON_PUSH_FRAME(arr, 1);

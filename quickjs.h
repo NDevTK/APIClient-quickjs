@@ -2231,6 +2231,18 @@ JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
    `TypeError` — a whole document's worth of statements lost to a read that looked like an operator bug. */
 JS_EXTERN bool JS_AtomIsPublishedName(JSRuntime *rt, JSAtom atom);
 
+/* …AND IS IT AN INDEX RATHER THAN A NAME? The two keys the answer above admits are not spelled the same way,
+   and a provenance is the EXPRESSION THE RUN BUILT (§@H) — `__STATE__.users[0].role` is one a reader can
+   paste and `__STATE__.users.0.role` is a syntax error wearing a path. That distinction used to cost nothing
+   because an index key reached the channel only when a server wrote one (`{"0":…}`); it is now the ordinary
+   case, because the walk descends through the LISTS a server's tree is made of and every element is reached
+   by its index.
+   ASKED OF THE ATOM AND NOT OF ITS SPELLING, which is the whole reason it is exported rather than re-derived:
+   a digit test on the C string cannot tell `x[1]` from `x["01"]` — ECMAScript §6.1.7 The Object Type makes an
+   array index a canonical numeric string, so "01" is a NAME — and a host that guessed would compose one path
+   for two different keys, which is the collision the symbol rule already refuses one key kind for. */
+JS_EXTERN bool JS_AtomIsIndexName(JSAtom atom);
+
 /* APIClient @S — THE JS-CONTEXT CODE-EXECUTION SINK, ANNOUNCED BY THE ENGINE THAT OWNS IT.
  *
  * The other two sink classes belong to the HOST: a markup sink is `element.innerHTML` and a URL sink is a
