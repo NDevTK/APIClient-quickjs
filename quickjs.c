@@ -52173,9 +52173,13 @@ typedef struct JSParseState {
     JSFunctionDef *cur_func;
     bool is_module; /* parsing a module */
     bool allow_html_comments;
-    /* the next FUNCTION EXPRESSION parsed is the Function constructor's own synthesized wrapper, which is
-       parsed but never EVALUATED as an expression — so it has no self-name binding. Consumed by the first one,
-       which is always the outer wrapper: nothing inside its parameter list is parsed before it exists. */
+    /* THIS SOURCE IS 20.2.1.1.1's, AND IT IS NOT A Script. Two productions read it, in this order.
+       js_parse_program routes the whole parse to js_parse_fn_ctor_source, because step 23's goal symbol is
+       FunctionExpression and a StatementList would let either half close the wrapper and keep going.
+       PDS_FDECL then consumes the flag at the first FUNCTION EXPRESSION — always the outer wrapper, since
+       nothing inside its parameter list is parsed before it exists — to say that this one has no self-name
+       binding: 20.2.1.1.1 creates the function from the parsed parameters and body in the GLOBAL environment
+       (steps 26-28), where a named function expression would have bound its own name in a scope of its own. */
     bool fn_ctor_toplevel;
     /* THE PARSE DESCENT'S FRAME STACK — see js_parse_descent. It belongs to the PARSE, not to a driver
        activation: productions the driver does not own yet (js_parse_statement_or_decl and the statement cone)
@@ -56038,7 +56042,9 @@ static void pd_release(JSContext *ctx, JSParseState *s)
    is therefore FRESH. A production that read one across a suspension sees its initialiser instead of the value
    it left, so the corpus reports it as a wrong parse instead of it lying in wait for a scheduler. */
 static __exception int js_parse_drive(JSParseState *s, int entry, int level,
-                                      int parse_flags, int op, bool resuming)
+                                      int parse_flags, int op,
+                                      const uint8_t *entry_ptr, int entry_line, int entry_col,
+                                      bool resuming)
 {
     JSContext *ctx = s->ctx;
     /* NOT loaded into locals. An earlier version cached the parse's state here so the dispatch loop would not
@@ -56053,9 +56059,10 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
        the way out told the nested activation the stack was EMPTY: it overwrote this activation's frames and
        then released the whole stack on its way out, leaving this one reading freed chunks. That was a segfault
        on the first harness file and a leak on hundreds of tests. pd_base is this activation's floor.
-       THE NESTING IT DEFENDED AGAINST IS GONE: every production is a state on this stack and the only caller
-       is js_parse_program, so there is exactly one activation, and the DCHECK below is what keeps it that way —
-       a re-entry is reported at its origin instead of silently sharing pd_base. */
+       THE NESTING IT DEFENDED AGAINST IS GONE: every production is a state on this stack and the only callers
+       are js_parse_program and js_parse_fn_ctor_source — the two arms of one top-level parse, never nested in
+       each other — so there is exactly one activation, and the DCHECK below is what keeps it that way: a
+       re-entry is reported at its origin instead of silently sharing pd_base. */
     int tok, opcode = 0, drop_count = 0;
     bool is_non_reserved_ident = false;
     /* TemplateLiteral scratch — never live across a PD_CALL (the substitution descent is the only one, and
@@ -56098,6 +56105,23 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
             goto unwind;                                                        \
         f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
         PD_INIT()                                                               \
+        goto dispatch;                                                          \
+    } while (0)
+/* THE ENTRY PUSH, WHICH IS THE ONE PUSH WITH NO CALLER FRAME TO SEED FROM. Every descent taken from inside a
+   production carries its callee's source position on the CALLER's frame (PD_CALL_P / PD_CALL_AT); the frame
+   this driver is ENTERED with has no such caller, so the position has to arrive as an argument. It matters for
+   exactly one entry production — PDS_FDECL reads st_ptr to slice [[SourceText]] out of the buffer — and a NULL
+   there would make that slice start at address zero. PD_INIT settles all three first, so this seeds rather
+   than partially initialises. */
+#define PD_PUSH_AT(entry_, level_, flags_, op_, ptr_, line_, col_) do {         \
+        int e_ = (entry_), lv_ = (level_), fl_ = (flags_), o_ = (op_);          \
+        const uint8_t *p_ = (ptr_);                                             \
+        int ln_ = (line_), cl_ = (col_);                                        \
+        if (pd_reserve(ctx, s, s->pd_sp + 1))                                   \
+            goto unwind;                                                        \
+        f = PD_FRAME(s->pd_sp); s->pd_sp++;                                     \
+        PD_INIT()                                                               \
+        f->st_ptr = p_; f->st_line = ln_; f->st_col = cl_;                      \
         goto dispatch;                                                          \
     } while (0)
 /* A descent: record where THIS frame continues, then push the callee's. */
@@ -56162,7 +56186,7 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
     s->pd_ret = 0;
     s->pd_suspended = false;
 
-    PD_PUSH(entry, level, parse_flags, op);
+    PD_PUSH_AT(entry, level, parse_flags, op, entry_ptr, entry_line, entry_col);
 
  dispatch:
     if (s->pd_sp == s->pd_base)
@@ -61908,6 +61932,7 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
         pd_release(ctx, s);   /* the whole descent drained — the parse owns nothing until the next one */
     return s->pd_ret;
 #undef PD_PUSH
+#undef PD_PUSH_AT
 #undef PD_CALL
 #undef PD_RET
 #undef PD_RET_ERR
@@ -61923,15 +61948,26 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
    for a forced back-edge preempt, which self-resumes so a preempt is never mistaken for a yield. Nothing above
    the parser can carry a suspended parse yet, so this resumes immediately; when the eval path can, the
    scheduler takes this loop's place and the seam does not change. */
+static __exception int js_parse_descent_at(JSParseState *s, int entry, int level,
+                                           int parse_flags, int op,
+                                           const uint8_t *entry_ptr, int entry_line, int entry_col)
+{
+    int r = js_parse_drive(s, entry, level, parse_flags, op, entry_ptr, entry_line, entry_col, false);
+    while (s->pd_suspended) {
+        s->pd_suspended = false;
+        r = js_parse_drive(s, 0, 0, 0, 0, NULL, 0, 0, true);
+    }
+    return r;
+}
+
+/* The entry that carries no source position. The other caller of this driver enters at PDS_SRCELEM, which
+   reads none; PDS_FDECL is the one entry production that does, and it goes through js_parse_descent_at above.
+   The NULL is a NAMED absence rather than a default: a production entered through here that grows a need for
+   st_ptr gets a NULL it can DCHECK, never a plausible pointer into the buffer. */
 static __exception int js_parse_descent(JSParseState *s, int entry, int level,
                                         int parse_flags, int op)
 {
-    int r = js_parse_drive(s, entry, level, parse_flags, op, false);
-    while (s->pd_suspended) {
-        s->pd_suspended = false;
-        r = js_parse_drive(s, 0, 0, 0, 0, true);
-    }
-    return r;
+    return js_parse_descent_at(s, entry, level, parse_flags, op, NULL, 0, 0);
 }
 
 /* allowed parse_flags: PF_IN_ACCEPTED */
@@ -71234,6 +71270,83 @@ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
     return fd;
 }
 
+/* §20.2.1.1.1 CreateDynamicFunction steps 23-24 — "Let expr be ParseText(sourceText, exprGrammar)" and "If
+   expr is a List of errors, throw a SyntaxError exception". exprGrammar is the grammar symbol
+   FunctionExpression (step 2.2, and the corresponding step of each of the three other kinds), and §11.1.6
+   Static Semantics: ParseText attempts "to parse sourceText using goalSymbol as the goal symbol", so the WHOLE
+   text must be one FunctionExpression.
+     WHY THIS IS A PRODUCTION AND NOT A PROGRAM PARSE. A Script's body is a StatementList, so a program parse
+   of the synthesized `(function anonymous(P\n) {\nB\n})` accepts a B that CLOSES the wrapper: `}); f(); ({`
+   makes the text three source elements — a function expression, a call, an object literal — every one of
+   which a program is entitled to hold. The engine then EVALUATED that program, so `new Function` ran the
+   page's `f()` at the point the standard makes a parse, and returned the trailing `{}`: a `new Function`
+   whose result answered `typeof` "object". The parameter half escaped the same way through `){}); f();
+   (function(`, and steps 17-20's two half-probes caught neither, because each is this same wrapper with the
+   other half empty and an escape that re-balances the tail satisfies them exactly as it satisfied this one.
+     WHAT PINS IT IS THE END OF INPUT. §20.2.1.1.1's own sourceString has no parentheses; this engine adds them
+   because the value it needs is the closure the expression evaluates to, and a PARENTHESISED
+   FunctionExpression followed by end of input admits exactly the texts the bare FunctionExpression goal
+   admits — both halves sit strictly INSIDE the parentheses, and no text inside them can survive an EOF that
+   is not the wrapper's own. That is also what makes steps 17-20 exact rather than approximate: pinned this
+   way, the parameter probe accepts P if and only if P alone is FormalParameters and the body probe accepts B
+   if and only if B alone is a FunctionBody, which is what step 21's NOTE means by "each is valid alone".
+     AND NO WRAPPER ALONE COULD HAVE DONE IT, which is why the stop is the parser's. Every enclosing
+   expression this could have been spelled as — an array element, an object property value, a unary operand —
+   is reached from a Script whose ExpressionStatement is an Expression, and the comma operator re-enters that
+   level from inside any of them. */
+static __exception int js_parse_fn_ctor_source(JSParseState *s)
+{
+    JSFunctionDef *fd = s->cur_func;
+    int idx;
+
+    /* THE WRAPPER IS A PLAIN SCRIPT-SHAPED PROGRAM WHATEVER KIND IT CREATES. 20.2.1.1.1's async-ness lives in
+       the FUNCTION — step 4's prefix and exprGrammar — and never in the text that evaluates to it, so the two
+       shapes js_parse_program's tail has for a toplevel (a module's, and an ASYNC program's promise-returning
+       one) are both unreachable here and this tail is the third. A caller that reached this with either would
+       get a `return` of the wrong shape and no diagnostic, so both are asserted rather than handled. */
+    DCHECK(!s->is_module,
+           "20.2.1.1.1's synthesized source was compiled as a module — CreateDynamicFunction step 26 gives the "
+           "function currentRealm.[[GlobalEnv]], and there is no module goal anywhere in that algorithm");
+    DCHECK(fd->func_kind != JS_FUNC_ASYNC,
+           "20.2.1.1.1's synthesized source was compiled with JS_EVAL_FLAG_ASYNC — the async kind belongs to "
+           "the function step 4 builds, not to the program that evaluates to it, so a toplevel await here "
+           "would be awaiting in a realm this algorithm never enters");
+    fd->is_global_var = (fd->eval_type == JS_EVAL_TYPE_GLOBAL) ||
+        (fd->eval_type == JS_EVAL_TYPE_MODULE) ||
+        !fd->is_strict_mode;
+    fd->eval_ret_idx = idx = add_var(s->ctx, fd, JS_ATOM__ret_);
+    if (idx < 0)
+        return -1;
+
+    if (js_parse_expect(s, '('))
+        return -1;
+    /* PDS_FDECL at JS_PARSE_FUNC_EXPR spells all four kinds itself — it consumes the `async` pseudo-keyword
+       and the `*` before the name — so the prefix steps 2-5 chose needs no second spelling here, and a kind
+       added to that switch cannot go missing from this one. */
+    DCHECK(s->token.val == TOK_FUNCTION || token_is_pseudo_keyword(s, JS_ATOM_async),
+           "20.2.1.1.1's synthesized source does not begin `(function` or `(async function` — js_dynfunc_source "
+           "writes the prefix steps 2-5 chose and JS_EVAL_FLAG_FUNCTION_CTOR reaches this parse from nowhere "
+           "else, so a third spelling means a second producer of this source now exists");
+    emit_source_loc(s);   /* the ExpressionStatement path this replaces emitted one here */
+    if (js_parse_descent_at(s, PDS_FDECL, JS_PARSE_FUNC_EXPR, PF_IN_ACCEPTED, JS_FUNC_NORMAL,
+                            s->token.ptr, s->token.line_num, s->token.col_num))
+        return -1;
+    if (js_parse_expect(s, ')'))
+        return -1;
+    if (s->token.val != TOK_EOF)
+        return js_parse_error(s, "unexpected token after the function `new Function` is creating — "
+                              "20.2.1.1.1 step 23 parses the whole source as one FunctionExpression");
+
+    /* The closure is on the stack; a program answers with eval_ret_idx, so store it there and return it the
+       way js_parse_program's tail does. */
+    emit_op(s, OP_put_loc);
+    emit_u16(s, fd->eval_ret_idx);
+    emit_op(s, OP_get_loc);
+    emit_u16(s, fd->eval_ret_idx);
+    emit_return(s, true);
+    return 0;
+}
+
 static __exception int js_parse_program(JSParseState *s)
 {
     JSFunctionDef *fd = s->cur_func;
@@ -71243,6 +71356,11 @@ static __exception int js_parse_program(JSParseState *s)
 
     if (next_token(s))
         return -1;
+
+    /* 20.2.1.1.1's source is not a Script and must not be parsed as one. The flag is cleared by PDS_FDECL
+       when it reaches the function expression, so it is read HERE while it still stands. */
+    if (s->fn_ctor_toplevel)
+        return js_parse_fn_ctor_source(s);
 
     if (js_parse_directives(s))
         return -1;
@@ -71513,9 +71631,12 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         fd->func_kind = JS_FUNC_ASYNC;
     }
     s->is_module = (m != NULL);
-    /* 20.2.1.1.1 does NOT evaluate the synthesized `(function anonymous(…){…})`: steps 25-28 parse it and then
-       OrdinaryFunctionCreate builds the function from the PARSED parameters and body with the global
-       environment. A named function EXPRESSION would additionally bind its own name in a scope of its own, and
+    /* 20.2.1.1.1 does NOT evaluate the synthesized `(function anonymous(…){…})`: steps 17-24 parse it — the
+       parameters, the body and the whole text, each against its own goal symbol — and step 28's
+       OrdinaryFunctionCreate then builds the function from the PARSED parameters and body with the global
+       environment step 26 names. (This said "steps 25-28 parse it", which is the prototype read, the two
+       environment steps and the create; the numbers were checked against the spec text rather than recalled.)
+       A named function EXPRESSION would additionally bind its own name in a scope of its own, and
        that binding does not exist here — `new Function("return typeof anonymous")()` is "undefined". The name
        stays in the source text, which is what [[SourceText]] and toString report. */
     s->fn_ctor_toplevel = (flags & JS_EVAL_FLAG_FUNCTION_CTOR) != 0;
@@ -77780,9 +77901,17 @@ static JSValue js_function_proto(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-/* 20.2.1.1.1 CreateDynamicFunction step 18's `prefix ( parameters ) { body }`, assembled from arguments that are
-   already STRINGS — so it runs nothing and cannot fail except on allocation. DYNSRC_PARAMS and DYNSRC_BODY are
-   the same assembly with the OTHER half empty; steps 17-20 parse each half on its own. */
+/* §20.2.1.1.1 CreateDynamicFunction step 15's sourceString — "the string-concatenation of prefix,
+   " anonymous(", paramString, 0x000A (LINE FEED), ") {", bodyParseString, and "}"", with step 14's
+   bodyParseString being the body between two LINE FEEDs. Assembled from arguments that are already STRINGS, so
+   it runs nothing and cannot fail except on allocation. (It was cited as step 18, which is the parameter
+   parse's throw; the number was checked against the spec text rather than recalled.)
+     THE ONE ADDITION IS THE PARENTHESES, and js_parse_fn_ctor_source is where that is argued: step 23 parses
+   sourceText as a FunctionExpression, this engine needs the VALUE the expression evaluates to, and a
+   parenthesised FunctionExpression pinned to end-of-input admits exactly the same texts.
+     DYNSRC_PARAMS and DYNSRC_BODY are the same assembly with the OTHER half empty — steps 17-20's "each is
+   valid alone" — and they are exact for the same reason: with the tail pinned, a half that closes the wrapper
+   has nowhere to put what follows. */
 enum { DYNSRC_ALL, DYNSRC_PARAMS, DYNSRC_BODY };
 
 static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, JSValue *strs, int n, int mode)
@@ -77820,7 +77949,12 @@ static JSValue js_dynfunc_source(JSContext *ctx, JSFunctionKindEnum func_kind, J
    21's NOTE says it is "to ensure that each is valid alone" — and that is the whole of what rejects a
    `new Function` whose two arguments are the two halves of one block comment, which parse only once
    concatenated. (These used to be cited as steps 20-23, which are the whole-source parse's throw and the two
-   NOTEs before it; the numbers were checked against the spec text rather than recalled.) Assembling each probe
+   NOTEs before it; the numbers were checked against the spec text rather than recalled.)
+     THESE PROBES ARE NOT WHAT REJECTS AN ESCAPE, and reading them as if they were is how one lived here: a
+   probe is the whole wrapper with the other half empty, so a half spelled `}); f(); ({` closes the wrapper and
+   satisfies the probe exactly as it satisfied the whole-source parse. What rejects it is
+   js_parse_fn_ctor_source's end-of-input, and that is also what makes these two probes EXACT — a half that
+   parses inside the pinned wrapper is a half that parses alone under its own goal symbol. Assembling each probe
    from the SAME builder is what gives the parameter list the right goal for the kind (a generator's [+Yield],
    an async function's [+Await]) with no second spelling of that mapping. Parsing runs none of the page's code,
    so this needs no trampoline — and it announces nothing at the @S seam, because §20.2.1.1.1 performs
@@ -77929,6 +78063,15 @@ static int js_dynfunc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
         created = true;
     }
     if (created) {
+        /* THE OTHER SIDE OF js_parse_fn_ctor_source'S REFUSAL. 20.2.1.1.1 returns an ECMAScript function
+           object, and the only reason the value this sub-sequence hands back is one is that step 23's goal
+           parse admits nothing but a FunctionExpression — so when that stopped being true, this returned
+           whatever the trailing source element evaluated to. It did: a body of `}); f(); ({` made
+           `new Function(...)` answer an OBJECT, with the page's `f()` already run. Asserted where the value
+           ARRIVES because a wrong one is a fact about the parse and not about anything below this line. */
+        DCHECK(JS_IsFunction(ctx, s->func),
+               "20.2.1.1.1's synthesized source evaluated to something that is not a function — step 23 parses "
+               "it as one FunctionExpression, so a second source element got past js_parse_fn_ctor_source");
         cb_result = JS_UNDEFINED;
         s->hdr.stage = DYNF_PROTO;
         /* The CALL form leaves new.target undefined, and the synthesized source already gave the function the
