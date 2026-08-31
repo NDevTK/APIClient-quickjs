@@ -23569,31 +23569,41 @@ static uint32_t step_fork_key(const char *op)
     return k ? k : 1u;   /* 0 is reserved for "nothing asked", which a zeroed header already reads as */
 }
 
-int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int real, int *parm)
+/* THE FORK'S ONE BODY, under both of the questions that use it — see JSStepHdr.fork_kind. `kind` is the only
+   thing that differs between an outcome fork and a ToBoolean, and it differs at exactly one line: which seam
+   the DRIVER asks. Everything else — the two phases, the borrowed operands, the ask key, the range check on
+   the answer — is one implementation, so the two questions cannot drift apart in their bookkeeping. */
+static int step_fork_ask(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int real,
+                         int kind, int *parm)
 {
     (void)ctx;
     if (h->fork_phase == FORK_PH_ASK) {
-        DCHECK(n >= 2, "a step machine declared an outcome fork with fewer than two feasible completions — a "
-                       "single completion is not a fork, it is the answer");
+        DCHECK(n >= 2, "a step machine declared a fork with fewer than two feasible completions — a single "
+                       "completion is not a fork, it is the answer");
         DCHECK(real == JS_OUTCOME_REAL_UNSTATED || (real >= 0 && real < n),
                "a step machine declared a REAL completion that is not one of the completions it declared "
                "feasible — `real` is a completion index or JS_OUTCOME_REAL_UNSTATED, and a third value is a "
                "machine answering a different question here (the arm a non-forking run takes is the NUMBERING "
                "rule above, not this)");
-        DCHECK(h->fork_op == NULL, "an outcome fork was asked for while another one's operands were still on "
-                                   "this machine's header");
+        DCHECK(h->fork_op == NULL, "a fork was asked for while another one's operands were still on this "
+                                   "machine's header");
+        DCHECK(kind == JS_FORK_KIND_OUTCOME || kind == JS_FORK_KIND_TOBOOL,
+               "a step machine's fork named neither of the two questions a fork can be — JS_FORK_KIND_NONE is "
+               "the driver's reset value and names nothing, so an ask carrying it is one that never said which "
+               "seam must answer it, and the driver would route a predicate to the wrong key space");
         h->fork_over = over;   /* BORROWED for the length of the request; the driver reads and resets it */
         h->fork_op = op;
         h->fork_n = n;
         h->fork_real = real;
+        h->fork_kind = (uint8_t)kind;
         /* WRITTEN ON EVERY ASK, including the sibling's first one: a clone carries the key of the ask it was
            forked at, and re-asking there overwrites it with the identical value. */
         h->fork_ask_key = step_fork_key(op);
         return JS_STEP_FORK;
     }
-    DCHECK(h->fork_phase == FORK_PH_ANSWERED, "a step machine's outcome fork resumed in no phase");
+    DCHECK(h->fork_phase == FORK_PH_ANSWERED, "a step machine's fork resumed in no phase");
     DCHECK(h->fork_ask_key == step_fork_key(op),
-           "an outcome fork's answer was delivered to a DIFFERENT question than the one that asked for it. The "
+           "a fork's answer was delivered to a DIFFERENT question than the one that asked for it. The "
            "machine resumed at a call site other than its outstanding ask, so the phase or stage it resumes on "
            "does not tell the two apart — the usual cause is an algorithm that DELEGATES to another one through "
            "the same phase byte while numbering its own phases in the same value space, which makes 'the inner "
@@ -23602,11 +23612,47 @@ int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *o
            "it here files one question's world as another's. Number a delegating algorithm's phases ABOVE the "
            "whole phase space of the one it delegates into");
     DCHECK(h->fork_arm >= 0 && h->fork_arm < n,
-           "the outcome fork answered with a completion this machine did not declare");
+           "the fork answered with an arm this machine did not declare — a completion it never numbered, or a "
+           "truth value that is neither true nor false");
     *parm = h->fork_arm;
     h->fork_phase = FORK_PH_ASK;   /* a machine may fork again — an iteration over unknown input does, per step */
     h->fork_arm = 0;
     h->fork_ask_key = 0;
+    return 0;
+}
+
+int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int real, int *parm)
+{
+    return step_fork_ask(ctx, h, over, op, n, real, JS_FORK_KIND_OUTCOME, parm);
+}
+
+/* §7.1.2 ToBoolean ( arg ) AS A STEP MACHINE'S OWN — see quickjs-step.h for the whole argument. */
+int step_tobool_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, const char *op, int *pres)
+{
+    int arm, r;
+
+    if (h->fork_phase == FORK_PH_ASK) {
+        /* THE SAME GATE branch_arm_fork PUTS IN FRONT OF THE BRANCH HOOK, and for the same reason: a concolic
+           is minted through exactly one entry (concolic_alloc → JS_NewObjectClass), so unknown input is always
+           an Object and nothing else can be. A value that is not one is answered by §7.1.2 itself with no
+           request, no round trip through the driver and no fork — which is what makes this a coercion with one
+           path rather than a choice between two. */
+        if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT || !g_concolic.is || !g_concolic.is(v)) {
+            *pres = JS_ToBool(ctx, v);
+            DCHECK(*pres == 0 || *pres == 1,
+                   "§7.1.2 ToBoolean answered neither true nor false for a value that is not unknown input — "
+                   "it answers -1 only for an exception, so a machine has handed its coercion a pending throw "
+                   "instead of the value its callback returned");
+            return 0;
+        }
+    }
+    /* n IS 2 AND `real` IS UNSTATED, and neither is a placeholder. A truth has exactly two completions; and the
+       arm a real session takes is computed by the BRANCH seam out of the condition's own example (that is what
+       decide_real_arm is), so a machine stating one here would be a second, weaker answer to a question the
+       seam already answers from the value itself. */
+    r = step_fork_ask(ctx, h, v, op, 2, JS_OUTCOME_REAL_UNSTATED, JS_FORK_KIND_TOBOOL, &arm);
+    if (r) return r;
+    *pres = arm;
     return 0;
 }
 
@@ -28111,6 +28157,16 @@ typedef struct JSArrayEvery {
     JSValue ta_dest;      /* filter|TA: the species-created destination, held across the per-element stores (owned) */
     JSValue def_val;      /* the element being WRITTEN into the result, held across the write (owned) */
     int64_t def_k;        /* its index — captured, because filter's n advances once and the write can suspend */
+    /* WHAT THE CALLBACK RETURNED, held across the ToBoolean — `testResult` in 23.1.3.6/23.1.3.29 step 5.3.2 and
+       `selected` in 23.1.3.8 step 7.3.2. It is ON THE STATE and not in a C local because §7.1.2 over UNKNOWN
+       input is a FORK: the machine returns JS_STEP_FORK, the driver snapshots it, and the sibling resumes at
+       the same ask — which it can only do if the operand it is about came with the snapshot. `visit` carries
+       it; a local would leave the sibling asking about nothing. (owned)
+       JS_UNINITIALIZED IS "no coercion in flight" AND JS_UNDEFINED IS NOT, because `undefined` is an ordinary
+       thing for a predicate to return and is precisely the falsy value the coercion exists to answer for. It is
+       the same sentinel park_in and unknown_operand use, for the same reason and with the same consequence:
+       UNINITIALIZED is not refcounted, so `visit` needs no test for the absent case. */
+    JSValue test;
 } JSArrayEvery;
 /* Array iteration builtins (forEach/map/every/some/filter) drive a JS callback from a C loop — the
    CONTINUATION-HOLDING re-entrant. They are a step machine, so that drive runs on the tramp chain: each callback
@@ -35458,46 +35514,69 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto do_step_step;
                 }
                 if (st == JS_STEP_FORK) {
-                    /* AN OUTCOME FORK. The machine's completion depends on UNKNOWN input and is one of N
-                       feasible ones. It cannot pick — picking DELETES the other arm — and neither can this
-                       driver: the arm belongs to the flow's DECISION VECTOR, which is why a sibling parked
-                       today and resumed next session takes the same one.
+                    /* A FORK. The machine's next step depends on UNKNOWN input and has more than one feasible
+                       answer. It cannot pick — picking DELETES the other arm — and neither can this driver: the
+                       arm belongs to the flow's DECISION VECTOR, which is why a sibling parked today and
+                       resumed next session takes the same one.
                        What this does is the half the machine cannot: it SNAPSHOTS the flow AT the machine, so
-                       the sibling RESUMES here holding the other outcome. Nothing is replayed. */
+                       the sibling RESUMES here holding the other answer. Nothing is replayed.
+                       TWO QUESTIONS SHARE EVERY LINE OF THIS AND DIVERGE AT ONE — see JSStepHdr.fork_kind. An
+                       OUTCOME asks which of the machine's own declared completions this run reaches, and is
+                       keyed by (operand, operation, completion). A ToBoolean asks whether one value is truthy,
+                       and is keyed by the VALUE'S OWN branch identity, because it is the same predicate `if (p)`
+                       asks about — one gate however the page spelled it, and the seam that owns it is the one
+                       that records the pin, the excluded token, the bound and the call predicate. */
                     JSValueConst fover = h->fork_over;
                     const char *fop = h->fork_op;
                     int fn = h->fork_n, freal = h->fork_real, harm;
+                    int fkind = h->fork_kind;
                     /* read + reset BEFORE the snapshot, like every other request input — a clone taken with the
                        operands still on it would carry a borrowed pointer into a flow it does not belong to.
                        `fork_real` resets to the SENTINEL and not to 0: 0 is a completion, so a stale zero would
-                       be a claim about a real session that no machine made. */
+                       be a claim about a real session that no machine made. `fork_kind` resets to NONE for
+                       exactly that reason: a stale kind would route the next ask that forgot to state one. */
                     h->fork_over = JS_UNDEFINED; h->fork_op = NULL; h->fork_n = 0;
                     h->fork_real = JS_OUTCOME_REAL_UNSTATED;
+                    h->fork_kind = JS_FORK_KIND_NONE;
                     DCHECK(freal == JS_OUTCOME_REAL_UNSTATED || (freal >= 0 && freal < fn),
-                           "an outcome fork reached the driver with a REAL completion outside the ones its "
+                           "a fork reached the driver with a REAL completion outside the ones its "
                            "machine declared — the ask asserts this too, so a value that only fails HERE is a "
                            "STALE one read off a state whose last request was never reset, which is the one "
                            "failure the sentinel-reset above exists to make impossible");
+                    DCHECK(fkind == JS_FORK_KIND_OUTCOME || fkind == JS_FORK_KIND_TOBOOL,
+                           "a fork reached the driver naming neither question — the ask asserts this too, so a "
+                           "kind that only fails HERE is a STALE one read off a state whose last fork was never "
+                           "reset, and this driver would answer a predicate out of the wrong key space");
                     DCHECK(h->fork_phase == FORK_PH_ASK,
-                           "an outcome fork was decided while an answer to a previous one was still outstanding");
-                    harm = g_flow_control.outcome ? g_flow_control.outcome(ctx, fover, fop, fn, freal) : -1;
-                    if (harm < 0)
-                        harm = 0;   /* no forking policy (the @S candidate re-fire): ONE concrete path down the
-                                       machine's outcome 0, which is what that numbering means — exactly as a
-                                       declined `branch` leaves the interpreter taking the ordinary arm */
+                           "a fork was decided while an answer to a previous one was still outstanding");
+                    if (fkind == JS_FORK_KIND_TOBOOL) {
+                        /* THE BRANCH HOOK, ASKED WITH THE OPERAND RAW, exactly as branch_arm_fork asks it from
+                           OP_if_false: the seam reads the value's own branch identity and polarity, so `if (p)`
+                           and a predicate returning `p` into `filter` are ONE constraint entry. */
+                        harm = g_flow_control.branch ? g_flow_control.branch(ctx, fover) : -1;
+                        if (harm < 0)
+                            harm = JS_ToBool(ctx, fover);   /* no forking policy (the @S candidate re-fire): the
+                                                               ordinary §7.1.2, which is what OP_if_false falls
+                                                               through to when the same hook declines */
+                    } else {
+                        harm = g_flow_control.outcome ? g_flow_control.outcome(ctx, fover, fop, fn, freal) : -1;
+                        if (harm < 0)
+                            harm = 0;   /* no forking policy (the @S candidate re-fire): ONE concrete path down
+                                           the machine's outcome 0, which is what that numbering means */
+                    }
                     if (harm & 0x100) {
                         TrampFrame *ftf;
                         JSValue *cl;
                         harm &= 0xff;
                         if (gen_state == NULL)
-                            DFAIL("an outcome fork in a NON-coroutine activation (gen_state NULL): its C entry "
-                                  "never became a flow base — route that caller onto the tramp chain");
+                            DFAIL("a step machine's fork in a NON-coroutine activation (gen_state NULL): its C "
+                                  "entry never became a flow base — route that caller onto the tramp chain");
                         if (gen_state != g_flow_base_gen)
-                            DFAIL("an outcome fork inside a coroutine activation that is not the flow base — "
+                            DFAIL("a step machine's fork inside a coroutine activation that is not the flow base — "
                                   "give that resume path a resume-as-flow driver; a sibling snapshotted here "
                                   "would be rebuilt against the wrong base");
                         DCHECK(g_flow_control.fork != NULL,
-                               "a forking outcome policy with no fork hook to build the sibling from its clone");
+                               "a forking policy with no fork hook to build the sibling from its clone");
                         STEP_ANCHOR_NEW(ftf);
                         ftf->cont_state = stt; ftf->cont_kind = CONT_STEP_YIELD;
                         /* the CURRENT frame's resume point, exactly as do_preempt records it. The sibling's
@@ -35509,14 +35588,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            resume without. Held only across the clone: the PARENT is running, so the completion
                            it parked with is handed straight back to it below. */
                         DCHECK(JS_IsUninitialized(h->park_in) && JS_IsUninitialized(h->park_exc),
-                               "an outcome fork found the driver already owing this machine a parked delivery");
+                               "a fork found the driver already owing this machine a parked delivery");
                         h->park_in = JS_UNDEFINED;
                         h->park_exc = rt->current_exception;
                         rt->current_exception = JS_UNINITIALIZED;
                         gen_state->tramp_top = ftf;
                         cl = JS_FlowClone(ctx, (JSValue *)gen_state);
-                        CHECK(cl != NULL, "the outcome fork could not snapshot the flow — the other completion "
-                                          "would be dropped, and the frontier never drops a work item");
+                        CHECK(cl != NULL, "the fork could not snapshot the flow — the other arm would be "
+                                          "dropped, and the frontier never drops a work item");
                         g_flow_control.fork(ctx, cl);
                         gen_state->tramp_top = NULL;   /* the parent's chain is live in tf_top, never stashed */
                         sf->cur_sp = NULL;             /* running again */
@@ -83251,7 +83330,7 @@ static const char *const js_ta_filter_steps[] = {
 static int js_array_every_recv(JSContext *ctx, JSArrayEvery *s)
 {
     s->obj = JS_UNDEFINED; s->ret = JS_UNDEFINED; s->val = JS_UNDEFINED; s->def_val = JS_UNDEFINED;
-    s->ta_dest = JS_UNDEFINED;
+    s->ta_dest = JS_UNDEFINED; s->test = JS_UNINITIALIZED;
     s->len = 0; s->k = 0; s->n = 0; s->def_k = 0; s->special = s->hdr.arg; s->pending_k = -1;
     if (s->special & special_TA) {
         s->obj = js_dup(s->hdr.this_val);
@@ -83318,6 +83397,13 @@ static int js_array_every_seed(JSContext *ctx, JSArrayEvery *s, JSValue in,
    captured invocation, plus the loop's index, so none of them is visited. `ret` is visited here and the teardown
    below hands it out instead when the machine SUCCEEDED, which is the one thing a completion knows that this
    declaration cannot. */
+/* THE ASK'S IDENTITY ON THIS MACHINE — step_tobool_run's `op`, which is NOT the constraint key. The key is the
+   coerced value's own branch identity, so two elements ask two questions and a predicate the flow already fixed
+   is not asked twice; this string exists only so that an answer cannot be consumed at a call site other than
+   the one that asked. This walk performs exactly ONE ToBoolean, in every one of the six algorithms that share
+   it, so one string names it and there is no per-algorithm step number to get wrong. */
+#define ACB_TEST_OP "ToBoolean of the callback's result"
+
 static void js_array_every_visit(JSContext *ctx, void *st, JSStepVisit *v)
 {
     JSArrayEvery *s = st;
@@ -83326,6 +83412,7 @@ static void js_array_every_visit(JSContext *ctx, void *st, JSStepVisit *v)
     v->val(ctx, &s->obj);
     v->val(ctx, &s->def_val);
     v->val(ctx, &s->ta_dest);
+    v->val(ctx, &s->test);
 }
 
 /* every/some/forEach/map/filter (and their TypedArray twins) as a STEP builtin. js_array_every was ALREADY split
@@ -83400,20 +83487,56 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
             *out_cb = s->cb_args; *out_argc = 3;
             return JS_STEP_CALL;
 
-        case ACB_CALL:
+        case ACB_CALL: {
+            /* 23.1.3.6 / 23.1.3.29 step 5.3.2's `testResult` and 23.1.3.8 step 7.3.2's `selected`: the SAME
+               STEP that calls the predicate also coerces what it returned, which is why this is not a stage of
+               its own. §7.1.2 ToBoolean over UNKNOWN external input is a FORK — `arr.filter(x => x.isAdmin)`
+               over a collection this run has no values for has two feasible answers per element, and the
+               coercion answers `true` for every one of them at §7.1.2 step 4, because a concolic rides an Object.
+               That is not a coarse answer, it is a DECIDED one: every element kept, no sibling, nothing to say
+               so. step_tobool_run asks the BRANCH seam, which is the same constraint entry `if (x.isAdmin)`
+               would file, so a flow that already fixed the predicate does not fork twice over it and the gate
+               reaches the report as a domain rather than as silence. */
+            int testres = 0;
+            switch (s->special & ~special_TA) {
+            case special_every:
+            case special_some:
+            case special_filter:
+                if (JS_IsUninitialized(s->test)) {
+                    s->test = cb_result;   /* ownership moves to the state, which the fork's snapshot carries */
+                } else {
+                    /* a re-entry of an outstanding coercion — this flow's own answer arriving, or a SIBLING
+                       resuming at the ask it was forked from. Either way the driver places nothing, and the
+                       operand it is about is already on the state. */
+                    DCHECK(JS_IsUndefined(cb_result),
+                           "the callback-result coercion was re-entered with a VALUE placed on it while the "
+                           "operand it is coercing is still held — the driver re-enters a forked machine with "
+                           "undefined, so a value here is a second callback completion delivered to a machine "
+                           "that never asked for one, and the first would be the one that leaked");
+                    JS_FreeValue(ctx, cb_result);
+                }
+                cb_result = JS_UNDEFINED;
+                r = step_tobool_run(ctx, &s->hdr, s->test, ACB_TEST_OP, &testres);
+                if (r) return r < 0 ? -1 : r;
+                JS_FreeValue(ctx, s->test); s->test = JS_UNINITIALIZED;
+                break;
+            default:
+                break;   /* forEach discards its result and map keeps it whole — neither asks §7.1.2 */
+            }
+            /* ONLY NOW, because everything above can suspend and a fork re-enters at the top of this stage: a
+               cursor advanced before the coercion resolved would be advanced again by the resume, and the
+               sibling would be snapshotted having already consumed the element it has not tested yet. */
             s->def_k = s->pending_k;
             s->pending_k = -1;
             s->hdr.stage = ACB_HAS;
             switch (s->special) {
             case special_every:
             case special_every | special_TA:
-                /* the result is CONSUMED by the coercion, so the local must stop naming it before any exit —
-                   walk_done releases whatever it still holds. */
-                if (!JS_ToBoolFree(ctx, cb_result)) { cb_result = JS_UNDEFINED; s->ret = JS_FALSE; goto walk_done; }
+                if (!testres) { s->ret = JS_FALSE; goto walk_done; }
                 break;
             case special_some:
             case special_some | special_TA:
-                if (JS_ToBoolFree(ctx, cb_result)) { cb_result = JS_UNDEFINED; s->ret = JS_TRUE; goto walk_done; }
+                if (testres) { s->ret = JS_TRUE; goto walk_done; }
                 break;
             case special_map:
             case special_map | special_TA:
@@ -83423,11 +83546,10 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
                 continue;
             case special_filter:
             case special_filter | special_TA:
-                if (JS_ToBoolFree(ctx, cb_result)) {
+                if (testres) {
                     s->def_k = s->n++;
                     s->def_val = js_dup(s->val);
                     s->hdr.stage = ACB_WRITE;
-                    cb_result = JS_UNDEFINED;
                     continue;
                 }
                 break;
@@ -83437,8 +83559,9 @@ static int js_array_every_vstep(JSContext *ctx, void *st, JSValue cb_result, JSV
             }
             JS_FreeValue(ctx, s->val);
             s->val = JS_UNDEFINED;
-            cb_result = JS_UNDEFINED;   /* the switch above consumed it on every arm */
+            cb_result = JS_UNDEFINED;   /* the two switches above consumed it on every arm */
             continue;
+        }
 
         case ACB_WRITE:
             if (s->special == (special_map | special_TA)) {

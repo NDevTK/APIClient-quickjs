@@ -398,6 +398,13 @@ typedef struct JSTrampStepDef {
         return (undeclared);                                                                            \
     } while (0)
 
+/* THE TWO QUESTIONS A STEP MACHINE'S FORK CAN BE — see JSStepHdr.fork_kind for why they are two and what is
+   lost by collapsing them into one. NONE is the reset value and names no question, so a fork that reaches the
+   driver carrying it is an ask that never stated which it was. */
+#define JS_FORK_KIND_NONE     0
+#define JS_FORK_KIND_OUTCOME  1
+#define JS_FORK_KIND_TOBOOL   2
+
 typedef struct JSStepHdr {
     const JSTrampStepDef *def;
     /* THE RUNTIME'S CENSUS OF LIVE MACHINES — the same accounting gc_obj_list gives every GC object, given to
@@ -530,6 +537,22 @@ typedef struct JSStepHdr {
     int          fork_real;
     int          fork_arm;
     uint8_t      fork_phase;
+    /* WHICH QUESTION THIS FORK IS — the machine's ALGORITHM asking which of its own completions it reaches
+       (JS_FORK_KIND_OUTCOME, step_fork_run), or §7.1.2 ToBoolean asking whether one VALUE is truthy
+       (JS_FORK_KIND_TOBOOL, step_tobool_run). The two share every line of the fork's bookkeeping and the
+       driver's whole snapshot, and they differ in exactly one thing: WHICH SEAM ANSWERS.
+       THAT IS NOT A DETAIL OF PLUMBING, IT IS THE CONSTRAINT KEY. A ToBoolean is the SAME PREDICATE the
+       interpreter's own `if` asks about — `if (p)`, `if (!p)`, `Boolean(p)` and a callback returning `p` into
+       `filter` are ONE gate, keyed by the value's own branch identity — so routing it to the outcome seam
+       would file a SECOND, independent entry over one predicate, and a flow that had already fixed `p` would
+       fork again and then stand on two arms that contradict each other. It would also record NONE of what a
+       branch records: no CONCRETIZE-ON-PIN, no excluded token, no `{int>5}` bound and no `{startsWith:/api}`
+       call predicate, so a report would print an unconstrained parameter where the page had gated one.
+       It is a ROUTING question and never a fallback selector: delete either seam and the other still has to be
+       asked, because they are two questions and not two implementations of one.
+       JS_FORK_KIND_NONE is what the driver RESETS it to, for `fork_real`'s reason exactly — a stale kind would
+       read as a positive claim at the next ask that forgot to state one, and both asks state it always. */
+    uint8_t      fork_kind;
     /* WHICH QUESTION THE OUTSTANDING ANSWER BELONGS TO — the identity of the ask, so that the answer cannot be
        consumed by a DIFFERENT call site. `fork_arm` alone says nothing about which fork it answers, and every
        machine declares n == 2, so an answer delivered to the wrong ask passes every check there was: it is a
@@ -1054,6 +1077,58 @@ JS_EXTERN int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj
  * resume land back on the ask, which re-derives the same arm from the flow's decision vector. */
 JS_EXTERN int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int real,
                             int *parm);
+
+/* §7.1.2 ToBoolean ( arg ) AS A STEP MACHINE'S OWN, which is what a C builtin that branches on what the
+ * page's callback returned is performing. `arr.filter(x => x.isAdmin)` over a collection whose fields are
+ * unknown external input has TWO feasible answers per element, and §7.1.2 decides neither of them: its steps
+ * answer from the value's TYPE, an unknown rides an ordinary Object, and step 4 returns true for every one. So
+ * the coercion did not answer the question coarsely, it DECIDED it — every element kept, no fork, nothing to
+ * say so, and the rule that both arms run wherever the domain permits both of them false of the commonest
+ * predicate a real bundle writes. It is the identical defect the `!` operator had, one layer out: a coercion
+ * that answers from the REPRESENTATION deletes an arm silently, wherever it is performed.
+ *
+ * THE ANSWER IS THE BRANCH SEAM AND NOT THE OUTCOME SEAM, and that is the whole of the design — see
+ * JSStepHdr.fork_kind. A ToBoolean is the same predicate `if (p)` asks about, so it is keyed by the VALUE'S OWN
+ * branch identity and it records what a branch records (the pin, the excluded token, the bound, the call
+ * predicate). The outcome seam keys by (operand, OPERATION, completion), which is right for a machine asking
+ * which of ITS completions it reaches and wrong here twice over: it would fork a second time over a predicate
+ * the flow may already have fixed, and it would file a domain-less shape for a parameter the page had gated.
+ *
+ * IT IS NOT A SECOND SPELLING OF JSConcolicHooks.to_bool, WHICH MINTS A VALUE. `to_bool` exists because a
+ * program HOLDS the boolean (`var q = !p`), so `!p` needs an identity of its own or `"" + !p` and `"" + p`
+ * compose to one derivation. A machine that only needs a C `int` to branch on holds no value and mints none —
+ * exactly as OP_if_false hands its operand straight to the branch hook while OP_lnot is the one that mints.
+ *
+ * `op` NAMES THE ASK ON THIS MACHINE AND IS NOT THE CONSTRAINT KEY. The key is the operand's, above; this is
+ * what `fork_ask_key` hashes, so a machine with two ToBoolean asks cannot consume one's answer at the other's
+ * call site. A machine with one ask names its coercion and is done.
+ *
+ * `v` is BORROWED for the length of the request, exactly as step_fork_run's `over` is, so the caller must hold
+ * it somewhere THE SNAPSHOT CARRIES — its own state, reached by its `visit` — and not in a C local. A value
+ * that is not unknown input is answered HERE with the ordinary §7.1.2 and no fork, which is why this has no
+ * predicate at its call sites: there is no second path for one to select.
+ *
+ * Returns JS_STEP_FORK (the caller returns it; the state must be complete-or-empty, since the sibling's
+ * snapshot is taken there), or 0 once *pres is 0 or 1.
+ *
+ * RESIDUAL — WHAT IS NOT COVERED. The array-callback walk (every/some/filter and their %TypedArray% twins) is
+ * the only consumer. Every other C body that coerces a value the PAGE produced still answers from §7.1.2's own
+ * steps and therefore takes `true` for unknown input: the Array find family (find/findIndex/findLast/
+ * findLastIndex), the Iterator helper `filter` predicate, the eager iterator terminals (`some`/`every`/`find`
+ * over an iterator), and the internal-method booleans a Proxy trap returns ([[Has]], [[Set]],
+ * [[DefineOwnProperty]], [[PreventExtensions]], [[SetPrototypeOf]], [[IsExtensible]]).
+ *
+ * WHAT THE NEXT DIFF BUILDS. The find family alone is routable as this one was: its state begins with a
+ * JSStepHdr, so it needs a held-operand field of its own (JSArrayEvery.test's shape and sentinel) and its
+ * predicate-test branch calling this. The two ITERATOR families are NOT — their records carry no JSStepHdr at
+ * all, so they have no fork seam to reach and the diff that covers them is the one that gives them one; naming
+ * them here without that distinction would send the next reader to add a call where there is no header to pass.
+ *
+ * HOW ITS ABSENCE WOULD SHOW. `[{}].find(x => x.isAdmin)` over unknown input answers with the element and
+ * forks nothing, where the same predicate written as `for (…) if (x.isAdmin)` forks two worlds — one builtin
+ * and its hand-written equivalent disagreeing about the same program, which is exactly the divergence the
+ * solver differential is built to fail on. */
+JS_EXTERN int step_tobool_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, const char *op, int *pres);
 
 /* ToString AS A REQUEST — the coercion nearly every Web IDL argument actually is. `DOMString type`,
    `DOMString name`, `DOMString selector`: each is ToString on whatever the page passed, so
