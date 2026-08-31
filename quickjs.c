@@ -92266,6 +92266,20 @@ static JSValue js_boolean_ctor_body(JSContext *ctx, JSValueConst obj_, int argc,
                   "decide every gate behind it concretely");
             return g_concolic.to_bool(ctx, argv[0], 0);   /* step 2: the call form IS the primitive */
         }
+        /* RESIDUAL — THE WRAPPER IS DERIVED, NOT BUILT, so `new Boolean(unknown)` is an unknown and not a
+           Boolean exotic object. It is a residual and not an assert because this arm is CORRECT for what it
+           does: the alternative is storing a concrete `true` in [[BooleanData]], which decides the value the
+           whole diff above exists to keep undecided, and there is nothing to crash on — the operand is
+           handled, just more coarsely than §20.3.1 describes.
+             WHAT IS NOT COVERED: step 4's [[BooleanData]] holding an unknown. js_thisBooleanValue reads that
+             slot by TAG, so an unknown in it has no representation the wrapper's own members can read back.
+             WHAT THE NEXT DIFF BUILDS: the primitive-example wrapper surface — the same one the concolic
+             class's [[OwnPropertyKeys]] already DFAILs for by name when an unknown whose example is a STRING
+             is asked to enumerate itself. One surface answers both, because both are the same question: what
+             a wrapper over an unknown primitive exposes.
+             HOW ITS ABSENCE WOULD SHOW: `new Boolean(x) instanceof Boolean` is false and
+             `Object.prototype.toString.call(new Boolean(x))` is not "[object Boolean]", for an `x` this
+             engine minted as unknown — where the same two expressions over any concrete `x` answer normally. */
         c = js_concolic_derive(ctx, argv[0], "new Boolean", JS_UNDEFINED);
         DCHECK(!JS_IsUninitialized(c),
                "new Boolean(unknown external input) declined an operand this engine had already recognised as "
