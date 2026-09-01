@@ -1997,8 +1997,10 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val);
    assertion, and an intermediate that re-captured would name the one site that is never the answer. The `At`
    entries below take the site as an argument and pass it ON; only a macro ever captures.
    §7.1.14 ToUint8Clamp ( arg ) and JS_ToArrayLengthFree are in the family because both fall through to §7.1.4
-   ToNumber ( arg ) for the non-numeric case; §7.1.15 ToBigInt ( arg ) is NOT, because it reaches §7.1.1
-   ToPrimitive ( input [ , preferredType ] ) without passing through that assertion at all. */
+   ToNumber ( arg ) for the non-numeric case. §7.1.15 ToBigInt ( arg ) does NOT fall through to §7.1.4 — its
+   step 1 reaches §7.1.1 ToPrimitive ( input [ , preferredType ] ) directly — so it is a SECOND boundary with
+   its own assertion rather than a caller of the one above, and it carries a site for exactly the same reason:
+   see the block below and JS_ToBigIntFreeAt's object arm. */
 static int JS_ToInt32FreeAt(JSContext *ctx, int32_t *pres, JSValue val,
                             const char *file, int line);
 #define JS_ToInt32Free(ctx, pres, val) \
@@ -2061,6 +2063,26 @@ static __exception int JS_ToLengthFreeAt(JSContext *ctx, int64_t *plen, JSValue 
                                          const char *file, int line);
 #define JS_ToLengthFree(ctx, plen, val) \
     JS_ToLengthFreeAt((ctx), (plen), (val), __FILE__, __LINE__)
+/* §7.1.15 ToBigInt ( arg )'s OWN FAMILY, and it carries a site for the same reason the numeric one above does,
+   against an assertion of its own rather than that one's. This is a SECOND boundary, not a caller of the first:
+   §7.1.15's step 1 is `? ToPrimitive(arg, number)` and its step 2 reads Table 12, so nothing in it passes
+   through §7.1.4 ToNumber ( arg ) and JS_ToNumberHintFree's object arm never sees it. §7.1.17 ToBigInt64 ( arg )
+   and §7.1.18 ToBigUint64 ( arg ) are in the family because their step 1 is `? ToBigInt(arg)`.
+   The site is threaded for a HARDER failure than the numeric side's, not a milder one — see the object arm of
+   JS_ToBigIntFreeAt for what happens without the assertion there. Every internal spelling is a MACRO so a
+   caller written as `JS_ToBigInt64Free(ctx, &v, val)` names ITS line; the `At` entries take the site as an
+   argument and pass it ON, and only a macro ever captures. The public §7.1.17 / §7.1.18 spellings are declared
+   the same way over in quickjs.h. */
+static JSValue JS_ToBigIntFreeAt(JSContext *ctx, JSValue val, const char *file, int line);
+#define JS_ToBigIntFree(ctx, val) \
+    JS_ToBigIntFreeAt((ctx), (val), __FILE__, __LINE__)
+static JSValue JS_ToBigIntAt(JSContext *ctx, JSValueConst val, const char *file, int line);
+#define JS_ToBigInt(ctx, val) \
+    JS_ToBigIntAt((ctx), (val), __FILE__, __LINE__)
+static int JS_ToBigInt64FreeAt(JSContext *ctx, int64_t *pres, JSValue val,
+                               const char *file, int line);
+#define JS_ToBigInt64Free(ctx, pres, val) \
+    JS_ToBigInt64FreeAt((ctx), (pres), (val), __FILE__, __LINE__)
 static JSValue JS_ToPropertyKeyInternal(JSContext *ctx, JSValueConst val,
                                         int flags, const char *file, int line);
 static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len);
@@ -2101,7 +2123,6 @@ static void array_dense_truncate(JSContext *ctx, JSObject *p, uint32_t len, bool
 static int array_grow_dense_to(JSContext *ctx, JSObject *p, uint32_t idx);
 static void set_fast_array_element(JSContext *ctx, JSObject *p, uint32_t idx, JSValue val);
 static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom, bool as_slot);
-static int JS_ToBigInt64Free(JSContext *ctx, int64_t *pres, JSValue val);
 static JSValue JS_ThrowStackOverflow(JSContext *ctx);
 static JSValue JS_ThrowTypeErrorRevokedProxy(JSContext *ctx);
 static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj);
@@ -16782,8 +16803,11 @@ static void js_why_backtrace(JSContext *ctx, char *dst, size_t n)
    so a boundary that can only name the VALUE sends them to search every edge that could have taken it.
    HINT STRING therefore cannot arrive here at all: §7.1.19 ToString ( arg ) step 10 is its ONE caller and it
    now asserts before the hop. What still arrives HERE is the NUMERIC half — an operator's or a builtin's
-   ToNumber/ToNumeric-side coercion (7.1.4 ToNumber, 7.1.13 ToBigInt, 13.15.3's `+`, a relational or a loose
-   equality) called straight from C without being routed to the trampoline. */
+   ToNumber/ToNumeric-side coercion (§7.1.4 ToNumber ( arg ), 13.15.3's `+`, a relational or a loose equality)
+   called straight from C without being routed to the trampoline. §7.1.15 ToBigInt ( arg ) is NOT among them
+   any more: it asserts one frame earlier, in JS_ToBigIntFreeAt's object arm, which names the asking file:line
+   exactly as the two string-side boundaries above do. (It was listed here as "7.1.13 ToBigInt", and §7.1.13 is
+   ToUint8 ( arg ) — a number that sent a reader to the wrong operation.) */
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
 {
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
@@ -19041,8 +19065,12 @@ int JS_ToInt64At(JSContext *ctx, int64_t *pres, JSValueConst val,
 int JS_ToInt64ExtAt(JSContext *ctx, int64_t *pres, JSValueConst val,
                     const char *file, int line)
 {
+    /* BOTH ARMS FORWARD the caller's site; this wrapper is an intermediate and is never the answer. Note which
+       arm an UNKNOWN takes: JS_IsBigInt is a pure tag test for JS_TAG_BIG_INT / JS_TAG_SHORT_BIG_INT and a
+       concolic is JS_TAG_OBJECT, so an unknown here takes the NUMERIC arm and asserts in JS_ToNumberHintFree,
+       never §7.1.15's. */
     if (JS_IsBigInt(val))
-        return JS_ToBigInt64(ctx, pres, val);
+        return JS_ToBigInt64At(ctx, pres, val, file, line);
     else
         return JS_ToInt64At(ctx, pres, val, file, line);
 }
@@ -20075,11 +20103,21 @@ static JSValue JS_StringToBigIntErr(JSContext *ctx, JSValue val)
     return val;
 }
 
-/* JS Numbers are not allowed */
-static JSValue JS_ToBigIntFree(JSContext *ctx, JSValue val)
+/* JS Numbers are not allowed.
+   §7.1.15 ToBigInt ( arg ) — "It converts arg to a BigInt value, or throws if an implicit conversion from
+   Number would be required." Its step 1 is `? ToPrimitive(arg, number)` and its step 2 reads Table 12, so this
+   function is a CONVERSION BOUNDARY in the same sense JS_ToNumberHintFree is: every caller needs a real BigInt
+   back, and it reaches §7.1.4 ToNumber ( arg ) at no point, which is why the assertion that boundary carries
+   does not cover this one and this one needs its own. */
+static JSValue JS_ToBigIntFreeAt(JSContext *ctx, JSValue val, const char *file, int line)
 {
     uint32_t tag;
 
+    (void)file; (void)line;
+    DCHECK(file != NULL,
+           "a §7.1.15 ToBigInt coercion reached JS_ToBigIntFreeAt with no call site — every public and internal "
+           "spelling is a macro that captures __FILE__/__LINE__, so a NULL means a caller was written against "
+           "a raw `At` entry and the assertion in the object arm below would name nothing");
  redo:
     tag = JS_VALUE_GET_NORM_TAG(val);
     switch(tag) {
@@ -20101,6 +20139,85 @@ static JSValue JS_ToBigIntFree(JSContext *ctx, JSValue val)
             return val;
         goto redo;
     case JS_TAG_OBJECT:
+        /* THE CONVERSION CONTRACT, AND THE ONE PLACE IN THE FAMILY WHERE BREAKING IT DOES NOT PRODUCE A WRONG
+           ANSWER BUT NO ANSWER AT ALL. The twin in JS_ToNumberHintFree's object arm states the rule: a CONCOLIC
+           must never reach a conversion boundary, because opacity has to SURVIVE the coercion or the value stops
+           forking control flow, and this boundary owes C a real BigInt that a concolic cannot be.
+           WITHOUT THIS TEST THE FUNCTION DOES NOT RETURN. §7.1.1 ToPrimitive over an unknown is the IDENTITY —
+           JS_ToPrimitiveFree hands a concolic straight back, and it does so from BELOW its own
+           `tag != JS_TAG_OBJECT` early return, so the value it returns is JS_TAG_OBJECT by construction. The
+           `goto redo` below then re-reads the same tag off the same value and calls the same function, with no
+           allocation, no free and no interpreter check anywhere in the cycle. That is not a slow path: it is a
+           non-terminating loop inside ONE C activation, which is the shape CLAUDE.md records from the
+           self-jump incident — the interpreter never regains control, the flow cannot be preempted, no sibling
+           runs, no document interleaves, and the cooperative quantum's timer raises a bit nothing will ever
+           poll. It presents as a performance problem and is not one.
+           SO THE TEST IS BEFORE THE HOP, NOT AFTER IT. Asserted at the origin, where the unknown is still
+           distinguishable from the plain object the hop would return; and asserted HERE rather than at the
+           coercion sites because this is the one place all of them funnel into — but the SITE is an argument
+           and not this function's own __LINE__, for the reason the twin gives: one assert below every
+           §7.1.15 / §7.1.17 / §7.1.18 spelling in the engine and the host can state the RULE and could not
+           state the ADDRESS. In release the DCHECK is gone and the throw is what keeps it from looping. */
+        if (unlikely(js_value_is_concolic(val))) {
+#if APICLIENT_DEV
+            {
+                /* Sized as the twin is, and for the same reason: the frames are the last field and the only one
+                   that names the CALL SITE, so a message that outgrows the buffer truncates exactly the half a
+                   reader needs. key_name answers the concolic's own display form as a real String and runs no
+                   page code. */
+                char why[6144];
+                char frames[2048];
+                char shbuf[256];
+                JSValue sv = JS_UNINITIALIZED;
+
+                snprintf(shbuf, sizeof shbuf, "%s", "(a shape this engine could not spell)");
+                if (g_concolic.key_name) {
+                    sv = g_concolic.key_name(ctx, val);
+                    if (JS_IsString(sv)) {
+                        const char *s = JS_ToCString(ctx, sv);
+                        if (s) { js_why_sanitize(shbuf, sizeof shbuf, s); JS_FreeCString(ctx, s); }
+                    }
+                }
+                JS_FreeValue(ctx, sv);
+                js_why_backtrace(ctx, frames, sizeof frames);
+                snprintf(why, sizeof why,
+                         "§7.1.15 ToBigInt ( arg ) at %s:%d over UNKNOWN EXTERNAL INPUT `%.240s`. This arrival "
+                         "is a HANG and not a wrong number: §7.1.15 step 1 is `? ToPrimitive(arg, number)`, "
+                         "§7.1.1 ToPrimitive ( input [ , preferredType ] ) over an unknown is the IDENTITY, and "
+                         "this switch re-dispatches on the tag it gets back — so converting here is an "
+                         "unbounded loop in one C activation that no preempt, no quantum and no sibling flow "
+                         "can interrupt. Do NOT convert. "
+                         "WHO SHOULD HAVE ANSWERED FIRST: an ECMAScript OPERATOR over an unknown answers at its "
+                         "own site with a derived concolic (.add for 13.15.3's `+`, .cmp, .rel, .arith for the "
+                         "update operators, 13.7's multiplicative family, 13.9 Bitwise Shift Operators and "
+                         "13.12 Binary Bitwise Operators), so an arrival here is NOT an operator. Nor is it a "
+                         "builtin's declared argument coercion: a JS_CFUNC_STEP_DEF that declares PRIMARGS "
+                         "performs §7.1.1 and §7.1.1 over an unknown is the identity, so a declaration passes a "
+                         "concolic STRAIGHT THROUGH to the body's own JS_ToBigInt64 — which is this call. It is "
+                         "therefore a C BODY doing its own §7.1.15 / §7.1.17 ToBigInt64 ( arg ) / §7.1.18 "
+                         "ToBigUint64 ( arg ), or a host component's own conversion. "
+                         "WHAT TO BUILD, and it differs by which of the two shapes this site is. (a) A VALUE "
+                         "the page will read back: derive it at that site with js_concolic_derive naming the "
+                         "operation the spec was performing, exactly as 19.2.6.1 decodeURI ( encodedURI ) does "
+                         "— BigInt.asIntN / asUintN and the DataView setters are this shape. (b) A STORE INTO "
+                         "RAW BYTES: `ta[i] = x` on a BigInt64Array/BigUint64Array and every Atomics operation "
+                         "write a uint64_t into a data block, which holds no JSValue and so has nowhere for an "
+                         "unknown to live — converting would make the very next read hand the page a concrete "
+                         "number where it had unknown external input, deleting the fork and everything behind "
+                         "the other arm. §10.4.5.18 TypedArraySetElement ( obj, index, value ) already states "
+                         "that refusal, by name, on the ROUTED property-set path; a fast-path store or an "
+                         "Atomics call reaching HERE is the same refusal arriving where that DFAIL cannot see "
+                         "it, and what to build is the same thing it names — an element store that can hold "
+                         "unknown input. Where the consumer wants BYTES rather than a value, ask the unknown "
+                         "for its own projection (concolic_example / concolic_shape_c) as fetch's URL and the "
+                         "Attr/Element text edges do. Frames: %s",
+                         file, line, shbuf, frames);
+                DFAIL(why);
+            }
+#endif
+            JS_FreeValue(ctx, val);
+            return JS_ThrowTypeError(ctx, "a BigInt conversion of unknown external input is not modelled yet");
+        }
         val = JS_ToPrimitiveFree(ctx, val, HINT_NUMBER);
         if (JS_IsException(val))
             return val;
@@ -20113,17 +20230,20 @@ static JSValue JS_ToBigIntFree(JSContext *ctx, JSValue val)
     return val;
 }
 
-static JSValue JS_ToBigInt(JSContext *ctx, JSValueConst val)
+/* Every wrapper from here down FORWARDS `file`/`line` rather than re-capturing them: each is an intermediate,
+   and an intermediate is the one site that is never the answer. */
+static JSValue JS_ToBigIntAt(JSContext *ctx, JSValueConst val, const char *file, int line)
 {
-    return JS_ToBigIntFree(ctx, js_dup(val));
+    return JS_ToBigIntFreeAt(ctx, js_dup(val), file, line);
 }
 
 /* XXX: merge with JS_ToInt64Free with a specific flag */
-static int JS_ToBigInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
+static int JS_ToBigInt64FreeAt(JSContext *ctx, int64_t *pres, JSValue val,
+                               const char *file, int line)
 {
     uint64_t res;
 
-    val = JS_ToBigIntFree(ctx, val);
+    val = JS_ToBigIntFreeAt(ctx, val, file, line);
     if (JS_IsException(val)) {
         *pres = 0;
         return -1;
@@ -20142,15 +20262,14 @@ static int JS_ToBigInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
     return 0;
 }
 
-int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val)
+int JS_ToBigInt64At(JSContext *ctx, int64_t *pres, JSValueConst val,
+                    const char *file, int line)
 {
-    return JS_ToBigInt64Free(ctx, pres, js_dup(val));
+    return JS_ToBigInt64FreeAt(ctx, pres, js_dup(val), file, line);
 }
-
-int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val)
-{
-    return JS_ToBigInt64Free(ctx, (int64_t *)pres, js_dup(val));
-}
+/* §7.1.18 ToBigUint64 ( arg ) has no definition here: it is §7.1.17's bit pattern read unsigned, so it is the
+   one member of this family that stays in the header as a forwarding `static inline` — the same shape and the
+   same reason as §7.1.9 ToUint32 ( arg )'s. See quickjs.h. */
 
 static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
                                                      JSValue *sp,

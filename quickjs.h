@@ -1231,11 +1231,36 @@ JS_EXTERN int JS_ToFloat64At(JSContext *ctx, double *pres, JSValueConst val,
 #define JS_ToFloat64(ctx, pres, val) \
     JS_ToFloat64At((ctx), (pres), (val), __FILE__, __LINE__)
 /* return an exception if 'val' is a Number.
-   NOT in the family above: §7.1.15 ToBigInt ( arg ) reaches §7.1.1 ToPrimitive directly rather than through
-   §7.1.4, so these two carry no site — the assertion the family above feeds is one they never reach, and a
-   site threaded here would be read by nothing. */
-JS_EXTERN int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
-JS_EXTERN int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val);
+   §7.1.17 ToBigInt64 ( arg ) and §7.1.18 ToBigUint64 ( arg ), whose step 1 is `? ToBigInt(arg)`. They do NOT
+   feed the assertion the family above feeds: §7.1.15 ToBigInt ( arg ) reaches §7.1.1 ToPrimitive
+   ( input [ , preferredType ] ) directly rather than through §7.1.4 ToNumber ( arg ), so JS_ToNumberHintFree's
+   object arm never sees them. They carry a site anyway, against a SECOND assertion of their own, in
+   JS_ToBigIntFreeAt's object arm — and it guards a HARDER failure than the numeric one. §7.1.1 over UNKNOWN
+   EXTERNAL INPUT is the IDENTITY and §7.1.15's switch re-dispatches on the tag it gets back, so a boundary
+   with no assertion here does not return a wrong BigInt: it DOES NOT RETURN, in one C activation, with no
+   preempt point and no way for the scheduler to take the thread back. That is why "a site threaded here would
+   be read by nothing" — the argument this comment used to make, correctly, while no such assertion existed —
+   no longer holds, and it is also why this pair is worth threading before anything else in the family.
+   ONE ABI IN BOTH BUILDS and MACROS RATHER THAN INLINE WRAPPERS, for the reasons stated in full above
+   JS_ToNumberAt: a translation unit built with a different APICLIENT_DEV cannot disagree with this one about
+   the argument list, and __FILE__/__LINE__ inside a static inline expands at the HEADER, which is the one site
+   that is never the answer. A release build simply never reads the two words. */
+JS_EXTERN int JS_ToBigInt64At(JSContext *ctx, int64_t *pres, JSValueConst val,
+                              const char *file, int line);
+#define JS_ToBigInt64(ctx, pres, val) \
+    JS_ToBigInt64At((ctx), (pres), (val), __FILE__, __LINE__)
+/* §7.1.18 is §7.1.17's bit pattern read unsigned, so this is the ONE member of the family that stays a
+   FUNCTION, exactly as §7.1.9 ToUint32 ( arg ) is in the numeric family and for the identical reason. It
+   FORWARDS its caller's site rather than capturing one — this wrapper is never the answer — and it is a
+   function so `uint64_t *` keeps being TYPE-CHECKED: the macro form would have to spell the cast itself, and a
+   cast in a macro accepts a wrong pointer type silently at every call site. */
+static inline int JS_ToBigUint64At(JSContext *ctx, uint64_t *pres, JSValueConst val,
+                                   const char *file, int line)
+{
+    return JS_ToBigInt64At(ctx, (int64_t *)pres, val, file, line);
+}
+#define JS_ToBigUint64(ctx, pres, val) \
+    JS_ToBigUint64At((ctx), (pres), (val), __FILE__, __LINE__)
 /* same as JS_ToInt64() but allow BigInt */
 JS_EXTERN int JS_ToInt64ExtAt(JSContext *ctx, int64_t *pres, JSValueConst val,
                               const char *file, int line);
