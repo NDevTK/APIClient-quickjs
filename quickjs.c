@@ -1746,8 +1746,13 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
                                           JSValueConst new_target,
                                           int argc, JSValueConst *argv, int flags);
-static __exception int JS_ToArrayLengthFree(JSContext *ctx, uint32_t *plen,
-                                            JSValue val, bool is_array_ctor);
+/* In the numeric family (its non-numeric case falls through to §7.1.4 ToNumber ( arg )), so it carries its
+   caller's site — see the block over JS_ToInt32FreeAt below for the whole contract. */
+static __exception int JS_ToArrayLengthFreeAt(JSContext *ctx, uint32_t *plen,
+                                              JSValue val, bool is_array_ctor,
+                                              const char *file, int line);
+#define JS_ToArrayLengthFree(ctx, plen, val, is_array_ctor) \
+    JS_ToArrayLengthFreeAt((ctx), (plen), (val), (is_array_ctor), __FILE__, __LINE__)
 static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
                                        JSValueConst suppressed, int backtrace_flags);
 static __maybe_unused void JS_DumpString(JSRuntime *rt, JSString *p);
@@ -1985,9 +1990,77 @@ static JSValue JS_ToStringFreeAt(JSContext *ctx, JSValue val, const char *file, 
 #define JS_ToStringFree(ctx, val) \
     JS_ToStringFreeAt((ctx), (val), __FILE__, __LINE__)
 static int JS_ToBoolFree(JSContext *ctx, JSValue val);
-static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val);
-static int JS_ToFloat64Free(JSContext *ctx, double *pres, JSValue val);
-static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val);
+/* THE NUMERIC FAMILY'S OWN CALL SITES, exactly as the §7.1.19 / §7.1.21 spellings above carry theirs and
+   against the assertion in JS_ToNumberHintFree's object arm — the contract is stated in full over the public
+   declarations in quickjs.h. EVERY internal spelling is a MACRO here too, so a helper written as
+   `JS_ToLengthFree(ctx, &n, v)` names ITS line and not this block's: each of these forwards to the ONE
+   assertion, and an intermediate that re-captured would name the one site that is never the answer. The `At`
+   entries below take the site as an argument and pass it ON; only a macro ever captures.
+   §7.1.14 ToUint8Clamp ( arg ) and JS_ToArrayLengthFree are in the family because both fall through to §7.1.4
+   ToNumber ( arg ) for the non-numeric case; §7.1.15 ToBigInt ( arg ) is NOT, because it reaches §7.1.1
+   ToPrimitive ( input [ , preferredType ] ) without passing through that assertion at all. */
+static int JS_ToInt32FreeAt(JSContext *ctx, int32_t *pres, JSValue val,
+                            const char *file, int line);
+#define JS_ToInt32Free(ctx, pres, val) \
+    JS_ToInt32FreeAt((ctx), (pres), (val), __FILE__, __LINE__)
+static int JS_ToFloat64FreeAt(JSContext *ctx, double *pres, JSValue val,
+                              const char *file, int line);
+#define JS_ToFloat64Free(ctx, pres, val) \
+    JS_ToFloat64FreeAt((ctx), (pres), (val), __FILE__, __LINE__)
+static int JS_ToUint8ClampFreeAt(JSContext *ctx, int32_t *pres, JSValue val,
+                                 const char *file, int line);
+#define JS_ToUint8ClampFree(ctx, pres, val) \
+    JS_ToUint8ClampFreeAt((ctx), (pres), (val), __FILE__, __LINE__)
+static JSValue JS_ToNumberFreeAt(JSContext *ctx, JSValue val, const char *file, int line);
+#define JS_ToNumberFree(ctx, val) \
+    JS_ToNumberFreeAt((ctx), (val), __FILE__, __LINE__)
+static JSValue JS_ToNumericFreeAt(JSContext *ctx, JSValue val, const char *file, int line);
+#define JS_ToNumericFree(ctx, val) \
+    JS_ToNumericFreeAt((ctx), (val), __FILE__, __LINE__)
+static JSValue JS_ToNumericAt(JSContext *ctx, JSValueConst val, const char *file, int line);
+#define JS_ToNumeric(ctx, val) \
+    JS_ToNumericAt((ctx), (val), __FILE__, __LINE__)
+static JSValue JS_ToIntegerFreeAt(JSContext *ctx, JSValue val, const char *file, int line);
+#define JS_ToIntegerFree(ctx, val) \
+    JS_ToIntegerFreeAt((ctx), (val), __FILE__, __LINE__)
+static int JS_ToInt64FreeAt(JSContext *ctx, int64_t *pres, JSValue val,
+                            const char *file, int line);
+#define JS_ToInt64Free(ctx, pres, val) \
+    JS_ToInt64FreeAt((ctx), (pres), (val), __FILE__, __LINE__)
+static int JS_ToUint32FreeAt(JSContext *ctx, uint32_t *pres, JSValue val,
+                             const char *file, int line);
+#define JS_ToUint32Free(ctx, pres, val) \
+    JS_ToUint32FreeAt((ctx), (pres), (val), __FILE__, __LINE__)
+static int JS_ToInt32SatFreeAt(JSContext *ctx, int *pres, JSValue val,
+                               const char *file, int line);
+#define JS_ToInt32SatFree(ctx, pres, val) \
+    JS_ToInt32SatFreeAt((ctx), (pres), (val), __FILE__, __LINE__)
+static int JS_ToInt32SatAt(JSContext *ctx, int *pres, JSValueConst val,
+                           const char *file, int line);
+#define JS_ToInt32Sat(ctx, pres, val) \
+    JS_ToInt32SatAt((ctx), (pres), (val), __FILE__, __LINE__)
+static int JS_ToInt32ClampAt(JSContext *ctx, int *pres, JSValueConst val,
+                             int min, int max, int min_offset,
+                             const char *file, int line);
+#define JS_ToInt32Clamp(ctx, pres, val, min, max, min_offset) \
+    JS_ToInt32ClampAt((ctx), (pres), (val), (min), (max), (min_offset), __FILE__, __LINE__)
+static int JS_ToInt64SatFreeAt(JSContext *ctx, int64_t *pres, JSValue val,
+                               const char *file, int line);
+#define JS_ToInt64SatFree(ctx, pres, val) \
+    JS_ToInt64SatFreeAt((ctx), (pres), (val), __FILE__, __LINE__)
+int JS_ToInt64SatAt(JSContext *ctx, int64_t *pres, JSValueConst val,
+                    const char *file, int line);
+#define JS_ToInt64Sat(ctx, pres, val) \
+    JS_ToInt64SatAt((ctx), (pres), (val), __FILE__, __LINE__)
+int JS_ToInt64ClampAt(JSContext *ctx, int64_t *pres, JSValueConst val,
+                      int64_t min, int64_t max, int64_t neg_offset,
+                      const char *file, int line);
+#define JS_ToInt64Clamp(ctx, pres, val, min, max, neg_offset) \
+    JS_ToInt64ClampAt((ctx), (pres), (val), (min), (max), (neg_offset), __FILE__, __LINE__)
+static __exception int JS_ToLengthFreeAt(JSContext *ctx, int64_t *plen, JSValue val,
+                                         const char *file, int line);
+#define JS_ToLengthFree(ctx, plen, val) \
+    JS_ToLengthFreeAt((ctx), (plen), (val), __FILE__, __LINE__)
 static JSValue JS_ToPropertyKeyInternal(JSContext *ctx, JSValueConst val,
                                         int flags, const char *file, int line);
 static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len);
@@ -2115,7 +2188,6 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                                JSValue prop, JSValue val, int flags);
 static int JS_NumberIsInteger(JSContext *ctx, JSValueConst val);
 static bool JS_NumberIsNegativeOrMinusZero(JSContext *ctx, JSValueConst val);
-static JSValue JS_ToNumberFree(JSContext *ctx, JSValue val);
 static int JS_GetOwnPropertyInternal(JSContext *ctx, JSPropertyDescriptor *desc,
                                      JSObject *p, JSAtom prop);
 static int JS_GetOwnPropertyFlagsInternal(JSContext *ctx, int *pflags,
@@ -18492,12 +18564,22 @@ typedef enum JSToNumberHintEnum {
     TON_FLAG_NUMERIC,
 } JSToNumberHintEnum;
 
+/* `file`/`line` are the COERCING SITE's, captured by the macro over every public and internal spelling — see
+   the contract above the numeric declarations in quickjs.h. They are read only by the assertion in the object
+   arm, which a release build compiles out; the parameters stay in the signature there so ONE argument list
+   serves both builds. */
 static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
-                                   JSToNumberHintEnum flag)
+                                   JSToNumberHintEnum flag,
+                                   const char *file, int line)
 {
     uint32_t tag;
     JSValue ret;
 
+    (void)file; (void)line;
+    DCHECK(file != NULL,
+           "a numeric coercion reached JS_ToNumberHintFree with no call site — every public and internal "
+           "spelling is a macro that captures __FILE__/__LINE__, so a NULL means a caller was written against "
+           "a raw `At` entry and the assertion in the object arm below would name nothing");
  redo:
     tag = JS_VALUE_GET_NORM_TAG(val);
     switch(tag) {
@@ -18528,10 +18610,14 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
            REACH IT: the operator above must have answered with the concolic hooks (.add / .cmp / .rel / .arith)
            before converting, because opacity has to SURVIVE the coercion or the value stops forking control
            flow.
-           Asserted HERE rather than at the eighteen coercion sites, because this is the one place all of them
+           Asserted HERE rather than at the coercion sites, because this is the one place all of them
            funnel into — an operator with no concolic semantics yet crashes naming ToNumber instead of looping
            forever (ToPrimitive hands a concolic straight back, which is an infinite coercion) or silently
-           collapsing to NaN. Where C genuinely wants a concrete projection of a concolic it asks EXPLICITLY —
+           collapsing to NaN. THAT IS WHY THE SITE IS AN ARGUMENT AND NOT THIS FUNCTION'S OWN __LINE__: one
+           assert below hundreds of coercing call sites can state the RULE and could not state the ADDRESS, so
+           its "fix it at that site" named an action with no object. `file`/`line` are the coercing site's,
+           captured by the macro over every spelling (quickjs.h), and the message names them.
+           Where C genuinely wants a concrete projection of a concolic it asks EXPLICITLY —
            concolic_shape_c for a DOM text node's bytes, concolic_example for a learned value — never implicitly
            through a coercion. In release the DCHECK is gone and the throw is what keeps it from looping. */
         if (unlikely(js_value_is_concolic(val))) {
@@ -18560,7 +18646,7 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
                 JS_FreeValue(ctx, sv);
                 js_why_backtrace(ctx, frames, sizeof frames);
                 snprintf(why, sizeof why,
-                         "7.1.4 ToNumber over UNKNOWN EXTERNAL INPUT `%.240s`. Every ECMAScript OPERATOR over "
+                         "7.1.4 ToNumber at %s:%d over UNKNOWN EXTERNAL INPUT `%.240s`. Every ECMAScript OPERATOR over "
                          "an unknown answers at its own site with a derived concolic — .add for 13.15.3's `+`, "
                          ".cmp, .rel, and .arith for 13.5.4/.5/.6, the update operators, 13.7's multiplicative "
                          "family, 13.9 Bitwise Shift Operators and 13.12 Binary Bitwise Operators — and every "
@@ -18586,7 +18672,7 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
                          "text edges do. Never convert here: this boundary owes C a real number, and "
                          "ToPrimitive hands a concolic straight back, so converting is an infinite coercion. "
                          "Frames: %s",
-                         shbuf, frames);
+                         file, line, shbuf, frames);
                 DFAIL(why);
             }
 #endif
@@ -18648,28 +18734,30 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
     return ret;
 }
 
-static JSValue JS_ToNumberFree(JSContext *ctx, JSValue val)
+/* Every wrapper from here down FORWARDS `file`/`line` rather than re-capturing them: each is an intermediate,
+   and an intermediate is the one site that is never the answer. */
+static JSValue JS_ToNumberFreeAt(JSContext *ctx, JSValue val, const char *file, int line)
 {
-    return JS_ToNumberHintFree(ctx, val, TON_FLAG_NUMBER);
+    return JS_ToNumberHintFree(ctx, val, TON_FLAG_NUMBER, file, line);
 }
 
-static JSValue JS_ToNumericFree(JSContext *ctx, JSValue val)
+static JSValue JS_ToNumericFreeAt(JSContext *ctx, JSValue val, const char *file, int line)
 {
-    return JS_ToNumberHintFree(ctx, val, TON_FLAG_NUMERIC);
+    return JS_ToNumberHintFree(ctx, val, TON_FLAG_NUMERIC, file, line);
 }
 
-static JSValue JS_ToNumeric(JSContext *ctx, JSValueConst val)
+static JSValue JS_ToNumericAt(JSContext *ctx, JSValueConst val, const char *file, int line)
 {
-    return JS_ToNumericFree(ctx, js_dup(val));
+    return JS_ToNumericFreeAt(ctx, js_dup(val), file, line);
 }
 
-static __exception int __JS_ToFloat64Free(JSContext *ctx, double *pres,
-                                          JSValue val)
+static __exception int __JS_ToFloat64FreeAt(JSContext *ctx, double *pres,
+                                            JSValue val, const char *file, int line)
 {
     double d;
     uint32_t tag;
 
-    val = JS_ToNumberFree(ctx, val);
+    val = JS_ToNumberFreeAt(ctx, val, file, line);
     if (JS_IsException(val))
         goto fail;
     tag = JS_VALUE_GET_NORM_TAG(val);
@@ -18690,7 +18778,8 @@ fail:
     return -1;
 }
 
-static inline int JS_ToFloat64Free(JSContext *ctx, double *pres, JSValue val)
+static inline int JS_ToFloat64FreeAt(JSContext *ctx, double *pres, JSValue val,
+                                     const char *file, int line)
 {
     uint32_t tag;
 
@@ -18702,22 +18791,24 @@ static inline int JS_ToFloat64Free(JSContext *ctx, double *pres, JSValue val)
         *pres = JS_VALUE_GET_FLOAT64(val);
         return 0;
     } else {
-        return __JS_ToFloat64Free(ctx, pres, val);
+        return __JS_ToFloat64FreeAt(ctx, pres, val, file, line);
     }
 }
 
-int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val)
+int JS_ToFloat64At(JSContext *ctx, double *pres, JSValueConst val,
+                   const char *file, int line)
 {
-    return JS_ToFloat64Free(ctx, pres, js_dup(val));
+    return JS_ToFloat64FreeAt(ctx, pres, js_dup(val), file, line);
 }
 
-JSValue JS_ToNumber(JSContext *ctx, JSValueConst val)
+JSValue JS_ToNumberAt(JSContext *ctx, JSValueConst val, const char *file, int line)
 {
-    return JS_ToNumberFree(ctx, js_dup(val));
+    return JS_ToNumberFreeAt(ctx, js_dup(val), file, line);
 }
 
 /* same as JS_ToNumber() but return 0 in case of NaN/Undefined */
-static __maybe_unused JSValue JS_ToIntegerFree(JSContext *ctx, JSValue val)
+static __maybe_unused JSValue JS_ToIntegerFreeAt(JSContext *ctx, JSValue val,
+                                                 const char *file, int line)
 {
     uint32_t tag;
     JSValue ret;
@@ -18744,7 +18835,7 @@ static __maybe_unused JSValue JS_ToIntegerFree(JSContext *ctx, JSValue val)
         }
         break;
     default:
-        val = JS_ToNumberFree(ctx, val);
+        val = JS_ToNumberFreeAt(ctx, val, file, line);
         if (JS_IsException(val))
             return val;
         goto redo;
@@ -18753,7 +18844,8 @@ static __maybe_unused JSValue JS_ToIntegerFree(JSContext *ctx, JSValue val)
 }
 
 /* Note: the integer value is satured to 32 bits */
-static int JS_ToInt32SatFree(JSContext *ctx, int *pres, JSValue val)
+static int JS_ToInt32SatFreeAt(JSContext *ctx, int *pres, JSValue val,
+                               const char *file, int line)
 {
     uint32_t tag;
     int ret;
@@ -18786,7 +18878,7 @@ static int JS_ToInt32SatFree(JSContext *ctx, int *pres, JSValue val)
         }
         break;
     default:
-        val = JS_ToNumberFree(ctx, val);
+        val = JS_ToNumberFreeAt(ctx, val, file, line);
         if (JS_IsException(val)) {
             *pres = 0;
             return -1;
@@ -18797,15 +18889,17 @@ static int JS_ToInt32SatFree(JSContext *ctx, int *pres, JSValue val)
     return 0;
 }
 
-static int JS_ToInt32Sat(JSContext *ctx, int *pres, JSValueConst val)
+static int JS_ToInt32SatAt(JSContext *ctx, int *pres, JSValueConst val,
+                           const char *file, int line)
 {
-    return JS_ToInt32SatFree(ctx, pres, js_dup(val));
+    return JS_ToInt32SatFreeAt(ctx, pres, js_dup(val), file, line);
 }
 
-static int JS_ToInt32Clamp(JSContext *ctx, int *pres, JSValueConst val,
-                           int min, int max, int min_offset)
+static int JS_ToInt32ClampAt(JSContext *ctx, int *pres, JSValueConst val,
+                             int min, int max, int min_offset,
+                             const char *file, int line)
 {
-    int res = JS_ToInt32SatFree(ctx, pres, js_dup(val));
+    int res = JS_ToInt32SatFreeAt(ctx, pres, js_dup(val), file, line);
     if (res == 0) {
         if (*pres < min) {
             *pres += min_offset;
@@ -18819,7 +18913,8 @@ static int JS_ToInt32Clamp(JSContext *ctx, int *pres, JSValueConst val,
     return res;
 }
 
-static int JS_ToInt64SatFree(JSContext *ctx, int64_t *pres, JSValue val)
+static int JS_ToInt64SatFreeAt(JSContext *ctx, int64_t *pres, JSValue val,
+                               const char *file, int line)
 {
     uint32_t tag;
 
@@ -18851,7 +18946,7 @@ static int JS_ToInt64SatFree(JSContext *ctx, int64_t *pres, JSValue val)
         }
         return 0;
     default:
-        val = JS_ToNumberFree(ctx, val);
+        val = JS_ToNumberFreeAt(ctx, val, file, line);
         if (JS_IsException(val)) {
             *pres = 0;
             return -1;
@@ -18860,15 +18955,17 @@ static int JS_ToInt64SatFree(JSContext *ctx, int64_t *pres, JSValue val)
     }
 }
 
-int JS_ToInt64Sat(JSContext *ctx, int64_t *pres, JSValueConst val)
+int JS_ToInt64SatAt(JSContext *ctx, int64_t *pres, JSValueConst val,
+                    const char *file, int line)
 {
-    return JS_ToInt64SatFree(ctx, pres, js_dup(val));
+    return JS_ToInt64SatFreeAt(ctx, pres, js_dup(val), file, line);
 }
 
-int JS_ToInt64Clamp(JSContext *ctx, int64_t *pres, JSValueConst val,
-                    int64_t min, int64_t max, int64_t neg_offset)
+int JS_ToInt64ClampAt(JSContext *ctx, int64_t *pres, JSValueConst val,
+                      int64_t min, int64_t max, int64_t neg_offset,
+                      const char *file, int line)
 {
-    int res = JS_ToInt64SatFree(ctx, pres, js_dup(val));
+    int res = JS_ToInt64SatFreeAt(ctx, pres, js_dup(val), file, line);
     if (res == 0) {
         if (*pres < 0)
             *pres += neg_offset;
@@ -18882,7 +18979,8 @@ int JS_ToInt64Clamp(JSContext *ctx, int64_t *pres, JSValueConst val,
 
 /* Same as JS_ToInt32Free() but with a 64 bit result. Return (<0, 0)
    in case of exception */
-static int JS_ToInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
+static int JS_ToInt64FreeAt(JSContext *ctx, int64_t *pres, JSValue val,
+                            const char *file, int line)
 {
     uint32_t tag;
     int64_t ret;
@@ -18923,7 +19021,7 @@ static int JS_ToInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
         }
         break;
     default:
-        val = JS_ToNumberFree(ctx, val);
+        val = JS_ToNumberFreeAt(ctx, val, file, line);
         if (JS_IsException(val)) {
             *pres = 0;
             return -1;
@@ -18934,21 +19032,24 @@ static int JS_ToInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
     return 0;
 }
 
-int JS_ToInt64(JSContext *ctx, int64_t *pres, JSValueConst val)
+int JS_ToInt64At(JSContext *ctx, int64_t *pres, JSValueConst val,
+                 const char *file, int line)
 {
-    return JS_ToInt64Free(ctx, pres, js_dup(val));
+    return JS_ToInt64FreeAt(ctx, pres, js_dup(val), file, line);
 }
 
-int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val)
+int JS_ToInt64ExtAt(JSContext *ctx, int64_t *pres, JSValueConst val,
+                    const char *file, int line)
 {
     if (JS_IsBigInt(val))
         return JS_ToBigInt64(ctx, pres, val);
     else
-        return JS_ToInt64(ctx, pres, val);
+        return JS_ToInt64At(ctx, pres, val, file, line);
 }
 
 /* return (<0, 0) in case of exception */
-static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
+static int JS_ToInt32FreeAt(JSContext *ctx, int32_t *pres, JSValue val,
+                            const char *file, int line)
 {
     uint32_t tag;
     int32_t ret;
@@ -18990,7 +19091,7 @@ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
         }
         break;
     default:
-        val = JS_ToNumberFree(ctx, val);
+        val = JS_ToNumberFreeAt(ctx, val, file, line);
         if (JS_IsException(val)) {
             *pres = 0;
             return -1;
@@ -19001,17 +19102,20 @@ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
     return 0;
 }
 
-int JS_ToInt32(JSContext *ctx, int32_t *pres, JSValueConst val)
+int JS_ToInt32At(JSContext *ctx, int32_t *pres, JSValueConst val,
+                 const char *file, int line)
 {
-    return JS_ToInt32Free(ctx, pres, js_dup(val));
+    return JS_ToInt32FreeAt(ctx, pres, js_dup(val), file, line);
 }
 
-static inline int JS_ToUint32Free(JSContext *ctx, uint32_t *pres, JSValue val)
+static inline int JS_ToUint32FreeAt(JSContext *ctx, uint32_t *pres, JSValue val,
+                                    const char *file, int line)
 {
-    return JS_ToInt32Free(ctx, (int32_t *)pres, val);
+    return JS_ToInt32FreeAt(ctx, (int32_t *)pres, val, file, line);
 }
 
-static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val)
+static int JS_ToUint8ClampFreeAt(JSContext *ctx, int32_t *pres, JSValue val,
+                                 const char *file, int line)
 {
     uint32_t tag;
     int res;
@@ -19042,7 +19146,7 @@ static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val)
         }
         break;
     default:
-        val = JS_ToNumberFree(ctx, val);
+        val = JS_ToNumberFreeAt(ctx, val, file, line);
         if (JS_IsException(val)) {
             *pres = 0;
             return -1;
@@ -19080,8 +19184,9 @@ static int js_array_length_numeric(uint32_t *plen, JSValueConst val)
     return 0;
 }
 
-static __exception int JS_ToArrayLengthFree(JSContext *ctx, uint32_t *plen,
-                                            JSValue val, bool is_array_ctor)
+static __exception int JS_ToArrayLengthFreeAt(JSContext *ctx, uint32_t *plen,
+                                              JSValue val, bool is_array_ctor,
+                                              const char *file, int line)
 {
     uint32_t len, len1;
     int r;
@@ -19097,17 +19202,17 @@ static __exception int JS_ToArrayLengthFree(JSContext *ctx, uint32_t *plen,
     /* not numeric: coerce, then convert. ToNumber's result is a Number, so the conversion below needs no
        further coercion — the whole reason the original could call itself here. */
     if (is_array_ctor) {
-        val = JS_ToNumberFree(ctx, val);
+        val = JS_ToNumberFreeAt(ctx, val, file, line);
         if (JS_IsException(val))
             return -1;
         r = js_array_length_numeric(&len, val);
     } else {
         /* legacy behavior: must do the conversion twice and compare */
-        if (JS_ToUint32(ctx, &len1, val)) {
+        if (JS_ToUint32At(ctx, &len1, val, file, line)) {
             JS_FreeValue(ctx, val);
             return -1;
         }
-        val = JS_ToNumberFree(ctx, val);
+        val = JS_ToNumberFreeAt(ctx, val, file, line);
         if (JS_IsException(val))
             return -1;
         r = js_array_length_numeric(&len, val);
@@ -19133,10 +19238,11 @@ static bool is_safe_integer(double d)
         fabs(d) <= (double)MAX_SAFE_INTEGER;
 }
 
-int JS_ToIndex(JSContext *ctx, uint64_t *plen, JSValueConst val)
+int JS_ToIndexAt(JSContext *ctx, uint64_t *plen, JSValueConst val,
+                 const char *file, int line)
 {
     int64_t v;
-    if (JS_ToInt64Sat(ctx, &v, val))
+    if (JS_ToInt64SatAt(ctx, &v, val, file, line))
         return -1;
     if (v < 0 || v > MAX_SAFE_INTEGER) {
         JS_ThrowRangeError(ctx, "invalid array index");
@@ -19149,10 +19255,10 @@ int JS_ToIndex(JSContext *ctx, uint64_t *plen, JSValueConst val)
 
 /* convert a value to a length between 0 and MAX_SAFE_INTEGER.
    return -1 for exception */
-static __exception int JS_ToLengthFree(JSContext *ctx, int64_t *plen,
-                                       JSValue val)
+static __exception int JS_ToLengthFreeAt(JSContext *ctx, int64_t *plen, JSValue val,
+                                         const char *file, int line)
 {
-    int res = JS_ToInt64Clamp(ctx, plen, val, 0, MAX_SAFE_INTEGER, 0);
+    int res = JS_ToInt64ClampAt(ctx, plen, val, 0, MAX_SAFE_INTEGER, 0, file, line);
     JS_FreeValue(ctx, val);
     return res;
 }

@@ -1185,20 +1185,61 @@ static inline JSValue JS_ToBoolean(JSContext *ctx, JSValueConst val)
 {
     return JS_NewBool(ctx, JS_ToBool(ctx, val));
 }
-JS_EXTERN JSValue JS_ToNumber(JSContext *ctx, JSValueConst val);
-JS_EXTERN int JS_ToInt32(JSContext *ctx, int32_t *pres, JSValueConst val);
-static inline int JS_ToUint32(JSContext *ctx, uint32_t *pres, JSValueConst val)
+/* THE COERCING SITE'S OWN ADDRESS TRAVELS WITH THE REQUEST, for the SAME reason the converter's and the byte
+   consumer's do below and against an abort of the same shape. ECMAScript §7.1.4 ToNumber ( arg ) hands the
+   remaining Object case to §7.1.1 ToPrimitive ( input [ , preferredType ] ), and §7.1.1 over UNKNOWN EXTERNAL
+   INPUT is the IDENTITY — so an unknown arriving in this family is not a value to convert but a C body
+   performing its own §7.1.4 / §7.1.3 ToNumeric ( arg ) where the OPERATOR should have answered at its own
+   site, and converting it is an infinite coercion rather than a wrong number.
+   The engine asserts that where every spelling converges, in ONE function, which is what makes the assert
+   possible at all — but is also exactly why its remedy could not name the SITE it was instructing anyone to
+   fix. It fires one frame below every numeric coercion in the engine and the host, so "fix it at that site"
+   named an action with no object, over a call-site population far larger than anyone reads by hand. The site
+   is known at the one place that knows it, so it is passed from there and the abort names the file:line.
+   ONE ABI IN BOTH BUILDS and MACROS RATHER THAN INLINE WRAPPERS, both for the reasons stated in full above
+   JS_ToStringAt: a translation unit built with a different APICLIENT_DEV cannot disagree with this one about
+   the argument list, and __FILE__/__LINE__ inside a static inline expands at the HEADER, which is the one site
+   that is never the answer. A release build simply never reads the two words. */
+JS_EXTERN JSValue JS_ToNumberAt(JSContext *ctx, JSValueConst val, const char *file, int line);
+#define JS_ToNumber(ctx, val) \
+    JS_ToNumberAt((ctx), (val), __FILE__, __LINE__)
+JS_EXTERN int JS_ToInt32At(JSContext *ctx, int32_t *pres, JSValueConst val,
+                           const char *file, int line);
+#define JS_ToInt32(ctx, pres, val) \
+    JS_ToInt32At((ctx), (pres), (val), __FILE__, __LINE__)
+/* §7.1.9 ToUint32 ( arg ) is §7.1.8 ToInt32 ( arg )'s bit pattern read unsigned, so this is the ONE member of
+   the family that stays a FUNCTION. It FORWARDS its caller's site rather than capturing one — this wrapper is
+   never the answer — and it is a function so `uint32_t *` keeps being TYPE-CHECKED: the macro form would have
+   to spell the cast itself, and a cast in a macro accepts a wrong pointer type silently at every call site. */
+static inline int JS_ToUint32At(JSContext *ctx, uint32_t *pres, JSValueConst val,
+                                const char *file, int line)
 {
-    return JS_ToInt32(ctx, (int32_t*)pres, val);
+    return JS_ToInt32At(ctx, (int32_t*)pres, val, file, line);
 }
-JS_EXTERN int JS_ToInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
-JS_EXTERN int JS_ToIndex(JSContext *ctx, uint64_t *plen, JSValueConst val);
-JS_EXTERN int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
-/* return an exception if 'val' is a Number */
+#define JS_ToUint32(ctx, pres, val) \
+    JS_ToUint32At((ctx), (pres), (val), __FILE__, __LINE__)
+JS_EXTERN int JS_ToInt64At(JSContext *ctx, int64_t *pres, JSValueConst val,
+                           const char *file, int line);
+#define JS_ToInt64(ctx, pres, val) \
+    JS_ToInt64At((ctx), (pres), (val), __FILE__, __LINE__)
+JS_EXTERN int JS_ToIndexAt(JSContext *ctx, uint64_t *plen, JSValueConst val,
+                           const char *file, int line);
+#define JS_ToIndex(ctx, plen, val) \
+    JS_ToIndexAt((ctx), (plen), (val), __FILE__, __LINE__)
+JS_EXTERN int JS_ToFloat64At(JSContext *ctx, double *pres, JSValueConst val,
+                             const char *file, int line);
+#define JS_ToFloat64(ctx, pres, val) \
+    JS_ToFloat64At((ctx), (pres), (val), __FILE__, __LINE__)
+/* return an exception if 'val' is a Number.
+   NOT in the family above: §7.1.15 ToBigInt ( arg ) reaches §7.1.1 ToPrimitive directly rather than through
+   §7.1.4, so these two carry no site because the assertion they would feed is not the one below. */
 JS_EXTERN int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
 JS_EXTERN int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val);
 /* same as JS_ToInt64() but allow BigInt */
-JS_EXTERN int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
+JS_EXTERN int JS_ToInt64ExtAt(JSContext *ctx, int64_t *pres, JSValueConst val,
+                              const char *file, int line);
+#define JS_ToInt64Ext(ctx, pres, val) \
+    JS_ToInt64ExtAt((ctx), (pres), (val), __FILE__, __LINE__)
 
 JS_EXTERN JSValue JS_NewStringLen(JSContext *ctx, const char *str1, size_t len1);
 static inline JSValue JS_NewString(JSContext *ctx, const char *str) {
