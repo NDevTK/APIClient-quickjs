@@ -8037,7 +8037,7 @@ static bool js_tonumeric_eager(JSValueConst v)
  * the unapply whose whole job is to take it back out.
  *
  * `p` is the VIEW (a typed array or a DataView) and what is captured is its BUFFER, because the buffer is the
- * storage and the view is only a name for part of it — see JSTimeTravelHooks.buf_write for why the unit is the
+ * storage and the view is only a name for part of it — see JSTimeTravelHooks.buf_state for why the unit is the
  * bytes and not the element. Two views over one buffer therefore dedup to ONE entry rather than aliasing each
  * other under two keys that the delta could not know were the same storage.
  *
@@ -8048,25 +8048,25 @@ static bool js_tonumeric_eager(JSValueConst v)
  * deliberate: the detach is itself an uncaptured shared mutation, and the restore is where that aborts by name. */
 static void cow_capture_bytes(JSContext *ctx, JSObject *p)
 {
-    if (!g_time_travel.buf_write)
+    if (!g_time_travel.buf_state)
         return;
     DCHECK(p->u.typed_array != NULL,
            "a byte write on a view with no JSTypedArray record: the buffer it writes into cannot be named, so "
            "the capture would silently record nothing");
-    g_time_travel.buf_write(ctx, JS_MKPTR(JS_TAG_OBJECT, p->u.typed_array->buffer));
+    g_time_travel.buf_state(ctx, JS_MKPTR(JS_TAG_OBJECT, p->u.typed_array->buffer));
 }
 /* THE ONE PLACE A BUFFER'S STORAGE IS DECLARED ABOUT TO MOVE — resize/grow, transfer, detach. `abuf` is the
-   ArrayBuffer/SharedArrayBuffer OBJECT, the same name cow_capture_bytes uses, because the byte entry and this
-   one are two facts about one thing.
-   IT IS ASKED AT THE MUTATION, WHICH IS THE WHOLE OF WHY IT EXISTS. cow_state_save already refuses a captured
-   buffer whose bytes have gone or whose length has changed — but only for a buffer this flow had captured
-   BEFORE it mutated it. The other ordering (resize, then write) creates the entry afterwards, over the
-   post-resize bytes, and every later save agrees with itself: one ordering aborts by name and the other
-   corrupts every sibling in silence. A capture point at the mutation has no ordering to get wrong. */
+   ArrayBuffer/SharedArrayBuffer OBJECT, the same name cow_capture_bytes uses, and it raises the SAME hook,
+   because the contents and the extent are two facts about ONE storage and the entry that holds them is one.
+   IT IS ASKED AT THE MUTATION, WHICH IS THE WHOLE OF WHY IT EXISTS. A save-side check can only refuse a buffer
+   this flow had captured BEFORE it mutated it. The other ordering (resize, then write) creates the entry
+   afterwards, over the post-resize bytes, and every later save agrees with itself: one ordering would abort by
+   name and the other corrupts every sibling in silence. A capture point at the mutation has no ordering to get
+   wrong. */
 static void cow_capture_buffer_lifetime(JSContext *ctx, JSValueConst abuf)
 {
-    if (g_time_travel.buf_lifetime)
-        g_time_travel.buf_lifetime(ctx, abuf);
+    if (g_time_travel.buf_state)
+        g_time_travel.buf_state(ctx, abuf);
 }
 #if APICLIENT_DEV
 /* WHAT THE TIME-TRAVEL CAPTURE TOOK ON ONE KEY, so a define's own ledger can subtract it.
@@ -13878,7 +13878,7 @@ void JS_SetOwnSlotDesc(JSContext *ctx, JSValueConst obj, JSAtom prop, JSProperty
                NORMALISES a NaN, so a Float64Array element the page stored with a payload came back canonical and
                the resume was not byte-identical; a DataView's write has no element to name at all; and two views
                over one buffer named one storage under two keys the delta could not know were the same.
-               The bytes are captured on the BUFFER now (cow_capture_bytes / JSTimeTravelHooks.buf_write), and no
+               The bytes are captured on the BUFFER now (cow_capture_bytes / JSTimeTravelHooks.buf_state), and no
                element entry is created for a typed array at all: cow_capture ROUTES a typed array's numeric
                index to the bytes, so every site that captures a slot is covered by that one decision. Reaching
                here means a capture went around cow_capture and made a slot entry for storage the byte entry
@@ -111987,36 +111987,6 @@ const uint8_t *JS_GetBufferBytes(JSValueConst obj, uint32_t *plen)
     return abuf->data;
 }
 
-/* ITS WRITE TWIN — see quickjs.h. It CANNOT FAIL for the reason JS_SetOwnSlotDesc cannot, and the two ways it could
-   not land are both mutations of the buffer OBJECT rather than of its contents, which is precisely what this
-   entry cannot express: a DETACH (transfer / structuredClone) frees the storage, and a RESIZE reallocates it to
-   a different length. Both abort here naming the buffer-lifetime entry to build, rather than writing bytes into
-   storage that is no longer the storage the flow read. */
-void JS_SetBufferBytes(JSValueConst obj, const void *bytes, uint32_t len)
-{
-    JSObject *p;
-    JSArrayBuffer *abuf;
-
-    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
-           "a COW delta puts a buffer's bytes back on something that is not an object");
-    p = JS_VALUE_GET_OBJ(obj);
-    DCHECK(p->class_id == JS_CLASS_ARRAY_BUFFER || p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER,
-           "a COW delta puts a buffer's bytes back on a class that owns no ArrayBuffer storage");
-    abuf = p->u.array_buffer;
-    /* CHECK and not DCHECK, on check.h's own rule: past either of these the memcpy below writes into storage
-       that was freed or is shorter than the copy, and proceeding is memory corruption rather than a wrong
-       answer. The capability they name is the same one either way. */
-    CHECK(!abuf->detached,
-          "a COW delta is putting a buffer's bytes back into a DETACHED buffer: a flow transferred it and the "
-          "storage every entry names is freed, so build the buffer-LIFETIME entry (detach and resize are "
-          "mutations of the buffer object, which an entry over its contents cannot express)");
-    CHECK((uint32_t)abuf->byte_length == len,
-          "a COW delta is putting back a different number of bytes than the buffer now holds: a flow RESIZED "
-          "it, which is a mutation of the buffer object rather than of its contents — build the "
-          "buffer-lifetime entry beside the byte entry");
-    memcpy(abuf->data, bytes, len);
-}
-
 static bool array_buffer_is_resizable(const JSArrayBuffer *abuf)
 {
     return abuf->max_byte_length >= 0;
@@ -112056,6 +112026,226 @@ static void js_array_buffer_update_typed_arrays(JSArrayBuffer *abuf)
                 p->u.array.u.ptr = &data[ta->offset];
             }
         }
+    }
+}
+
+/* A BUFFER'S WHOLE STORAGE STATE — see quickjs.h for what it holds and why the views are in it. */
+typedef struct JSBufferStateView {
+    JSObject *obj;      /* ONE COUNTED REFERENCE, held for the life of the blob: a delta outlives a flow, and a
+                           view the page dropped would otherwise be a dangling name in it */
+    uint32_t length;    /* the view's cached ta->length — the one window the re-derivation cannot reach */
+} JSBufferStateView;
+
+typedef struct JSBufferState {
+    int byte_length;
+    int max_byte_length;
+    uint8_t detached;
+    uint8_t immutable;      /* RECORDED TO BE ASSERTED, never to be written back — see the restore */
+    uint8_t engine_owned;   /* the block was ours (js_array_buffer_free), so a restore may hand one back */
+    uint8_t *data;          /* an OWNED copy of byte_length bytes; NULL iff detached */
+    int n_view;
+    JSBufferStateView *view;
+} JSBufferState;
+
+void JS_BufferStateFree(JSRuntime *rt, void *blob)
+{
+    JSBufferState *st = blob;
+    int i;
+
+    if (!st)
+        return;
+    for (i = 0; i < st->n_view; i++)
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, st->view[i].obj));
+    js_free_rt(rt, st->view);
+    js_free_rt(rt, st->data);
+    js_free_rt(rt, st);
+}
+
+/* THE BUFFER, AS THIS FLOW FOUND IT. Answers NULL on OOM only — the caller CHECKs it, because a lost baseline
+   leaks one flow's storage into every sibling. */
+void *JS_BufferStateSave(JSContext *ctx, JSValueConst obj)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p;
+    JSArrayBuffer *abuf;
+    JSBufferState *st;
+    struct list_head *el;
+    JSTypedArray *ta;
+    int n = 0, i = 0;
+
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+           "a COW delta is saving the storage state of something that is not an object");
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id == JS_CLASS_ARRAY_BUFFER || p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER,
+           "a COW delta is saving the storage state of a class that owns no ArrayBuffer storage — the capture "
+           "named a VIEW where it must name the buffer that owns the bytes");
+    abuf = p->u.array_buffer;
+    DCHECK(abuf->byte_length >= 0, "an ArrayBuffer with a negative byte length");
+    DCHECK(abuf->detached == (abuf->data == NULL),
+           "an ArrayBuffer's detached bit and its data block disagree — §25.1.3.4 IsDetachedBuffer is the one "
+           "question 'is [[ArrayBufferData]] null', so a restore reading one of them would decide the other "
+           "wrong");
+    st = js_mallocz_rt(rt, sizeof(*st));
+    if (!st)
+        return NULL;
+    st->byte_length = abuf->byte_length;
+    st->max_byte_length = abuf->max_byte_length;
+    st->detached = abuf->detached;
+    st->immutable = abuf->immutable;
+    st->engine_owned = !abuf->detached && abuf->free_func == js_array_buffer_free;
+    if (!abuf->detached) {
+        st->data = js_malloc_rt(rt, max_int(abuf->byte_length, 1));
+        if (!st->data)
+            goto fail;
+        memcpy(st->data, abuf->data, abuf->byte_length);
+    }
+    /* ONLY THE VIEWS WHOSE WINDOW IS NOT RE-DERIVABLE, which is a test and not a shortcut: every other view's
+       cached extent is a function of the buffer's, so recording it would be a second copy of a computed fact
+       and would cost a reference per view on the hot byte-write path. What is left is exactly the field
+       js_array_buffer_update_typed_arrays declines to write — a LENGTH-TRACKING DATAVIEW's `ta->length`, which
+       that update leaves alone whenever the view's offset lands at or past the buffer's length, so the value
+       it keeps is history rather than a derivation, and js_dataview_getValue's bounds test reads it back. */
+    list_for_each(el, &abuf->array_list) {
+        ta = list_entry(el, JSTypedArray, link);
+        if (ta->obj->class_id == JS_CLASS_DATAVIEW && ta->track_rab)
+            n++;
+    }
+    if (n > 0) {
+        st->view = js_malloc_rt(rt, sizeof(*st->view) * (size_t)n);
+        if (!st->view)
+            goto fail;
+        list_for_each(el, &abuf->array_list) {
+            ta = list_entry(el, JSTypedArray, link);
+            DCHECK(ta->obj != NULL, "a view is on a buffer's list with no back pointer to its own object — the "
+                                    "blob would hold a reference on nothing and restore a window to nobody");
+            if (ta->obj->class_id != JS_CLASS_DATAVIEW || !ta->track_rab)
+                continue;
+            DCHECK(i < n, "a buffer's view list grew between the count and the walk");
+            st->view[i].obj = ta->obj;
+            st->view[i].length = ta->length;
+            (void)js_dup(JS_MKPTR(JS_TAG_OBJECT, ta->obj));
+            /* PUBLISHED PER ENTRY, not after the loop: the count is what the free walks, so a bail-out that
+               left it at 0 would drop every reference this loop had already taken. */
+            st->n_view = ++i;
+        }
+        DCHECK(i == n, "a buffer's view list changed under the walk that records it");
+    }
+    return st;
+ fail:
+    JS_BufferStateFree(rt, st);
+    return NULL;
+}
+
+/* …AND PUT BACK. The three operations that move storage are put back by their inverses, and then every DERIVED
+   per-view field is re-derived by the engine's own js_array_buffer_update_typed_arrays rather than by a second
+   stored copy of a computed fact — see quickjs.h for which single field that re-derivation cannot reach. */
+void JS_BufferStateRestore(JSContext *ctx, JSValueConst obj, void *blob)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p;
+    JSArrayBuffer *abuf;
+    JSBufferState *st = blob;
+    uint8_t *data;
+    int i;
+
+    DCHECK(st != NULL, "a buffer's storage state was re-applied before any unapply had recorded one — the "
+                       "context switch that parked this flow did not run");
+    DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+           "a COW delta is putting a buffer's storage state back on something that is not an object");
+    p = JS_VALUE_GET_OBJ(obj);
+    DCHECK(p->class_id == JS_CLASS_ARRAY_BUFFER || p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER,
+           "a COW delta is putting a buffer's storage state back on a class that owns no ArrayBuffer storage");
+    abuf = p->u.array_buffer;
+    DCHECK(st->max_byte_length == abuf->max_byte_length,
+           "a buffer's maxByteLength changed under a delta — no operation in §25.1 or §25.2 writes "
+           "[[ArrayBufferMaxByteLength]] after allocation, so whatever moved it is not a resize and this blob "
+           "describes a different buffer than the one it is being put back into");
+    /* IMMUTABILITY IS RECORDED AND ASSERTED, NOT RESTORED, and that is a positive statement rather than a gap:
+       no JS operation flips an EXISTING buffer's immutable bit — `transferToImmutable` sets it on the buffer it
+       creates, which is this flow's own object — so a flow cannot make one visible to a sibling and there is
+       nothing per-flow to swap. The day a path does write it, this fires instead of that write standing in the
+       baseline for every sibling, which is what a bit with a writer and no entry would do. */
+    DCHECK(st->immutable == abuf->immutable,
+           "a flow changed a shared ArrayBuffer's IMMUTABLE bit: nothing in §25.1 writes it after construction, "
+           "so a path was added that does — carry the bit in the buffer-state blob's restore beside the extent, "
+           "or the arm that set it stands for every sibling");
+    if (abuf->shared) {
+        DCHECK(!st->detached,
+               "a SharedArrayBuffer was recorded DETACHED — §25.1.3.5 DetachArrayBuffer step 1 is \"Assert: "
+               "IsSharedArrayBuffer(arrayBuffer) is false.\", so nothing can have detached this and the blob "
+               "names a state no operation produces");
+        DCHECK(!abuf->detached && abuf->data != NULL, "a SharedArrayBuffer is detached");
+        /* §25.2.5.3 SharedArrayBuffer.prototype.grow moves no storage: js_array_buffer_constructor3 commits the
+           max-sized block upfront and the grow arm sets byte_length alone, so the extent is put back the same
+           way it was taken and there is nothing to reallocate.
+           …WHICH IS TRUE ONLY THROUGH sab_alloc, and this says so rather than leaning on it. The non-sab arm of
+           that constructor allocates the INITIAL length, so growing such a buffer already writes past its own
+           block — the page's own byte write does it one byte at a time and this would do it in one memcpy,
+           which is the same defect with a worse symptom. It fires only where the engine is already corrupting
+           and it names what to build. */
+        DCHECK(st->byte_length <= abuf->byte_length || rt->sab_funcs.sab_alloc != NULL,
+               "a GROWABLE SharedArrayBuffer's block is only its INITIAL length: js_array_buffer_constructor3 "
+               "commits maxByteLength upfront only through sab_alloc, while §25.2.5.3 grow sets byte_length "
+               "with no reallocation — so make the non-sab arm commit maxByteLength as the sab arm does, or "
+               "give the runtime sab_funcs");
+        memcpy(abuf->data, st->data, st->byte_length);
+        abuf->byte_length = st->byte_length;
+    } else if (st->detached) {
+        if (!abuf->detached) {
+            /* §25.1.3.5 steps 4 and 5, and the engine's own release beside them — the same three writes
+               JS_DetachArrayBuffer makes, so a flow's transfer replays as the detach it was. */
+            if (abuf->free_func) {
+                abuf->free_func(rt, abuf->opaque, abuf->data);
+                abuf->free_func = NULL;
+                abuf->opaque = NULL;
+            }
+            abuf->data = NULL;
+            abuf->byte_length = 0;
+            abuf->detached = true;
+        }
+        /* else: already detached, and no operation re-attaches — there is nothing left to put back */
+    } else if (!abuf->detached && st->byte_length == abuf->byte_length) {
+        /* THE CONTENTS HALF ALONE — the storage did not move, so nothing is reallocated and an EMBEDDER's block
+           is written in place exactly as the page writes it. This is the hot path: a flow that only wrote bytes
+           has a blob whose extent equals the buffer's. */
+        memcpy(abuf->data, st->data, st->byte_length);
+    } else {
+        /* THE STORAGE MOVES — a resize's realloc (§25.1.6.6 steps 14 and 15) or the re-attach that inverts a
+           detach. Only a block this engine allocated can be handed back: an embedder gave us memory and a
+           free_func, and a restore that replaced it with js_malloc'd storage would leave the buffer holding a
+           block the embedder never gave and never hears about. */
+        CHECK(abuf->detached ? st->engine_owned : abuf->free_func == js_array_buffer_free,
+              "a flow moved the storage of an ArrayBuffer whose block an EMBEDDER owns (a non-engine "
+              "free_func): the swap can only hand back storage it allocated itself, so build the "
+              "embedder-storage arm of the buffer-state entry — the blob must carry the embedder's free_func "
+              "and opaque and re-present the SAME block rather than a copy of it");
+        data = js_realloc_rt(rt, abuf->data, max_int(st->byte_length, 1));
+        CHECK(data, "cow: OOM restoring an ArrayBuffer's storage — a lost extent leaks one flow's resize into "
+                    "every sibling, and there is no shorter buffer that would be the right answer");
+        memcpy(data, st->data, st->byte_length);
+        abuf->data = data;
+        abuf->byte_length = st->byte_length;
+        abuf->detached = false;
+        abuf->free_func = js_array_buffer_free;
+        abuf->opaque = NULL;
+    }
+    js_array_buffer_update_typed_arrays(abuf);
+    /* AND THE ONE WINDOW THAT RE-DERIVATION CANNOT REACH, put back AFTER the update because the update is what
+       would otherwise leave the flow's value standing. Where the update DID write this field it wrote the same
+       number, so this is an overwrite only in the case it exists for. */
+    for (i = 0; i < st->n_view; i++) {
+        JSObject *vp = st->view[i].obj;
+        DCHECK(vp->u.typed_array != NULL,
+               "a view the blob holds a reference on has no JSTypedArray record — the reference is what makes "
+               "that impossible, so whatever freed the record did it under a live object");
+        DCHECK(vp->class_id == JS_CLASS_DATAVIEW && vp->u.typed_array->track_rab,
+               "a recorded view is not a length-tracking DataView — every other view's cached extent is derived "
+               "from the buffer's, so writing one back over what the re-derivation just computed would install "
+               "a window this buffer does not have");
+        DCHECK(vp->u.typed_array->buffer == p,
+               "a view recorded on one buffer's list names a different buffer — a view's [[ViewedArrayBuffer]] "
+               "is fixed at construction, so the blob is being put back into a buffer it did not come from");
+        vp->u.typed_array->length = st->view[i].length;
     }
 }
 
@@ -112191,10 +112381,14 @@ static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val,
     bad_length:
         return JS_ThrowRangeError(ctx, "invalid array buffer length");
     }
-    /* A SAB CAN ONLY GROW — 25.2.5.4 step 8's RangeError, hoisted out of the branch below so that the single
-       lifetime capture can stand AFTER every refusal and BEFORE the storage moves. It is the same refusal at
-       the same point (no user code runs between the two) and it is what lets the capture be one line rather
-       than one per arm. */
+    /* A SAB CAN ONLY GROW — §25.2.5.3 SharedArrayBuffer.prototype.grow step 12.4, "If newByteLength <
+       currentByteLength or newByteLength > obj.[[ArrayBufferMaxByteLength]], throw a RangeError exception.",
+       hoisted out of the branch below so that the single lifetime capture can stand AFTER every refusal and
+       BEFORE the storage moves. It is the same refusal at the same point (no user code runs between the two)
+       and it is what lets the capture be one line rather than one per arm.
+       THE NUMBER STOOD HERE AS `25.2.5.4 step 8` AND WAS WRONG IN BOTH HALVES: §25.2.5.4 is `get
+       SharedArrayBuffer.prototype.growable`, a five-step accessor with no RangeError in it. The sub-number is
+       safe to write because step 12 ("Repeat,") holds exactly ONE list. */
     if (abuf->shared && len < abuf->byte_length)
         goto bad_length;
     /* forced-exec TIME-TRAVEL: THE STORAGE IS ABOUT TO MOVE, and that is a mutation of the buffer OBJECT that

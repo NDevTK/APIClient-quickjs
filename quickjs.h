@@ -1431,17 +1431,16 @@ JS_EXTERN void JS_SetOwnSlotDesc(JSContext *ctx, JSValueConst obj, JSAtom prop, 
    default to false — is the commonest way a flow creates one. CANNOT FAIL, for the same reason the write
    cannot. */
 JS_EXTERN void JS_DeleteOwnSlot(JSContext *ctx, JSValueConst obj, JSAtom prop);
-/* THE BUFFER'S BYTES, READ AND PUT BACK — the byte twin of the slot pair above, and the reason it is a separate
-   pair rather than one more kind of slot is JSTimeTravelHooks.buf_write's: a view's element is not what the page
-   wrote, the storage is. `obj` is the ArrayBuffer/SharedArrayBuffer OBJECT.
-   Neither takes a JSContext and neither can throw, for the same reason JS_SetOwnSlotDesc cannot: they run inside a
-   context switch that has no flow base to receive an exception. The read answers NULL with *plen 0 for a
-   DETACHED buffer — a positive statement, not a failure: a detached buffer holds no bytes, so there is nothing a
-   flow could have changed. The write asserts the length it is handed is still the buffer's; a flow that RESIZED
-   or DETACHED it aborts there naming the buffer-lifetime entry to build, because those are mutations of the
-   buffer OBJECT rather than of its contents and an entry over the contents cannot express them. */
+/* THE BUFFER'S BYTES, READ — the byte twin of the slot read above, and the reason it is a separate call rather
+   than one more kind of slot is JSTimeTravelHooks.buf_state's: a view's element is not what the page wrote, the
+   storage is. `obj` is the ArrayBuffer/SharedArrayBuffer OBJECT.
+   It takes no JSContext and cannot throw, for the same reason JS_GetOwnSlotDesc cannot: its callers run where
+   there is no flow base to receive an exception. It answers NULL with *plen 0 for a DETACHED buffer — a positive
+   statement, not a failure: a detached buffer holds no bytes, so there is nothing a flow could have changed.
+   THERE IS NO WRITE TWIN, and that is the shape of the fact rather than an omission: putting bytes back is only
+   half of putting a buffer back, because a flow that RESIZED, TRANSFERRED or DETACHED it moved the storage those
+   bytes live in. Both halves are one blob — JS_BufferStateSave below. */
 JS_EXTERN const uint8_t *JS_GetBufferBytes(JSValueConst obj, uint32_t *plen);
-JS_EXTERN void JS_SetBufferBytes(JSValueConst obj, const void *bytes, uint32_t len);
 JS_EXTERN void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                                    uint32_t len);
 
@@ -1933,28 +1932,55 @@ typedef struct JSTimeTravelHooks {
        write through memmove/memset over the raw storage, where there is no per-element hook to hang a capture
        on and one entry per element would cost sizeof(CowEntry) per BYTE.
        Aliasing follows from the unit rather than being handled by it: a Float64Array and a Uint8Array over one
-       buffer are one entry, because they are one storage. The host captures the buffer's bytes ONCE per flow
-       (JS_GetBufferBytes / JS_SetBufferBytes are the read/write twins the swap uses), so a loop overwriting one
-       element a million times costs one entry — the delta stays O(shared state TOUCHED), which an undo log of
-       ranges would not. */
-    void (*buf_write)(JSContext *ctx, JSValueConst abuf);
-    /* Before a flow changes a shared ARRAY BUFFER's LIFETIME — its `resize`/`grow`, its `transfer`, or a
-       detach. buf_write above is about the buffer's CONTENTS; this is about the storage those contents live
-       in, and they are two facts because a byte entry cannot express either one: an entry holds `a_len` bytes
-       read off the buffer, so a resize makes the entry describe a length the buffer no longer has and a detach
-       makes it name storage that has been freed.
-       WHY THE SITE IS THE MUTATION AND NOT THE SAVE. The save-side CHECKs in cow_state_save (a NULL byte
-       pointer, a length that no longer matches) DO name this, and they can only fire for a buffer this flow
-       had ALREADY captured — which is one of the two orderings. Resize FIRST and write SECOND and the entry is
-       created after the fact, holding the post-resize bytes as if they were the baseline: no length ever
-       disagrees, no CHECK fires, and the sibling silently inherits both the new size and the write. A
-       zero-length resizable buffer is only the extreme of that ordering (there is no byte to write before the
-       resize, so it is ALWAYS the silent one) and not a separate case. Asked here, the ordering stops
-       mattering, because the mutation cannot happen without passing this.
-       The host answers it as it answers every other capture: a buffer the running flow created is private and
-       may be resized freely; a SHARED one aborts naming the entry to build. */
-    void (*buf_lifetime)(JSContext *ctx, JSValueConst abuf);
+       buffer are one entry, because they are one storage. The host captures the buffer's state ONCE per flow
+       (JS_BufferStateSave/Restore are the read/write twins the swap uses), so a loop overwriting one element a
+       million times costs one entry — the delta stays O(shared state TOUCHED), which an undo log of ranges
+       would not.
+       CONTENTS AND EXTENT ARE ONE HOOK BECAUSE THEY ARE ONE STORAGE, and this was two. `resize`/`transfer`/
+       detach had a hook of their own whose host arm could only ABORT, because an entry holding `a_len` bytes
+       read off the buffer describes a length a resize takes away and names storage a detach frees. Splitting
+       them cannot be repaired by giving the second one an entry too: two entries over one buffer have an ORDER,
+       and a replay that puts the flow's bytes back before its length has an extent the bytes do not fit. So the
+       blob is the buffer's WHOLE storage state and a flow that reaches any part of it may write any other —
+       exactly the argument obj_state's one kind for three fields makes.
+       WHY THE SITE IS THE MUTATION AND NOT THE SAVE, for the extent half. A save-side check can only fire for a
+       buffer this flow had ALREADY captured, which is one of the two orderings. Resize FIRST and write SECOND
+       and the entry is created after the fact, over the post-resize bytes: no length ever disagrees, nothing
+       fires, and the sibling silently inherits both the new size and the write. A zero-length resizable buffer
+       is only the extreme of that ordering (there is no byte to write before the resize, so it is ALWAYS the
+       silent one) and not a separate case. Raised here, the ordering stops mattering, because the mutation
+       cannot happen without passing this. */
+    void (*buf_state)(JSContext *ctx, JSValueConst abuf);
 } JSTimeTravelHooks;
+/* A BUFFER'S WHOLE STORAGE STATE, as an opaque owned blob — the buffer twin of JS_ObjStateSave, and engine-owned
+   for the same reason: two of the things it holds are engine-internal and one of them is a REFERENCE.
+ *
+ * WHAT IT HOLDS is what the three operations of §25.1.6.6 ArrayBuffer.prototype.resize, §25.1.3.5
+ * DetachArrayBuffer and §25.2.5.3 SharedArrayBuffer.prototype.grow between them change: the [[ArrayBufferData]]
+ * block (its BYTES, copied — a restore must be able to hand storage back that a detach freed), the
+ * [[ArrayBufferByteLength]], and whether the buffer is detached at all. §25.1.6.6 steps 14 and 15 are "Set
+ * obj.[[ArrayBufferData]] to newBlock." and "Set obj.[[ArrayBufferByteLength]] to newByteLength."; §25.1.3.5
+ * steps 4 and 5 are "Set arrayBuffer.[[ArrayBufferData]] to null." and "Set
+ * arrayBuffer.[[ArrayBufferByteLength]] to 0."; and §25.1.6.8 ArrayBuffer.prototype.transfer step 2 is "Return
+ * ? ArrayBufferCopyAndDetach(obj, newLength, preserve-resizability)", whose §25.1.3.3 step 15 is "Perform !
+ * DetachArrayBuffer(arrayBuffer)." — so a transfer is a detach of THIS buffer plus a new one, and only the
+ * detach half is this buffer's state.
+ *
+ * AND THE VIEWS, WHICH ARE NOT A SECOND ENTRY. Per the specification a view carries no state a resize changes:
+ * §25.3.1.3 GetViewByteLength step 3 is "If view.[[ByteLength]] is not auto, return view.[[ByteLength]]." and
+ * step 8 "Return byteLength - byteOffset.", so a length-tracking view's extent is DERIVED at every read from
+ * the buffer's current one. This engine CACHES that derivation — `p->u.array.count`/`.u.ptr` on every typed
+ * array and `ta->length` on a tracking DataView — and js_array_buffer_update_typed_arrays re-derives them, so
+ * the restore re-derives rather than storing a second copy of a computed fact. ONE cached field does not
+ * re-derive: that update leaves a tracking DataView's `ta->length` ALONE when the view's offset lands at or
+ * past the new length, so the value it keeps is history rather than a function of the buffer, and it is read
+ * back by js_dataview_getValue's bounds test. That one is recorded, for THOSE views only, and recording it is
+ * why the blob holds a counted reference on each of them rather than a bare pointer — a delta outlives a flow,
+ * so a view the page dropped would otherwise be a dangling name in it. Every other view costs the blob nothing,
+ * which is what keeps the hot byte-write path free of per-view work. */
+JS_EXTERN void *JS_BufferStateSave(JSContext *ctx, JSValueConst obj);
+JS_EXTERN void  JS_BufferStateRestore(JSContext *ctx, JSValueConst obj, void *blob);
+JS_EXTERN void  JS_BufferStateFree(JSRuntime *rt, void *blob);
 /* The evaluation state of a module record, as an opaque owned blob — the module twin of JS_AsyncStateSave. */
 JS_EXTERN void *JS_ModuleEvalStateSave(JSContext *ctx, void *m);
 JS_EXTERN void  JS_ModuleEvalStateRestore(JSContext *ctx, void *m, void *blob);
