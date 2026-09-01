@@ -24735,16 +24735,45 @@ static void js_step_visit_free_reexec(JSContext *ctx, REExecContext *ec, uint8_t
     (void)ctx; (void)capture;
     lre_exec_end(ec);   /* which is exactly this side's job, and already knows both buffers */
 }
+/* THE DECLARATION IS THE HOST'S TO ACT ON — this engine owns no DOM, so both sides of a private tree are
+   function pointers the machine's declaration carries and all this side decides is which one runs. Asserted
+   on both consumers that dereference them: a declaration naming a tree and no operations names nothing this
+   walk can do, and the state block would be freed with a whole parse still hanging off it. */
+#define JS_STEP_TREE_OPS_DCHECK(ops)                                                                         \
+    DCHECK((ops) != NULL && (ops)->clone != NULL && (ops)->destroy != NULL,                                  \
+           "a step state declared a flow-private DOM tree and handed the walk no operations to act on it — "  \
+           "the engine owns no DOM, so the declaration carries the host's clone and destroy or the tree is "  \
+           "a field nothing can copy and nothing can free")
+static void js_step_visit_dup_tree(JSContext *ctx, void **root, void **cursors[], int ncursors,
+                                   const JSStepTreeOps *ops) {
+    JS_STEP_TREE_OPS_DCHECK(ops);
+    if (!*root) return;
+    *root = ops->clone(ctx, *root, cursors, ncursors);
+    DCHECK(*root != NULL,
+           "a flow-private DOM tree's clone answered NULL — the copy is fatal on allocation failure by "
+           "contract, because a sibling arm holding half a tree has no arm it belongs to");
+}
+static void js_step_visit_free_tree(JSContext *ctx, void **root, void **cursors[], int ncursors,
+                                    const JSStepTreeOps *ops) {
+    int i;
+    JS_STEP_TREE_OPS_DCHECK(ops);
+    if (*root) { ops->destroy(ctx, *root); *root = NULL; }
+    /* The cursors named nodes the tree OWNED, so this side frees none of them and clears them all — a cursor
+       left naming a destroyed node is the one thing a later read of this state could still fault on. */
+    for (i = 0; i < ncursors; i++) *cursors[i] = NULL;
+}
 static const JSStepVisit js_step_visit_dup  = { js_step_visit_dup_val,  js_step_visit_dup_strbuf,  js_step_visit_dup_props,
                                                 js_step_visit_dup_slots,  js_step_visit_dup_buf,
                                                 js_step_visit_dup_atom,  js_step_visit_dup_machine,
                                                 js_step_visit_dup_array,  js_step_visit_dup_shared,
-                                                js_step_visit_dup_maprec, js_step_visit_dup_reexec };
+                                                js_step_visit_dup_maprec, js_step_visit_dup_reexec,
+                                                js_step_visit_dup_tree };
 static const JSStepVisit js_step_visit_free = { js_step_visit_free_val, js_step_visit_free_strbuf, js_step_visit_free_props,
                                                 js_step_visit_free_slots, js_step_visit_free_buf,
                                                 js_step_visit_free_atom, js_step_visit_free_machine,
                                                 js_step_visit_free_array, js_step_visit_free_shared,
-                                                js_step_visit_free_maprec, js_step_visit_free_reexec };
+                                                js_step_visit_free_maprec, js_step_visit_free_reexec,
+                                                js_step_visit_free_tree };
 /* DELETED: tramp_step_visit_free, the per-machine call that discharged the declaration. Every one of the 137
    engine finis that called it — and the 46 host teardowns that spelled the same list out by hand — asked the
    ONE question "release what this state owns", at 183 places, one per machine. It is asked once now, in
@@ -24913,6 +24942,19 @@ static void js_step_visit_fp_reexec(JSContext *ctx, REExecContext *ec, uint8_t *
     js_step_fp_fold(ctx, (uint64_t)(uintptr_t)ec->reach);
     js_step_fp_fold(ctx, (uint64_t)(uintptr_t)capture);
 }
+/* THE ROOT AND EVERY CURSOR, and no operation of `ops` is called: this walk folds pointers and dereferences
+   nothing, so a `release` that has already destroyed the tree is diagnosed here rather than faulted on. The
+   cursors are folded for the same reason a `buf`'s pointer is — a `release` that moved one has changed what
+   the declaration names, and that is the whole question this number answers. */
+static void js_step_visit_fp_tree(JSContext *ctx, void **root, void **cursors[], int ncursors,
+                                  const JSStepTreeOps *ops)
+{
+    int i;
+    (void)ops;
+    js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*root);
+    js_step_fp_fold(ctx, (uint64_t)(uint32_t)ncursors);
+    for (i = 0; i < ncursors; i++) js_step_fp_fold(ctx, (uint64_t)(uintptr_t)*cursors[i]);
+}
 static const JSStepVisit js_step_visit_fp;
 /* An array OF SUB-OBJECTS is walked, because its elements can be values — the element visit is the machine's
    own and the fold has to reach through it exactly as the free and the clone do. */
@@ -24929,7 +24971,8 @@ static const JSStepVisit js_step_visit_fp = { js_step_visit_fp_val, js_step_visi
                                               js_step_visit_fp_slots, js_step_visit_fp_buf,
                                               js_step_visit_fp_atom, js_step_visit_fp_machine,
                                               js_step_visit_fp_array, js_step_visit_fp_shared,
-                                              js_step_visit_fp_maprec, js_step_visit_fp_reexec };
+                                              js_step_visit_fp_maprec, js_step_visit_fp_reexec,
+                                              js_step_visit_fp_tree };
 
 uint64_t JS_StepVisitOwnedFingerprint(JSContext *ctx, JSStepVisitFn visit, void *state)
 {

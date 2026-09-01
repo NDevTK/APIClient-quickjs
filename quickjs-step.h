@@ -27,6 +27,23 @@ struct JSMapRecord;
 struct REExecContext;
 struct JSStepHdr;
 
+/* WHAT A FLOW-PRIVATE TREE ANSWERS, declared by the HOST because the engine owns no DOM. A tree is not a
+   JSValue and not an allocation with a size, so no other operation below can name one; what the engine
+   contributes is only the decision of WHICH consumer is visiting, which is the one thing a machine must never
+   learn for itself.
+   TWO OPERATIONS AND NOT THREE. The consumer that clones needs a third — the old-node-to-new map it re-points
+   its cursors through — and needs it only for the length of one `clone` call, because a map records a copy
+   that has just been made and nothing about it parks. So it lives inside that call and never crosses this
+   boundary, which is also why the cursors are an argument of `clone` rather than a slot kind of their own. */
+typedef struct JSStepTreeOps {
+    /* Deep-copy the tree at `root` into a tree with the same owner, and re-point each of the `ncursors` cursor
+       slots — every one of which names a node OF that tree — at the copy of the node it named. Fatal on
+       allocation failure rather than answering NULL: a half-copied private tree has no arm it belongs to. */
+    void *(*clone)(JSContext *ctx, void *root, void **cursors[], int ncursors);
+    /* Destroy the tree at `root` and everything under it. */
+    void  (*destroy)(JSContext *ctx, void *root);
+} JSStepTreeOps;
+
 typedef struct JSStepVisit JSStepVisit;
 struct JSStepVisit {
     void (*val)(JSContext *ctx, JSValue *slot);
@@ -81,6 +98,19 @@ struct JSStepVisit {
        whichever copy it now belongs to. Every other pointer in the context aims into the subject string or the
        compiled bytecode, and both arms hold their own reference to those, so both stay valid unchanged. */
     void (*reexec)(JSContext *ctx, struct REExecContext *ec, uint8_t **capture);
+    /* A FLOW-PRIVATE DOM TREE a machine OWNS, and the CURSORS standing in it. Its own operation for the reason
+       `reexec` is one: the three consumers do different work over it and none of the others can name it. A
+       byte copy of the state leaves every one of those pointers aimed at the ORIGINAL arm's nodes, so a
+       sibling that took one would place the same nodes into two documents and both teardowns would destroy
+       them — which is exactly the corruption a fork abort exists to prevent.
+       THE CURSORS TRAVEL WITH THE TREE and are not slots of their own, because a cursor is only meaningful
+       against the copy the clone has just made: the clone re-points each one through its map, the teardown
+       clears it (the tree owned the node, so a cursor is BORROWED and is never freed here), and the
+       fingerprint folds it. A cursor slot holding NULL is a cursor the algorithm has not taken yet and is
+       passed through untouched by all three.
+       THE ROOT IS THE OWNED THING AND THE CURSORS ARE NOT, which is why they are two arguments and not one
+       array: getting that backwards is a double free of every node in the tree. */
+    void (*tree)(JSContext *ctx, void **root, void **cursors[], int ncursors, const JSStepTreeOps *ops);
 };
 
 /* A MACHINE'S DECLARATION. A host component writes one of these and hands it to JS_RegisterStepDef, which
