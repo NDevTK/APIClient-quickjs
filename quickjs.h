@@ -1232,7 +1232,8 @@ JS_EXTERN int JS_ToFloat64At(JSContext *ctx, double *pres, JSValueConst val,
     JS_ToFloat64At((ctx), (pres), (val), __FILE__, __LINE__)
 /* return an exception if 'val' is a Number.
    NOT in the family above: §7.1.15 ToBigInt ( arg ) reaches §7.1.1 ToPrimitive directly rather than through
-   §7.1.4, so these two carry no site because the assertion they would feed is not the one below. */
+   §7.1.4, so these two carry no site — the assertion the family above feeds is one they never reach, and a
+   site threaded here would be read by nothing. */
 JS_EXTERN int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
 JS_EXTERN int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val);
 /* same as JS_ToInt64() but allow BigInt */
