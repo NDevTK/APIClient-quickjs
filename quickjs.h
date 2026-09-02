@@ -1986,9 +1986,10 @@ typedef struct JSTimeTravelHooks {
        `closure` for the duration of this flow and records the swap on its delta, exactly as gen_fork does for a
        generator's execution state. The delta OWNS cur_data (JS_AsyncDataRef/Unref). */
     void (*async_fork)(JSContext *ctx, JSValueConst closure, void *base_data, void *cur_data);
-    /* Before a flow writes any of a shared ARRAY BUFFER's BYTES. `abuf` is the ArrayBuffer/SharedArrayBuffer
-       OBJECT — never a view and never a raw pointer — because the buffer is what OWNS the storage and is the
-       only name every writer of it agrees on.
+    /* Before a flow changes a shared ARRAY BUFFER's STORAGE STATE — any of its BYTES, or the EXTENT those bytes
+       live in (`resize`/`grow`, `transfer`, a detach). `abuf` is the ArrayBuffer/SharedArrayBuffer OBJECT —
+       never a view and never a raw pointer — because the buffer is what OWNS the storage and is the only name
+       every writer of it agrees on.
        THE UNIT IS THE BUFFER'S BYTES AND NOT A VIEW'S ELEMENT, for three reasons the code decides rather than
        taste. (1) A DataView write has NO element: `dv.setFloat64(3, x)` writes bytes 3..10 of the buffer, a
        DataView exposes no indexed properties at all, and those bytes cross the element boundary of every view
