@@ -600,6 +600,39 @@ typedef struct JSStepHdr {
        address at all. The bytes are the only thing that is the same question in every tier. Zero is "nothing
        asked", which a js_mallocz'd state already reads as. */
     uint32_t     fork_ask_key;
+    /* WHICH STAGE ISSUED THE FORK THAT IS OUTSTANDING — req_stage's argument, made of the one request kind that
+       did not have it, and made because the key above CANNOT ANSWER THIS QUESTION AND WAS BEING ASKED IT.
+       An ask key names the QUESTION and a resume needs the SITE, which are two questions over one string —
+       and they agree at every machine until one algorithm asks ONE predicate at TWO of its own call sites. Then
+       the stricter question decides the string and the looser one loses in silence, which is exactly what an
+       elimination chain does: its key is composed from the PREDICATE and the member's own name, deliberately
+       carrying neither the algorithm nor the operand (so that two members reached over one unknown agree), so
+       an algorithm running the chain TWICE over TWO operands spells the SAME BYTES at the same position in
+       both. DOM §4.10 Interface CharacterData's `substringData(offset, count)` is that algorithm: with both
+       operands unknown it draws Web IDL §3.2.4.6's chain over `offset` and then again over `count`, and at the
+       position where the two chains stand on the same number the ask key hashes identically — so the re-entry
+       that follows the `count` chain's park re-asks the ANSWERED `offset` chain, the key check agrees, and one
+       question's world is filed as another's with every arm real and in range.
+       THE STAGE IS WHAT TELLS THEM APART, for the reason req_stage gives one paragraph down: a machine that has
+       not moved is at the site that parked, and a stage is the resume point the driver already checks and a
+       parked flow already says out loud. It is WRITTEN ON EVERY ASK and cleared with `fork_ask_key`, so the two
+       halves of one outstanding question are set and reset together and a stale stage cannot outlive the key
+       that names its question.
+       NAMED RESIDUAL — TWO ASKS AT ONE STAGE OVER TWO OPERANDS SPELLING ONE OPERATION STRING ARE STILL ONE
+       QUESTION TO BOTH HALVES OF THIS CHECK, and that is narrower than the invariant rather than wrong: an
+       algorithm whose two sub-sequences can be in flight across a re-entry is one whose resume point is a
+       STAGE, which is what the check above requires of it, and no algorithm in this engine asks that shape at
+       one stage today (§5.1's two asks off one phase byte spell two operation strings over ONE operand, so the
+       key tells them apart; §4.10's two chains spell one string over two operands and are now two stages).
+       WHAT THE NEXT DIFF BUILDS: an OPERAND-IDENTITY accessor on JSConcolicHooks — the table carries `is`,
+       `example` and `lead` and NOTHING that names a value, which is why step_fork_key can only reach the
+       operation string — folded into that hash beside the op, so an ask is keyed by the predicate's own
+       identity (operator AND operand) exactly as the constraint the seam files under it already is.
+       HOW ITS ABSENCE SHOWS: an algorithm that grows a second sub-sequence over a second unknown at ONE stage
+       consumes the first's arm at the second's call site with every assert on the path satisfied — the arm is
+       real, in range, and recorded under the other operand's key — and the symptom is a report in which two
+       unknowns of one call carry one unknown's narrowing. */
+    uint16_t     fork_stage;
     /* the key a GETPROP sub-sequence is holding across its suspension. It is OWNED here because the driver
        BORROWS the atom the request carries, and released by the shared teardown so an abandon mid-read cannot
        leak it. JS_ATOM_NULL is zero, so a js_mallocz'd state already reads as "no read in flight". */

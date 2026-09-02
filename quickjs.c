@@ -23899,6 +23899,39 @@ static uint32_t step_fork_key(const char *op)
     return k ? k : 1u;   /* 0 is reserved for "nothing asked", which a zeroed header already reads as */
 }
 
+/* AND A FORK'S ANSWER ARRIVES AT THE STAGE THAT ASKED — step_keyed_answered's assertion, made of the one
+ * request kind that did not have it. See JSStepHdr::fork_stage for why the key above cannot stand in for it:
+ * an elimination chain's key is composed from the PREDICATE and the member's own name and carries neither the
+ * algorithm nor the operand, precisely so that two members reached over ONE unknown agree — which makes it
+ * BYTE-IDENTICAL between two chains ONE algorithm draws over TWO operands at the same position.
+ *
+ * IT REFUSES A FORK THAT OUTLIVES ITS STAGE, WHICH IS THE SAME REFUSAL step_keyed_inflight MAKES. Two asks
+ * legitimately stand inside one stage in sequence — a chain asks per position, and permission_store.c's §5.1
+ * asks twice off one phase byte — because only one of them is ever OUTSTANDING at a time. What is refused is
+ * the re-entry that reaches a DIFFERENT sub-sequence's ask than the one that parked, and a sub-sequence that
+ * can be in flight while another has already answered is one whose resume point is a STAGE. */
+static void step_fork_answered_stage(const JSStepHdr *h)
+{
+#if APICLIENT_DEV
+    char why[640];   /* the tail is where this names what to build; a truncated DFAIL loses exactly that */
+
+    if (h->fork_stage == h->stage) return;
+    snprintf(why, sizeof why,
+             "%s consumed a fork's answer at stage %u (%s) that was ASKED at stage %u (%s) — the machine left "
+             "the stage that parked on the ask, so this call site is taking another site's arm: a real "
+             "completion, in range, recorded by the flow's decision vector under the OTHER question's key and "
+             "read here as the answer to this one. The ask key cannot see it when the two sites spell one "
+             "operation, which is what an elimination chain drawn twice over two operands does at every "
+             "position the two chains share. Let the outstanding ask END before leaving its stage, and give a "
+             "sub-sequence that can still be in flight while another has answered a STAGE of its own",
+             h->def->algorithm, (unsigned)h->stage, step_stage_label(h, h->stage),
+             (unsigned)h->fork_stage, step_stage_label(h, h->fork_stage));
+    DFAIL(why);
+#else
+    (void)h;
+#endif
+}
+
 /* THE FORK'S ONE BODY, under both of the questions that use it — see JSStepHdr.fork_kind. `kind` is the only
    thing that differs between an outcome fork and a ToBoolean, and it differs at exactly one line: which seam
    the DRIVER asks. Everything else — the two phases, the borrowed operands, the ask key, the range check on
@@ -23927,11 +23960,17 @@ static int step_fork_ask(JSContext *ctx, JSStepHdr *h, JSValueConst over, const 
         h->fork_real = real;
         h->fork_kind = (uint8_t)kind;
         /* WRITTEN ON EVERY ASK, including the sibling's first one: a clone carries the key of the ask it was
-           forked at, and re-asking there overwrites it with the identical value. */
+           forked at, and re-asking there overwrites it with the identical value. The STAGE is written with it
+           and cleared with it — see JSStepHdr::fork_stage — so the two halves of one outstanding question can
+           never be half-set, and a stale stage cannot outlive the key that names its question. */
         h->fork_ask_key = step_fork_key(op);
+        h->fork_stage = h->stage;
         return JS_STEP_FORK;
     }
     DCHECK(h->fork_phase == FORK_PH_ANSWERED, "a step machine's fork resumed in no phase");
+    /* THE SITE FIRST AND THE QUESTION SECOND, because the site is what the question cannot answer: two asks
+       that spell one operation are indistinguishable to the key below, and the stage names them apart. */
+    step_fork_answered_stage(h);
     DCHECK(h->fork_ask_key == step_fork_key(op),
            "a fork's answer was delivered to a DIFFERENT question than the one that asked for it. The "
            "machine resumed at a call site other than its outstanding ask, so the phase or stage it resumes on "
@@ -23948,6 +23987,7 @@ static int step_fork_ask(JSContext *ctx, JSStepHdr *h, JSValueConst over, const 
     h->fork_phase = FORK_PH_ASK;   /* a machine may fork again — an iteration over unknown input does, per step */
     h->fork_arm = 0;
     h->fork_ask_key = 0;
+    h->fork_stage = 0;             /* cleared WITH the key: neither half of an answered question survives it */
     return 0;
 }
 
