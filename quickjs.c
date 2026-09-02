@@ -31966,6 +31966,14 @@ static void js_call_shape_idle_fail(JSContext *ctx, JSFunctionBytecode *b, uint3
 #define CALL_SHAPE_IDLE_CHECK() do { } while (0)
 #endif
 
+/* WHAT A CALL COULD NOT CALL, SAID AT THE CALL SITE — see js_throw_callee_not_a_function for the whole of the
+   reasoning. Declared here because the interpreter is compiled above the opcode size table the recovery walks,
+   which is js_sp_level_window's arrangement and for the same reason. */
+static bool js_callee_has_call(JSRuntime *rt, JSValueConst v);
+static void js_throw_callee_not_a_function(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *call_end_pc,
+                                           JSValueConst func, JSValueConst receiver,
+                                           int argc, int callee_slot, bool is_method);
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -32562,6 +32570,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         call_func = rt->class_array[p->class_id].call;
         if (!call_func) {
         not_a_function:
+            /* THE TWO CALLABILITY ANSWERS MUST BE ONE. A call site that refuses BEFORE this function (so it can
+               name the callee — see js_throw_callee_not_a_function) asks js_callee_has_call; if that predicate
+               were LOOSER than this refusal a non-callable would arrive here and get the nameless message, which
+               is merely the old behaviour, but if it were STRICTER the site would refuse a call this function
+               would have RUN. Asserted on the arm that can see both. */
+            DCHECK(!js_callee_has_call(rt, func_obj),
+                   "JS_CallInternal refused a callee that js_callee_has_call accepts — a call site that "
+                   "pre-checks with that predicate would raise a TypeError for a call this function performs");
             return JS_ThrowTypeErrorNotAFunction(caller_ctx);
         }
         return call_func(caller_ctx, func_obj, this_obj, argc,
@@ -34997,8 +35013,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int dfof = tramp_cont_forof;
                     void *dcs = tramp_cont_state;
                     tramp_cont_kind = CONT_NONE; tramp_cont_state = NULL; tramp_cont_forof = 0;
-                    ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
-                                              call_argc, vc(call_argv), 0);
+                    /* A CALLEE THAT IS NOT CALLABLE IS REFUSED HERE AND NOT INSIDE THE CALL, because THIS is the
+                       only place that holds the site: the caller's body, the call's own pc, its argument count,
+                       the operand slot the callee occupies and — for a method call — the receiver.
+                       JS_CallInternal's own refusal is the same TypeError with none of that in it, and it cannot
+                       acquire it: the same function is entered from C, where there is no call site to read. The
+                       question is asked with ITS test and never a second one (js_callee_has_call), so a
+                       non-callable Proxy still reaches js_proxy_call and raises its own error.
+                       THE SLOT IS ONLY MEANINGFUL WHEN THE OPERANDS ARE STILL THE CALLER'S STACK — a reshaped
+                       call (bound unwrap, apply list, proxy resolve) holds them in an owned heap list — so it is
+                       not assumed, it is CHECKED against sp, and -1 says "this body's operand depth cannot
+                       address this callee" rather than handing the recovery an index into the wrong memory. */
+                    if (unlikely(!js_callee_has_call(rt, call_argv[-1]))) {
+                        bool cal_on_stack = (b && !call_args_owned && call_argv == sp - call_argc
+                                             && call_argv - 1 >= stack_buf);
+                        js_throw_callee_not_a_function(ctx, b, sf->cur_pc, call_argv[-1], gthis, call_argc,
+                                                       cal_on_stack ? (int)((call_argv - 1) - stack_buf) : -1,
+                                                       tramp_first == -2);
+                        ret_val = JS_EXCEPTION;
+                    } else {
+                        ret_val = JS_CallInternal(ctx, call_argv[-1], gthis, JS_UNDEFINED,
+                                                  call_argc, vc(call_argv), 0);
+                    }
                     /* the arguments were read; an apply shape's list is done with HERE, before either exit — the
                        tail exit below never reaches the cleanup block, which is where it leaked. */
                     if (call_args_owned) {
@@ -52808,6 +52844,311 @@ static void js_sp_level_window(JSFunctionBytecode *b, uint32_t pos, char *out, s
     }
 }
 #endif
+
+/* ─── "not a function" NAMES ITS CALLEE ────────────────────────────────────────────────────────────────────
+ * A bare `TypeError: not a function` beside a byte offset into a minified one-line program is a crash nobody
+ * can act on: it states a correct spec fact and no site, so the reader discovers there is nowhere to apply it
+ * only after trying. It is the shared-helper defect — JS_ThrowTypeErrorNotAFunction takes a `ctx` and eleven
+ * call sites each throw away the facts they are holding — and it is worse than a missing file:line, because two
+ * DIFFERENT missing capabilities produce a BYTE-IDENTICAL report. Measured: `gp([10,20,30]).next().value`
+ * reports one column for BOTH of its calls (the parser deliberately keeps the head of a postfix chain, so
+ * `f()()` attributes both calls to `f` and V8's eval-origin column agrees), so "gp is not defined" and "what
+ * gp returned has no .next" are the same line and the reader cannot tell which capability to build.
+ *
+ * SO THE CALLEE'S OWN NAME IS RECOVERED FROM THE BODY THE CALL WAS COMPILED INTO. The walk is FORWARD FROM
+ * ZERO over the opcode size table, which is the only sound direction across variable-length opcodes and is the
+ * same walk js_sp_level_window and compute_stack_size perform; a pc it cannot land on exactly is itself a
+ * finding and reports NO name rather than a guess. Everything below refuses rather than approximates, because
+ * a WRONG name is worse than none — it is authoritative and sends the reader to build the wrong thing.
+ *
+ * IT COSTS NOTHING UNTIL A CALL FAILS: no operand, no side table, no bytecode-format change, nothing
+ * serialized, and not one instruction on the calling path beyond the callability test the call was about to
+ * make anyway. On the throw path it walks the body a few times, which is the same order build_backtrace's own
+ * pc2line walk already pays per frame — a larger constant on a path that is already O(body), not a new class.
+ *
+ * NAMED RESIDUAL — WHAT IS NOT COVERED: a target refused by `check_function` (the `.apply`, `Reflect.apply`
+ * and spread operator routes) and by JS_CallConstructorInternal (`new X()`) still raises the NAMELESS message,
+ * because those sites hold a different operand shape and the slot arithmetic below is not theirs.
+ * WHAT THE NEXT DIFF BUILDS: each of those sites calling js_throw_callee_not_a_function with its OWN
+ * (bytecode, call-end pc, target, receiver, argc, operand slot) — six sites, not one line, because the shapes
+ * differ; `check_function` then has no caller left that wants the anonymous form.
+ * HOW ITS ABSENCE SHOWS: a page error whose text is exactly `not a function`, with no parenthesised value and
+ * no `this body does not name it` clause, raised from a call written `.apply`, `Reflect.apply`, `f(...spread)`
+ * or `new`. (That bare spelling is NOT unique to this residual — GetMethod's own TypeError is spelled the same
+ * at several step machines, and those are a different sentence in a different algorithm — so the call spelling
+ * is part of the tell, not decoration on it.) */
+
+/* WHERE A JUMP IN FINAL BYTECODE LANDS. Every form reads its displacement at the byte AFTER the opcode and adds
+   it to that same address (OP_goto, OP_goto8, OP_goto16, OP_if_false, OP_if_true, OP_if_false8, OP_if_true8,
+   OP_catch and OP_gosub all do `pc += diff` with `pc` one past the opcode — and note that writing that opcode
+   family with a star would END THIS COMMENT, which is why it is spelled out), so there is one formula and it
+   is read off quickjs-opcode.h's own FMT column rather
+   than a hand-kept opcode list. Returns 0 for a non-jump; *target is only written when it returns 1.
+   THE UNDECODED FORMS ARE A REFUSAL, NOT AN OMISSION — see js_call_callee_name's caller of this. */
+static int js_bc_jump_target(const uint8_t *buf, uint32_t q, uint32_t *target)
+{
+    switch (short_opcode_info(buf[q]).fmt) {
+    case OP_FMT_label:
+        *target = q + 1 + (uint32_t)(int32_t)get_u32(buf + q + 1);
+        return 1;
+    case OP_FMT_label8:
+        *target = (uint32_t)((int32_t)(q + 1) + (int32_t)(int8_t)buf[q + 1]);
+        return 1;
+    case OP_FMT_label16:
+        *target = (uint32_t)((int32_t)(q + 1) + (int32_t)(int16_t)get_u16(buf + q + 1));
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Does a FMT carry a jump this walk cannot decode? `with` (atom_label_u8) puts its displacement five bytes in,
+   and OP_gosub's matching OP_ret returns to an address the gosub PUSHED. Rather than model either, a body that
+   contains one answers no name at all: the interval check below can only clear an interval it can see every
+   entry into, so an entry it cannot compute is a reason to say nothing. */
+static int js_bc_fmt_is_opaque_jump(uint8_t op)
+{
+    switch (short_opcode_info(op).fmt) {
+    case OP_FMT_atom_label_u8:
+    case OP_FMT_atom_label_u16:
+    case OP_FMT_label_u16:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* THE NAME OF THE VALUE THE CALL AT `call_end` TOOK AS ITS CALLEE, or JS_ATOM_NULL when this body cannot say.
+   `call_end` is the byte AFTER the call instruction (what the call opcodes store in sf->cur_pc). `argc` and
+   `callee_slot` are read off the LIVE call — the operand count about to be passed, and the operand index the
+   callee actually occupies — and both are CHECKED against the instruction, so a call whose operands were
+   RESHAPED (a bound unwrap, an apply list, a proxy resolve) cannot be attributed to an opcode describing a
+   different call: its argc will not match and the answer is no name. */
+static JSAtom js_call_callee_name(JSContext *ctx, JSFunctionBytecode *b, uint32_t call_end,
+                                  int argc, int callee_slot, bool *is_computed)
+{
+    const uint8_t *buf;
+    uint32_t len, p, prev = UINT32_MAX, cur = UINT32_MAX, producer = UINT32_MAX, t = 0;
+    int sz, op, idx;
+
+    *is_computed = false;
+    if (!b)
+        return JS_ATOM_NULL;
+    buf = b->byte_code_buf;
+    if (!buf || b->byte_code_len <= 0)
+        return JS_ATOM_NULL;
+    len = (uint32_t)b->byte_code_len;
+    if (call_end == 0 || call_end > len)
+        return JS_ATOM_NULL;
+
+    /* (1) the instruction that ENDS where the call ended, and the one before it. */
+    p = 0;
+    while (p < call_end) {
+        sz = short_opcode_info(buf[p]).size;
+        if (sz <= 0)
+            return JS_ATOM_NULL;
+        prev = cur;
+        cur = p;
+        p += (uint32_t)sz;
+    }
+    if (p != call_end || cur == UINT32_MAX)
+        return JS_ATOM_NULL;   /* not an opcode boundary of this body: that, not the name, is the finding */
+
+    /* (2) …AND IT MUST BE THIS CALL. A step machine re-entering from C leaves sf->cur_pc pointing at the OUTER
+       call, whose callee is a different value entirely; the argument count is what refuses it. */
+    op = buf[cur];
+    if (op == OP_call || op == OP_tail_call || op == OP_call_method || op == OP_tail_call_method) {
+        if ((int)get_u16(buf + cur + 1) != argc)
+            return JS_ATOM_NULL;
+    } else if (op >= OP_call0 && op <= OP_call3) {
+        if (op - OP_call0 != argc)
+            return JS_ATOM_NULL;
+    } else {
+        return JS_ATOM_NULL;
+    }
+
+    /* (3) WHICH INSTRUCTION PUSHED THE CALLEE. compute_stack_size already proved the operand depth at a pc is a
+       property of the BYTECODE and not of the path that reached it — it refuses a body where the two disagree —
+       so the last instruction whose depth AFTER it is the callee's slot is the one that wrote that slot. */
+#if APICLIENT_DEV
+    if (b->stack_level_tab && callee_slot >= 0) {
+        p = 0;
+        while (p < cur) {
+            uint32_t nxt;
+            sz = short_opcode_info(buf[p]).size;
+            if (sz <= 0)
+                return JS_ATOM_NULL;
+            nxt = p + (uint32_t)sz;
+            if (nxt > cur)
+                return JS_ATOM_NULL;
+            if (b->stack_level_tab[nxt] != 0xffffu && (int)b->stack_level_tab[nxt] == callee_slot + 1)
+                producer = p;
+            p = nxt;
+        }
+    }
+#else
+    (void)callee_slot;
+#endif
+    if (producer == UINT32_MAX) {
+        /* WITHOUT that table only a ZERO-ARGUMENT call can be attributed, and it can be attributed exactly: the
+           callee IS the top of the stack at the call, so the instruction before it is what left it there. A
+           call with arguments has the LAST ARGUMENT's producer in that position and gets no name — which is a
+           narrower answer, never a wrong one. */
+        if (argc != 0)
+            return JS_ATOM_NULL;
+        producer = prev;
+    }
+    if (producer == UINT32_MAX)
+        return JS_ATOM_NULL;
+
+    /* (4) …AND NOTHING MAY JUMP OVER IT. A path landing strictly after the producer and at or before the call
+       reaches the call WITHOUT having run the producer, so on that path the name is a different one:
+       `(c ? a.foo : b.bar)()` would otherwise always report `bar`. This is the check that makes the recovery a
+       fact rather than a likelihood, and it is why the opaque forms above refuse outright. */
+    p = 0;
+    while (p < len) {
+        sz = short_opcode_info(buf[p]).size;
+        if (sz <= 0)
+            return JS_ATOM_NULL;
+        if (js_bc_fmt_is_opaque_jump(buf[p]))
+            return JS_ATOM_NULL;
+        if (buf[p] == OP_gosub && (uint32_t)(p + 5) > producer && (uint32_t)(p + 5) <= cur)
+            return JS_ATOM_NULL;   /* OP_ret lands here, and the address came off the stack */
+        if (js_bc_jump_target(buf, p, &t) && t > producer && t <= cur)
+            return JS_ATOM_NULL;
+        p += (uint32_t)sz;
+    }
+
+    /* (5) THE NAME. A member read carries its key in the instruction; a variable read carries an index into a
+       table this body already owns. A COMPUTED member (`o[k]`) carries neither, and that is a POSITIVE
+       statement — the key is a runtime value, so the name has to come from the run — not a hole. */
+    op = buf[producer];
+    if (op == OP_get_field || op == OP_get_field2 || op == OP_get_var || op == OP_get_var_undef)
+        return JS_DupAtom(ctx, (JSAtom)get_u32(buf + producer + 1));
+    if (op == OP_get_array_el || op == OP_get_array_el2) {
+        *is_computed = true;
+        return JS_ATOM_NULL;
+    }
+    /* `vardefs` is absent for a stripped function that contains no eval() — the same guard
+       JS_ThrowReferenceErrorUninitialized2 makes, for the same reason. */
+    if (b->vardefs) {
+        idx = -1;
+        if (op == OP_get_loc || op == OP_get_loc_ref || op == OP_get_loc_check)
+            idx = (int)get_u16(buf + producer + 1);
+        else if (op == OP_get_loc8)
+            idx = (int)buf[producer + 1];
+        else if (op >= OP_get_loc0 && op <= OP_get_loc3)
+            idx = op - OP_get_loc0;
+        if (idx >= 0 && idx < (int)b->var_count)
+            return JS_DupAtom(ctx, b->vardefs[b->arg_count + idx].var_name);
+        idx = -1;
+        if (op == OP_get_arg)
+            idx = (int)get_u16(buf + producer + 1);
+        else if (op >= OP_get_arg0 && op <= OP_get_arg3)
+            idx = op - OP_get_arg0;
+        if (idx >= 0 && idx < (int)b->arg_count)
+            return JS_DupAtom(ctx, b->vardefs[idx].var_name);
+    }
+    if (b->closure_var) {
+        idx = -1;
+        if (op == OP_get_var_ref || op == OP_get_var_ref_check)
+            idx = (int)get_u16(buf + producer + 1);
+        else if (op >= OP_get_var_ref0 && op <= OP_get_var_ref3)
+            idx = op - OP_get_var_ref0;
+        if (idx >= 0 && idx < (int)b->closure_var_count)
+            return JS_DupAtom(ctx, b->closure_var[idx].var_name);
+    }
+    return JS_ATOM_NULL;
+}
+
+/* WHAT A VALUE IS, WITHOUT RUNNING A LINE OF THE PAGE'S CODE. An object is named by the ENGINE's own class name
+   — never by a `toString`, which is the page's code and would run inside a throw — and a primitive by its type
+   rather than its contents, because a string callee can be megabytes of attacker input. */
+static const char *js_callee_kind_str(JSContext *ctx, JSValueConst v, char *buf, size_t size)
+{
+    int tag = JS_VALUE_GET_TAG(v);
+    if (JS_TAG_IS_FLOAT64(tag))
+        return "a number";
+    switch (tag) {
+    case JS_TAG_UNDEFINED:     return "undefined";
+    case JS_TAG_NULL:          return "null";
+    case JS_TAG_BOOL:          return "a boolean";
+    case JS_TAG_INT:           return "a number";
+    case JS_TAG_STRING:        return "a string";
+    case JS_TAG_STRING_ROPE:   return "a string";
+    case JS_TAG_SYMBOL:        return "a symbol";
+    case JS_TAG_BIG_INT:       return "a bigint";
+    case JS_TAG_SHORT_BIG_INT: return "a bigint";
+    case JS_TAG_UNINITIALIZED: return "uninitialized";
+    case JS_TAG_OBJECT:
+        {
+            char abuf[ATOM_GET_STR_BUF_SIZE];
+            JSObject *p = JS_VALUE_GET_OBJ(v);
+            snprintf(buf, size, "[object %.40s]",
+                     JS_AtomGetStr(ctx, abuf, sizeof(abuf), ctx->rt->class_array[p->class_id].class_name));
+            return buf;
+        }
+    default:                   return "a primitive this report has no name for";
+    }
+}
+
+/* EXACTLY JS_CallInternal's OWN [[Call]] TEST, in one place so a call site that wants to raise a SITED refusal
+   cannot answer this differently from the call it is about to make. It is NOT JS_IsFunction: a non-callable
+   Proxy has a [[Call]] handler (js_proxy_call) that raises its own error, and that error must still be the one
+   the page sees. */
+static bool js_callee_has_call(JSRuntime *rt, JSValueConst v)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return false;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
+        return true;   /* JS_CallInternal runs its body rather than consulting class_array */
+    return rt->class_array[p->class_id].call != NULL;
+}
+
+static void js_throw_callee_not_a_function(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *call_end_pc,
+                                           JSValueConst func, JSValueConst receiver,
+                                           int argc, int callee_slot, bool is_method)
+{
+    char vbuf[72], rbuf[72], nbuf[ATOM_GET_STR_BUF_SIZE];
+    const char *what = js_callee_kind_str(ctx, func, vbuf, sizeof(vbuf));
+    bool computed = false;
+    JSAtom name = JS_ATOM_NULL;
+
+    if (b && call_end_pc && b->byte_code_buf && call_end_pc >= b->byte_code_buf)
+        name = js_call_callee_name(ctx, b, (uint32_t)(call_end_pc - b->byte_code_buf),
+                                   argc, callee_slot, &computed);
+    if (name != JS_ATOM_NULL) {
+        const char *key = JS_AtomGetStr(ctx, nbuf, sizeof(nbuf), name);
+        if (is_method)
+            JS_ThrowTypeError(ctx, "%.64s of %.56s is not a function (it is %.56s)",
+                              key, js_callee_kind_str(ctx, receiver, rbuf, sizeof(rbuf)), what);
+        else
+            JS_ThrowTypeError(ctx, "%.64s is not a function (it is %.56s)", key, what);
+        JS_FreeAtom(ctx, name);
+        return;
+    }
+    /* A COMPUTED member is always a METHOD call — `o[k]()` and `(o[k])()` both compile through OP_get_array_el
+       to OP_call_method — so the receiver is real here; the conditional is the assertion of that, written as a
+       fallback rather than a DCHECK because a diagnostic must not be the thing that aborts. */
+    if (computed) {
+        if (is_method)
+            JS_ThrowTypeError(ctx, "a computed member of %.56s is not a function (it is %.56s) — the key is a "
+                                   "runtime value, so only the run can name it",
+                              js_callee_kind_str(ctx, receiver, rbuf, sizeof(rbuf)), what);
+        else
+            JS_ThrowTypeError(ctx, "a computed member is not a function (it is %.56s) — the key is a runtime "
+                                   "value, so only the run can name it", what);
+        return;
+    }
+    if (is_method)
+        JS_ThrowTypeError(ctx, "a member of %.56s is not a function (it is %.56s) — this body does not name it",
+                          js_callee_kind_str(ctx, receiver, rbuf, sizeof(rbuf)), what);
+    else
+        JS_ThrowTypeError(ctx, "not a function (this call's callee is %.56s) — this body does not name it",
+                          what);
+}
 
 static void json_free_token(JSParseState *s, JSToken *token) {
     // Only free actual allocated values
