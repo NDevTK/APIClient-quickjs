@@ -2391,11 +2391,24 @@ JS_EXTERN JSValue *JS_FlowNew(JSContext *ctx, const char *src, size_t len, const
    reachable only by calling it, and a host that JS_Calls it from C runs it in an activation with no flow base
    under it, which is the drive-to-completion this engine aborts on. The base built here is the one a promise
    reaction runs on, so `func` may be of any kind and a loop or an await inside it PARKS like any other flow's.
-   The call's result is not observable and is discarded; a throw is the flow's completion and arrives through
-   JS_FlowResume's `pres` exactly as a program's does. Resumed, cloned and freed by the three calls below.
+   A throw is the flow's completion and arrives through JS_FlowResume's `pres` exactly as a program's does.
+   WHETHER THE CALL'S RESULT ARRIVES THERE TOO IS THE CALLER'S TO STATE, and it is a required argument rather
+   than a default because the two answers are not interchangeable and neither is safe to assume. A host that
+   drives a call for its SIDE EFFECTS (an orphan invoked to see what it reaches, a report of an exception) has
+   no use for the value and must not be handed one: `pres` is read by arms that dispatch on its TYPE, so a
+   driven function returning a string would arrive at a reader asking whether a javascript: URL evaluated to
+   one. A host that drives a call for its ANSWER — an algorithm queued as a task whose completion value IS the
+   fact the caller needs, which is what HTML §6.10.1 "Close requests"' step 9 is — must be handed it, and a
+   `false` here is then a reader whose producer produces nothing, with `JS_UNDEFINED` standing in for the
+   answer and no way to tell that apart from a real one.
+   take_result FALSE: the result is discarded here and `pres` is JS_UNDEFINED on a normal completion.
+   take_result TRUE:  the result is handed to `pres` and the CALLER OWNS IT (it frees it, exactly as it frees a
+   program flow's completion value).
+   Resumed, cloned and freed by the three calls below; a CLONE keeps this answer, because a forked arm of a
+   call flow completes the same call and owes its completion to the same host.
    NULL if the allocation failed (the exception is live). */
 JS_EXTERN JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueConst this_val,
-                                  int argc, JSValueConst *argv);
+                                  int argc, JSValueConst *argv, bool take_result);
 /* IS THIS HANDLE A CALL FLOW (JS_FlowNewCall's) rather than a program flow (JS_FlowNew's)? A program's
    completion advances a document's script sequence and its throw is the page's; a call's completion advances
    nothing and its throw belongs to whoever made the call. A host running both must be able to tell them apart,

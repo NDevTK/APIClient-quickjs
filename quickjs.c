@@ -48984,7 +48984,7 @@ JSValue JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const cha
 }
 
 static JSAsyncFunctionData *flow_async_data(JSAsyncFunctionState *s);
-static int  flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res);
+static int  flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res, JSValue *pres);
 static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s);
 /* the snapshot's OTHER HALF, released — defined beside clone_deep_flow, which is the ownership list it mirrors */
 static void free_tramp_chain(JSContext *ctx, JSAsyncFunctionState *s);
@@ -49095,16 +49095,19 @@ int JS_FlowResume(JSContext *ctx, JSValue *flow, JSValue *pres) {
             JS_FreeValue(ctx, r);
             return 1;   /* suspended: the scheduler resumes it with its COW delta swapped back in */
         }
-        result = flow_reaction_complete(ctx, s, r);
+        result = flow_reaction_complete(ctx, s, r, pres);
         /* A CALL ROOT THAT THREW COMPLETED WITH A THROW, and the completion is what `pres` is for. This arm used
            to leave `*pres` at UNDEFINED unconditionally, so a call-root flow the SCHEDULER drives — a driven
            orphan, and equally the sibling of a forked promise reaction — reported success to its host while the
            exception sat live on the context, to be found later by whatever asked next. The bytecode base below
            hands its JS_EXCEPTION back through the same field; both kinds of base now answer the same way, which
-           is what lets one host read one completion. flow_reaction_complete has already consumed `r` (phase 1
-           discards the result, phase 0 gives it to the capability), so the live exception is the only thing left
-           to report and JS_HasException is how it is asked — `current_exception` holds the thrown VALUE and is
-           JS_UNINITIALIZED when there is none, never the JS_TAG_EXCEPTION sentinel. */
+           is what lets one host read one completion. THE NORMAL HALF OF THAT SENTENCE WAS THE OTHER HALF OF THE
+           SAME DEFECT and is now answered in the same place: `flow_reaction_complete` writes `*pres` on every
+           path — the value for a flow whose host takes it, JS_UNDEFINED for one whose does not, and the
+           capability's for a phase-0 completion — so this line no longer has to know which. What remains here
+           is the THROW, because an abrupt completion leaves nothing in `r` to hand over: JS_HasException is how
+           it is asked — `current_exception` holds the thrown VALUE and is JS_UNINITIALIZED when there is none,
+           never the JS_TAG_EXCEPTION sentinel. */
         if (result == 0 && JS_HasException(ctx))
             *pres = JS_EXCEPTION;
         return result;
@@ -49345,8 +49348,10 @@ typedef struct JSReactionFlow JSReactionFlow;
 static JSAsyncFunctionState *flow_reaction_clone_alloc(JSContext *ctx, JSAsyncFunctionState *src);
 static void flow_reaction_shell_free(JSContext *ctx, JSAsyncFunctionState *c);
 /* The handler body finished: settle the derived promise. Returns 1 when the flow has MORE to run (the settle is
-   phase 1 of the same flow, so the scheduler resumes it once more), 0 when it is finished. `res` is consumed. */
-static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res);
+   phase 1 of the same flow, so the scheduler resumes it once more), 0 when it is finished. `res` LEAVES THIS
+   FUNCTION ONE OF TWO WAYS and never a third: consumed here (given to the capability, or freed), or handed to
+   `pres` for the caller to own when the flow's own record says its host takes the call's completion value. */
+static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res, JSValue *pres);
 static void flow_reaction_free(JSContext *ctx, JSAsyncFunctionState *s);
 
 /* An ASYNC_CALL base is EMBEDDED in the JSAsyncFunctionData that holds the capability its completion settles. */
@@ -106166,13 +106171,27 @@ typedef struct JSReactionFlow {
          phase 0 — a HANDLER body: its completion is owed to `resolve`/`reject`, so an abrupt one becomes the
                    capability's rejection and is consumed HERE. A reaction with no capability at all (the await
                    extension passes undefined for both) drops it, which is 27.5.2.1's behaviour and upstream's.
-         phase 1 — the LAST call of the flow: its RESULT is not observable and is discarded, and its THROW is
-                   the flow's completion — returned to the job pump, which is the host's report-an-exception
-                   edge. js_settle_as_flow and host_call_job are both whole flows of this shape; a host callback
-                   that throws is reported exactly as HTML §8.8's queueMicrotask and ECMAScript §9.12
-                   "CleanupFinalizationRegistry"'s cleanup callback
-                   require, rather than being handed to a capability that does not exist. */
+         phase 1 — the LAST call of the flow: its THROW is the flow's completion — returned to the job pump,
+                   which is the host's report-an-exception edge. js_settle_as_flow and host_call_job are both
+                   whole flows of this shape; a host callback that throws is reported exactly as HTML §8.8's
+                   queueMicrotask and ECMAScript §9.12 "CleanupFinalizationRegistry"'s cleanup callback
+                   require, rather than being handed to a capability that does not exist. Its RESULT is
+                   discarded UNLESS `take_result` below says a host is waiting for it — this used to read
+                   "not observable and is discarded" with no qualification, which was true of every phase-1
+                   flow the engine itself makes and FALSE of the one a host makes in order to read an
+                   answer. */
     uint8_t phase;
+    /* DOES THE FLOW'S HOST TAKE THE CALL'S COMPLETION VALUE — JS_FlowNewCall's own argument, stated per
+     * flow because it is a fact about WHO ASKED and about nothing else. A phase-1 completion has exactly
+     * one value and two legitimate fates: freed here, or handed to `pres` for the host to own. Guessing
+     * either way is the defaulted-field defect in one of its two directions — free a value a host is
+     * waiting for and the host reads JS_UNDEFINED as though it were the answer (an algorithm's boolean
+     * becomes `false`, which is a POSITIVE claim nothing computed); hand one to a host that dispatches on
+     * its TYPE and an unrelated arm claims it. So it is asked at the one site that knows.
+     * IT IS COPIED BY THE CLONE, like `phase`: a forked arm is the same call completing on another
+     * timeline, so it owes its completion to the same host. An arm that dropped the answer would leave
+     * the host's latch unwritten for exactly the arm that reached the step producing it. */
+    uint8_t take_result;
 } JSReactionFlow;
 
 static void js_reaction_park_resume(JSContext *ctx, void *opaque);
@@ -106326,6 +106345,9 @@ static JSAsyncFunctionState *flow_reaction_clone_alloc(JSContext *ctx, JSAsyncFu
        is worse than the arm going unreported. */
     c->hook_promise = JS_UNDEFINED;
     c->phase = sr->phase;
+    /* …AND THE COMPLETION CONTRACT, which is not a reference and is still the arm's to keep: the sibling
+       completes the SAME call and owes its value to the SAME host. See the field. */
+    c->take_result = sr->take_result;
     return &c->fs;
 }
 
@@ -106334,7 +106356,10 @@ static void flow_reaction_shell_free(JSContext *ctx, JSAsyncFunctionState *c)
     reaction_flow_free(ctx, (JSReactionFlow *)c);
 }
 
-static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res)
+/* `pres` IS PART OF THE COMPLETION, exactly as it is at JS_FlowResume's own entry: a phase-1 call flow has
+   ONE completion value and the flow's own record says whether its host takes it. It is written on every
+   path, so no caller can read a slot this function did not answer. */
+static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSValue res, JSValue *pres)
 {
     /* A JSReactionFlow's fields live AFTER the embedded state, so this cast reads past a state that is not one.
        The base_kind is what says it is — asserted here, at the cast, rather than discovered as a 4-byte read
@@ -106352,10 +106377,22 @@ static int flow_reaction_complete(JSContext *ctx, JSAsyncFunctionState *s, JSVal
     rf->fs.frame.arg_buf = NULL;
     rf->fs.frame.cur_func = JS_UNDEFINED;
     rf->fs.this_val = JS_UNDEFINED;
+    DCHECK(pres != NULL,
+           "a call-root flow's completion was taken with nowhere to put its value — the value is part of "
+           "the completion and the caller must take it, exactly as JS_FlowResume's own entry says");
+    *pres = JS_UNDEFINED;
     if (rf->phase == 0 && reaction_flow_settle_start(ctx, rf, res) == 0)
         return 1;   /* PHASE 1 is the same flow: the scheduler resumes it and the resolve runs on this base */
-    if (rf->phase != 0)
-        JS_FreeValue(ctx, res);   /* phase 1: the resolving function's own result is not observable */
+    /* PHASE 1'S ONE VALUE, TO WHICHEVER OF ITS TWO OWNERS THE FLOW NAMED. `take_result` is the caller's
+       answer at JS_FlowNewCall and is 0 for every call flow the engine builds itself, so the engine's own
+       settles are unchanged: a resolving function's result is still not observable and is still freed
+       here. What used to be unconditional is the OTHER half — a host that queued an algorithm as a call
+       BECAUSE its completion value is the fact it needs read JS_UNDEFINED for it on every completion,
+       with nothing anywhere to say the value had been freed one frame below. */
+    if (rf->phase != 0) {
+        if (rf->take_result) *pres = res;   /* the caller owns it now, and frees it */
+        else JS_FreeValue(ctx, res);
+    }
     return 0;
 }
 
@@ -106513,6 +106550,7 @@ static int js_settle_as_flow(JSContext *ctx, JSValueConst func, JSValueConst val
     rf->reject = JS_UNDEFINED;
     rf->hook_promise = JS_UNDEFINED;   /* no .then invocation here, so no BEFORE/AFTER bracket to close */
     rf->phase = 1;   /* there is no handler phase: the settle is the entire flow */
+    rf->take_result = 0;   /* a resolving function's own result is not an answer anybody asked for */
     if (reaction_call_flow_init(ctx, &rf->fs, JS_UNDEFINED, func, 1, vc(&value)) < 0) { reaction_flow_free(ctx, rf); return -1; }
     return JS_IsException(reaction_flow_step(ctx, rf)) ? -1 : 0;
 }
@@ -106559,7 +106597,8 @@ int JS_FlowIsCall(const JSValue *flow)
     return s->base_kind == FLOW_BASE_STEP_ROOT;
 }
 
-JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueConst this_val, int argc, JSValueConst *argv)
+JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueConst this_val, int argc,
+                        JSValueConst *argv, bool take_result)
 {
     JSReactionFlow *rf = js_mallocz(ctx, sizeof(*rf));
     if (unlikely(!rf)) { JS_ThrowOutOfMemory(ctx); return NULL; }
@@ -106569,6 +106608,9 @@ JSValue *JS_FlowNewCall(JSContext *ctx, JSValueConst func, JSValueConst this_val
     rf->reject = JS_UNDEFINED;
     rf->hook_promise = JS_UNDEFINED;   /* no `.then` invocation here, so no BEFORE/AFTER bracket to close */
     rf->phase = 1;
+    /* THE CALLER'S ANSWER TO WHO OWNS THE COMPLETION — a REQUIRED argument, so a host that builds a call
+       flow cannot leave the question unasked and get one of the two answers by accident. See the field. */
+    rf->take_result = take_result ? 1 : 0;
     if (reaction_call_flow_init(ctx, &rf->fs, this_val, func, argc, argv) < 0) {
         reaction_flow_free(ctx, rf);
         return NULL;
