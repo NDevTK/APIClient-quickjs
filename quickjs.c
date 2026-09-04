@@ -26482,13 +26482,34 @@ typedef struct JSOpClass {
     uint8_t computed;    /* 1 = OP_define_class_computed */
 } JSOpClass;
 
-#define CONT_TOPRIM_GET    62  /* gp_outer = JSToPrim: 7.1.1 step 2.a's GetMethod(input, @@toPrimitive) and
-                                  7.1.1.1 step 2's Get(O, "toString"/"valueOf"). All three are [[Get]]s on the
-                                  object being coerced, so an accessor or a Proxy `get` trap is the page's code —
-                                  and the sequence read them with JS_GetProperty from C, behind a comment
-                                  claiming a coercion method "is a data property in every real case". Measured
-                                  false: `String(new Proxy({}, {get(t,k){ if (k === Symbol.toPrimitive) for(;;){} }}))`
-                                  aborted with no flow base, and EVERY coercion in the engine reaches this. */
+#define CONT_TOPRIM_GET    62  /* gp_outer = JSToPrim: §7.1.1 ToPrimitive ( input [ , preferredType ] ) step 1.a's
+                                  "Let exoticToPrimitive be ? GetMethod(input, %Symbol.toPrimitive%)." and
+                                  §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3.a's "Let method be ?
+                                  Get(obj, name)." — which is TWO reads, one per element of methodNames, not one.
+                                  All are [[Get]]s on the object being coerced, so an accessor or a Proxy `get`
+                                  trap is the page's code — and the sequence read them with JS_GetProperty from C,
+                                  behind a comment claiming a coercion method "is a data property in every real
+                                  case". Measured false:
+                                  `String(new Proxy({}, {get(t,k){ if (k === Symbol.toPrimitive) for(;;){} }}))`
+                                  aborted with no flow base, and EVERY coercion in the engine reaches this.
+                                  THE NUMBERS ABOVE WERE 2.a AND "step 2" UNTIL THEY WERE FETCHED. §7.1.1's
+                                  GetMethod is nested under step 1's "If input is an Object, then", so it is 1.a
+                                  and there is no step 2.a at all (step 2 is the bare "Return input"); §7.1.1.1's
+                                  Get is nested under step 3's "For each element name of methodNames, do", so it
+                                  is 3.a and step 2 is the methodNames order for a non-string hint. TWO OTHER
+                                  SITES IN THIS FILE HAD IT RIGHT THE WHOLE TIME (js_toprim_clone quotes 1.a and
+                                  1.d), which is the tell CLAUDE.md names: when N sites state one spec fact and
+                                  disagree, diff the siblings before diffing any of them against the standard.
+
+                                  AND READ THE SUFFIX. CONT_TOPRIM (21) IS A DIFFERENT KIND, NOT AN ABBREVIATION
+                                  OF THIS ONE. The two name ONE JSToPrim record in two roles — 21 is the coercion
+                                  METHOD CALL running on the chain, 62 is the METHOD READ that fetches it — and
+                                  `tp->reading` is the field that says which (see TOPRIM_ROLE_AGREES). Every
+                                  ownership walk needs BOTH, and for a long time each had only 21: a reader
+                                  scanning tramp_cont_free for "TOPRIM" saw an arm, concluded the coercion path
+                                  was covered, and left `String(o)` as a flow that could be forked and could not
+                                  be freed. A kind whose name is a PREFIX of another kind's is the one shape a
+                                  grep for coverage answers wrongly and confidently. */
 #define CONT_SET_RECV      61  /* gp_outer = JSSetRecv: 10.1.9.2 OrdinarySetWithOwnDescriptor step 3, the part of
                                   a [[Set]] that runs on the RECEIVER once the walk over O found nothing to
                                   answer with. Two internal methods on an object the walk never touched, so when
@@ -27426,6 +27447,30 @@ typedef struct JSToPrim {
                                  which is what lets there be a single dispatch instead of a copy per sequence. */
 } JSToPrim;
 
+/* THE ROLE AND THE FIELD AGREE, ASSERTED WHERE THE KIND IS IN HAND. One JSToPrim stands under two CONT_* kinds
+ * — CONT_TOPRIM while the coercion's METHOD CALL is on the chain, CONT_TOPRIM_GET while the METHOD READ that
+ * fetches it is out — and `reading` is the record's own statement of which. The two are set together and
+ * cleared together (toprim_walk raises `reading` in the same breath as `gp_outer_kind = CONT_TOPRIM_GET`;
+ * do_toprim_have_method clears it before toprim_dispatch names CONT_TOPRIM), so the equivalence is a fact this
+ * engine computes about its own record and is exactly what a DCHECK is for.
+ *
+ * A MACRO EXPANDED AT EACH SITE, NEVER A FUNCTION CALLED FROM THEM, for CLAUDE.md's reason: this is an
+ * invariant over a TRANSITION between walks, and a shared helper would stamp one file:line for every walk that
+ * routes a coercion — an abort naming a remedy with no site to apply it to.
+ *
+ * IT REPLACES A ONE-SIDED ASSERT AND IS STRICTLY STRONGER. js_toprim_clone carried `DCHECK(!o->reading)` on the
+ * argument that a reading record reaches the GETPROP frame's arm instead — true of the frame walk it was
+ * written for, and FALSE the moment the link walk grew an arm for the read role, which is the call it now has
+ * to serve. Stated over the kind it catches both directions: a reading record arriving as CONT_TOPRIM (the
+ * method-call arm reading a record whose call has not been made) and a non-reading one arriving as
+ * CONT_TOPRIM_GET (a read arm handed a record whose read already landed). */
+#define TOPRIM_ROLE_AGREES(tp_, kind_)                                                                       \
+    DCHECK(!!((const JSToPrim *)(tp_))->reading == ((kind_) == CONT_TOPRIM_GET),                              \
+           "a §7.1.1 coercion sequence reached an ownership walk under a kind that disagrees with its own "    \
+           "`reading` flag. CONT_TOPRIM is the METHOD CALL on the chain and CONT_TOPRIM_GET is the METHOD "    \
+           "READ that fetches it — ONE record in two roles, so a walk that routes one to the other's arm is "  \
+           "acting on a record in a state that arm does not describe")
+
 static void js_toprim_free_cb(JSContext *ctx, struct JSToPrim *tp)
 {
     int i;
@@ -27471,14 +27516,20 @@ static struct JSToPrim *js_toprim_clone(JSContext *ctx, const struct JSToPrim *o
     n->cb[0] = js_dup(o->cb[0]);
     n->cb[1] = js_dup(o->cb[1]);
     n->cb[2] = js_dup(o->cb[2]);
-    /* A METHOD READ IN FLIGHT DOES NOT REACH HERE, and asserting it is what keeps those four a complete list.
-       While `reading` is set the frame on this chain is the [[Get]]'s — §7.1.1 step 1.a's
-       "? GetMethod(input, %Symbol.toPrimitive%)" or §7.1.1.1 step 3.a's "? Get(obj, name)" — whose own kind is
-       the getter's and whose gp_outer is this record, so a fork there is that kind's arm and not this one, and
-       cb[0..2] are not yet the live call's operands. */
-    DCHECK(!o->reading,
-           "deep-fork of a ToPrimitive sequence with a METHOD READ in flight — the frame carrying that read is "
-           "the property-get continuation's, so its clone arm is the one that must adopt this record");
+    /* A METHOD READ IN FLIGHT REACHES HERE, AND THE FOUR DUPS ABOVE ARE STILL THE WHOLE LIST. While `reading`
+       is set the frame on this chain is the [[Get]]'s — §7.1.1 step 1.a's
+       "Let exoticToPrimitive be ? GetMethod(input, %Symbol.toPrimitive%)." or §7.1.1.1 step 3.a's "Let method
+       be ? Get(obj, name)." — whose own kind is the getter's and whose gp_outer is THIS record under
+       CONT_TOPRIM_GET, so the arm that adopts it is the LINK walk's rather than a frame's. That is a statement
+       about which caller arrives, not about what has to be copied: cb[0..2] are the zeroed slots js_mallocz
+       left (or the JS_UNDEFINEDs js_toprim_free_cb wrote), so duping them is a no-op that is correct rather
+       than a special case, and every other field is either owned-and-duped or POD carried by the struct copy.
+       THIS FUNCTION THEREFORE ASSERTS NOTHING ABOUT THE ROLE — it cannot, it is not told the kind. The
+       equivalence is asserted at each walk that IS (TOPRIM_ROLE_AGREES), which is where a wrong route can
+       still be named. A `DCHECK(!o->reading)` stood here on the argument that the read role never arrives; it
+       was true of this function's only caller at the time and is false of the caller the link walk now is,
+       which is the shape CLAUDE.md warns about — an assert stating a fact about the CALL GRAPH from a site
+       that cannot see it. */
     return n;
 }
 
@@ -28329,6 +28380,17 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_PROXY_INV:
     case CONT_KEYED_INV:
     case CONT_WITH_HAS:
+    /* FOUR LIVE KINDS THAT WERE OUTSIDE THIS GUARD, which is the guard failing silently rather than the kinds
+       being new: 51, 52, 54 and 76 are each assigned, each dispatched on, and none of them was here — so the
+       one construct that makes a duplicate constant a COMPILE ERROR was not covering them, and the next kind
+       to reuse one of those numbers would have collided in exactly the way CONT_IMPORT and CONT_PROMISE_TRY
+       both landing at 18 collided. Found while giving CONT_TOPRIM_GET its ownership arms: the same namespace,
+       the same failure to notice, and the same reason — a kind that appears only as another record's
+       outer_kind has no frame arm and no switch entry to be conspicuously missing from. */
+    case CONT_CONSUME_NEXT_GET:
+    case CONT_PROMISE_ALL_NEXT_GET:
+    case CONT_ITER_FROM_NEXT_GET:
+    case CONT_PROMISE_ALL_RECAP:
         break;
     }
 }
@@ -36815,10 +36877,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 
         do_toprim_tramp:
-            /* 7.1.1 ToPrimitive, with its METHOD CALL on this chain. Entered with tp_slot / tp_hint /
-               tp_op_byte; a JSToPrim carries the sequence position across the call so a suspended coercion
-               resumes where it left off. The property READS stay inline (a coercion method is a data property in
-               every real case; an accessor one is the getter-from-C family, not this one). */
+            /* §7.1.1 ToPrimitive ( input [ , preferredType ] ), with its METHOD CALL on this chain. Entered
+               with tp_slot / tp_hint / tp_op_byte; a JSToPrim carries the sequence position across the call so
+               a suspended coercion resumes where it left off. THE PROPERTY READS ARE ON THIS CHAIN TOO — see
+               toprim_walk, which issues each one through do_getprop_tramp with this record as its gp_outer
+               under CONT_TOPRIM_GET. A sentence here used to say the reads "stay inline (a coercion method is
+               a data property in every real case)", which is the claim CONT_TOPRIM_GET's own declaration
+               records as measured false; it is deleted rather than corrected, because a scar describing a
+               mechanism this fork replaced reads as a statement that the replacement does not exist. */
             {
                 JSToPrim *tp = js_mallocz(ctx, sizeof(*tp));
                 if (unlikely(!tp)) { JS_ThrowOutOfMemory(ctx); goto exception; }
@@ -36888,10 +36954,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_UNINITIALIZED;
                 }
             toprim_walk:
-                /* every method READ is a request: 7.1.1 step 2.a and 7.1.1.1 step 2 are [[Get]]s on the object
-                   being coerced, so an accessor or a Proxy `get` trap runs the page's code and must run on this
-                   chain. `tp` is re-derived at the label because a goto into this block skips the declaration's
-                   initialiser. */
+                /* every method READ is a request: §7.1.1 ToPrimitive ( input [ , preferredType ] ) step 1.a
+                   ("Let exoticToPrimitive be ? GetMethod(input, %Symbol.toPrimitive%).") and §7.1.1.1
+                   OrdinaryToPrimitive ( obj, hint ) step 3.a ("Let method be ? Get(obj, name).") are [[Get]]s
+                   on the object being coerced, so an accessor or a Proxy `get` trap runs the page's code and
+                   must run on this chain. Those numbers read 2.a and "step 2" until they were fetched: both
+                   reads are NESTED — 1.a under step 1's "If input is an Object, then", 3.a under step 3's "For
+                   each element name of methodNames, do" — and a flat count of the <li>s promotes each nested
+                   list's items to peers, which is exactly how a sub-step number drifts. `tp` is re-derived at
+                   the label because a goto into this block skips the declaration's initialiser. */
                 tp = (JSToPrim *)cont_st;
                 for (;;) {
                     if (tp->stage == 0) {
@@ -49932,7 +50003,13 @@ static void *cont_outer_get(void *st, uint8_t kind, uint8_t *out_kind)
            through this same walk: a kind absent here CRASHES, and "terminal" is the answer for the record
            whichever role it is standing in — the field it would name does not exist. */
         return NULL;
-    case CONT_TOPRIM:
+    case CONT_TOPRIM: case CONT_TOPRIM_GET:
+        /* BOTH ROLES, because both are reachable here: 21 is the coercion's METHOD CALL and 62 is the METHOD
+           READ that fetches it, ONE JSToPrim, and what waits on it is the same either way — whoever asked for
+           the primitive. The read role is what a chain walked up from a CONT_GETPROP / CONT_GETPROP_YIELD
+           frame arrives at, which is every `${o}`, `"" + o`, `o == s` and `obj[o]` whose object answers a
+           coercion-method read with an accessor or a Proxy `get` trap. */
+        TOPRIM_ROLE_AGREES(st, kind);
         *out_kind = ((struct JSToPrim *)st)->outer_kind;
         return ((struct JSToPrim *)st)->outer;
     case CONT_PROMISE_EXEC:
@@ -49985,7 +50062,8 @@ static void cont_outer_set(void *st, uint8_t kind, void *outer, uint8_t outer_ki
         ((JSGetProp *)st)->outer = outer; ((JSGetProp *)st)->outer_kind = outer_kind; return;
     case CONT_ARRAY_LEN: case CONT_ARRAY_LEN_YIELD:
         ((JSArrayLen *)st)->outer = outer; ((JSArrayLen *)st)->outer_kind = outer_kind; return;
-    case CONT_TOPRIM:
+    case CONT_TOPRIM: case CONT_TOPRIM_GET:
+        TOPRIM_ROLE_AGREES(st, kind);
         ((struct JSToPrim *)st)->outer = outer; ((struct JSToPrim *)st)->outer_kind = outer_kind; return;
     case CONT_PROMISE_EXEC:
         ((JSPromiseExec *)st)->outer = outer; ((JSPromiseExec *)st)->outer_kind = outer_kind; return;
@@ -50011,8 +50089,16 @@ static void *tramp_cont_clone_one(JSContext *ctx, void *st, uint8_t kind)
 {
     if (kind == CONT_STEP || kind == CONT_STEP_YIELD)
         return tramp_step_state_clone(ctx, st);
-    if (kind == CONT_TOPRIM)
+    if (kind == CONT_TOPRIM || kind == CONT_TOPRIM_GET) {
+        /* BOTH ROLES OF ONE RECORD. 21 is the coercion's METHOD CALL waiting under the callee it dispatched;
+           62 is the METHOD READ — §7.1.1 step 1.a's GetMethod or §7.1.1.1 step 3.a's Get — waiting under the
+           keyed operation that performs it. A fork inside a `get` trap or a getter that answers one of those
+           reads lands on the SECOND, and it arrived here as a DFAIL by kind: 62's name is 21's with a suffix,
+           so the arm for 21 read as coverage for both. The record and its release are identical, so one clone
+           serves both and the ROLE is what gets asserted rather than duplicated. */
+        TOPRIM_ROLE_AGREES(st, kind);
         return js_toprim_clone(ctx, (const struct JSToPrim *)st);
+    }
     if (kind == CONT_ARRAY_LEN)
         return js_array_len_clone(ctx, (const JSArrayLen *)st);
     if (kind == CONT_OP_KEYED)
@@ -50565,7 +50651,12 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
                    THE FIELD LIST LIVES AT js_toprim_clone, beside the release it mirrors, because this is no
                    longer its only caller: the requester walk below finds sequences no frame owns. */
                 JSToPrim *ots = (JSToPrim *)otf->cont_state;
-                JSToPrim *nts = js_toprim_clone(ctx, ots);
+                JSToPrim *nts;
+                /* A FRAME carrying kind 21 IS the coercion's method call, so its record must not be mid-READ:
+                   the read role rides a CONT_GETPROP / CONT_GETPROP_YIELD frame with this record as its
+                   gp_outer, which the requester walk below reaches under CONT_TOPRIM_GET. */
+                TOPRIM_ROLE_AGREES(ots, CONT_TOPRIM);
+                nts = js_toprim_clone(ctx, ots);
 
                 if (!nts) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
                 ct->cont_state = nts;
@@ -50803,7 +50894,14 @@ static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s)
    why this exists rather than a call to it.
    The KIND LIST IS clone_deep_flow's LIST. A frame kind that can ride a parked chain must be answerable by
    both — the clone takes a second reference to everything the frame owns and this releases one — so a kind
-   missing from either is the same defect, and the DFAIL below names it exactly as the clone's does. */
+   missing from either is the same defect, and the DFAIL below names it exactly as the clone's does.
+   AND "clone_deep_flow's LIST" IS FOUR FUNCTIONS, NOT ONE, WHICH IS WHERE A KIND HIDES. The frame arms live in
+   clone_deep_flow; the LINK arms live in tramp_cont_clone_one, and the link accessors in
+   cont_outer_get/cont_outer_set. A kind that only ever appears as another record's outer_kind — every
+   `gp_outer = …` kind is one — has no frame arm to be missing from, so it can be absent from all four at once
+   and read as covered from any of them. CONT_TOPRIM_GET was: 62 is 21's record in the METHOD-READ role, none
+   of the four knew it, and the free walk's DFAIL was where it surfaced because a flow is destroyed more often
+   than it is forked. When you add a kind, add it to all four in one diff and say which role it stands in. */
 static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
 {
     JSRuntime *rt = ctx->rt;
@@ -50886,7 +50984,7 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
         js_arg_list_free(ctx, (JSArgList *)st);
         return;
     }
-    if (kind == CONT_TOPRIM) {
+    if (kind == CONT_TOPRIM || kind == CONT_TOPRIM_GET) {
         /* THE ARM THE CLONE HAD AND THIS DID NOT. clone_deep_flow has copied a coercion sequence since the
            frame it rides was first cloned, so a parked flow could hold one and could not be released — the
            kind DFAILed here, which means a flow suspended inside `${o}` or `"" + o` could be forked and could
@@ -50895,12 +50993,53 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
            §7.1.1 ToPrimitive ( input [ , preferredType ] ) step 1.b.iv is "? Call(exoticToPrimitive, input,
            « hint »)" and §7.1.1.1 OrdinaryToPrimitive ( obj, hint ) step 3.b.i is "? Call(method, obj)" — an
            abrupt completion from either PROPAGATES, so the sequence dies and takes its requester with it, and
-           that is what the shared walk performs. */
+           that is what the shared walk performs.
+
+           AND THE SAME DEFECT ONE SUFFIX OVER, WHICH IS WHY 62 STANDS HERE TOO. This arm covered 21 alone for
+           as long as it existed, and a reader scanning the walk for "TOPRIM" saw it and stopped — 62 is the
+           METHOD READ (§7.1.1 step 1.a's GetMethod, §7.1.1.1 step 3.a's Get), the SAME JSToPrim under a
+           different kind, and it is the role reached whenever the object answers one of those reads with a
+           getter or a Proxy `get` trap. A flow parked inside `String(new Proxy({}, {get(){…}}))` therefore
+           aborted exactly here rather than being freed, and the reason it survived is a NAME: a kind whose
+           name is a prefix of another's is the one shape a coverage grep answers wrongly and confidently. The
+           ENTRY KIND stays CONT_TOPRIM for both, which is not a shortcut — it is what the interpreter's own
+           abandon paths already do with a 62 link (getprop_throw and do_getprop_abandon hand it straight to
+           js_toprim_abandon), so this walk now releases it the way the rest of the engine already does.
+
+           WHAT THE SHARED WALK PARKS IS TAKEN BACK, because destroy mode has no exception label to drain it.
+           tramp_chain_unwind is written for an unwind that RETURNS to the interpreter: reaching a CONT_IMPORT
+           it parks the capability in ctx->pending_import_cap for the label to reject, and reaching a
+           CONT_ARRAY_LEN_FWD it goes through js_array_len_abandon, which parks the write's requester in
+           ctx->pending_gp_unwind for the same label. Here the flow is being DESTROYED — there is no label, no
+           frame and no operand stack to come back to — so a parked record is one nothing will ever drain: a
+           leak in release, and in dev the "a parked import capability outlived its context" / "a parked
+           keyed-operation unwind outlived its context" DCHECKs at JS_FreeContext, or the "already set" DCHECK
+           firing on the next unrelated `import(obj)`. Both slots are therefore snapshotted and RESTORED, and
+           what the walk left in them is released with the rest of the chain — the completion nobody will
+           observe is not computed, which is this function's whole difference from tramp_chain_unwind. This is
+           not new with 62: `import(o)` whose `o.valueOf` suspends reaches it under 21. */
         uint8_t left = CONT_NONE;
         /* a released park has no caller stack to restore: the shape has no consumer here. */
         int lcf = 0, lcg = 0;
-        void *rest = tramp_chain_unwind(ctx, st, CONT_TOPRIM, &left, &lcf, &lcg);
+        JSImportCap *pic0 = ctx->pending_import_cap;
+        void *pgu0 = ctx->pending_gp_unwind;
+        uint8_t pgk0 = ctx->pending_gp_unwind_kind;
+        void *rest;
+        TOPRIM_ROLE_AGREES(st, kind);
+        rest = tramp_chain_unwind(ctx, st, CONT_TOPRIM, &left, &lcf, &lcg);
         (void)lcf; (void)lcg;
+        if (ctx->pending_import_cap != pic0) {
+            JSImportCap *ic = ctx->pending_import_cap;
+            ctx->pending_import_cap = pic0;
+            js_import_cap_free(ctx, ic);
+        }
+        if (ctx->pending_gp_unwind != pgu0) {
+            void *pg = ctx->pending_gp_unwind;
+            uint8_t pk = ctx->pending_gp_unwind_kind;
+            ctx->pending_gp_unwind = pgu0;
+            ctx->pending_gp_unwind_kind = pgk0;
+            tramp_cont_free(ctx, pg, pk);
+        }
         tramp_cont_free(ctx, rest, left);
         return;
     }
