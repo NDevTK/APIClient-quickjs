@@ -107765,10 +107765,11 @@ uint64_t JS_OrphanHash(JSContext *ctx, JSValueConst fn)
  * ONE NAME MUST DENOTE ONE OBJECT, AND THAT IS TWO SEPARATE OBLIGATIONS RATHER THAN ONE. BETWEEN spellings:
  * `%C%` is a constructor and `%C.prototype%` a prototype, told apart by a `.` that no class name contains —
  * which is also what keeps a class name clear of a well-known symbol's description, since every one of those
- * opens `Symbol.` — and clear of `%globalThis%`, which is checked by name. WITHIN one spelling: class names are
- * NOT unique in this registry (five classes are named `Function`, two `Arguments`, two `Object`), so the walk
- * below establishes that no OTHER slot of the same kind holds a DIFFERENT object under the same name, and
- * refuses the name rather than issuing an ambiguous one. Both are enforced at the site rather than argued here.
+ * opens `Symbol.` — and clear of `%globalThis%`, which is checked by name. WITHIN one spelling: `class_name` is
+ * the BRAND §20.1.3.6 Object.prototype.toString prints and not a name, so classes deliberately share it, and
+ * the walk below gives each shared name to the FIRST slot holding an object under it and refuses the rest —
+ * 1:1 by construction, and it puts the name on the member a reader of a fork census means by it. Both are
+ * enforced at the site rather than argued here; read the walk for why refusing wholesale was worse than either.
  *
  * SYMBOLS ARE HERE AND NOT IN A SECOND FUNCTION because they are the same question: a well-known symbol IS an
  * intrinsic, held in the atom table below JS_ATOM_END, which is a compile-time enum and therefore the same kind
@@ -107857,25 +107858,48 @@ int JS_IntrinsicName(JSContext *ctx, JSValueConst v, char *buf, size_t buf_size)
             JS_VALUE_GET_OBJ(ctx->class_ctor[i]) == p) { want_proto = false; break; }
     }
     if (i >= rt->class_count) return -1;
-    /* CLASS NAMES ARE NOT UNIQUE, AND THAT IS A PROPERTY OF THE REGISTRY RATHER THAN AN OVERSIGHT: five
-       classes are named `Function` (a C function, a bytecode function, a bound function, a C function with
-       data, a C closure), two are named `Arguments`, and `Object` names both the ordinary class and a module
-       namespace. Where two such slots of the SAME KIND hold the SAME object there is nothing to disambiguate —
-       one object, one name — and where they hold DIFFERENT objects the spelling would name two of them, which
-       is the wrong-identity failure this whole mechanism exists to prevent, and it is strictly worse than
-       leaving them unnamed: two intrinsics under one constraint key make one flow's narrowing refine the
-       other's branch, so ARMS ARE LOST rather than duplicated.
-       NAMED RESIDUAL: an intrinsic whose class name is shared with a DIFFERENT object of the same kind is
-       refused, which is exactly the answer it had before this function existed, so nothing regresses — it is
-       narrower than the design and not wrong. What the next diff builds is a per-slot name that does not go
-       through the class-name atom at all, at which point the ambiguity has no way to arise. ITS ABSENCE SHOWS
-       as a fork census still carrying a `~?[…]` site row whose subject a reader can identify as
-       `Function.prototype` or an arguments object after every %-named subject has left that column. */
+    /* `class_name` IS A BRAND AND NOT A NAME, WHICH IS THE ONE THING THIS FUNCTION HAS TO GET RIGHT ABOUT THE
+       REGISTRY IT READS. It is the atom §20.1.3.6 Object.prototype.toString prints, so classes that must brand
+       as `[object Object]` deliberately SHARE it: SIX are named `Object` (the ordinary class, a module
+       namespace, RawJSON, Proxy, ShadowRealm, a wrapped function), FIVE are named `Function`, TWO `Arguments`.
+       Reading it as "what is this class called" is therefore a many-to-one projection of the slot, and a name
+       that is many-to-one is the wrong-identity failure this whole mechanism exists to prevent — two intrinsics
+       under one constraint key make one flow's narrowing refine the other's branch, so ARMS ARE LOST rather
+       than duplicated, which is strictly worse than leaving them unnamed.
+       SO THE NAME GOES TO THE FIRST OBJECT-HOLDING SLOT UNDER IT, AND THE REST ARE REFUSED. That is 1:1 by
+       construction — exactly one slot can be the lowest one holding an object under a given name, and it holds
+       exactly one object — and it puts the name where a reader can act on it, because the class enum opens with
+       the ordinary class: `%Object.prototype%` is Object.prototype and `%Function.prototype%` is
+       Function.prototype, in every realm that has intrinsics at all. AN ORDINAL WOULD NOT BE BETTER, and that
+       is a judgement rather than an omission: `%Object.prototype~3%` is unique and identifies NOTHING to the
+       reader of a fork census, which is what this name is for, so a semantically empty disambiguator is worse
+       here than an honest absence.
+       REFUSING WHOLESALE — which is what this walk did first — WAS MEASURABLY WORSE THAN EITHER. It landed on
+       the single most common intrinsic in real JavaScript: `Object.prototype` was refused because ShadowRealm's
+       prototype sits in an `Object`-named slot, so `{}.hasOwnProperty`, `Object.prototype.toString.call(x)` and
+       every `for…in` guard stayed unnamed while `Array.prototype` and `String.prototype` named. Measured on the
+       artifact of f96aae21: a three-intrinsic fixture emitted `%Array.prototype%` and `%String.prototype%` rows
+       and left the Object one as a bare `~?[…]` site row.
+       NAMED RESIDUAL, and it is now exactly ONE OBJECT PER SHARED NAME rather than a family: every other slot
+       sharing a name holds JS_NULL, so the only refusals in this engine are `ShadowRealm.prototype` and the
+       `ShadowRealm` constructor. What the next diff builds — if a fork census ever shows one of those as a
+       heavy `~?[…]` row — is a name taken from the intrinsic's own §6.1.7.4 spelling rather than from the
+       brand, which needs a registry this engine does not keep and is not worth building before that row exists.
+       ITS ABSENCE SHOWS as a `~?[…]` row whose subject is reachable only through `ShadowRealm`. */
     cname = rt->class_array[i].class_name;
-    for (j = 0; j < rt->class_count; j++) {
+    for (j = 0; j < i; j++) {
         JSValueConst other = want_proto ? ctx->class_proto[j] : ctx->class_ctor[j];
-        if (j == i || rt->class_array[j].class_name != cname) continue;
-        if (JS_VALUE_GET_TAG(other) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(other) != p) return -1;
+        if (rt->class_array[j].class_name != cname) continue;
+        /* A LOWER SLOT HOLDING AN OBJECT HAS ALREADY TAKEN THIS NAME — and it necessarily holds a DIFFERENT
+           object, because the walk above breaks at the first slot holding this one, so reaching here means
+           that slot was passed over. */
+        if (JS_VALUE_GET_TAG(other) == JS_TAG_OBJECT) {
+            DCHECK(JS_VALUE_GET_OBJ(other) != p,
+                   "the walk that finds the first slot holding this object passed a lower slot that holds it, "
+                   "which means it did not break at the first match and the name it is about to compose is "
+                   "the one belonging to a slot further down the registry");
+            return -1;
+        }
     }
     name = intrinsic_atom_str(rt, nbuf, sizeof nbuf, cname);
     if (!name) return -1;
