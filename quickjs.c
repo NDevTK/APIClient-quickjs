@@ -25416,8 +25416,8 @@ static void js_toprim_free(JSContext *ctx, struct JSToPrim *tp);
 typedef struct JSArgList JSArgList;
 static void js_arg_list_free(JSContext *ctx, JSArgList *al);
 /* CONT_ARG_LIST's and CONT_ARRAY_LEN's values, forward for the reason CONT_FROM_CTOR and CONT_ITER_CONSUME_FWD
-   already are: this walk runs before the kind list is declared. The _Static_asserts at the list keep them from
-   drifting. */
+   already are: this walk runs before the kind list is declared. The _Static_asserts in the forward-alias block
+   below the kind list keep them from drifting. */
 #define CONT_ARG_LIST_FWD   68
 #define CONT_ARRAY_LEN_FWD  64
 /* The ARRAY_LEN link is handed to its own hook rather than unwound here, because unwinding it reads fields of a
@@ -25430,7 +25430,7 @@ static void js_array_len_abandon(JSContext *ctx, void *st);
                                   is one of the three places that has to know the kind. */
 static void js_from_ctor_abandon(JSContext *ctx, void *st);
 /* CONT_ITER_CONSUME's value, needed by BOTH abandon walks below (this one and js_toprim_abandon), which run
-   before the kind list is declared. The _Static_assert at the list keeps the two from drifting. */
+   before the kind list is declared. The _Static_assert in the forward-alias block keeps the two from drifting. */
 #define CONT_ITER_CONSUME_FWD 8
 static void js_iter_consume_abandon(JSContext *ctx, void *st);
 static void *js_iter_consume_abandon_upto(JSContext *ctx, void *st, uint8_t *out_kind);
@@ -26255,7 +26255,6 @@ typedef struct JSOpKeyed {
                                   to is parked across them, exactly as a handler's trap READ parks it. It is the
                                   same nesting CONT_TRAP_GET already is: a keyed request whose outer is not a
                                   machine but another keyed OPERATION, carrying what waits on that one. */
-_Static_assert(CONT_ARG_LIST_FWD == 68, "the forward-declared CONT_ARG_LIST drifted");
 #define CONT_ARG_LIST      68  /* gp_outer AND tp_outer = JSArgList: 7.3.19 CreateListFromArrayLike, which
                                   `f.apply(t, arrayLike)`, `Reflect.apply` and the `f(...arr)` spread all reach.
                                   Step 3 is `? LengthOfArrayLike(obj)` and step 5 is `? Get(obj, index)` PER
@@ -26390,7 +26389,6 @@ typedef struct JSCtorProto {
 enum { CTOR_RESUME_CONSTRUCT = 0, CTOR_RESUME_PROMISE_EXEC };
 static void js_ctor_proto_free(JSContext *ctx, JSCtorProto *cp);
 
-_Static_assert(CONT_ARRAY_LEN_FWD == 64, "the forward-declared CONT_ARRAY_LEN drifted");
 #define CONT_ARRAY_LEN     64  /* tp_outer = JSArrayLen: 10.4.2.4 ArraySetLength steps 3-5, whose TWO coercions
                                   are the page's code — ToUint32(V) then ToNumber(V), both on the ORIGINAL V, so
                                   a substituted primitive cannot stand for them and the coerce-then-resume
@@ -26860,13 +26858,16 @@ typedef struct JSPromiseCap {
 static JSValue js_promise_executor_new(JSContext *ctx);
 struct JSPromiseAll;
 static void js_promise_all_end(JSContext *ctx, struct JSPromiseAll *s);
-/* CONT_PROMISE_ALL's value, forward for the same reason CONT_ITER_CONSUME_FWD is: the abandon walks run above the
-   kind's own declaration, and the static assert beside that declaration is what keeps the two in step. */
 /* THE SAME AGGREGATE, ASKING AGAIN. A freshly-forked Promise.all sibling owes itself a capability the clone
    could not build (see JSPromiseAll.cap_owed), so it asks on its first step. Its own kind rather than
    CONT_PROMISE_ALL because the delivery differs: the original acquisition goes on to read `constructor.resolve`
    and start the walk, while this one is filling a hole in a machine that is already mid-walk. */
 #define CONT_PROMISE_ALL_RECAP 76
+/* CONT_PROMISE_ALL's value, forward for the same reason CONT_ITER_CONSUME_FWD is: the abandon walks run above
+   the kind's own declaration, and the static assert in the forward-alias block keeps the two in step. THIS IS
+   NOT A KIND OF ITS OWN -- 9 IS CONT_PROMISE_ALL, and the assert is what says so. Each note sits UNDER the
+   define it describes: stacked above both, the RECAP note directly above reads as a claim that 9 is its own
+   kind, which is exactly how the shared number comes to look like a collision. */
 #define CONT_PROMISE_ALL_FWD 9
 static void js_promise_cap_abandon(JSContext *ctx, JSPromiseCap *pc)
 {
@@ -28250,9 +28251,22 @@ static bool iter_helper_drive_ready(JSValueConst func, JSValueConst this_val);
                                   C-recursion drive-to-completion JS_IteratorNext would use. The generator drive
                                   frame carries this cont; its direct-mode settle re-enters js_iter_consume_step
                                   with the {value,done} result. */
+/* THE FORWARD ALIASES, CHECKED AGAINST THE KINDS THEY ALIAS. Each CONT_*_FWD above is a SECOND SPELLING of a
+   number whose own #define sits below a walk that already needs it, so every one is a hand-copied constant and
+   this block is the only thing that keeps the copy honest. EACH ASSERT NAMES BOTH SYMBOLS, and that is the
+   whole mechanism rather than a style: a `_FWD == <literal>` compares the alias with ITSELF, so it passes for
+   every renumbering of the parent -- which is the one drift its own message claims to catch. Kinds here are
+   retired and their numbers reused, so a stale alias does not merely miss its arm: it matches whichever kind
+   inherits the number and hands that record to the wrong terminal owner (js_arg_list_free on a cast pointer).
+   The asserts live HERE, below every parent, because an assert written beside a #define sits ABOVE it, where
+   the parent is not yet defined and the comparison silently degrades to the literal form. That is not
+   hypothetical -- ARG_LIST and ARRAY_LEN were both written that way. A new alias is added to THIS block, in
+   THIS form. */
 _Static_assert(CONT_ITER_CONSUME_FWD == CONT_ITER_CONSUME, "the forward alias used by the abandon walks must equal CONT_ITER_CONSUME");
 _Static_assert(CONT_PROMISE_ALL_FWD == CONT_PROMISE_ALL, "the forward alias used by the capability abandon must equal CONT_PROMISE_ALL");
 _Static_assert(CONT_ITER_HELPER_FWD == CONT_ITER_HELPER, "the forward alias used by the abandon walk must equal CONT_ITER_HELPER");
+_Static_assert(CONT_ARG_LIST_FWD == CONT_ARG_LIST, "the forward alias used by the chain unwind must equal CONT_ARG_LIST");
+_Static_assert(CONT_ARRAY_LEN_FWD == CONT_ARRAY_LEN, "the forward alias used by the chain unwind must equal CONT_ARRAY_LEN");
 
 #define CONT_WITH_HAS      60  /* cont_state = JSWithHas: 9.1.1.2.1 HasBinding step 2, the object Environment
                                   Record's own HasProperty, which decides whether a `with` reference resolves
