@@ -79560,8 +79560,8 @@ static int prim_arg_check(JSContext *ctx, JSValueConst v, int hint)
     X(PRIMARGS_ENTRY,  "7.1.1 over a coerce-then-compute builtin's declared arguments: the leading validation " \
                        "the spec performs BEFORE any coercion (the definition's `precheck`), then the padded " \
                        "argument vector") \
-    X(PRIMARGS_COERCE, "7.1.1 step 2.a ToPrimitive(argument, hint) for each declared argument in argument " \
-                       "order, with the definition's `midcheck` interleaved after the first - and then the " \
+    X(PRIMARGS_COERCE, "7.1.1 ToPrimitive ( input [ , preferredType ] ) applied to each declared argument " \
+                       "in argument order, with the definition's `midcheck` interleaved after the first - and then the " \
                        "definition's `body`, over the primitives this stage put in place")
 enum { PRIMARGS_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_primargs_steps[] = { PRIMARGS_STAGES(JS_STEP_STAGE_LABEL) NULL };
