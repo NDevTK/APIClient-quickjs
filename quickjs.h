@@ -2519,6 +2519,29 @@ JS_EXTERN uint32_t JS_OrphanGen(JSRuntime *rt);
    called from inside the object-list walk above. `fn` must be an object with a bytecode body; a C function, a
    bound function and a Proxy have no body to name and are never orphans. */
 JS_EXTERN uint64_t JS_OrphanHash(JSContext *ctx, JSValueConst fn);
+/* THE NAME OF AN INTRINSIC OF THIS REALM — the OTHER name source a value can have, for the creator kind
+   JS_OrphanHash's composition cannot reach. A locator built from a script, a position and a body's text names
+   nothing for `Array.prototype`: no page created it. An intrinsic is a SINGLETON of its realm, so the SLOT it
+   occupies is its whole name, and a slot may name it because the class registry is fixed at each class's own
+   definition rather than being an ordinal over a set the page mutates. Answered by walking the per-realm
+   class_proto/class_ctor arrays — the ONE registry every realm goes through — plus the global object and the
+   well-known symbols, which live below JS_ATOM_END and are therefore the same kind of compile-time registry.
+   TEXT AND NOT A HASH, because its consumer spends the name twice: once as an operand's IDENTITY and once as
+   its DISPLAY SHAPE, under the rule that a shape must separate every pair of operands its identity separates.
+   A hash separates the first and collapses the second. The spelling is ECMAScript's own §6.1.7.4 Well-Known
+   Intrinsic Objects notation — `%Array.prototype%`, `%Array%`, `%Symbol.iterator%`, `%globalThis%`.
+   ALLOCATION-FREE and side-effect-free: no property is read, so no accessor and no Proxy trap runs, which is
+   what lets a caller with no flow base under it ask at all. `v` is BORROWED and may be any value.
+   RETURNS snprintf's length — the length that WOULD have been written, so a caller checks it against its own
+   buffer rather than trusting a silent truncation — or -1 where this value is not an intrinsic of this realm,
+   which is the "no name" answer every value gave before and is never an error. */
+JS_EXTERN int      JS_IntrinsicName(JSContext *ctx, JSValueConst v, char *buf, size_t buf_size);
+/* THE LONGEST NAME THE ABOVE CAN COMPOSE, so a caller's buffer makes truncation IMPOSSIBLE rather than
+   asserted: every name is `%` + one registry name + at most `.prototype` + `%`, and the registry name is
+   bounded by the atom-spelling buffer quickjs.c sizes for it. A _Static_assert there ties the two, so widening
+   one without the other stops the build instead of silently shortening a name — and a shortened intrinsic name
+   is two intrinsics under one key. */
+#define JS_INTRINSIC_NAME_MAX 96
 /* MODULE sources: a graph to link and evaluate, not a program to wrap. Returns the evaluation PROMISE. */
 JS_EXTERN JSValue  JS_FlowEvalModule(JSContext *ctx, const char *src, size_t len, const char *filename, int eval_flags);   /* eval_flags: JS_EVAL_FLAG_STRICT threaded through; opaque flow handle (NULL on error) */
 /* 1 = suspended (preempted), 0 = completed. *pres receives the program's COMPLETION VALUE (or JS_EXCEPTION) on
