@@ -22243,11 +22243,19 @@ static JSVarRef *js_create_var_ref(JSContext *ctx, bool is_gc_object)
     return var_ref;
 }
 
-/* The frame-OWNED closed heap cell for a captured local at var_ref_idx (V8 Context model). Created CLOSED on
-   first access (owning frame's loc op OR a capturing closure), holding a copy of the current value; refcount 1
-   is the FRAME's ownership, released by close_var_refs on return. Both the owning frame (via redirected loc
-   ops) and closures (via get_var_ref) use this one cell, so the captured var is a single COW-swappable heap
-   slot — a snapshot fork isolates it and the escaped closure sees the per-flow value. */
+/* The frame-owned cell for a captured local at var_ref_idx. Minted on first access (the owning frame's loc op
+   OR a capturing closure); refcount 1 is the FRAME's ownership, released by close_var_refs on return. Both the
+   owning frame (via redirected loc ops) and closures (via get_var_ref) use this one cell.
+   THE CELL IS BORN **OPEN**, AND THIS COMMENT SAID "CLOSED" — in four places across this file plus
+   clone_deep_flow — WHICH IS WHY NOBODY LOOKED AT WHAT A FORK DOES TO IT. An open cell's storage is not the
+   heap: `pvalue` is a slot in THIS frame's var_buf/arg_buf, so "a single COW-swappable heap slot" was true of
+   a design that was reverted (see the is_detached line below) and false of the code. The COW delta isolates a
+   CELL; it does not isolate the FRAME SLOT an open cell names, and after a snapshot fork two flows' frames
+   hold the same open cell over ONE flow's buffer. MEASURED — engine/tests/solver/captured_var_fork.html, three
+   runs a side on one artifact, one variable changed: a captured `var` assigned AFTER a deep concolic fork is
+   read back as its PRE-ASSIGNMENT value on the forced sibling, while an UNCAPTURED local written by the same
+   assignment expression holds the function; the same document with the cell's owning frame already RETURNED
+   (so the cell is detached, heap-only) is clean. */
 static JSVarRef *get_captured_cell(JSContext *ctx, JSStackFrame *sf, JSValue *pvalue, int var_ref_idx)
 {
     JSVarRef *vr;
@@ -22271,8 +22279,32 @@ static JSVarRef *get_captured_cell(JSContext *ctx, JSStackFrame *sf, JSValue *pv
            "var-ref array and an owner field, so this frame's array write lands outside any allocation and its "
            "owner is whatever its memory held, which the cell would take a reference on and later free");
     vr = sf->var_refs[var_ref_idx];
-    if (vr)
+    if (vr) {
+        /* THE CELL THIS FRAME'S ARRAY NAMES ALIASES ANOTHER FRAME'S BUFFER — an unbuilt capability, asserted at
+           the ONE point every captured-local access and every closure capture passes through, because after a
+           snapshot fork there is no write site left to catch it: the loc op reads `sf` and the cell decides the
+           address, and the two disagree only here.
+           WHAT IS NOT BUILT: clone_susp_frame and clone_deep_flow SHARE a frame's cells with the sibling (+1
+           ref each) and give the sibling its own copied buffer, so an OPEN cell keeps naming the SOURCE frame's
+           slot. Both flows' captured-local reads and writes then land in ONE flow's frame, which §State
+           isolation forbids by construction — a frame is flow-private, and the COW delta isolates the CELL and
+           not the slot the cell points into. The sibling's write is consequently un-applied out from under it
+           and the read answers the pre-assignment value.
+           HOW ITS ABSENCE SHOWS, and it is a live product defect rather than a theory: a real minified bundle
+           throws `<name> is not a function (it is undefined)` at a call whose callee is assigned EARLIER in the
+           same flat `var` chain — the engine inventing a throw real Chrome does not make, which kills the
+           script and every endpoint behind it. engine/tests/solver/captured_var_fork.html is the reproduction
+           and states the controlled measurement.
+           WHAT THE NEXT DIFF MUST ESTABLISH: a forked sibling's captured local has storage of its OWN — the
+           measurement in that fixture is that a DETACHED cell over the same fork is already correct, so
+           detaching a frame's open cells at the clone is the candidate to price first, against captured
+           ARGUMENTS, whose open cell aliasing arg_buf is what makes mapped `arguments` observable. */
+        DCHECK(vr->is_detached || vr->stack_frame == sf,
+               "a captured local reached through a frame whose array names an OPEN cell belonging to a "
+               "DIFFERENT frame — a snapshot fork shared the cell and not the storage, so this read/write "
+               "lands in another flow's frame-private buffer and the sibling's assignment is lost");
         return vr;
+    }
     vr = js_malloc(ctx, sizeof(JSVarRef));
     if (!vr)
         return NULL;
@@ -22280,10 +22312,16 @@ static JSVarRef *get_captured_cell(JSContext *ctx, JSStackFrame *sf, JSValue *pv
     vr->is_detached = false;              /* OPEN: ALIASES the live frame slot (spec-correct closures/arguments) —
                                              its value IS the slot, so the owning frame's plain slot accesses and
                                              every capturing closure share ONE storage. close_var_refs snapshots it
-                                             to the heap on frame teardown; a snapshot fork re-points pvalue at the
-                                             cloned frame (clone_deep_flow). The closed-COPY design that replaced
+                                             to the heap on frame teardown. The closed-COPY design that replaced
                                              this broke closures-over-mutated-args, mapped-arguments aliasing and
-                                             the per-iteration let. */
+                                             the per-iteration let.
+                                             THIS SAID "a snapshot fork re-points pvalue at the cloned frame
+                                             (clone_deep_flow)". NOTHING RE-POINTS pvalue — `pvalue` is assigned
+                                             at exactly two places in this file, here and close_var_ref's detach
+                                             — and both fork sites say the opposite in their own words
+                                             (clone_susp_frame: "A shared cell keeps naming the SOURCE frame").
+                                             A claim about another function is checked before it is trusted;
+                                             this one sent every reader past the defect the DCHECK below names. */
     vr->is_lexical = false;
     vr->is_const = false;
     /* OPEN (is_detached=false) uses the {var_ref_idx, stack_frame} arm of the JSVarRef union — NOT `value` (which
@@ -22339,9 +22377,11 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
         pvalue = &sf->var_buf[var_idx];
     }
 
-    /* CAPTURED locals live in a frame-owned CLOSED heap cell (V8 Context model) — heap-resident from creation,
-       so COW-swappable and a snapshot fork isolates them. get_captured_cell makes the cell closed on first
-       access (owning frame OR capturing closure); here the closure adds ITS ref on top of the frame's. */
+    /* CAPTURED locals live in a frame-owned cell minted by get_captured_cell on first access (owning frame OR
+       capturing closure); here the closure adds ITS ref on top of the frame's. This said the cell is CLOSED and
+       "heap-resident from creation, so COW-swappable and a snapshot fork isolates them" — it is born OPEN over
+       a slot in this frame's buffer, and a fork does NOT isolate it. See get_captured_cell's own header and the
+       DCHECK there. */
     if (vd->is_captured) {
         var_ref = get_captured_cell(ctx, sf, pvalue, vd->var_ref_idx);
         if (!var_ref) return NULL;
@@ -22657,9 +22697,10 @@ static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
     JSVarRef *var_ref;
     int i;
 
-    /* Captured locals are now frame-owned CLOSED cells (V8 Context model): on frame return the frame RELEASES
-       its ownership ref (free_var_ref decrefs — the cell survives while any capturing closure holds a ref).
-       They are already closed, so there is nothing to detach. */
+    /* On frame return the frame RELEASES its ownership ref (free_var_ref decrefs — the cell survives while any
+       capturing closure holds a ref), and close_var_ref DETACHES the cell first because a captured local's cell
+       is OPEN over this frame's buffer. This said they "are already closed, so there is nothing to detach",
+       which is what the loop below refutes: the detach is the whole reason a closure outlives its frame. */
     for (i = 0; i < sf->var_ref_count; i++) {
         var_ref = sf->var_refs[i];
         if (var_ref) {
@@ -28255,9 +28296,23 @@ static bool iter_helper_drive_ready(JSValueConst func, JSValueConst this_val);
    number whose own #define sits below a walk that already needs it, so every one is a hand-copied constant and
    this block is the only thing that keeps the copy honest. EACH ASSERT NAMES BOTH SYMBOLS, and that is the
    whole mechanism rather than a style: a `_FWD == <literal>` compares the alias with ITSELF, so it passes for
-   every renumbering of the parent -- which is the one drift its own message claims to catch. Kinds here are
-   retired and their numbers reused, so a stale alias does not merely miss its arm: it matches whichever kind
-   inherits the number and hands that record to the wrong terminal owner (js_arg_list_free on a cast pointer).
+   every renumbering of the parent -- which is the one drift its own message claims to catch. A NON-CHECK that
+   reports as a pass, which is worse than no assert: nothing can make it fail, so it certifies only itself
+   while reading as the guard on the alias.
+   THIS BLOCK SAID "kinds here are retired and their numbers REUSED" AND THAT WAS FALSE -- corrected here
+   because a right conclusion resting on a wrong reason is discarded whole by the first reader who checks it.
+   Retired numbers are BURNED, not reused: the space is monotone with holes left where kinds went (1-2, 6-7,
+   13, 15, 23, 71) and 41 is held by name as CONT_AGEN_SETTLE_DELETED. So the hazard is NOT a stale alias
+   inheriting a successor's record -- nothing inherits. It is simply that the alias stops naming its parent:
+   the arm goes DEAD, the record it was to release is not released, and the walk falls through to whatever
+   follows. Keep burning retired numbers; a reuse would restore the worse failure this paragraph used to
+   describe, and would additionally put a kind on a wire it does not currently reach (see below).
+   THESE NUMBERS ARE ENGINE-INTERNAL AND CROSS NO PERSISTED FORMAT. A park does not write a frame chain --
+   solver/cold.h regenerates it by REPLAY, and a resume re-runs the document with no frame at cursor 0 -- so
+   no continuation kind reaches the cold tier and renumbering cannot rename a parked flow's referent. That is
+   what makes reuse merely inadvisable rather than a cross-session corruption. Anything that DOES start
+   writing a kind to a persisted format takes on the burn rule as a hard requirement, the way the recipe
+   grammar already does with its retired record letter.
    The asserts live HERE, below every parent, because an assert written beside a #define sits ABOVE it, where
    the parent is not yet defined and the comparison silently degrades to the literal form. That is not
    hypothetical -- ARG_LIST and ARRAY_LEN were both written that way. A new alias is added to THIS block, in
@@ -50208,8 +50263,12 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
     TrampFrame **ca = js_mallocz(ctx, (size_t)n * sizeof(TrampFrame *));
     if (!oa || !ca) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
     { int k = 0; for (TrampFrame *t = (TrampFrame *)s->tramp_top; t; t = t->up) oa[k++] = t; }
-    /* Captured-local cells are CLOSED heap cells (V8 Context model): each frame SHARES them (COW-swappable,
-       isolated per-flow by the delta) and takes an ownership ref — no per-frame open-cell aliasing. */
+    /* Each cloned frame SHARES the source frame's cells and takes an ownership ref. THIS SAID THEY ARE "CLOSED
+       heap cells … no per-frame open-cell aliasing", AND THEY ARE OPEN: get_captured_cell mints them
+       is_detached=false over `&var_buf[idx]`, so a shared cell keeps naming the SOURCE frame's slot — which is
+       what clone_susp_frame says in its own words and what this sentence denied, at the fork, where a reader
+       would look. The delta isolates the CELL, never the frame slot it points into. See the DCHECK in
+       get_captured_cell and engine/tests/solver/captured_var_fork.html. */
 
     /* ---- clone the base frame (dormant, mid-call): live end = the bottom frame's caller_sp ---- */
     ptrdiff_t blive = oa[n - 1]->caller_sp - ob->arg_buf;
