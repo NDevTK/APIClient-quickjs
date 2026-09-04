@@ -36935,11 +36935,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (JS_VALUE_GET_TAG(ret_val) != JS_TAG_UNINITIALIZED) {
                     if (tp->stage == 1 && !JS_IsUninitialized(ret_val)) {
-                        /* @@toPrimitive's result: 7.1.1 step 2.d — it MUST be primitive, there is no fallback.
+                        /* @@toPrimitive's result. §7.1.1 ToPrimitive ( input [ , preferredType ] ) step 1.b.v is
+                           "If result is not an Object, return result." and step 1.b.vi is "Throw a TypeError
+                           exception." — the two arms below, in that order. It MUST be primitive, there is no
+                           fallback: 1.b.vi is the END of the exotic branch's list, so nothing follows it and
+                           OrdinaryToPrimitive is never reached from here (that is 1.d, on the branch where
+                           exoticToPrimitive was undefined).
                            This is an ABRUPT exit like the method throwing, so it abandons the machine that asked
                            for the primitive too; freeing only the sequence leaked the realm through that
                            machine's captured invocation. The rule has one function precisely so it cannot be
-                           half-applied, and this exit predates it. */
+                           half-applied, and this exit predates it.
+                           THIS SAID "step 2.d", AND §7.1.1 HAS TWO TOP-LEVEL STEPS — step 2 is the bare "Return
+                           input", so it has no sub-items at all and neither 2.a nor 2.d can exist. Every real
+                           step here is nested: step 1 holds a list of four (a–d), and 1.b holds ONE list of six
+                           (i–vi), which is why a flat count of the <li>s promotes sub-items to peers and lands
+                           a citation one level up. The sub-number is written rather than the list being named
+                           in the spec's own words because 1.b holds exactly one list — checked, not assumed;
+                           where a step holds several, the list gets named instead. */
                         if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
                             JS_FreeValue(ctx, ret_val);
                             js_toprim_abandon(ctx, tp);
@@ -50901,7 +50913,34 @@ static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s)
    `gp_outer = …` kind is one — has no frame arm to be missing from, so it can be absent from all four at once
    and read as covered from any of them. CONT_TOPRIM_GET was: 62 is 21's record in the METHOD-READ role, none
    of the four knew it, and the free walk's DFAIL was where it surfaced because a flow is destroyed more often
-   than it is forked. When you add a kind, add it to all four in one diff and say which role it stands in. */
+   than it is forked. When you add a kind, add it to all four in one diff and say which role it stands in.
+
+   AND THE GAP IS LARGE, WHICH IS WHY THIS SAYS HOW TO COUNT IT AND NOT WHAT THE COUNT IS. A reader who meets
+   the DFAIL below is meeting one member of a SET, not an isolated omission, and the next failure is the next
+   kind this walk is dispatched with rather than a harder case of whichever one stopped them. So the useful
+   thing to hand them is the set — and the set is a fact about the tree at a revision. NO CENSUS AND NO LIST,
+   for the reason tramp_cont_clone_one gives over its own DFAIL: a message that names arms stays true about the
+   OBLIGATION and goes wrong about the TREE, in the direction that tells its reader the walk is less finished
+   than it is. A COUNT would be worse than a list, because it shrinks every time somebody does the work and
+   nothing anywhere says so. DERIVE IT INSTEAD — the vocabulary is every kind ASSIGNED to a cont_kind or an
+   outer_kind, the covered set is this function's own arms, and the gap is the difference:
+
+       comm -23 \
+        <(grep -oE '(cont_kind|outer_kind) *= *CONT_[A-Z_0-9]+' quickjs.c | grep -oE 'CONT_[A-Z_0-9]+' | sort -u) \
+        <(sed -n '/^static void tramp_cont_free(/,/^}/p' quickjs.c | grep -oE 'CONT_[A-Z_0-9]+' | sort -u)
+
+   Read its output with two corrections it cannot make for itself: a kind whose declaration says
+   `cont_state = NULL` carries no record and is answered by the !st early return below, and CONT_AGEN_CREATE /
+   CONT_AGEN_DRIVE are refused earlier still by free_tramp_chain's own DCHECK. What remains carries a record
+   and would abort here. (The pattern needs the space before `=`: written without one it matches nothing and
+   returns a confident empty answer, which is how this command was first got wrong.)
+
+   WHAT DOES NOT ROT IS THE SHAPE OF THAT SET, and it is the same sentence as the paragraph above rather than a
+   new one: nearly every kind in the gap is LINK-ONLY — declared `gp_outer = …`, never a frame's cont_state.
+   A link-only kind has no frame arm to be conspicuously missing from and no per-frame switch to be absent
+   from, so it goes missing from all four walks at once and reads as covered from any one of them. The gap is
+   therefore not a backlog that happens to be long; it is a blind spot with a DIRECTION, and that direction is
+   where to look first. */
 static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
 {
     JSRuntime *rt = ctx->rt;
