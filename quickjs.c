@@ -22888,6 +22888,9 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
        absent must not read as a value for the reason two lines up: js_mallocz reads as the INTEGER 0, and a
        0 here would be handed to step_tobool_run as the predicate to fork over. */
     h->keys_pred = JS_UNINITIALIZED;
+    /* …AND HOW FAR ITS TRUE ARM HAS GOT. js_mallocz reads as 0, which is this cursor's FIRST POSITION and not
+       its absence, so the one value that means "no chain" has to be written here by hand. */
+    h->keys_probe = KEYS_PROBE_UNASKED;
     h->cap_promise = JS_UNDEFINED;     /* a CAPABILITY request's [promise, resolve, reject], filled by its delivery */
     h->cap_funcs[0] = JS_UNDEFINED; h->cap_funcs[1] = JS_UNDEFINED;
     h->desc_get = JS_UNDEFINED; h->desc_set = JS_UNDEFINED; h->desc_flags = 0;
@@ -23236,6 +23239,82 @@ int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom a
    site, because there is exactly one issuer of this request. */
 #define OWNKEYS_PRED_OP "ToBoolean of the record's own-key-set predicate"
 
+/* ONE MEMBER, PERFORMED — the position the chain below is standing on, materialised, and the cursor advanced
+   past it so the next question is about a position nobody has answered. The two are one operation because
+   advancing without materialising would leave a member the flow decided on unnamed for ever.
+   THE NULL TEST IS A `CHECK` AND NOT A `DCHECK` because this call is the pointer's ONLY dereference and it
+   happens in every build: a host that installed the question and not its answer would segfault in release
+   where dev aborts, and the two must be the same event. */
+static int step_ownkeys_mint(JSContext *ctx, JSStepHdr *h, JSValueConst obj)
+{
+    int r;
+
+    CHECK(g_concolic.own_key_mint != NULL,
+          "a host asked the own-key-set question and installed no way to perform its TRUE arm — the enumeration "
+          "would decide that the record holds a member and then enumerate nothing, which is the empty-List "
+          "fabrication the predicate exists to prevent, arriving one step later");
+    r = g_concolic.own_key_mint(ctx, obj, h->keys_probe);
+    if (r < 0)
+        return -1;
+    DCHECK(r == 1, "the host declined to materialise a member of a record whose own-key-set predicate IT "
+                   "minted — the two answers are about one record, so a host that asks the question owns its "
+                   "true arm");
+    h->keys_probe++;
+    CHECK(h->keys_probe > 0, "the unknown-member cursor wrapped — the frontier's floor is RAM and disk, not an "
+                             "integer width, so this cursor has to be wide enough to be one");
+    return 0;
+}
+
+/* HOW MANY MEMBERS THE RECORD HOLDS, ONE POSITION AT A TIME — the chain the predicate's TRUE arm opens, and the
+ * question no single predicate can be. "It holds a member" and "it holds exactly one member" are not the same
+ * fact: every count is a world the program can be in, and a wrapper that named one member and stopped would
+ * decide `Object.keys(x).length === 2` false for a record no run ever saw — the empty-List fabrication moved
+ * one member out rather than removed. So at n the question is "beyond the n members already named, is there
+ * another?", position n and position n + 1 are DIFFERENT predicates because the operation string carries n, and
+ * there is NO BOUND on n: what makes this behave like a finite enumeration is the WFQ, since the flow that
+ * keeps answering "another" emits nothing new and is aged below every flow that does.
+ *
+ * IT IS THE OUTCOME SEAM WHERE THE FIRST QUESTION IS THE BRANCH SEAM, AND THAT IS NOT ONE CHAIN IN TWO KEY
+ * SPACES. The first question has TWO readers — the wrapper below and the record's own §10.1.11 internal method,
+ * which reads the arm back when the request reaches it — so it must be keyed by the record's own branch
+ * identity, which is the only key both of them can spell. Every question after it has ONE reader, is about a
+ * POSITION rather than about the record, and is exactly what solver_outcome's (operand, operation, completion)
+ * key space is for — the same shape, spelled the same way, as step_length_unknown's `LengthOfArrayLike>%d`.
+ *
+ * THE MEMBER IS MATERIALISED, NOT HANDED BACK AS A VALUE. See JSConcolicHooks.own_key_mint for why: the member
+ * becomes an ordinary slot whose name is the unknown's own shape, so it arrives in the delivered List as an
+ * ordinary String key and every consumer downstream needs nothing at all. The chain therefore runs BEFORE the
+ * request is issued — a member materialised afterwards would not be in the List the walk had already built.
+ *
+ * `h->keys_probe` IS THE COUNT OF MEMBERS ALREADY MATERIALISED, and the outstanding question is always "is there
+ * another beyond those?". It is opened at 0 by the branch question's TRUE arm — which IS the question at
+ * position 0 — so the first thing this does is perform that arm. The two mint sites are the two
+ * AUTHORISATIONS and not one rule written twice: the guarded one spends the answer the caller already has, the
+ * loop's spends the one the ask just returned. Placing the ask between them is also what makes the resume point
+ * right — a machine re-entered after a fork lands on the ask it parked at, never on a mint it already ran. */
+static int step_ownkeys_chain(JSContext *ctx, JSStepHdr *h, JSValueConst obj)
+{
+    for (;;) {
+        int arm, r, w;
+
+        DCHECK(h->keys_probe >= 0, "the unknown-member chain ran with no position — its cursor is the count of "
+                                   "members already named and the caller opens it at 0");
+        if (h->keys_probe == 0 && step_ownkeys_mint(ctx, h, obj) < 0)
+            return -1;
+        w = snprintf(h->keys_op, sizeof h->keys_op, "[[OwnPropertyKeys]]>%d", h->keys_probe);
+        CHECK(w > 0 && (size_t)w < sizeof h->keys_op,
+              "the unknown-member chain's operation string did not fit its buffer — a truncated one keys two "
+              "positions to one question, so the chain would answer position n from position m's world");
+        r = step_fork_run(ctx, h, obj, h->keys_op, 2, JS_OUTCOME_REAL_UNSTATED, &arm);
+        if (r)
+            return r;                    /* JS_STEP_FORK: the driver snapshots the sibling and re-enters here */
+        if (arm == 0)                    /* no member beyond the ones already named: the record is enumerated */
+            return 0;
+        if (step_ownkeys_mint(ctx, h, obj) < 0)
+            return -1;
+    }
+}
+
 /* [[OwnPropertyKeys]] AS A REQUEST — see quickjs-step.h. The request itself is what the engine's own property
    walk already issues (step code 11, the object borrowed in the header's request buffer); this is the two-phase
    wrapper that lets a HOST machine issue it, which is the half that was missing. It carries no key, so its
@@ -23252,20 +23331,24 @@ int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in,
            for unknown external input that carries no EXAMPLE has an unknown key SET, and answering the empty
            List for it is not a coarse answer but a DECIDED one: it states that the record holds nothing, which
            is a fact no run observed, and it decides `Object.keys(x).length === 0` for the program. The class
-           that holds such a record cannot fork over it — §10.1.11 [[OwnPropertyKeys]] ( ) "takes no arguments
-           and returns a normal completion containing a List of property keys", §6.1.7 The Object Type says "A
-           property key is either a String or a Symbol.", and §6.1.7.3 Invariants of the Essential Internal
-           Methods requires that "Each element of the returned List must be a property key", so the arm on which
-           the record HOLDS a member whose name is unknown has no representation in the returned List at all —
-           and its internal method is reached from inside a C activation with no flow base under it either.
+           that holds such a record cannot fork over it: §10.1.11 [[OwnPropertyKeys]] ( ) "takes no arguments
+           and returns a normal completion containing a List of property keys", and its internal method is
+           reached from inside a C activation with no flow base under it, so there is nothing there to snapshot
+           a sibling at. A FORK NEEDS A RESUME POINT AND THAT IS THE WHOLE OF WHY THE ASK IS HERE — it is not
+           that the arm cannot be expressed in the List. It can: §6.1.7 The Object Type says "A property key is
+           either a String or a Symbol." and §6.1.7.3 Invariants of the Essential Internal Methods requires that
+           "Each element of the returned List must be a property key", and an unknown key in this engine already
+           DENOTES a real String, its own shape (JSConcolicHooks.key_name), so the member the flow decides on is
+           materialised under that name and the ordinary walk lists it like any other key.
            THE HOST STATES THE QUESTION AND THIS SEAM ASKS IT. The predicate is minted by the host over the
            record's own identity, so two consumers asking about ONE record ask ONE question; the engine never
            spells that key, which is why this hands the VALUE to the branch seam rather than composing anything.
-           IT IS THE BRANCH SEAM AND NOT THE OUTCOME SEAM. A key set's emptiness is the same predicate an `if`
-           over it would test, so it is keyed by the value's own branch identity — the key the host reads back
-           when the internal method answers the arm this flow decided. The outcome seam keys by (operand,
-           operation, completion) and would file one question under a second name, which no consumer's fork
-           could then answer.
+           THIS ONE QUESTION IS THE BRANCH SEAM AND NOT THE OUTCOME SEAM, because it has TWO readers. A key
+           set's emptiness is the same predicate an `if` over it would test, so it is keyed by the value's own
+           branch identity — the key the host reads back when the internal method answers the arm this flow
+           decided. The outcome seam keys by (operand, operation, completion) and would file this question under
+           a second name, which no consumer's fork could then answer. Every question AFTER it has one reader and
+           is about a POSITION, and lives at the outcome seam where it belongs — see step_ownkeys_chain.
            HELD ON THE HEADER, NOT IN A C LOCAL, because the ask suspends: step_tobool_run's operand must live
            somewhere the sibling's snapshot carries, and this function's frame is gone when the answer lands. */
         DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
@@ -23276,32 +23359,26 @@ int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in,
            at all (a conformance run) has no record to ask about, and there is no second implementation for this
            to select between — the hook itself answers JS_UNINITIALIZED for every object that carries no
            question, which is where the condition that decides that lives. */
-        if (JS_IsUninitialized(h->keys_pred) && g_concolic.own_keys_pred)
-            h->keys_pred = g_concolic.own_keys_pred(ctx, obj);
-        if (!JS_IsUninitialized(h->keys_pred)) {
-            r = step_tobool_run(ctx, h, h->keys_pred, OWNKEYS_PRED_OP, &arm);
-            if (r) return r < 0 ? -1 : r;
-            JS_FreeValue(ctx, h->keys_pred);
-            h->keys_pred = JS_UNINITIALIZED;
-            if (arm) {
-                /* THE ARM ON WHICH THE RECORD HOLDS A MEMBER. It is answered HERE and not by the internal
-                   method, for the return-type reason above: this is the vocabulary in which a key is a VALUE —
-                   §14.7.5.9 EnumerateObjectProperties ( obj ) yields one per iteration, §14.7.5.10.2.1
-                   %ForInIteratorPrototype%.next ( ) hands that key back, and §20.1.2.19 Object.keys ( obj )
-                   builds an Array of ordinary values — so the member the flow decided exists is expressible in
-                   the ANSWER even though it is not expressible in the List the internal method returns. */
-                DFAIL("a flow decided that an example-free record HOLDS an own member and the enumeration had "
-                      "no key to hand back. The name is unknown, so it is not a property key and §6.1.7.3 "
-                      "Invariants of the Essential Internal Methods keeps it out of §10.1.11 "
-                      "[[OwnPropertyKeys]] ( )'s List — it belongs in the ANSWER this wrapper delivers, where a "
-                      "key is a value. WHAT TO BUILD: derive the key from the record under this operation "
-                      "(JSConcolicHooks.builtin, the same mint JSON.parse's unknown arm uses) and append it to "
-                      "the array the request delivers, in the GOT phase below. Each consumer of that array then "
-                      "owes an answer for a key whose KIND is unknown: the walks that call JS_ValueToAtom take "
-                      "it through JSConcolicHooks.key_name and need nothing, while the one that filters by "
-                      "JS_GPN_STRING_MASK / JS_GPN_SYMBOL_MASK (Object.getOwnPropertyNames and "
-                      "Object.getOwnPropertySymbols) must decide which of the two lists an unknown name is in");
+        if (h->keys_probe == KEYS_PROBE_UNASKED) {
+            if (JS_IsUninitialized(h->keys_pred) && g_concolic.own_keys_pred)
+                h->keys_pred = g_concolic.own_keys_pred(ctx, obj);
+            if (!JS_IsUninitialized(h->keys_pred)) {
+                r = step_tobool_run(ctx, h, h->keys_pred, OWNKEYS_PRED_OP, &arm);
+                if (r) return r < 0 ? -1 : r;
+                JS_FreeValue(ctx, h->keys_pred);
+                h->keys_pred = JS_UNINITIALIZED;
+                /* THE ARM ON WHICH THE RECORD HOLDS A MEMBER, PERFORMED — see step_ownkeys_chain, and
+                   JSConcolicHooks.own_key_mint for why it is a materialisation rather than a key appended to
+                   the answer. The chain runs to its end BEFORE the request is issued, so the walk that builds
+                   the List sees every member this flow decided the record holds. */
+                if (arm)
+                    h->keys_probe = 0;
             }
+        }
+        if (h->keys_probe != KEYS_PROBE_UNASKED) {
+            r = step_ownkeys_chain(ctx, h, obj);
+            if (r) return r < 0 ? -1 : r;
+            h->keys_probe = KEYS_PROBE_UNASKED;
         }
         step_keyed_inflight(h);
         h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver across the request */
@@ -23310,6 +23387,12 @@ int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in,
         return 11;
     }
     DCHECK(h->keys_phase == GET_PH_GOT, "an own-keys request was delivered with none in flight on this header");
+    /* THE CHAIN'S WHOLE LIFE IS INSIDE ONE ENTRY INTO THE PHASE ABOVE, asserted HERE because here is the far
+       side of the request — the driver, a park and a clone all stand between the two, and this is where a
+       cursor that survived any of them shows up. One still open would have members to materialise after the
+       walk that lists them has already run, so its remaining positions would be enumerated by nobody. */
+    DCHECK(h->keys_probe == KEYS_PROBE_UNASKED,
+           "an unknown-member chain was still open when its enumeration's key list came back");
     step_keyed_answered(h);   /* it carries no key either, so the stage is its whole site identity */
     h->keys_phase = GET_PH_START;
     if (JS_IsException(in))

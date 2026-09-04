@@ -551,6 +551,21 @@ typedef struct JSStepHdr {
        JS_UNINITIALIZED = this enumeration carries no question (an ordinary object, or a record whose example
        holds the answer). It IS carried across a fork, unlike `unknown_operand`, and that is the whole point. */
     JSValue keys_pred;
+    /* THE UNKNOWN-MEMBER CHAIN's cursor and its operation string — see step_ownkeys_run. Once the predicate
+       above answers TRUE the record holds a member, and how MANY it holds is a second unknown: every count is a
+       world the program can be in, so the enumeration asks a chain of per-position questions ("beyond the n
+       already named, is there another?") exactly as step_length_unknown asks one per index. The machine
+       SUSPENDS at every one of them, so neither the cursor nor the string the question is keyed by may live in
+       a C local. Its OWN buffer and not len_op's: that chain and this one cannot be in flight on one header
+       today, and sharing the storage would make a future overlap key two different questions to one string
+       rather than fail. KEYS_PROBE_UNASKED = no chain is running, which is also the state the wrapper restores
+       before it issues the request, so the cursor never spans an outstanding delivery. */
+    int keys_probe;
+    char keys_op[40];
+/* NO CHAIN IS RUNNING. It is -1 and not 0 because 0 is the first POSITION the chain stands at, and a cursor
+   whose "not started" reads as its own first value is one that re-names the member it has already named every
+   time the wrapper is re-entered. Beside the field it is the sentinel for, so the two cannot drift. */
+#define KEYS_PROBE_UNASKED (-1)
     /* the [[GetOwnProperty]] sub-sequence's own cursor, for the same reason keys_phase has one: Web IDL's
        record<> conversion asks for a key's DESCRIPTOR and then READS that key, so the two are in flight in the
        same stage and a shared phase would answer one at the other's call site. */

@@ -2330,15 +2330,16 @@ typedef struct JSConcolicHooks {
        a real world (the payload was `{}`, and it is the world a program branching on
        `Object.keys(x).length === 0` needs to have run) and it is a WRONG one as a FACT, because it states that
        the record holds nothing — which no run observed. So it is an ARM, and the fork needs a resume point.
-       The record's own internal method has neither half of one: §10.1.11 "takes no arguments and returns a
-       normal completion containing a List of property keys", §6.1.7 The Object Type says "A property key is
-       either a String or a Symbol.", and §6.1.7.3 Invariants of the Essential Internal Methods requires that
-       "Each element of the returned List must be a property key" — so the arm on which the record holds a
-       member of unknown NAME is not expressible in what it returns; and it is reached from inside a C
-       activation with no flow base under it, so it could not snapshot a sibling either. Both halves are fixed
-       at the CONSUMER, where a key is a VALUE (§14.7.5.9 EnumerateObjectProperties ( obj ) yields one per
-       iteration, §14.7.5.10.2.1 %ForInIteratorPrototype%.next ( ) hands it back, §20.1.2.19 Object.keys ( obj )
-       builds an Array of them) and where the enumeration is a step machine's request that can park.
+       The record's own internal method has no resume point: §10.1.11 "takes no arguments and returns a normal
+       completion containing a List of property keys", and it is reached from inside a C activation with no flow
+       base under it, so it cannot snapshot a sibling. That, and only that, is why the ask is at the CONSUMER,
+       where the enumeration is a step machine's request that can park.
+       IT IS NOT THAT THE TRUE ARM CANNOT BE EXPRESSED — an earlier statement here said so and it was wrong.
+       §6.1.7 The Object Type says "A property key is either a String or a Symbol." and §6.1.7.3 Invariants of
+       the Essential Internal Methods requires that "Each element of the returned List must be a property key",
+       and an unknown key in this engine ALREADY denotes a real String, its own shape (`key_name`), so the
+       member the flow decides on is materialised under that name by `own_key_mint` below and the ordinary key
+       walk lists it like any other. The List needs nothing it cannot hold; the FORK needed somewhere to stand.
        THE HOST OWNS THE KEY AND THE ENGINE NEVER SPELLS ONE. The returned value's identity is composed over the
        record's, so two consumers asking about ONE record ask ONE question and the host reads that same answer
        back when its internal method runs. An engine that built the key itself would file the question under a
@@ -2350,6 +2351,30 @@ typedef struct JSConcolicHooks {
        leaves it unasked — and its own record class is then reached without a decided arm, which is the state
        that class must refuse rather than answer. Install the two together. */
     JSValue (*own_keys_pred)(JSContext *ctx, JSValueConst record);
+    /* MATERIALISE THE RECORD'S n-TH UNKNOWN OWN MEMBER — the arm the predicate above answers TRUE, PERFORMED.
+       WHY IT IS A MATERIALISATION AND NOT A KEY HANDED BACK. A member whose name is unknown looks unable to
+       reach §10.1.11 [[OwnPropertyKeys]] ( )'s answer at all, because §6.1.7.3 Invariants of the Essential
+       Internal Methods requires that "Each element of the returned List must be a property key" and §6.1.7 The
+       Object Type says "A property key is either a String or a Symbol." — so the arm reads as one the internal
+       method cannot express. It can: an unknown key ALREADY denotes a real String in this engine, its own
+       SHAPE, which is what .key_name states and what makes `o[x] = 1` then `o[x]` find one slot. So the host
+       gives the member that name and an ordinary slot on the record, and the ordinary key walk underneath
+       [[OwnPropertyKeys]] lists it like any other — one List, one vocabulary, and every consumer (the
+       enumerable-key cursor's [[GetOwnProperty]] re-check, §20.1.2.11.1 GetOwnPropertyKeys ( value, type )'s
+       String/Symbol filter, §14.7.5.10.2.1 %ForInIteratorPrototype%.next ( )) works on it unchanged.
+       A SLOT IS ALSO WHAT MAKES IT PER-FLOW: the write is an ordinary property creation, so the COW delta
+       captures it and the sibling that took the empty arm never sees the member.
+       THE NAME IS DERIVED, NEVER INVENTED (§@H): it is composed over the record's own identity and n through
+       the host's one derivation speller, so it is the same string every time this flow re-asks and a different
+       one for every other record. STRING rather than Symbol is not a coin toss either — the channel these
+       records stand for is a server writing a record of fields into the page, which JS_AtomIsPublishedName
+       states carries no Symbol.
+       `n` counts from 0 and rises only while the enumeration's chain keeps answering "another". Returns 1
+       when the member is on the record, 0 when this host models no such record, -1 having thrown.
+       INSTALLED WITH own_keys_pred OR NEITHER: a host that asks the question and cannot perform its true arm
+       has an enumeration that decided a member exists and then enumerated nothing, which is the empty-List
+       fabrication the predicate exists to prevent, arriving one step later. */
+    int (*own_key_mint)(JSContext *ctx, JSValueConst record, int n);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 
