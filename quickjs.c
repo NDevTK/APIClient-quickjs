@@ -30784,6 +30784,17 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
             s->cur = cb_result;
             cb_result = JS_UNDEFINED;
             if (JS_IsException(s->cur)) { s->cur = JS_UNDEFINED; return -1; }
+            /* ASKED OF THE LINK THAT ARRIVED AND NOT OF THE STARTING OBJECT, which is the whole of why this
+               sits here rather than at FI_LINK. `for (k in rec)` over an unknown RECORD is supported: its own
+               keys come from this class's own enumeration seam. What is not supported is its PROTOTYPE, which
+               is a derivation with no example, has no own keys to contribute, and is never null. */
+            if (js_value_is_concolic(s->cur))
+            DFAIL("a prototype-chain walk reached a link that is unknown external input, and this machine has "
+                  "no arm for one: its only stopping tests are `is null` and a SameValue, both decided in C, "
+                  "and an unknown rides an ordinary Object — so every link takes the keep-walking arm and this "
+                  "walk does not terminate. Ask the outcome seam over the LINK with the shared "
+                  "PROTO_LINK_END/MATCH/MORE numbering and an op string of this algorithm's own; "
+                  "js_instanceof_step and js_proto_chain_step are the two built examples");
             s->hdr.stage = FI_LINK;
             continue;
         }
@@ -79366,6 +79377,17 @@ static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     JS_FreeValue(ctx, s->cur);
     s->cur = cb_result;
     cb_result = JS_UNDEFINED;
+    /* AND THIS ONE CANNOT STOP AT THE LINK EITHER, for a reason its own step 3.b makes worse: a link answers
+       the walk only when it HAS the key as an own property, and a derived prototype's example is absent, so
+       its [[GetOwnProperty]] reports nothing for every name. The descriptor arm can never fire and step 3.d
+       can never fire, which is both of this loop's exits. */
+    if (js_value_is_concolic(s->cur))
+        DFAIL("a prototype-chain walk reached a link that is unknown external input, and this machine has "
+              "no arm for one: its only stopping tests are `is null` and a SameValue, both decided in C, "
+              "and an unknown rides an ordinary Object — so every link takes the keep-walking arm and this "
+              "walk does not terminate. Ask the outcome seam over the LINK with the shared "
+              "PROTO_LINK_END/MATCH/MORE numbering and an op string of this algorithm's own; "
+              "js_instanceof_step and js_proto_chain_step are the two built examples");
     if (JS_IsNull(s->cur)) {   /* step 3.d: the chain ended */
         s->result = JS_UNDEFINED;
         return 0;
