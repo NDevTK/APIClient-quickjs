@@ -11870,6 +11870,22 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         JSObject *cur_p;
         if (unlikely(JS_IsException(cur)))
             return -1;
+        /* STEP 2's SameValue IS NOT DECIDABLE WHEN STEP 1 ANSWERED AN UNKNOWN, and the pointer test below
+           would decide it anyway — always FALSE, because a derived prototype is a fresh allocation and never
+           the object the page handed in. That is a fabrication of exactly the kind this class's own
+           [[GetPrototypeOf]] was built to stop, one internal method further on: `Object.setPrototypeOf(rec,
+           Base.prototype)` over a server-injected record reports the write as refused, and the throwing form
+           raises a TypeError, at a line real Chrome does not refuse at.
+           IT IS THE SAME TWO-COMPLETION QUESTION 7.3.21's step 6.c ASKS — "is this unknown that object?" —
+           with nothing else attached, so what belongs here is that ask and not a walk: the outcome seam over
+           `cur`, two completions, `real` unstated, the true arm returning true and the false arm falling
+           through to step 3. It is a DCHECK and not a residual because the answer beneath it is WRONG rather
+           than narrower: there is no case this door handles correctly today. */
+        DCHECK(!js_value_is_concolic(cur),
+               "10.4.7.2 SetImmutablePrototype ( obj, proto ) step 2 compares `proto` against a [[Prototype]] "
+               "this engine does not know, and the comparison below answers it in C — always false, so the "
+               "page is told its write was refused by a value nobody observed. Ask the outcome seam over the "
+               "value step 1 returned, two completions, exactly as 7.3.21's link walk asks step 6.c");
         cur_p = JS_IsNull(cur) ? NULL : JS_VALUE_GET_OBJ(cur);
         JS_FreeValue(ctx, cur);
         if (cur_p == proto)                          /* step 2: SameValue(proto, current) over Object|null */
