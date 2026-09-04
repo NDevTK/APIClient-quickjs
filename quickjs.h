@@ -2301,6 +2301,24 @@ typedef struct JSConcolicHooks {
        it is what lets `obj[x] = v`, `delete obj[x]`, `x in obj` and every key-taking builtin work at all.
        JS_UNINITIALIZED = not concolic. */
     JSValue (*key_name)(JSContext *ctx, JSValueConst key);
+    /* THE INVERSE, ASKED WHERE A PROPERTY NAME IS HANDED BACK TO THE PROGRAM AS A VALUE. `key_name` above is
+       a ONE-WAY DOOR: it spends a concolic's PROVENANCE and its DOMAIN to buy an atom, and that is the honest
+       price of the sentence it cites — a key is bytes, and an unknown cannot be bytes. The price is CORRECT at
+       every site that wanted bytes: a lookup, an atom a builtin is about to consume, a `@WHY` message's
+       display form. It is a LOSS at exactly one shape of site, the one that wanted a VALUE.
+       An ENUMERATION is that site. §14.7.5.10.2.1 %ForInIteratorPrototype%.next ( ) binds the name to a
+       variable the page then computes with, so a slot named through `key_name` — `o[x] = 1`, or a record's own
+       member materialised by `own_key_mint` below — reaches the page as an ordinary string: `k === "admin"` is
+       then decided by comparing two concrete strings and PRUNES an arm nothing contradicts, and
+       `fetch("/api/" + k)` composes a concrete path segment out of an unknown, which forks no branch and
+       reports no domain. Neither of those is a smaller answer; they are a wrong one.
+       So the name->value direction asks the host to answer the unknown AGAIN, and the two hooks compose:
+       `o[k]` over the restored value asks `key_name` and lands back in the same slot.
+       ASKED ONLY WHERE THE NAME BECOMES A VALUE THE PROGRAM OBSERVES — never at JS_AtomToString, whose callers
+       want bytes by construction, and never at an atom a lookup is about to consume.
+       JS_UNINITIALIZED = this string is not a name this host minted for an unknown key, which is the ordinary
+       case and covers every atom the parser, the bytecode and the engine's own vocabulary produce. */
+    JSValue (*key_value)(JSContext *ctx, JSValueConst name);
     /* A BUILTIN WHOSE OPERAND IS UNKNOWN produces an unknown DERIVED FROM IT, labelled with the operation the
        spec was performing ("RegExp.exec"). The same rule as .arith and .to_str, for the operations that are
        neither arithmetic nor a coercion: the operator answers, because the conversion boundary underneath owes

@@ -21983,12 +21983,40 @@ static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
    driven from OP_for_in_start — see js_for_in_step. The C body ran [[GetPrototypeOf]] and the per-link key walk
    from C, so `for (k in proxy)` reached three of the page's traps with no flow base. */
 
+/* THE NAME AN ENUMERATION DELIVERS TO THE PROGRAM, AS A VALUE — the ONE spelling, because there are several
+   enumerations and one rule, and two right answers to one question is the shape that drifts.
+   JS_AtomToValue answers the BYTES, which is what every other caller of it wants: a function's name, a
+   filename, a diagnostic, an operand a lookup is about to consume. This is the other question — the name is
+   about to become something the PAGE computes with — and it is the VALUE side of the trade
+   JS_ToPropertyKeyInternal makes on the way in. A slot named through JSConcolicHooks.key_name (`o[x] = 1`, or
+   a record's own member materialised by .own_key_mint) carries a string this engine composed in order to BE an
+   atom, and handing those bytes to the page is where the key's provenance and domain would end: `k === "admin"`
+   would be decided by comparing two concrete strings and would prune an arm nothing contradicts, and
+   `"/api/" + k` would emit a concrete path segment no run ever computed. The two hooks compose — `o[k]` over
+   the restored unknown asks .key_name again and lands back in the same slot.
+   An exception, an integer-index atom and an ordinary name all pass through unchanged: the host answers
+   JS_UNINITIALIZED for every string it did not mint for an unknown key. */
+static JSValue js_enum_key_value(JSContext *ctx, JSAtom atom)
+{
+    JSValue name = JS_AtomToValue(ctx, atom);
+    if (g_concolic.key_value && JS_IsString(name)) {
+        JSValue k = g_concolic.key_value(ctx, name);
+        if (!JS_IsUninitialized(k)) {
+            JS_FreeValue(ctx, name);
+            name = k;
+        }
+    }
+    return name;
+}
+
 /* Write 14.7.5.10.2.1's answer into the two slots OP_for_in_next grows the stack by. Both the "yielded a key" and
    the "exhausted" endings go through here so the shape cannot drift between them. */
 static void js_for_in_deliver(JSContext *ctx, JSValue *sp, JSAtom prop)
 {
     if (prop == JS_ATOM_NULL) { sp[0] = JS_UNDEFINED; sp[1] = JS_TRUE; return; }
-    sp[0] = JS_AtomToValue(ctx, prop);
+    /* §14.7.5.10.2.1 %ForInIteratorPrototype%.next ( ) binds this to the loop variable, so it is a VALUE the
+       page computes with and not an atom the engine looks up — see js_enum_key_value. */
+    sp[0] = js_enum_key_value(ctx, prop);
     sp[1] = JS_FALSE;
 }
 
@@ -77428,8 +77456,9 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                 if (!enumerable) { s->i++; s->hdr.stage = PW_KEYHEAD; continue; }
             }
             if (mode == PROPWALK_KEYS) {
-                /* 7.3.23 with kind = key: the KEY is the element, and there is no Get at all. */
-                JSValue kv = JS_AtomToValue(ctx, s->atoms[s->i].atom);
+                /* 7.3.23 with kind = key: the KEY is the element, and there is no Get at all. The element is
+                   the page's, so the name is delivered as a VALUE — see js_enum_key_value. */
+                JSValue kv = js_enum_key_value(ctx, s->atoms[s->i].atom);
                 if (JS_IsException(kv)) return -1;
                 if (JS_CreateDataPropertyUint32(ctx, s->result, s->j++, kv, 0) < 0) return -1;
                 s->i++; s->hdr.stage = PW_KEYHEAD;
@@ -77490,7 +77519,9 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             } else if (mode == PROPWALK_ENTRIES) {
                 JSValue pair = JS_NewArray(ctx), key;
                 if (JS_IsException(pair)) { JS_FreeValue(ctx, item); return -1; }
-                key = JS_AtomToValue(ctx, s->atoms[s->i].atom);
+                /* the pair's first element is the page's, so the name is delivered as a VALUE — see
+                   js_enum_key_value. */
+                key = js_enum_key_value(ctx, s->atoms[s->i].atom);
                 if (JS_IsException(key)) { JS_FreeValue(ctx, pair); JS_FreeValue(ctx, item); return -1; }
                 if (JS_CreateDataPropertyUint32(ctx, pair, 0, key, JS_PROP_THROW) < 0) {
                     JS_FreeValue(ctx, pair); JS_FreeValue(ctx, item); return -1;
