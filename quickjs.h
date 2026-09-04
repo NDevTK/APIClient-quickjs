@@ -2324,6 +2324,32 @@ typedef struct JSConcolicHooks {
        domain permits. A DERIVED value (`location.hash.slice(1)`) has its own identity and no declared
        delivery, so it answers 0 and both arms stay — which is the correct answer for it. */
     int (*lead)(JSValueConst v);
+    /* THE PREDICATE AN ENUMERATION OF AN UNKNOWN KEY SET FORKS ON — the question §10.1.11 [[OwnPropertyKeys]]
+       ( ) cannot ask and cannot answer, handed to the seam that has a resume point.
+       WHY THE ENGINE HAS TO ASK. An unknown that carries no EXAMPLE has an unknown key set: the empty List is
+       a real world (the payload was `{}`, and it is the world a program branching on
+       `Object.keys(x).length === 0` needs to have run) and it is a WRONG one as a FACT, because it states that
+       the record holds nothing — which no run observed. So it is an ARM, and the fork needs a resume point.
+       The record's own internal method has neither half of one: §10.1.11 "takes no arguments and returns a
+       normal completion containing a List of property keys", §6.1.7 The Object Type says "A property key is
+       either a String or a Symbol.", and §6.1.7.3 Invariants of the Essential Internal Methods requires that
+       "Each element of the returned List must be a property key" — so the arm on which the record holds a
+       member of unknown NAME is not expressible in what it returns; and it is reached from inside a C
+       activation with no flow base under it, so it could not snapshot a sibling either. Both halves are fixed
+       at the CONSUMER, where a key is a VALUE (§14.7.5.9 EnumerateObjectProperties ( obj ) yields one per
+       iteration, §14.7.5.10.2.1 %ForInIteratorPrototype%.next ( ) hands it back, §20.1.2.19 Object.keys ( obj )
+       builds an Array of them) and where the enumeration is a step machine's request that can park.
+       THE HOST OWNS THE KEY AND THE ENGINE NEVER SPELLS ONE. The returned value's identity is composed over the
+       record's, so two consumers asking about ONE record ask ONE question and the host reads that same answer
+       back when its internal method runs. An engine that built the key itself would file the question under a
+       second name and no consumer's fork could answer it.
+       Returns JS_UNINITIALIZED when this enumeration carries no question — an ordinary object, or a record
+       whose EXAMPLE holds the answer, whose key set is an OBSERVATION rather than an unknown. That is the same
+       positive statement `type_of` and `to_bool` make, and it is why this is not a boolean.
+       A HOST THAT INSTALLS THE VALUE CLASS AND NOT THIS MEMBER is not exempted from the question, it merely
+       leaves it unasked — and its own record class is then reached without a decided arm, which is the state
+       that class must refuse rather than answer. Install the two together. */
+    JSValue (*own_keys_pred)(JSContext *ctx, JSValueConst record);
 } JSConcolicHooks;
 JS_EXTERN void JS_SetConcolicHooks(const JSConcolicHooks *hooks);
 

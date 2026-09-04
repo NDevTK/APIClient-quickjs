@@ -22884,6 +22884,10 @@ static void *tramp_step_state_new(JSContext *ctx, const JSTrampStepDef *sd, JSVa
        to a keyed read. */
     h->park_in = JS_UNINITIALIZED;
     h->park_exc = JS_UNINITIALIZED;
+    /* THE OWN-KEY-SET QUESTION THIS MACHINE IS STANDING ON — absent until an enumeration asks one, and
+       absent must not read as a value for the reason two lines up: js_mallocz reads as the INTEGER 0, and a
+       0 here would be handed to step_tobool_run as the predicate to fork over. */
+    h->keys_pred = JS_UNINITIALIZED;
     h->cap_promise = JS_UNDEFINED;     /* a CAPABILITY request's [promise, resolve, reject], filled by its delivery */
     h->cap_funcs[0] = JS_UNDEFINED; h->cap_funcs[1] = JS_UNDEFINED;
     h->desc_get = JS_UNDEFINED; h->desc_set = JS_UNDEFINED; h->desc_flags = 0;
@@ -23225,6 +23229,13 @@ int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAtom a
     return 0;
 }
 
+/* THE ASK'S IDENTITY ON THIS WRAPPER — step_tobool_run's `op`, which is NOT the constraint key. The key is the
+   predicate's own branch identity, minted by the host over the RECORD, so one machine walking a prototype chain
+   asks a DIFFERENT question at every link while naming its call site with this one string. It exists only so
+   that an answer cannot be consumed at a call site other than the one that asked; there is exactly one such
+   site, because there is exactly one issuer of this request. */
+#define OWNKEYS_PRED_OP "ToBoolean of the record's own-key-set predicate"
+
 /* [[OwnPropertyKeys]] AS A REQUEST — see quickjs-step.h. The request itself is what the engine's own property
    walk already issues (step code 11, the object borrowed in the header's request buffer); this is the two-phase
    wrapper that lets a HOST machine issue it, which is the half that was missing. It carries no key, so its
@@ -23234,7 +23245,64 @@ int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in,
                      JSValue **out_cb, int *out_argc)
 {
     if (h->keys_phase == GET_PH_START) {
-        JS_FreeValue(ctx, in);
+        int arm, r;
+
+        JS_FreeValue(ctx, in);   /* never this request's answer: that arrives in the GOT phase below */
+        /* THE ENUMERATION'S OWN QUESTION, ASKED HERE BECAUSE HERE IS WHERE IT CAN BE ASKED. A record standing
+           for unknown external input that carries no EXAMPLE has an unknown key SET, and answering the empty
+           List for it is not a coarse answer but a DECIDED one: it states that the record holds nothing, which
+           is a fact no run observed, and it decides `Object.keys(x).length === 0` for the program. The class
+           that holds such a record cannot fork over it — §10.1.11 [[OwnPropertyKeys]] ( ) "takes no arguments
+           and returns a normal completion containing a List of property keys", §6.1.7 The Object Type says "A
+           property key is either a String or a Symbol.", and §6.1.7.3 Invariants of the Essential Internal
+           Methods requires that "Each element of the returned List must be a property key", so the arm on which
+           the record HOLDS a member whose name is unknown has no representation in the returned List at all —
+           and its internal method is reached from inside a C activation with no flow base under it either.
+           THE HOST STATES THE QUESTION AND THIS SEAM ASKS IT. The predicate is minted by the host over the
+           record's own identity, so two consumers asking about ONE record ask ONE question; the engine never
+           spells that key, which is why this hands the VALUE to the branch seam rather than composing anything.
+           IT IS THE BRANCH SEAM AND NOT THE OUTCOME SEAM. A key set's emptiness is the same predicate an `if`
+           over it would test, so it is keyed by the value's own branch identity — the key the host reads back
+           when the internal method answers the arm this flow decided. The outcome seam keys by (operand,
+           operation, completion) and would file one question under a second name, which no consumer's fork
+           could then answer.
+           HELD ON THE HEADER, NOT IN A C LOCAL, because the ask suspends: step_tobool_run's operand must live
+           somewhere the sibling's snapshot carries, and this function's frame is gone when the answer lands. */
+        DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+               "[[OwnPropertyKeys]] was requested over a value that is not an Object — §10.1.11 is an OBJECT "
+               "internal method and the request's delivery reads the operand as one, so a coercion owed by the "
+               "asking algorithm's own spec step was skipped at its call site");
+        /* THE NULL TEST IS THE HOST'S ANSWER AND NOT A FALLBACK: a host that installs no concolic value class
+           at all (a conformance run) has no record to ask about, and there is no second implementation for this
+           to select between — the hook itself answers JS_UNINITIALIZED for every object that carries no
+           question, which is where the condition that decides that lives. */
+        if (JS_IsUninitialized(h->keys_pred) && g_concolic.own_keys_pred)
+            h->keys_pred = g_concolic.own_keys_pred(ctx, obj);
+        if (!JS_IsUninitialized(h->keys_pred)) {
+            r = step_tobool_run(ctx, h, h->keys_pred, OWNKEYS_PRED_OP, &arm);
+            if (r) return r < 0 ? -1 : r;
+            JS_FreeValue(ctx, h->keys_pred);
+            h->keys_pred = JS_UNINITIALIZED;
+            if (arm) {
+                /* THE ARM ON WHICH THE RECORD HOLDS A MEMBER. It is answered HERE and not by the internal
+                   method, for the return-type reason above: this is the vocabulary in which a key is a VALUE —
+                   §14.7.5.9 EnumerateObjectProperties ( obj ) yields one per iteration, §14.7.5.10.2.1
+                   %ForInIteratorPrototype%.next ( ) hands that key back, and §20.1.2.19 Object.keys ( obj )
+                   builds an Array of ordinary values — so the member the flow decided exists is expressible in
+                   the ANSWER even though it is not expressible in the List the internal method returns. */
+                DFAIL("a flow decided that an example-free record HOLDS an own member and the enumeration had "
+                      "no key to hand back. The name is unknown, so it is not a property key and §6.1.7.3 "
+                      "Invariants of the Essential Internal Methods keeps it out of §10.1.11 "
+                      "[[OwnPropertyKeys]] ( )'s List — it belongs in the ANSWER this wrapper delivers, where a "
+                      "key is a value. WHAT TO BUILD: derive the key from the record under this operation "
+                      "(JSConcolicHooks.builtin, the same mint JSON.parse's unknown arm uses) and append it to "
+                      "the array the request delivers, in the GOT phase below. Each consumer of that array then "
+                      "owes an answer for a key whose KIND is unknown: the walks that call JS_ValueToAtom take "
+                      "it through JSConcolicHooks.key_name and need nothing, while the one that filters by "
+                      "JS_GPN_STRING_MASK / JS_GPN_SYMBOL_MASK (Object.getOwnPropertyNames and "
+                      "Object.getOwnPropertySymbols) must decide which of the two lists an unknown name is in");
+            }
+        }
         step_keyed_inflight(h);
         h->cb_coerce[0] = (JSValue)obj;   /* borrowed: the machine holds the receiver across the request */
         *out_cb = h->cb_coerce; *out_argc = 0;
@@ -24686,6 +24754,10 @@ static JSValue tramp_step_state_free_1(JSContext *ctx, void *st, bool take_resul
        the MACHINE's: they are the driver's, held on the header for exactly as long as the anchor stands. */
     JS_FreeValue(ctx, h->park_in);   h->park_in = JS_UNINITIALIZED;
     JS_FreeValue(ctx, h->park_exc);  h->park_exc = JS_UNINITIALIZED;
+    /* THE OWN-KEY-SET PREDICATE — a real reference whenever a machine is torn down between the ask and its
+       answer (a chain freed under a throw, a cold-tier tail dropped), which is exactly the window the field
+       exists to span, so it is released here like the two above and named by no machine's `visit`. */
+    JS_FreeValue(ctx, h->keys_pred); h->keys_pred = JS_UNINITIALIZED;
     for (i = 0; i < h->argc; i++)
         JS_FreeValue(ctx, h->argv[i]);
     h->argc = 0;                     /* the block is freed below; nothing may read the captures after this */
@@ -25216,6 +25288,11 @@ static void *tramp_step_state_clone(JSContext *ctx, const void *src)
        exactly as ctor_ntgt's does. */
     h->park_in = js_dup(h->park_in);
     h->park_exc = js_dup(h->park_exc);
+    /* THE OWN-KEY-SET PREDICATE, TAKEN A SECOND TIME. This is the one header value that is live ACROSS a
+       fork by design — the sibling resumes at the very ask it was forked from, and step_tobool_run reads the
+       operand off the header there — so it is dup'd rather than asserted absent the way unknown_operand is.
+       UNINITIALIZED is not refcounted, so the no-question case needs no test. */
+    h->keys_pred = js_dup(h->keys_pred);
     o->def->visit(ctx, h, (JSStepVisit *)&js_step_visit_dup);   /* the machine's own owned fields, taken a second time */
     return h;
 }

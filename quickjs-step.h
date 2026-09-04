@@ -541,6 +541,16 @@ typedef struct JSStepHdr {
        so the two sub-sequences are in flight in the same stage and sharing a phase would answer one at the
        other's call site. */
     uint8_t keys_phase;
+    /* THE OWN-KEY-SET PREDICATE, held across the fork that asks it — see step_ownkeys_run. An enumeration of a
+       record standing for unknown external input that carries no example forks over whether the record holds an
+       own member at all, and step_tobool_run's operand must live somewhere the SIBLING'S SNAPSHOT CARRIES: the
+       ask suspends, and the C frame that minted the value is gone when the answer lands. It is on the header
+       rather than in a machine's own state because the ask is the WRAPPER's, shared by every consumer of the
+       request, and a per-machine field would be the same declaration repeated once per consumer with one more
+       chance to forget the dup. OWNED, so tramp_step_state_clone dups it and the teardown releases it;
+       JS_UNINITIALIZED = this enumeration carries no question (an ordinary object, or a record whose example
+       holds the answer). It IS carried across a fork, unlike `unknown_operand`, and that is the whole point. */
+    JSValue keys_pred;
     /* the [[GetOwnProperty]] sub-sequence's own cursor, for the same reason keys_phase has one: Web IDL's
        record<> conversion asks for a key's DESCRIPTOR and then READS that key, so the two are in flight in the
        same stage and a shared phase would answer one at the other's call site. */
