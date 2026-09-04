@@ -26288,8 +26288,34 @@ typedef struct JSArgList {
     JSValue func, this_arg, src;
     int cfirst, cargc;
     uint8_t is_tail;
+    /* §7.3.19 step 3 OVER UNKNOWN EXTERNAL INPUT — the elimination chain's own state, held here for
+       step_length_unknown's reason: the sequence SUSPENDS at every ask (the sibling's snapshot is taken there)
+       and a C local is gone when it resumes. The four fields are JSArrayLen's four, asked of the same hook with
+       the same two-phase discipline, because this carrier is not a JSStepHdr either and so cannot call
+       step_fork_run.
+       THE QUESTION IS NOT STORED, only the CONTENT HASH of the one last asked, recomposed at every site from
+       the cursor — so a resume that lands at a different position than the ask crashes instead of filing one
+       world's answer under another's question. Nothing else catches that: fork_arm is a real, in-range arm
+       either way. The unknown itself rides `coerce`, which the clone dups and the teardown frees. */
+    int64_t  fork_probe;   /* WHICH length is being asked about — declared at §7.1.22 ToLength's own width, so
+                              the pin into `len` is a copy and never a narrowing */
+    uint32_t fork_ask_key;
+    int      fork_arm;
+    uint8_t  fork_phase;   /* ARGL_FORK_ASK / ARGL_FORK_ANSWERED — ASK in the sibling's snapshot, on purpose */
 } JSArgList;
-enum { ARGL_LEN = 0, ARGL_LEN_PRIM, ARGL_ELEM };
+/* ARGL_LEN/ARGL_LEN_PRIM are step 3's read and its coercion; ARGL_ELEM is step 6's per-element walk.
+   …AND ARGL_LEN_UNKNOWN is step 3 over UNKNOWN EXTERNAL INPUT, where the coercion is never asked for at all:
+   §7.1.1 ToPrimitive over a concolic is the identity, so it would hand the unknown straight to §7.1.22
+   ToLength, which owes C a real int64. It is numbered ABOVE the whole concrete space rather than interleaved
+   with it, for step_fork_key's reason: a phase that delegates must not share a value with the phases it
+   delegates into, or a chain parked at its own question reads as one parked at the coercion it delegates
+   into. */
+enum { ARGL_LEN = 0, ARGL_LEN_PRIM, ARGL_ELEM, ARGL_LEN_UNKNOWN };
+/* the fork's own two phases, which are step_fork_run's FORK_PH_* under this carrier's name. Which of them the
+   SIBLING's snapshot carries is the whole of the design: it carries ASK, so the sibling re-enters, asks AGAIN,
+   and reads its arm out of its own decision vector. An arm baked into the clone would be a second, weaker
+   answer to a question the vector already answers. */
+enum { ARGL_FORK_ASK = 0, ARGL_FORK_ANSWERED };
 enum { ARGL_TO_APPLY = 0, ARGL_TO_CONSTRUCT };
 static void js_arg_list_free(JSContext *ctx, JSArgList *al);
 
@@ -26394,7 +26420,7 @@ typedef struct JSArrayLen {
     /* §10.4.2.4 OVER UNKNOWN EXTERNAL INPUT — the outcome fork's own state, the shape JSStepHdr carries for
        step_fork_run and for the same reasons. This carrier is NOT a JSStepHdr (it is a keyed operation parked
        across a coercion, walked by the keyed chain), so it cannot call that function; what it can do is ask the
-       SAME hook with the SAME two-phase discipline, which is what these five fields are.
+       SAME hook with the SAME two-phase discipline, which is what these four fields are.
        THE QUESTION ITSELF IS NOT STORED, only the CONTENT HASH of the one last asked. It is composed at every
        site from (phase, probe) — the chain's own cursor — so the check below is a CHECK: storing the bytes and
        re-hashing those would compare a copy against itself and could never mismatch, which is the shape a
@@ -26585,6 +26611,20 @@ static JSTrapGet *js_trapget_clone(JSContext *ctx, const JSTrapGet *tg)
  * distinguishable by kind or one record would be cloned twice and the sibling would hold two half-advanced
  * copies of one cursor. */
 #define CONT_ARRAY_LEN_YIELD 78
+
+/* TrampFrame.cont_state = a JSArgList PARKED AT ITS OWN OUTCOME FORK — the fourth anchor, and it is here for
+ * the reason the other three are: §7.3.19's sequence is an interpreter local (`cont_st`), which no snapshot can
+ * reach, and the heap-frame chain can.
+ *
+ * IT IS A SEPARATE KIND FROM CONT_ARG_LIST for CONT_ARRAY_LEN_YIELD's reason, and the split is sharper here
+ * than there: CONT_ARG_LIST is a LINK and NOTHING ELSE. The sequence's ordinary suspensions are the `length`
+ * read, its ToPrimitive and each element read, and it parks by parking THOSE — it is their gp_outer/tp_outer,
+ * so tramp_cont_clone_one copies it and no frame owns it. Its unknown-length chain asks a question of nobody
+ * else's, so at that one point the record is a frame's own cont_state instead. cont_outer_get's invariant is
+ * that a record is EITHER a frame's cont_state OR reachable through exactly one `outer` link and never both,
+ * so the two roles must be distinguishable by kind or the fork would copy one record twice and the sibling
+ * would hold two half-advanced copies of one cursor. */
+#define CONT_ARG_LIST_YIELD  79
 
 /* EVERY REFERENCE THIS RECORD OWNS, NAMED ONCE — the list js_getprop_free releases and the list
    js_getprop_clone re-takes, written as ONE macro rather than as two walks that have to agree. A record that
@@ -27774,6 +27814,14 @@ static JSArgList *js_arg_list_clone(JSContext *ctx, const JSArgList *al)
     n->len = al->len; n->i = al->i;
     n->phase = al->phase; n->resume = al->resume;
     n->cfirst = al->cfirst; n->cargc = al->cargc; n->is_tail = al->is_tail;
+    /* THE CHAIN'S BOOKKEEPING, COPIED VERBATIM — fork_phase included. That is ARGL_FORK_ASK at every clone the
+       fork itself takes (it is asserted AT the fork), so the sibling re-asks at the position it was forked at
+       and its own decision vector answers; and it is whatever a PAGED snapshot held, which is how a parked
+       chain resumes next session without asking one question twice. */
+    n->fork_probe = al->fork_probe;
+    n->fork_ask_key = al->fork_ask_key;
+    n->fork_arm = al->fork_arm;
+    n->fork_phase = al->fork_phase;
     n->coerce = js_dup(al->coerce);
     n->idx = JS_DupAtom(ctx, al->idx);
     n->func = js_dup(al->func);
@@ -28270,6 +28318,7 @@ static inline void cont_kinds_are_distinct(int k)
     case CONT_DEFINE_CLASS:
     case CONT_ARRAY_LEN:
     case CONT_ARRAY_LEN_YIELD:
+    case CONT_ARG_LIST_YIELD:
     case CONT_CTOR_PROTO:
     case CONT_TA_TARGET:
     case CONT_SETMAP_CTOR:
@@ -32607,10 +32656,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    Re-enter the DEEPEST frame at its saved pc/sp. */
                 TrampFrame *dtf = s->tramp_top;
                 if (dtf->cont_kind == CONT_STEP_YIELD || dtf->cont_kind == CONT_GETPROP_YIELD
-                    || dtf->cont_kind == CONT_ARRAY_LEN_YIELD) {
+                    || dtf->cont_kind == CONT_ARRAY_LEN_YIELD || dtf->cont_kind == CONT_ARG_LIST_YIELD) {
                     /* AN ANCHOR: a STEP MACHINE parked at its own back-edge, a KEYED PROPERTY OPERATION
-                       parked at its own re-entry, or §10.4.2.4's chain parked at its own outcome fork. None
-                       has a body to restart, so this cannot take the `goto
+                       parked at its own re-entry, or §10.4.2.4's or §7.3.19's chain parked at its own outcome
+                       fork. None has a body to restart, so this cannot take the `goto
                        restart` below: the frame is popped, the interpreter registers are restored from the
                        frame's caller record (the same reconstruction do_return performs), and the continuation
                        is re-entered where it left off. Nothing is replayed — where each one is, is its own
@@ -32678,6 +32727,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                "suspension borrowed the anchor and its coercion is about to be skipped");
                         cont_st = ystt;
                         goto do_array_len_step;
+                    }
+                    if (ykind == CONT_ARG_LIST_YIELD) {
+                        /* §7.3.19's UNKNOWN-LENGTH CHAIN, handed back its record — the same anchor and the
+                           same reading as §10.4.2.4's one arm up. WHERE IN THE PAIR IT RESUMES IS ITS OWN
+                           fork_phase AND NEVER A POSITION THIS WALK GUESSES AT, and both values are legal
+                           here: a PARENT that took the value yield parked carrying its answer and consumes it
+                           without asking twice; a SIBLING was cloned AT the ask and asks again, so its own
+                           decision vector replays the arm it was forked for. */
+                        DCHECK(!JS_HasException(ctx),
+                               "a flow resumed into a parked argument-list chain with a completion already "
+                               "live in the runtime — the exception slot is shared, so this one belongs to "
+                               "another flow");
+                        DCHECK(((JSArgList *)ystt)->phase == ARGL_LEN_UNKNOWN,
+                               "an argument-list ANCHOR resumed in a phase that is not the unknown-length "
+                               "chain's — this frame is only ever built by that chain, so any other phase "
+                               "means some other suspension borrowed the anchor and a `length` read, its "
+                               "coercion or an element read is about to be skipped");
+                        cont_st = ystt;
+                        goto do_arg_list_step;
                     }
                     cont_st = ystt;
                     /* WHAT THE DRIVER OWED IT, TAKEN BACK — the delivery it parked holding and the completion
@@ -35539,6 +35607,54 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define STEP_ANCHOR_NEW(tfv) \
     ANCHOR_NEW(tfv, tramp_step_chain_free(ctx, stt); JS_ThrowOutOfMemory(ctx); goto exception)
 
+/* THE SIBLING AN INTERPRETER-INLINE OUTCOME FORK BUILDS — ONE COPY, for ANCHOR_NEW's reason and with the same
+   force. A chain that forks from inside JS_CallInternal cannot call step_fork_run (its carrier is not a
+   JSStepHdr) and cannot let the DRIVER take the snapshot (there is no driver: the fork is a `goto` away from
+   the operand it is deciding), so it takes the snapshot itself — anchor the record, record the frame's resume
+   point, clone, hand the clone to the fork hook, unanchor. Those ten lines are the whole of what a fork IS
+   here, and a second copy of them is where two chains would silently stop agreeing about what a sibling is:
+   an anchor left on the chain, a cur_sp not cleared, a clone handed over before the resume point was written.
+   `algo_` is a STRING LITERAL and is concatenated into every message, because §AN-ASSERT-THAT-NAMES-A-REMEDY
+   requires the crash to name the algorithm that reached it and not the mechanism they share — the macro
+   expands AT the site, so __FILE__/__LINE__ are the caller's already and only the name had to be carried.
+   What each chain keeps at its OWN site is what is genuinely its own: the question it composed, the phase byte
+   it asserts, and what its two arms mean. */
+#define OUTCOME_FORK_SNAPSHOT(algo_, st_, kind_, oom_action_) do {                                          \
+        TrampFrame *fk_tf_;                                                                                 \
+        JSValue *fk_cl_;                                                                                    \
+        if (gen_state == NULL)                                                                              \
+            DFAIL(algo_ " forked in a NON-coroutine activation (gen_state NULL): its C entry never became "  \
+                        "a flow base — route that caller onto the tramp chain");                            \
+        if (gen_state != g_flow_base_gen)                                                                   \
+            DFAIL(algo_ " forked inside a coroutine activation that is not the flow base — give that "      \
+                        "resume path a resume-as-flow driver; a sibling snapshotted here would be rebuilt "  \
+                        "against the wrong base");                                                          \
+        DCHECK(g_flow_control.fork != NULL,                                                                 \
+               "a forking outcome policy with no fork hook to build the sibling from its clone");           \
+        /* the completion slot is per-RUNTIME and a completion is per-EVALUATION, so one left standing       \
+           across the snapshot is delivered to the SIBLING. Asserted rather than assumed. */                 \
+        DCHECK(!JS_HasException(ctx),                                                                       \
+               algo_ "'s outcome fork was taken with a completion live in the runtime — the exception slot " \
+                     "is per-RUNTIME and a completion is per-EVALUATION, so this throw would be delivered "  \
+                     "to the sibling. Carry it across the fork the way JSStepHdr::park_exc is carried, or "  \
+                     "take it where it was produced");                                                      \
+        /* THE CHAIN'S OPERANDS ARE INTERPRETER LOCALS, so the snapshot cannot reach them where they are;    \
+           the anchor is what puts the record on the heap-frame chain for exactly as long as the clone        \
+           takes. The OOM unwinds through the operation's OWN teardown rather than the frame's generic one. */\
+        ANCHOR_NEW(fk_tf_, oom_action_);                                                                    \
+        fk_tf_->cont_state = (st_); fk_tf_->cont_kind = (kind_);                                            \
+        sf->cur_pc = pc; sf->cur_sp = sp;   /* the CURRENT frame's resume point, as do_preempt records it */ \
+        gen_state->tramp_top = fk_tf_;                                                                      \
+        fk_cl_ = JS_FlowClone(ctx, (JSValue *)gen_state);                                                   \
+        CHECK(fk_cl_ != NULL,                                                                               \
+              algo_ "'s outcome fork could not snapshot the flow — the other completion would be dropped, "  \
+                    "and the frontier never drops a work item");                                            \
+        g_flow_control.fork(ctx, fk_cl_);                                                                   \
+        gen_state->tramp_top = NULL;   /* the parent's chain is live in tf_top */                           \
+        sf->cur_sp = NULL;             /* running again */                                                  \
+        tramp_frame_free(rt, fk_tf_);                                                                       \
+    } while (0)
+
         do_step_tramp:
             /* ONE generic entry for every builtin DEFINED as a step machine. Nothing here names a builtin: the
                callee carries its own size/step/fini, so this path never grows an entry per builtin. */
@@ -37521,6 +37637,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                do_apply_tramp with the list already built. */
             {
                 JSArgList *al = (JSArgList *)cont_st;
+                /* THE UNKNOWN-LENGTH CHAIN'S ENTRY sets this phase below and the RESUME lands here with it
+                   already set, its fork_phase saying where in the ask/answer pair it stands. Both ways in are
+                   this one test, for do_array_len_step's reason: a resume that had to guess where in the pair
+                   a chain stood would be guessing at state the record already holds. */
+                if (al->phase == ARGL_LEN_UNKNOWN)
+                    goto do_arg_list_unknown;
                 if (al->phase == ARGL_LEN) {
                     /* step 3's `? Get(obj, "length")` — an accessor or a Proxy trap. */
                     al->phase = ARGL_LEN_PRIM;
@@ -37546,27 +37668,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        only a primitive, so a second coercion of one `length` is unreachable rather than
                        merely unobserved. */
                     if (unlikely(js_value_is_concolic(ret_val))) {
+                        /* §7.3.19 step 3 — `Let length be ? LengthOfArrayLike(obj)` — OVER UNKNOWN EXTERNAL
+                           INPUT: `f.apply(t, x)`, `f(...x)`, `new C(...x)` or `Reflect.apply` where the
+                           `length` read produced input the page never determined.
+                           NEITHER COERCING NOR PICKING. §7.1.22 ToLength ( arg ) owes C a real int64, and a
+                           pick would decide HOW MANY of the callee's parameters are bound — which of its arms
+                           run, and whether its rest parameter is empty — from a fact no run established. A
+                           length is not one fact with one answer: every non-negative integer is a world, and
+                           the answer is the per-position outcome-fork chain below, which is the question
+                           step_length_unknown already asks on the READ side, under the same key, over the same
+                           abstract operation. The two sides of §7.3.18 LengthOfArrayLike ( obj ) answer alike. */
                         JS_FreeValue(ctx, al->coerce);
-                        al->coerce = ret_val; ret_val = JS_UNDEFINED;   /* owned across the ask, and freed by
-                                                                          the teardown below */
-                        DFAIL("§7.3.19 CreateListFromArrayLike ( obj [ , validElementTypes ] ) step 3 — `Let "
-                              "length be ? LengthOfArrayLike(obj)` — over UNKNOWN EXTERNAL INPUT: "
-                              "`f.apply(t, x)`, `f(...x)`, `new C(...x)` or `Reflect.apply` where the `length` "
-                              "read produced input the page never determined. Do NOT coerce it and do NOT pick "
-                              "a number: §7.1.22 ToLength ( arg ) owes C a real int64, and a pick would decide "
-                              "HOW MANY of the callee's parameters are bound — which of its arms run, and "
-                              "whether its rest parameter is empty — from a fact no run established. A length "
-                              "is not one fact with one answer: every non-negative integer is a world, and the "
-                              "answer is the per-position outcome-fork chain the READ side already asks under "
-                              "the key `LengthOfArrayLike>%d` (step_length_unknown), asked here on the tramp "
-                              "the way §10.4.2.4 ArraySetLength ( array, propertyDesc )'s chain is. This "
-                              "record is now cloneable, so the fork's SIBLING can be built; what is still "
-                              "missing is the PARK at the ask — a yield-anchor kind for this carrier, with its "
-                              "clone_deep_flow arm and its deep-resume arm, the way CONT_ARRAY_LEN_YIELD is "
-                              "§10.4.2.4's. Build that anchor, then the chain.");
-                        JS_ThrowTypeError(ctx, "an argument-list length that is unknown external input is not "
-                                               "modelled yet");
-                        goto do_arg_list_throw;
+                        al->coerce = ret_val; ret_val = JS_UNDEFINED;   /* owned across every ask, and freed by
+                                                                          the pin or by the teardown */
+                        al->phase = ARGL_LEN_UNKNOWN;
+                        al->fork_probe = 0;
+                        al->fork_arm = 0;
+                        al->fork_ask_key = 0;
+                        al->fork_phase = ARGL_FORK_ASK;
+                        goto do_arg_list_unknown;
                     }
                     if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT) {
                         DCHECK(JS_IsUndefined(al->coerce),
@@ -37586,19 +37706,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto do_arg_list_throw;
                     }
                     ret_val = JS_UNDEFINED;
-                    if (unlikely(al->len > JS_MAX_LOCAL_VARS)) {
-                        /* the engine's own argument-count floor, which the spec leaves to the implementation. It
-                           is a CAPACITY limit on one call's operands, not a bound on exploration. */
-                        JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
-                                           JS_MAX_LOCAL_VARS);
-                        goto do_arg_list_throw;
-                    }
-                    /* avoid allocating 0 bytes, exactly as the C form did */
-                    al->tab = js_mallocz(ctx, sizeof(JSValue) * (size_t)max_uint32(1, (uint32_t)al->len));
-                    if (unlikely(!al->tab)) { JS_ThrowOutOfMemory(ctx); goto do_arg_list_throw; }
-                    al->i = 0;
-                    al->phase = ARGL_ELEM;
-                    goto do_arg_list_elem;
+                    goto do_arg_list_have_len;
                 }
                 DCHECK(al->phase == ARGL_ELEM, "the arg-list sequence resumed in no phase");
                 /* the previous element arrived */
@@ -37641,6 +37749,160 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ap_cfirst = al->cfirst; ap_cargc = al->cargc; tramp_is_tail = al->is_tail;
                 js_arg_list_free(ctx, al);
                 goto do_apply_tramp;
+
+            do_arg_list_have_len:
+                /* §7.3.19 step 3 HAS ANSWERED, however it was asked — the coercion of a primitive, or the
+                   elimination chain's pin. ONE tail for both, because from here `length` is a real non-negative
+                   integer and steps 4-6 are the identical algorithm over it; a second copy would be a second
+                   place for the capacity floor and the allocation to drift. */
+                if (unlikely(al->len > JS_MAX_LOCAL_VARS)) {
+                    /* the engine's own argument-count floor, which the spec leaves to the implementation. It
+                       is a CAPACITY limit on one call's operands, not a bound on exploration. Every world the
+                       chain pins ABOVE it is a world in which this call throws, which is a real answer and not
+                       a truncation — the chain goes on asking past it, and those worlds emit nothing new, so
+                       the WFQ sinks them exactly as it sinks the read side's. */
+                    JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
+                                       JS_MAX_LOCAL_VARS);
+                    goto do_arg_list_throw;
+                }
+                /* avoid allocating 0 bytes, exactly as the C form did */
+                al->tab = js_mallocz(ctx, sizeof(JSValue) * (size_t)max_uint32(1, (uint32_t)al->len));
+                if (unlikely(!al->tab)) { JS_ThrowOutOfMemory(ctx); goto do_arg_list_throw; }
+                al->i = 0;
+                al->phase = ARGL_ELEM;
+                goto do_arg_list_elem;
+
+            do_arg_list_unknown:
+                /* HOW LONG IS AN UNKNOWN ARRAY-LIKE, asked on the tramp — the SAME question
+                   step_length_unknown asks on the read side, under the SAME key, because it is the same
+                   abstract operation over the same value. At n: "is this array-like longer than n?".
+                   OUTCOME 0 IS "no, the length is exactly n", the completion a run with no forking policy
+                   takes: at n = 0 that is the empty argument list, a concrete terminating path, which is what
+                   an @S candidate re-fire on its way to a sink needs. OUTCOME 1 is "longer", and it asks again
+                   at n + 1. Position n and position n + 1 are DIFFERENT predicates — the operation string
+                   carries n, which is what solver_outcome's key space is for — so neither is decided by the
+                   other's answer.
+                   THE CURSOR IS A THRESHOLD AND NOT AN INDEX, which is why carrying it in the key is sound
+                   where a position into a mutable enumeration would not be. `n` here names ITSELF: the
+                   predicate "is this value's length greater than 3" means the same thing at every replay, in
+                   every session, whatever the page has since done to `src`. There is no referent for a
+                   mutation to rename, so the arms a decision vector recorded still answer the question they
+                   were recorded for. (Step 6's element reads that follow ARE indices into that object — and
+                   they are ordinary Gets whose answers are the object's own, never fork keys.)
+                   There is NO BOUND on n and there must not be one; what makes this behave like a finite walk
+                   is the WFQ, exactly as it does on the read side. */
+                {
+                    int aarm;
+                    char askop[48];
+                    DCHECK(al->phase == ARGL_LEN_UNKNOWN,
+                           "7.3.19's unknown-length chain resumed in no phase");
+                    DCHECK(js_value_is_concolic(al->coerce),
+                           "7.3.19's unknown-length chain resumed holding something that is NOT unknown "
+                           "external input — the operand it forks over has to be the value the `length` read "
+                           "actually produced, or the worlds it is splitting belong to a different question");
+                    /* THE QUESTION THIS SITE IS ASKING, composed from the chain's own cursor at EVERY entry —
+                       the ask AND the resume that consumes an answer — and spelled EXACTLY as
+                       step_length_unknown spells it, because a flow that answered "longer than 2" for this
+                       value through `Array.from(x)` has answered it for `f.apply(t, x)` too. */
+                    snprintf(askop, sizeof askop, "LengthOfArrayLike>%" PRId64, al->fork_probe);
+                    if (al->fork_phase == ARGL_FORK_ASK) {
+                        int harm;
+                        /* WRITTEN ON EVERY ASK, including the sibling's first one: a clone carries the key of
+                           the ask it was forked at, and re-asking there overwrites it with the identical
+                           value. */
+                        al->fork_ask_key = step_fork_key(askop);
+                        harm = g_flow_control.outcome
+                             ? g_flow_control.outcome(ctx, al->coerce, askop, 2,
+                                                      JS_OUTCOME_REAL_UNSTATED) : -1;
+                        if (harm < 0)
+                            harm = 0;   /* no forking policy (the @S candidate re-fire): ONE concrete path down
+                                           outcome 0, which is what that numbering means — exactly as a declined
+                                           `branch` leaves the interpreter taking the ordinary arm */
+                        if (harm & 0x100) {
+                            harm &= 0xff;
+                            DCHECK(al->fork_phase == ARGL_FORK_ASK,
+                                   "7.3.19's sibling is being snapshotted with the fork already ANSWERED — the "
+                                   "clone must be taken AT the ask so the sibling re-asks and reads its arm out "
+                                   "of its own decision vector; an arm baked into the clone is a second, weaker "
+                                   "answer to a question the vector already answers");
+                            OUTCOME_FORK_SNAPSHOT("7.3.19 CreateListFromArrayLike", al, CONT_ARG_LIST_YIELD,
+                                                  JS_ThrowOutOfMemory(ctx); goto do_arg_list_throw);
+                        }
+                        al->fork_arm = harm & 0xff;
+                        al->fork_phase = ARGL_FORK_ANSWERED;
+                        /* §scheduler's VALUE YIELD: a fork is the event that changes the ranking, because the
+                           sibling created a moment ago may outrank this flow immediately. The same clause the
+                           bytecode branch parks under, counted the same way — the point was reached and it
+                           parked, so engagement stays an honest ratio. */
+                        if (g_flow_control.preempt != NULL && g_flow_control.preempt(JS_PREEMPT_FORK)) {
+                            FLOW_PREEMPT_COUNT(g_flow_preempt_requested);
+                            FLOW_PREEMPT_COUNT(g_flow_preempt_fired);
+                            goto do_arg_list_park;
+                        }
+                    }
+                    DCHECK(al->fork_phase == ARGL_FORK_ANSWERED,
+                           "7.3.19's outcome fork resumed in no phase");
+                    DCHECK(al->fork_ask_key == step_fork_key(askop),
+                           "7.3.19's outcome fork answer was delivered to a DIFFERENT position than the one "
+                           "that asked for it. Every position of this chain declares two arms, so an answer "
+                           "consumed at the wrong one passes every other check there is: the arm is real, in "
+                           "range, and was recorded under the ASKING position's key");
+                    DCHECK(al->fork_arm >= 0 && al->fork_arm < 2,
+                           "7.3.19's outcome fork answered with a completion this chain did not declare");
+                    aarm = al->fork_arm;
+                    al->fork_arm = 0;
+                    al->fork_ask_key = 0;
+                    al->fork_phase = ARGL_FORK_ASK;   /* this chain forks again — per position, it must */
+                    if (aarm == 1) {
+                        al->fork_probe++;   /* longer: the next position is its own predicate */
+                        /* §7.1.22 ToLength ( arg ) "returns either a normal completion containing a
+                           non-negative integral Number or a throw completion", clamped between 0 and 2**53 - 1
+                           — so that interval IS the domain of the answer and a world past its top is not one
+                           this abstract operation can be in. This is the domain, not a cap: the
+                           frontier's floor is RAM and disk, and a cursor that could not span the domain would
+                           be an integer width standing in for one. */
+                        CHECK(al->fork_probe > 0 && al->fork_probe <= MAX_SAFE_INTEGER,
+                              "7.3.19's length probe ran past 7.1.22 ToLength's own range — every world above "
+                              "2**53 - 1 clamps back into it, so a `longer` answer there contradicts the "
+                              "abstract operation whose answer this chain is splitting");
+                        goto do_arg_list_unknown;
+                    }
+                    /* the length is exactly this many, IN THIS WORLD. From here it is a real non-negative
+                       integer and steps 4-6 are the concrete algorithm the shared tail performs — which is why
+                       the pin is a copy into `len` and not a narrowing: the cursor is declared at ToLength's
+                       own width. */
+                    al->len = al->fork_probe;
+                    JS_FreeValue(ctx, al->coerce); al->coerce = JS_UNDEFINED;
+                    /* THE CURSOR IS NOT RESET, and the phase STAYS ARGL_LEN_UNKNOWN until the shared tail
+                       stamps ARGL_ELEM: both fields are read by the resume assert one screen up, and a cursor
+                       zeroed after a pin at position 7 would tell that reader the chain stands at position 0.
+                       A record freed one call from here can do nothing else wrong; misleading its next reader
+                       is the one thing a false field can still do. */
+                    goto do_arg_list_have_len;
+                }
+
+            do_arg_list_park:
+                /* §scheduler's VALUE YIELD, TAKEN. The record goes on the heap-frame chain for the same reason
+                   the fork put it there a moment ago — it is an interpreter local, and a snapshot cannot reach
+                   one — and the resume hands it straight back at the ASK. */
+                {
+                    TrampFrame *atf;
+                    DCHECK(!JS_HasException(ctx),
+                           "7.3.19's unknown-length chain was parked with a completion live in the runtime — "
+                           "the exception slot is per-RUNTIME and a completion is per-EVALUATION, so this throw "
+                           "would be delivered to whichever flow the scheduler runs next");
+                    DCHECK(al->fork_phase == ARGL_FORK_ANSWERED,
+                           "7.3.19's chain took the value yield without an answer to carry — this park is "
+                           "reached only from the fork that has just decided this flow's arm, and resuming "
+                           "without it would ask the SAME question twice and file one world under two asks");
+                    ANCHOR_NEW(atf, JS_ThrowOutOfMemory(ctx); goto do_arg_list_throw);
+                    atf->cont_state = al; atf->cont_kind = CONT_ARG_LIST_YIELD;
+                    /* read + reset the register the record now carries: the next thing this frame does is
+                       RETURN to the scheduler, and an operand left standing applies to whatever runs next. */
+                    cont_st = NULL;
+                    tf_top = atf;
+                    goto do_preempt;
+                }
 
             do_arg_list_throw:
                 /* the read threw: the operands are the caller's and its catch-search frees them, as for any
@@ -37862,52 +38124,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                            outcome 0, which is what that numbering means — exactly as a declined
                                            `branch` leaves the interpreter taking the ordinary arm */
                         if (harm & 0x100) {
-                            TrampFrame *ftf;
-                            JSValue *cl;
                             harm &= 0xff;
-                            if (gen_state == NULL)
-                                DFAIL("10.4.2.4 ArraySetLength forked in a NON-coroutine activation (gen_state "
-                                      "NULL): its C entry never became a flow base — route that caller onto "
-                                      "the tramp chain");
-                            if (gen_state != g_flow_base_gen)
-                                DFAIL("10.4.2.4 ArraySetLength forked inside a coroutine activation that is "
-                                      "not the flow base — give that resume path a resume-as-flow driver; a "
-                                      "sibling snapshotted here would be rebuilt against the wrong base");
-                            DCHECK(g_flow_control.fork != NULL,
-                                   "a forking outcome policy with no fork hook to build the sibling from its "
-                                   "clone");
-                            /* the completion slot is per-RUNTIME and a completion is per-EVALUATION, so one
-                               left standing across the snapshot is delivered to the SIBLING. The concrete path
-                               reaches this chain before any of its own throws, and a coercion cannot have run
-                               (that is the whole point of answering before it is asked), so there is nothing
-                               to carry — asserted rather than assumed. */
-                            DCHECK(!JS_HasException(ctx),
-                                   "10.4.2.4's outcome fork was taken with a completion live in the runtime — "
-                                   "the exception slot is per-RUNTIME and a completion is per-EVALUATION, so "
-                                   "this throw would be delivered to the sibling. Carry it across the fork the "
-                                   "way JSStepHdr::park_exc is carried, or take it where it was produced");
-                            /* THE CHAIN'S OPERANDS ARE INTERPRETER LOCALS, so the snapshot cannot reach them
-                               where they are; the anchor is what puts `al` on the heap-frame chain for exactly
-                               as long as the clone takes. The OOM unwinds through the operation's OWN teardown
-                               — the write can never finish — rather than the frame's generic one. */
+                            /* THE CONCRETE PATH REACHES THIS CHAIN BEFORE ANY OF ITS OWN THROWS, and a
+                               coercion cannot have run (that is the whole point of answering before it is
+                               asked), so the shared snapshot's completion assert has nothing to carry here. */
                             DCHECK(al->fork_phase == AL_FORK_ASK,
                                    "10.4.2.4's sibling is being snapshotted with the fork already ANSWERED — "
                                    "the clone must be taken AT the ask so the sibling re-asks and reads its "
                                    "arm out of its own decision vector; an arm baked into the clone is a "
                                    "second, weaker answer to a question the vector already answers");
-                            ANCHOR_NEW(ftf, JS_ThrowOutOfMemory(ctx); goto do_array_len_throw);
-                            ftf->cont_state = al; ftf->cont_kind = CONT_ARRAY_LEN_YIELD;
-                            /* the CURRENT frame's resume point, exactly as do_preempt records it. */
-                            sf->cur_pc = pc; sf->cur_sp = sp;
-                            gen_state->tramp_top = ftf;
-                            cl = JS_FlowClone(ctx, (JSValue *)gen_state);
-                            CHECK(cl != NULL,
-                                  "10.4.2.4's outcome fork could not snapshot the flow — the other completion "
-                                  "would be dropped, and the frontier never drops a work item");
-                            g_flow_control.fork(ctx, cl);
-                            gen_state->tramp_top = NULL;   /* the parent's chain is live in tf_top */
-                            sf->cur_sp = NULL;             /* running again */
-                            tramp_frame_free(rt, ftf);
+                            OUTCOME_FORK_SNAPSHOT("10.4.2.4 ArraySetLength", al, CONT_ARRAY_LEN_YIELD,
+                                                  JS_ThrowOutOfMemory(ctx); goto do_array_len_throw);
                         }
                         al->fork_arm = harm & 0xff;
                         al->fork_phase = AL_FORK_ANSWERED;
@@ -49696,11 +49923,14 @@ static void *cont_outer_get(void *st, uint8_t kind, uint8_t *out_kind)
            than defaulted, for CONT_PROMISE_ALL's reason — a requester that reads as absent is indistinguishable
            from one this walk simply does not know, and only one of those is correct. */
         return NULL;
-    case CONT_ARG_LIST:
+    case CONT_ARG_LIST: case CONT_ARG_LIST_YIELD:
         /* 7.3.19 IS TERMINAL FOR THE SAME REASON, and the record says so by having no `outer` field at all: the
            finished List is handed to do_apply_tramp / do_construct_dispatch, which place their result on the
            operand stack. The sequence sits UNDER a keyed read or a coercion (it is their gp_outer / tp_outer),
-           never over one, so this is where a chain walked up from either of those stops. */
+           never over one, so this is where a chain walked up from either of those stops.
+           BOTH ROLES, because clone_deep_flow relinks EVERY frame's continuation and reaches the anchor form
+           through this same walk: a kind absent here CRASHES, and "terminal" is the answer for the record
+           whichever role it is standing in — the field it would name does not exist. */
         return NULL;
     case CONT_TOPRIM:
         *out_kind = ((struct JSToPrim *)st)->outer_kind;
@@ -49788,10 +50018,13 @@ static void *tramp_cont_clone_one(JSContext *ctx, void *st, uint8_t kind)
     if (kind == CONT_OP_KEYED)
         return js_op_keyed_clone(ctx, (const JSOpKeyed *)st);
     if (kind == CONT_ARG_LIST)
-        /* 7.3.19's sequence, which is a LINK under whichever read it is waiting on — its `length` Get, its
-           ToPrimitive, or an element Get — and never a frame's own cont_state, because it parks by parking
-           that read. Both of the page's operations it performs can fork, so this is reached by an ordinary
-           `f.apply(t, x)` whose `x` has a getter that branches on unknown input. */
+        /* 7.3.19's sequence IN ITS LINK ROLE — under whichever read it is waiting on: its `length` Get, its
+           ToPrimitive, or an element Get. Both of the page's operations it performs can fork, so this is
+           reached by an ordinary `f.apply(t, x)` whose `x` has a getter that branches on unknown input.
+           A LINK IS ALL THIS WALK EVER SEES OF IT, and that is a fact about the walk rather than about the
+           record: the sequence's other role is CONT_ARG_LIST_YIELD, a frame's own cont_state at the
+           unknown-length chain's outcome fork, and clone_deep_flow's arm builds that one — reached here would
+           mean one record cloned twice, which is exactly what the two kinds exist to keep apart. */
         return js_arg_list_clone(ctx, (const JSArgList *)st);
     if (kind == CONT_GETPROP)
         /* a keyed property OPERATION whose callee turned out to be a step machine — `new Proxy(t, {ownKeys:
@@ -49976,6 +50209,24 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             nal = js_array_len_clone(ctx, otf->cont_state);
             if (!nal) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
             ct->cont_state = nal;
+            ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0;
+        } else if (otf->cont_kind == CONT_ARG_LIST_YIELD) {
+            /* §7.3.19 CreateListFromArrayLike PARKED AT ITS OWN OUTCOME FORK — the same anchor once more, and
+               as with §10.4.2.4's the walk is not merely A reason the arm is needed but THE reason: the fork
+               this anchor exists for IS this function, so a chain that could not be cloned here could never
+               have forked at all. Its record is what the sibling's registers will borrow from on ITS resume,
+               so the two arms cannot share one — the first to exit would free what the second is still
+               reading, and what it holds is the collected prefix of an argument list.
+               NO ASSERT ON fork_phase HERE, deliberately, for the reason the arm above states: BOTH phases are
+               legal in a snapshot and this function cannot tell which moment it is. The invariant that the
+               FORK's clone is taken at the ask belongs at the fork, which is the one site that knows. */
+            JSArgList *nagl;
+            DCHECK(i == 0,
+                   "clone_deep_flow: an argument-list ANCHOR below the top of a parked chain — it is bodyless, "
+                   "so the frame under it would inherit a zeroed frame as its caller");
+            nagl = js_arg_list_clone(ctx, otf->cont_state);
+            if (!nagl) { js_free(ctx, oa); js_free(ctx, ca); return NULL; }
+            ct->cont_state = nagl;
             ct->local_buf = NULL; ct->b = NULL; ct->local_slots = 0;
         } else if (otf->async_data) {
             /* ASYNC body on the chain: clone a FRESH async_data with its OWN return-promise capability. The fork
@@ -50418,7 +50669,7 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
            rather than the reason this exemption is safe. */
         ct->caller_sf        = caller_clone;
         if (otf->cont_kind != CONT_STEP_YIELD && otf->cont_kind != CONT_GETPROP_YIELD
-            && otf->cont_kind != CONT_ARRAY_LEN_YIELD)
+            && otf->cont_kind != CONT_ARRAY_LEN_YIELD && otf->cont_kind != CONT_ARG_LIST_YIELD)
             tramp_live_sf(ct)->prev_frame = caller_clone;
         /* the caller's record IS the caller's frame — assert that on the ORIGINAL side, then take the clone's. */
         DCHECK(otf->caller_local_buf == cob,
@@ -50621,14 +50872,17 @@ static void tramp_cont_free(JSContext *ctx, void *st, uint8_t kind)
         js_free_rt(rt, ok);
         return;
     }
-    if (kind == CONT_ARG_LIST) {
+    if (kind == CONT_ARG_LIST || kind == CONT_ARG_LIST_YIELD) {
         /* 7.3.19's SEQUENCE, TERMINAL for cont_outer_get's reason — the finished List goes to a call, whose
            result is the operand stack's, so there is nothing above it to release and the walk stops here.
            THE OTHER DIRECTION OF js_arg_list_clone, and it lands in the SAME diff because that is what this
            walk's own DFAIL asks for: a kind present in only one of the two is a flow that can be forked and
            cannot be evicted, paged or freed, which is exactly the shape a flow suspended inside
            `f.apply(t, arrayLikeWithAGetter)` has. The record owns its resume shape, its collected prefix and
-           its index atom, and js_arg_list_free is the one place that list is spelled. */
+           its index atom, and js_arg_list_free is the one place that list is spelled.
+           BOTH ROLES, because both are reachable here: the LINK a keyed read or a coercion is waiting under,
+           and the ANCHOR a flow parked at the unknown-length chain's own outcome fork owns as its frame's
+           cont_state. */
         js_arg_list_free(ctx, (JSArgList *)st);
         return;
     }
