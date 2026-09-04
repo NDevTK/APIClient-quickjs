@@ -79182,6 +79182,26 @@ typedef struct JSProtoChain {
     JSValue obj;      /* ToObject(this) (owned) */
     JSValue cur;      /* the link being walked (owned) */
 } JSProtoChain;
+/* THE THREE COMPLETIONS OF ONE STEP OF A PROTOTYPE-CHAIN WALK, over a link that is unknown external input.
+   ONE numbering for BOTH walks, because 20.1.3.3 step 3 and 7.3.21 step 6 are literally the same three-step
+   loop: advance to the next link, return false if it is null, return true if SameValue says it is the object
+   we are looking for. Two copies of this would be two chances to number it differently.
+   EVERY ONE OF THE THREE IS A COMPLETION OF THE ITERATION, which is the part that is easy to get wrong: the
+   question is not "does the walk stop?" — that names the false arm and the true arm at once and then cannot
+   say which, and asked as a BOOLEAN it deletes the world in which the operator is TRUE. Enumerate what the
+   page can observe (false, true, not yet), never the branches of the prose.
+   ZERO ENDS THE WALK AND CLAIMS NOTHING, and that is forced rather than chosen. The driver takes outcome 0
+   when no forking policy answers — the @S candidate re-fire — so a numbering whose 0 were MORE would walk an
+   unknown chain for ever in exactly the run that has no scheduler to park it; and of the two that do end it,
+   the false arm asserts nothing about the value while the true arm asserts a relationship.
+   WHAT EACH SITE MUST NOT SHARE IS THE OPERATION NAME. The constraint key is (operand, operation, completion),
+   and these two walks ask DIFFERENT questions about the same link — one compares it against the constructor's
+   `prototype`, the other against the receiver — so a shared op string would let a flow that answered one
+   decide the other. */
+#define PROTO_LINK_END   0   /* the chain ends at this link: the operator is false */
+#define PROTO_LINK_MATCH 1   /* this link IS the object being looked for: the operator is true */
+#define PROTO_LINK_MORE  2   /* neither: ask this link for ITS [[GetPrototypeOf]] */
+
 /* The walk rests at step 3.a once per link; steps 3.b and 3.c decide from what that link answered and run none
    of the page's code. */
 #define PROTOCHAIN_STAGES(X) \
@@ -79208,9 +79228,32 @@ static int js_proto_chain_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         goto ask;
     }
     DCHECK(s->hdr.stage == PROTOCHAIN_LINK, "isPrototypeOf's walk resumed in no stage");
-    if (JS_IsException(cb_result)) return -1;
-    JS_FreeValue(ctx, s->cur);
-    s->cur = cb_result;                                               /* step 3.a's answer */
+    /* TWO WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 3.a's request answering, or this
+       stage's own fork being answered, where `cb_result` is the driver's filler and taking it as the link
+       would overwrite the very operand the fork was asked about. See the instanceof walk, which is the same
+       algorithm and has the same pair of entries. */
+    if (s->hdr.fork_phase != FORK_PH_ANSWERED) {
+        if (JS_IsException(cb_result)) return -1;
+        JS_FreeValue(ctx, s->cur);
+        s->cur = cb_result;                                           /* step 3.a's answer */
+    }
+    /* STEPS 3.b AND 3.c OVER AN UNKNOWN LINK ARE NOT DECIDABLE IN C. Both are identity comparisons and an
+       unknown rides an ordinary Object, so both tests below would silently take the keep-walking arm at every
+       link and this walk would never terminate — which is what it did the moment the solver's value class
+       stopped aborting in its [[GetPrototypeOf]] and started answering a derivation. The operand is the LINK
+       and never its depth, and it lives in `s->cur` because step_fork_run borrows it across the request and
+       the sibling's snapshot is taken at the ask, so it has to be reachable from js_proto_chain_visit. */
+    if (js_value_is_concolic(s->cur)) {
+        int arm, r;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* `real` UNSTATED: the derived link carries no example, so this machine has no ground to say which
+           completion a real session reaches. */
+        r = step_fork_run(ctx, &s->hdr, s->cur, "isPrototypeOf step 3", 3, JS_OUTCOME_REAL_UNSTATED, &arm);
+        if (r) return r;
+        if (arm == PROTO_LINK_END) { s->result = JS_FALSE; return 0; }    /* step 3.b */
+        if (arm == PROTO_LINK_MATCH) { s->result = JS_TRUE; return 0; }   /* step 3.c */
+        goto ask;                                                         /* PROTO_LINK_MORE: step 3.a again */
+    }
     if (JS_IsNull(s->cur)) { s->result = JS_FALSE; return 0; }         /* step 3.b */
     if (JS_VALUE_GET_TAG(s->cur) == JS_TAG_OBJECT
         && JS_VALUE_GET_OBJ(s->obj) == JS_VALUE_GET_OBJ(s->cur)) {
@@ -80561,23 +80604,9 @@ typedef struct JSInstanceOf {
 enum { INSTOF_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_instanceof_steps[] = { INSTOF_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
-/* THE THREE COMPLETIONS OF ONE ITERATION OF 7.3.21's STEP 6, over a link that is unknown external input.
-   Step 6's body is three steps and every one of them is a completion of the iteration: 6.b returns false, 6.c
-   returns true, and reaching neither continues the Repeat. An earlier statement of this design called the
-   question "is this link the end?" and therefore a BOOLEAN, which is a two-way partition of a three-way
-   question — it names 6.b and 6.c at once and then cannot say which, and a two-arm fork keeping only 6.b
-   deletes the world in which `e instanceof Object` is TRUE, which on a server-injected record is the world a
-   real session is standing in. The completions were enumerated from the branch of the prose rather than from
-   what the page can observe.
-   ZERO IS THE ONE THAT ENDS THE WALK AND CLAIMS NOTHING, and that is forced rather than chosen. The driver
-   takes outcome 0 when no forking policy answers — the @S candidate re-fire — so a numbering whose 0 were
-   INSTOF_LINK_MORE would walk an unknown chain for ever in exactly the run that has no scheduler to park it.
-   Of the two completions that DO end it, 6.b's `false` asserts nothing about the value while 6.c's `true`
-   asserts that it is an instance of the constructor, and a run with no policy to fork must not be the one
-   that states the stronger claim. */
-#define INSTOF_LINK_END  0   /* 7.3.21 step 6.b — the chain ends at this link; the operator is false */
-#define INSTOF_LINK_IS_P 1   /* 7.3.21 step 6.c — this link IS `proto`; the operator is true */
-#define INSTOF_LINK_MORE 2   /* neither: 7.3.21 step 6.a again, on the next link */
+/* 7.3.21's step 6 numbers its completions through the SHARED prototype-walk numbering above (PROTO_LINK_*),
+   because 20.1.3.3 step 3 is the same three-step loop and the two must not number it differently. The op
+   string below is what keeps the two walks' constraint keys apart. */
 
 /* steps 6.a-c over ORDINARY links, which have no [[GetPrototypeOf]] of their own to run: the shape's proto is
    the answer. Returns 0 = keep walking from s->val (a PROXY link needs the request), 1 = decided. */
@@ -80735,9 +80764,9 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             r = step_fork_run(ctx, &s->hdr, s->val, "OrdinaryHasInstance step 6", 3,
                               JS_OUTCOME_REAL_UNSTATED, &arm);
             if (r) return r;
-            if (arm == INSTOF_LINK_END) { s->result = JS_FALSE; return 0; }   /* step 6.b */
-            if (arm == INSTOF_LINK_IS_P) { s->result = JS_TRUE; return 0; }   /* step 6.c */
-            /* INSTOF_LINK_MORE — step 6.a on the next link. The ask is re-entered at the link that arrives,
+            if (arm == PROTO_LINK_END) { s->result = JS_FALSE; return 0; }    /* step 6.b */
+            if (arm == PROTO_LINK_MATCH) { s->result = JS_TRUE; return 0; }   /* step 6.c */
+            /* PROTO_LINK_MORE — step 6.a on the next link. The ask is re-entered at the link that arrives,
                under ITS identity, so an unknown chain is a chain of forks and not one question repeated. */
             s->hdr.cb_coerce[0] = s->val;
             *out_cb = s->hdr.cb_coerce; *out_argc = 0;
