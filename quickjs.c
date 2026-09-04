@@ -30676,6 +30676,22 @@ static bool for_in_is_ordinary(JSContext *ctx, JSObject *p)
     return !(em && (em->get_own_property_names || em->get_own_property));
 }
 
+/* THE TWO COMPLETIONS OF ONE STEP OF A PROTOTYPE-CHAIN WALK WHOSE ONLY STOPPING TEST IS `is null`, over a
+   link that is unknown external input. It is the SIBLING of PROTO_LINK_END/MATCH/MORE and deliberately not
+   that numbering: those three belong to a walk that ALSO compares each link against an object it is looking
+   for, and a walk carrying no such comparison has no MATCH to number. Declaring three completions where two
+   are feasible is the same defect as declaring two where three are — a machine stating a world its algorithm
+   cannot reach — so each site counts from what the PAGE can observe at ITS ask and never from the arms of a
+   neighbouring algorithm's prose.
+   ZERO ENDS THE WALK, forced rather than chosen and for the identical reason the three-way numbering puts its
+   own END at 0: the driver takes outcome 0 where no forking policy answers, so a numbering whose 0 were MORE
+   would walk an unknown chain for ever in exactly the run that has no scheduler to park it.
+   SHARING A NUMBERING IS NOT SHARING A QUESTION. The constraint key is (operand, operation, completion), so
+   every site still spells an operation string of its own — see PROTO_LINK_END's note for what goes wrong when
+   two walks that ask different things about one link agree on a name. */
+#define PROTO_CHAIN_ENDS 0   /* the chain ends at this link: this walk is over */
+#define PROTO_CHAIN_MORE 1   /* there is another link: ask this one for ITS [[GetPrototypeOf]] */
+
 typedef struct JSForIn {
     JSStepHdr hdr;         /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
     JSValue enum_obj;      /* the JS_CLASS_FOR_IN_ITERATOR being built (owned) */
@@ -30770,7 +30786,7 @@ static int for_in_fast(JSContext *ctx, JSValueConst obj, JSForInIterator *it, JS
 static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
     JSForIn *s = st;
-    int r;
+    int r, arm;
 
     if (s->hdr.stage == FI_CREATE) {
         JSValue obj;
@@ -30860,21 +30876,48 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
 
         default:
             DCHECK(s->hdr.stage == FI_PROTO, "the for-in key walk resumed in no phase");
-            JS_FreeValue(ctx, s->cur);
-            s->cur = cb_result;
-            cb_result = JS_UNDEFINED;
-            if (JS_IsException(s->cur)) { s->cur = JS_UNDEFINED; return -1; }
+            /* TWO WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 5.c's request answering,
+               whose result IS the link, or this stage's own fork being answered, where `cb_result` is the
+               driver's filler rather than a value from the algorithm and taking it as the link would
+               overwrite the very operand the fork was asked about. js_proto_chain_step and js_instanceof_step
+               are the same pair of entries and tell them apart the same way. */
+            if (s->hdr.fork_phase != FORK_PH_ANSWERED) {
+                JS_FreeValue(ctx, s->cur);
+                s->cur = cb_result;
+                cb_result = JS_UNDEFINED;
+                if (JS_IsException(s->cur)) { s->cur = JS_UNDEFINED; return -1; }
+            }
             /* ASKED OF THE LINK THAT ARRIVED AND NOT OF THE STARTING OBJECT, which is the whole of why this
                sits here rather than at FI_LINK. `for (k in rec)` over an unknown RECORD is supported: its own
-               keys come from this class's own enumeration seam. What is not supported is its PROTOTYPE, which
-               is a derivation with no example, has no own keys to contribute, and is never null. */
-            if (js_value_is_concolic(s->cur))
-            DFAIL("a prototype-chain walk reached a link that is unknown external input, and this machine has "
-                  "no arm for one: its only stopping tests are `is null` and a SameValue, both decided in C, "
-                  "and an unknown rides an ordinary Object — so every link takes the keep-walking arm and this "
-                  "walk does not terminate. Ask the outcome seam over the LINK with the shared "
-                  "PROTO_LINK_END/MATCH/MORE numbering and an op string of this algorithm's own; "
-                  "js_instanceof_step and js_proto_chain_step are the two built examples");
+               keys come from this class's own enumeration seam. Its PROTOTYPE is a derivation with no example
+               and is never null, so step 5.f's `If object is null` — this Repeat's ONLY stopping test — is a
+               C test against a value that is an ordinary Object at the C level, and the walk would take the
+               keep-walking arm at every link and never terminate.
+               TWO COMPLETIONS, COUNTED FROM WHAT THE PAGE OBSERVES RATHER THAN FROM THE PROSE. What a
+               `for..in` can see here is whether a further key ever arrives: the enumeration is over with
+               exactly the keys already collected, or this link joins it and contributes its own. There is no
+               third. This Repeat holds no comparison against anything, so the MATCH arm of the three-way
+               numbering names no world here; and the world in which the chain is longer than any particular
+               length is the MORE arm rather than a completion beside it.
+               THE CRASH THAT STOOD HERE PRESCRIBED THAT THREE-WAY NUMBERING, and its spec half was right
+               while its remedy clause was not — a completion count borrowed from a neighbouring algorithm
+               instead of derived here. Recorded at the site: a remedy clause is a hypothesis about this tree
+               and the reader who acts on one acts on it once. */
+            if (js_value_is_concolic(s->cur)) {
+                JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+                /* `real` UNSTATED: the derived link carries no example, so nothing this run observed says
+                   which completion a real session reaches. */
+                r = step_fork_run(ctx, &s->hdr, s->cur, "%ForInIteratorPrototype%.next step 5.f", 2,
+                                  JS_OUTCOME_REAL_UNSTATED, &arm);
+                if (r) return r;
+                if (arm == PROTO_CHAIN_ENDS) {                         /* step 5.f */
+                    s->result = s->enum_obj; s->enum_obj = JS_UNDEFINED;
+                    return 0;
+                }
+                /* PROTO_CHAIN_MORE — steps 5.d and 5.e, then the Repeat head at 5.a over THIS link, whose own
+                   keys the enumeration seam answers under a question of its own. The next link's ask is made
+                   under ITS identity, so an unknown chain is a chain of questions and not one repeated. */
+            }
             s->hdr.stage = FI_LINK;
             continue;
         }
@@ -79393,12 +79436,18 @@ static JSValue js_proto_chain_fini(JSContext *ctx, void *st, bool take_result)
    JS_ValueToAtom, the third from C with JS_GetOwnPropertyFlagsInternal, and the two in the WRONG ORDER besides.
    It is STEPDEF_PROP_IS_ENUM, the same machine Iterator.zipKeyed's own-enumerable probe uses. */
 
-/* B.2.2.4 __lookupGetter__ / B.2.2.5 __lookupSetter__: ToObject, ToPropertyKey, then walk the prototype chain
-   asking each link for its own descriptor until one answers. THREE of the page's operations, and the C body ran
-   all three — ToPropertyKey as a bare JS_ValueToAtom, and both [[GetOwnProperty]] and [[GetPrototypeOf]] per
-   link, which on a Proxy are its traps with no flow base. The walk is the shape for-in's slow path takes, and
-   the descriptor it needs is the RECORD, because the answer IS desc.[[Get]] or desc.[[Set]].
-   ONE machine: the two forms differ in which accessor they return, which is the arg. */
+/* 20.1.3.9.3 Object.prototype.__lookupGetter__ ( key ) / 20.1.3.9.4 Object.prototype.__lookupSetter__ ( key ):
+   ToObject, ToPropertyKey, then walk the prototype chain asking each link for its own descriptor until one
+   answers. THREE of the page's operations, and the C body ran all three — ToPropertyKey as a bare
+   JS_ValueToAtom, and both [[GetOwnProperty]] and [[GetPrototypeOf]] per link, which on a Proxy are its traps
+   with no flow base. The walk is the shape for-in's slow path takes, and the descriptor it needs is the
+   RECORD, because the answer IS propertyDesc.[[Getter]] or propertyDesc.[[Setter]].
+   ONE machine: the two forms differ in which accessor they return, which is the arg.
+   THESE SITES CITED B.2.2.4 AND B.2.2.5, WHICH IS NOT A RENUMBERING A READER CAN SURVIVE: in the edition the
+   editors maintain those two numbers are String.prototype.blink ( ) and String.prototype.bold ( ), so the old
+   citation resolves, reads as authoritative, and sends the reader to a clause about markup. A citation is owed
+   to the maintained document, and the TITLE beside the number is what makes a move like this visible instead
+   of silent — which is why every label below carries one. */
 typedef struct JSLookupAcc {
     JSStepHdr hdr;      /* MUST be first. arg: 0 = __lookupGetter__, 1 = __lookupSetter__ */
     JSValue cur;        /* the chain link being examined (owned) */
@@ -79418,15 +79467,15 @@ typedef struct JSLookupAcc {
 enum { LOOKUPACC_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
 static const char *const js_lookupgetter_steps[] = {
     LOOKUPACC_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.4 steps 1-2 (O is ToObject(this value); key is ToPropertyKey(P))",
-        "B.2.2.4 step 3.a (desc is O.[[GetOwnProperty]](key))",
-        "B.2.2.4 step 3.c (O is O.[[GetPrototypeOf]]())")
+        "20.1.3.9.3 steps 1-2 (obj is ToObject(this value); propertyKey is ToPropertyKey(key))",
+        "20.1.3.9.3 step 3.a (propertyDesc is obj.[[GetOwnProperty]](propertyKey))",
+        "20.1.3.9.3 step 3.c (obj is obj.[[GetPrototypeOf]]())")
     NULL };
 static const char *const js_lookupsetter_steps[] = {
     LOOKUPACC_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.5 steps 1-2 (O is ToObject(this value); key is ToPropertyKey(P))",
-        "B.2.2.5 step 3.a (desc is O.[[GetOwnProperty]](key))",
-        "B.2.2.5 step 3.c (O is O.[[GetPrototypeOf]]())")
+        "20.1.3.9.4 steps 1-2 (obj is ToObject(this value); propertyKey is ToPropertyKey(key))",
+        "20.1.3.9.4 step 3.a (propertyDesc is obj.[[GetOwnProperty]](propertyKey))",
+        "20.1.3.9.4 step 3.c (obj is obj.[[GetPrototypeOf]]())")
     NULL };
 
 static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -79454,7 +79503,25 @@ static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
         if (s->facts.flags >= 0) {
             /* step 3.b: found. An ACCESSOR yields the half this form asks for; anything else yields
-               undefined, and either way the walk stops here. */
+               undefined, and either way the walk stops here.
+               NAMED RESIDUAL — CORRECT, AND NARROWER THAN 20.1.3.9.3 OVER AN UNKNOWN CHAIN.
+               NOT COVERED: a link that is unknown external input and carries no EXAMPLE. Its [[GetOwnProperty]]
+               is answered from the example's own slots, so for a link with no example and no materialised
+               member it reports absent for EVERY name, with no question asked anywhere — and this arm cannot
+               fire on such a link however many the step-3.d fork below explores. It fires normally for a link
+               that carries an example, for a slot the page defined on one, and for a member the enumeration
+               materialised; the narrowing is the pristine derived link and only that.
+               NEXT DIFF: a per-NAME own-member question on the record — the named sibling of the own-key-set
+               predicate the enumeration already asks (JSConcolicHooks.own_keys_pred, whose true arm
+               own_key_mint performs). The table today carries no per-name form; it would be minted by the HOST
+               over the record and the name so both readers spell one key, asked HERE, where a step machine has
+               a flow base and the internal method has none, and read back by the record's own
+               [[GetOwnProperty]] so one question keeps one answer.
+               HOW ITS ABSENCE SHOWS: `'k' in p` answers true for every name on such a link, because
+               [[HasProperty]] is the derived-unknown door and answers a name the page wrote — while
+               `Object.getOwnPropertyDescriptor(p, 'k')` and `p.__lookupGetter__('k')` answer undefined for
+               every name. Two internal methods disagreeing about one record, with only the second's answer
+               decided by nothing the run observed. */
             if (s->facts.flags & JS_PROP_GETSET)
                 s->result = js_dup(s->hdr.arg ? s->facts.setter : s->facts.getter);
             else
@@ -79468,21 +79535,45 @@ static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         return 18;
     }
     DCHECK(s->hdr.stage == LA_PROTO, "__lookupGetter__'s walk resumed in no stage");
-    if (JS_IsException(cb_result)) return -1;
-    JS_FreeValue(ctx, s->cur);
-    s->cur = cb_result;
-    cb_result = JS_UNDEFINED;
-    /* AND THIS ONE CANNOT STOP AT THE LINK EITHER, for a reason its own step 3.b makes worse: a link answers
-       the walk only when it HAS the key as an own property, and a derived prototype's example is absent, so
-       its [[GetOwnProperty]] reports nothing for every name. The descriptor arm can never fire and step 3.d
-       can never fire, which is both of this loop's exits. */
-    if (js_value_is_concolic(s->cur))
-        DFAIL("a prototype-chain walk reached a link that is unknown external input, and this machine has "
-              "no arm for one: its only stopping tests are `is null` and a SameValue, both decided in C, "
-              "and an unknown rides an ordinary Object — so every link takes the keep-walking arm and this "
-              "walk does not terminate. Ask the outcome seam over the LINK with the shared "
-              "PROTO_LINK_END/MATCH/MORE numbering and an op string of this algorithm's own; "
-              "js_instanceof_step and js_proto_chain_step are the two built examples");
+    /* TWO WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 3.c's request answering, whose
+       result IS the link, or this stage's own fork being answered, where `cb_result` is the driver's filler
+       and taking it as the link would overwrite the operand the fork was asked about. */
+    if (s->hdr.fork_phase != FORK_PH_ANSWERED) {
+        if (JS_IsException(cb_result)) return -1;
+        JS_FreeValue(ctx, s->cur);
+        s->cur = cb_result;
+        cb_result = JS_UNDEFINED;
+    }
+    /* STEP 3.d OVER AN UNKNOWN LINK IS NOT DECIDABLE IN C. `If obj is null` is this Repeat's only stopping
+       test that the walk itself owns, and an unknown rides an ordinary Object, so the C test below would take
+       the keep-walking arm at every link and this Repeat would never terminate.
+       TWO COMPLETIONS, COUNTED FROM WHAT THE PAGE OBSERVES. The chain ends at this link and the method answers
+       undefined, or there is another link and step 3.a is asked of it. There is no third: step 3.b's outcome
+       is not this ask's to declare — it is decided one internal method down, by the link's own
+       [[GetOwnProperty]], and a walk that answered it here would file a second answer to that question under
+       a key the record's own method cannot spell.
+       BOTH FORMS SHARE THE OPERATION STRING, WHICH IS THE OPPOSITE OF PROTO_LINK_END's WARNING AND FOR ITS OWN
+       REASON: that note keeps two walks apart because they ask DIFFERENT things about one link. These two ask
+       the SAME thing — whether the chain ends here — and the answer cannot depend on which half of an accessor
+       the caller wanted, so one key is correct and two would be one world recorded twice.
+       THE CRASH THAT STOOD HERE was right that both exits of this loop are unreachable over a pristine derived
+       chain, and its remedy clause named the three-way numbering, which would have declared a MATCH arm whose
+       value this machine cannot produce without fabricating a descriptor. The reachability half is kept as a
+       NAMED RESIDUAL at step 3.b above, where the unreachable arm actually is. */
+    if (js_value_is_concolic(s->cur)) {
+        int arm;
+        JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+        /* `real` UNSTATED: the derived link carries no example, so nothing observed says which completion a
+           real session reaches. */
+        r = step_fork_run(ctx, &s->hdr, s->cur, "legacy accessor lookup step 3.d", 2,
+                          JS_OUTCOME_REAL_UNSTATED, &arm);
+        if (r) return r;
+        if (arm == PROTO_CHAIN_ENDS) {   /* step 3.d */
+            s->result = JS_UNDEFINED;
+            return 0;
+        }
+        goto ask_desc;                   /* PROTO_CHAIN_MORE: step 3.a on the link that arrived */
+    }
     if (JS_IsNull(s->cur)) {   /* step 3.d: the chain ended */
         s->result = JS_UNDEFINED;
         return 0;
@@ -86750,10 +86841,10 @@ static const JSTrampStepDef js_hasownprop_def  = { sizeof(JSHasOwn), js_hasown_s
                      .algorithm = "20.1.3.2 Object.prototype.hasOwnProperty",
                      .steps = js_hasownprop_steps };
 static const JSTrampStepDef js_lookupgetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 0, .visit = js_lookup_acc_visit,
-                      .algorithm = "B.2.2.4 Object.prototype.__lookupGetter__",
+                      .algorithm = "20.1.3.9.3 Object.prototype.__lookupGetter__ ( key )",
                       .steps = js_lookupgetter_steps };
 static const JSTrampStepDef js_lookupsetter_def = { sizeof(JSLookupAcc), js_lookup_acc_step, js_lookup_acc_fini, 1, .visit = js_lookup_acc_visit,
-                      .algorithm = "B.2.2.5 Object.prototype.__lookupSetter__",
+                      .algorithm = "20.1.3.9.4 Object.prototype.__lookupSetter__ ( key )",
                       .steps = js_lookupsetter_steps };
 static const char *const js_func_bind_steps[];
 static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_bind_step, js_func_bind_fini, 0, .visit = js_func_bind_visit,
