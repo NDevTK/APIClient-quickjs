@@ -50423,6 +50423,19 @@ static JSValue *clone_deep_flow(JSContext *ctx, JSAsyncFunctionState *s) {
             JS_REF_COUNT(as2) = 1;
             add_gc_object(ctx->rt, &as2->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
             as2->is_active = true;
+            /* A CLONE COMPLETES THE WAY ITS ORIGINAL DOES — flow_clone_state_alloc's own sentence, carried here
+               because this arm is the FOURTH constructor of a JSAsyncFunctionData and the only one that builds
+               its state field by field. js_mallocz zeroes base_kind, and 0 is FLOW_BASE_BYTECODE, so a deeply
+               forked async body was a genuine JSAsyncFunctionData LABELLED as a bare state. It is not a label
+               nobody reads: js_async_frame_clone asks it before cloning an awaiting activation, JS_FlowResume
+               branches a completion on it, and flow_clone_state_alloc allocates the CONTAINER from it — so the
+               next fork of this sibling takes the `else` arm, gets a bare JSAsyncFunctionState back, and returns
+               it through flow_async_data, which subtracts offsetof(JSAsyncFunctionData, func_state) from an
+               allocation that does not have it. In dev the DCHECK in js_async_frame_clone fires first.
+               THE DEFECT SHAPE, which is this function's own: a field-by-field clone drifts in exactly the
+               fields the consolidated clone assigns and this arm does not. js_async_frame_clone's header
+               records the same thing about itself, in three other fields, as the reason it stopped being one. */
+            as2->func_state.base_kind = as->func_state.base_kind;
             /* the sibling's activation owns the sibling's frame — see flow_clone_state_alloc */
             as2->func_state.frame.cur_gc_obj = &as2->header;
             as2->resolving_funcs[0] = JS_UNDEFINED; as2->resolving_funcs[1] = JS_UNDEFINED;
@@ -51415,7 +51428,13 @@ static JSAsyncFunctionData *js_async_frame_clone(JSContext *ctx, JSAsyncFunction
     /* THE CLONE IS BORN IN THE CONTAINER ITS BASE KIND NAMES, so this asks what flow_clone_state_alloc is about
        to answer: an async activation's state is EMBEDDED in the JSAsyncFunctionData this function returns, and
        a base that said anything else would be minted as a bare state and handed back through a header that is
-       not there. Both constructors of one (js_async_function_start and the tramp's async call) mark it. */
+       not there.
+       THIS SAID "Both constructors of one (js_async_function_start and the tramp's async call) mark it", AND
+       THERE ARE FOUR — the two named, flow_clone_state_alloc's ASYNC_CALL arm, and clone_deep_flow's async-body
+       arm, which is a field-by-field build that did NOT mark it. That omission is what fired this assert: the
+       activation reaching here was a real JSAsyncFunctionData whose base_kind was the zero js_mallocz left, so
+       the assert was RIGHT and its reason was the wrong half — the state was not bare, its LABEL was. Count the
+       constructors (grep JS_GC_OBJ_TYPE_ASYNC_FUNCTION) rather than trusting this sentence; it was wrong once. */
     DCHECK(s->func_state.base_kind == FLOW_BASE_ASYNC_CALL,
            "an async activation whose base is not an ASYNC_CALL — the clone is reached through the "
            "JSAsyncFunctionData its state is embedded in, so a bare state would be read past its allocation");
