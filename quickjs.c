@@ -80545,6 +80545,24 @@ typedef struct JSInstanceOf {
 enum { INSTOF_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_instanceof_steps[] = { INSTOF_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
+/* THE THREE COMPLETIONS OF ONE ITERATION OF 7.3.21's STEP 6, over a link that is unknown external input.
+   Step 6's body is three steps and every one of them is a completion of the iteration: 6.b returns false, 6.c
+   returns true, and reaching neither continues the Repeat. An earlier statement of this design called the
+   question "is this link the end?" and therefore a BOOLEAN, which is a two-way partition of a three-way
+   question — it names 6.b and 6.c at once and then cannot say which, and a two-arm fork keeping only 6.b
+   deletes the world in which `e instanceof Object` is TRUE, which on a server-injected record is the world a
+   real session is standing in. The completions were enumerated from the branch of the prose rather than from
+   what the page can observe.
+   ZERO IS THE ONE THAT ENDS THE WALK AND CLAIMS NOTHING, and that is forced rather than chosen. The driver
+   takes outcome 0 when no forking policy answers — the @S candidate re-fire — so a numbering whose 0 were
+   INSTOF_LINK_MORE would walk an unknown chain for ever in exactly the run that has no scheduler to park it.
+   Of the two completions that DO end it, 6.b's `false` asserts nothing about the value while 6.c's `true`
+   asserts that it is an instance of the constructor, and a run with no policy to fork must not be the one
+   that states the stronger claim. */
+#define INSTOF_LINK_END  0   /* 7.3.21 step 6.b — the chain ends at this link; the operator is false */
+#define INSTOF_LINK_IS_P 1   /* 7.3.21 step 6.c — this link IS `proto`; the operator is true */
+#define INSTOF_LINK_MORE 2   /* neither: 7.3.21 step 6.a again, on the next link */
+
 /* steps 6.a-c over ORDINARY links, which have no [[GetPrototypeOf]] of their own to run: the shape's proto is
    the answer. Returns 0 = keep walking from s->val (a PROXY link needs the request), 1 = decided. */
 static int js_instanceof_walk(JSContext *ctx, JSInstanceOf *s)
@@ -80672,9 +80690,43 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             return 18;
         }
         DCHECK(s->hdr.stage == IO_LINK_GOT, "the instanceof machine resumed in no stage");
-        if (JS_IsException(cb_result)) return -1;
-        JS_FreeValue(ctx, s->val);
-        s->val = cb_result; cb_result = JS_UNDEFINED;
+        /* TWO WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK. The ordinary one is step 6.a's request
+           answering, whose result IS the link. The other is this stage's own fork being answered, and there
+           `cb_result` is the driver's filler rather than a value from the algorithm — taking it as the link
+           would overwrite the very operand the fork was asked about. `fork_phase` is what tells them apart;
+           it is FORK_PH_ASK on every entry that is not a fork's delivery, including the first. */
+        if (s->hdr.fork_phase != FORK_PH_ANSWERED) {
+            if (JS_IsException(cb_result)) return -1;
+            JS_FreeValue(ctx, s->val);
+            s->val = cb_result; cb_result = JS_UNDEFINED;
+        }
+        /* STEP 6.b AND 6.c OVER AN UNKNOWN LINK ARE NOT DECIDABLE IN C, so they are asked. Both are identity
+           comparisons — `is null`, and SameValue against `proto` — and an unknown answers neither: it is an
+           ordinary Object at the C level, so the tests below would silently take the "keep walking" arm at
+           every link and this Repeat would never terminate. The operand is the LINK and never its depth, so
+           the constraint key the seam composes is a fact about a value that survives a park; a position in
+           the chain is an ordinal over something the page can lengthen, and a replayed ordinal names a
+           different link than the one that recorded it.
+           `s->val` IS WHERE THE OPERAND HAS TO LIVE. step_fork_run borrows it for the length of the request
+           and the sibling's snapshot is taken at the ask, so it must be reachable from js_instanceof_visit —
+           which is what makes this the machine's own field rather than a C local. */
+        if (js_value_is_concolic(s->val)) {
+            int arm, r;
+            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
+            /* `real` IS UNSTATED because nothing observed says which completion a real session reaches: the
+               derived link carries no example, so this machine has no ground to declare one and a claim here
+               would be a primacy nothing computed. */
+            r = step_fork_run(ctx, &s->hdr, s->val, "OrdinaryHasInstance step 6", 3,
+                              JS_OUTCOME_REAL_UNSTATED, &arm);
+            if (r) return r;
+            if (arm == INSTOF_LINK_END) { s->result = JS_FALSE; return 0; }   /* step 6.b */
+            if (arm == INSTOF_LINK_IS_P) { s->result = JS_TRUE; return 0; }   /* step 6.c */
+            /* INSTOF_LINK_MORE — step 6.a on the next link. The ask is re-entered at the link that arrives,
+               under ITS identity, so an unknown chain is a chain of forks and not one question repeated. */
+            s->hdr.cb_coerce[0] = s->val;
+            *out_cb = s->hdr.cb_coerce; *out_argc = 0;
+            return 18;
+        }
         if (JS_IsNull(s->val)) { s->result = JS_FALSE; return 0; }          /* step 6.b */
         if (JS_VALUE_GET_TAG(s->val) == JS_TAG_OBJECT
             && JS_VALUE_GET_OBJ(s->val) == JS_VALUE_GET_OBJ(s->proto)) {    /* step 6.c */
