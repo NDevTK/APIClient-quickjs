@@ -27028,6 +27028,22 @@ static void step_stage_check(const JSStepHdr *h, const char *when)
 static void step_request_check(JSContext *ctx, const JSStepHdr *h, int st, bool abrupt_in)
 {
 #if APICLIENT_DEV
+    /* ONE ISSUER OF [[OwnPropertyKeys]], ASSERTED AT THE POINT EVERY MACHINE'S REQUEST CONVERGES. Step code 11
+       is the only request whose ANSWER is a whole key list, and what a consumer must perform before asking for
+       one is a property of the OPERATION and not of the algorithm asking — so it belongs in step_ownkeys_run
+       and nowhere else, and the way to make that un-forgettable is to make a request that did not come through
+       it crash HERE rather than be served. `keys_phase` is that wrapper's own cursor and nothing else writes
+       it, so GET_PH_GOT is exactly the signature of a request it issued.
+       WHAT THIS DOES NOT COVER, because a partial guarantee stated as a total one is worse than none: step code
+       11 is not the only route to GP_OWNKEYS. PerformPromiseAllKeyed's step 1 asks under its own code, and
+       10.5.11's invariant walk reads the TARGET's keys from the driver's own continuation; neither passes
+       through a step machine's request at all, so neither is visible from here. */
+    DCHECK(st != 11 || h->keys_phase == GET_PH_GOT,
+           "a step machine issued [[OwnPropertyKeys]] (step code 11) without going through step_ownkeys_run — "
+           "that wrapper is the ONE issuer of this request, so a second one bypasses everything the engine "
+           "performs before the internal method is reached and the omission is silent, because the answer it "
+           "gets back is a perfectly ordinary key list. Ask through step_ownkeys_run at the stage that collects "
+           "its answer");
     if (abrupt_in && st > 0 && JS_HasException(ctx)) {
         /* The stage may still be past the end (that is step_stage_check's diagnosis, and this message should not
            read as if it were the same fault), but the LIST is always there — js_step_def_check saw to that. */
@@ -30036,25 +30052,26 @@ static void js_enum_keys_free(JSContext *ctx, JSEnumKeys *c)
    ALL of them, because a non-enumerable key SHADOWS an enumerable one deeper in the prototype chain and
    dropping it would enumerate a hidden property. Filtering here would have made for-in a second walk.
    `in` is the previous request's answer (UNDEFINED on entry). Returns 11 / 12 for the next request, 0 when the
-   snapshot in c->atoms[0..c->kept) is the answer, -1 having thrown. */
-static int js_enum_keys_run(JSContext *ctx, JSEnumKeys *c, JSValue in, JSValue **out_cb, int *out_argc)
+   snapshot in c->atoms[0..c->kept) is the answer, -1 having thrown.
+   `h` IS THE OWNING MACHINE'S HEADER AND IT IS NOT DECORATION: this cursor's [[OwnPropertyKeys]] goes through
+   step_ownkeys_run like every other one, so that there is exactly ONE issuer of that request in the engine and
+   a consumer added later cannot reach the internal method without whatever that wrapper performs first. The
+   cursor has no header of its own — it is embedded in five different machines — so the one it borrows is the
+   one whose stage the request is issued and answered at. */
+static int js_enum_keys_run(JSContext *ctx, JSStepHdr *h, JSEnumKeys *c, JSValue in,
+                            JSValue **out_cb, int *out_argc)
 {
     for (;;) {
-        if (c->phase == EK_ASK_KEYS) {
-            JS_FreeValue(ctx, in); in = JS_UNDEFINED;
-            c->phase = EK_GOT_KEYS;
-            c->cb[0] = c->obj;   /* borrowed: the cursor holds the reference */
-            *out_cb = c->cb; *out_argc = 0;
-            return 11;
-        }
-        if (c->phase == EK_GOT_KEYS) {
-            /* the key list arrived as an ARRAY. Turning it into an atom snapshot invokes nothing: it is a dense
+        if (c->phase == EK_ASK_KEYS || c->phase == EK_GOT_KEYS) {
+            /* the key list arrives as an ARRAY. Turning it into an atom snapshot invokes nothing: it is a dense
                array this engine built, of Strings and Symbols the [[OwnPropertyKeys]] invariant already
                validated. Only the STRING keys are kept — every consumer of this cursor takes `key` or `value`
                kinds, which 7.3.23 restricts to String keys. */
-            JSValue keys = in; uint32_t klen = 0, ki, kept = 0;
+            JSValue keys; uint32_t klen = 0, ki, kept = 0;
+            int r = step_ownkeys_run(ctx, h, c->obj, in, &keys, out_cb, out_argc);
             in = JS_UNDEFINED;
-            if (JS_IsException(keys)) return -1;
+            c->phase = EK_GOT_KEYS;
+            if (r) return r < 0 ? -1 : r;
             if (js_get_length32(ctx, &klen, keys)) { JS_FreeValue(ctx, keys); return -1; }
             c->atoms = klen ? js_mallocz(ctx, sizeof(c->atoms[0]) * klen) : NULL;
             if (klen && !c->atoms) { JS_FreeValue(ctx, keys); return -1; }
@@ -30359,7 +30376,7 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
 
         case FI_KEYS: {
             uint32_t k;
-            r = js_enum_keys_run(ctx, s->ek, cb_result, out_cb, out_argc);
+            r = js_enum_keys_run(ctx, &s->hdr, s->ek, cb_result, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
             if (r != 0) return r;
             for (k = 0; k < s->ek->kept; k++) {
@@ -66168,7 +66185,7 @@ static int js_import_opts_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
     DCHECK(s->hdr.stage == IMPOPTS_ATTRS, "import()'s options machine resumed in no stage");
     if (JS_IsException(cb_result))
         return js_import_opts_reject(ctx, s, JS_GetException(ctx));
-    r = js_enum_keys_run(ctx, s->ek, cb_result, out_cb, out_argc);
+    r = js_enum_keys_run(ctx, &s->hdr, s->ek, cb_result, out_cb, out_argc);
     if (r > 0) return r;
     if (r < 0) return js_import_opts_reject(ctx, s, JS_GetException(ctx));
     js_enum_keys_keep_enumerable(ctx, s->ek);
@@ -77168,20 +77185,17 @@ static int js_prop_walk_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
                because the reads run between the snapshot and the check and one of them can redefine a later key.
                [[OwnPropertyKeys]] is a REQUEST: on a Proxy it is the `ownKeys` trap, the page's code, and taking
                it with JS_GetOwnPropertyNamesInternal drove that trap from C. */
-            JS_FreeValue(ctx, cb_result); cb_result = JS_UNDEFINED;
-            s->hdr.stage = PW_KEYS;
-            s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds it across the request */
-            *out_cb = s->hdr.cb_coerce; *out_argc = 0;
-            return 11;
+            s->hdr.stage = PW_KEYS;   /* the ASK is issued from the stage that collects its answer */
         }
         if (s->hdr.stage == PW_KEYS) {
-            /* the key list arrived as an ARRAY. Turning it into the atom snapshot invokes nothing: it is a dense
+            /* the key list arrives as an ARRAY. Turning it into the atom snapshot invokes nothing: it is a dense
                array this engine built, of Strings and Symbols the invariant already validated.
                assign and a spread copy SYMBOL keys too; values/entries take only the string ones. */
-            JSValue keys = cb_result;
+            JSValue keys;
             uint32_t klen = 0, ki, kept = 0;
+            r = step_ownkeys_run(ctx, &s->hdr, s->obj, cb_result, &keys, out_cb, out_argc);
             cb_result = JS_UNDEFINED;
-            if (JS_IsException(keys)) return -1;
+            if (r) return r < 0 ? -1 : r;
             if (js_get_length32(ctx, &klen, keys)) { JS_FreeValue(ctx, keys); return -1; }
             s->atoms = klen ? js_mallocz(ctx, sizeof(s->atoms[0]) * klen) : NULL;
             if (klen && !s->atoms) { JS_FreeValue(ctx, keys); return -1; }
@@ -77484,14 +77498,14 @@ static int js_ownkeys_step(JSContext *ctx, void *st, JSValue cb_result, JSValue 
             s->obj = JS_ToObject(ctx, arg0);   /* a primitive wrapper; runs no user code */
             if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
         }
-        s->hdr.stage = OWNKEYS_KEYS;
-        s->hdr.cb_coerce[0] = s->obj;   /* borrowed: the machine holds it across the request */
-        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
-        return 11;
+        s->hdr.stage = OWNKEYS_KEYS;   /* the ASK is issued from the stage that collects its answer */
     }
     DCHECK(s->hdr.stage == OWNKEYS_KEYS, "Object.getOwnPropertyNames: unknown stage");
-    s->keys = cb_result;
-    if (JS_IsException(s->keys)) { s->keys = JS_UNDEFINED; return -1; }
+    {
+        int r = step_ownkeys_run(ctx, &s->hdr, s->obj, cb_result, &s->keys, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (r) return r < 0 ? -1 : r;
+    }
     if (s->hdr.arg == OWNKEYS_REFLECT)
         return 0;   /* CreateArrayFromList over every key, which is what the request already delivered */
     {
@@ -78106,14 +78120,12 @@ static int js_integrity_step(JSContext *ctx, void *st, JSValue cb_result, JSValu
             JS_ThrowTypeError(ctx, "object refused to become non-extensible");
             return -1;
         }
-        s->hdr.stage = IG_KEYS_GOT;     /* step 3: O.[[OwnPropertyKeys]]() */
-        s->hdr.cb_coerce[0] = s->obj;
-        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
-        return 11;
+        s->hdr.stage = IG_KEYS_GOT;     /* step 3: O.[[OwnPropertyKeys]]() — asked from the stage that collects it */
     }
     if (s->hdr.stage == IG_KEYS_GOT) {
-        if (JS_IsException(cb_result)) return -1;
-        s->keys = cb_result; cb_result = JS_UNDEFINED;
+        int kr = step_ownkeys_run(ctx, &s->hdr, s->obj, cb_result, &s->keys, out_cb, out_argc);
+        cb_result = JS_UNDEFINED;
+        if (kr) return kr < 0 ? -1 : kr;
         if (js_get_length32(ctx, &s->len, s->keys)) return -1;
         s->i = 0;
         s->hdr.stage = IG_NEXT;
@@ -87793,18 +87805,16 @@ static int js_iterator_zip_keyed_step(JSContext *ctx, void *st, JSValue cb_resul
            enumerability re-checked below, because the reads run between the snapshot and the check and one of them
            can flip a later key's visibility — which is the whole reason the self-hosted version collected
            everything first. On a Proxy this is the `ownKeys` trap. */
-        s->hdr.stage = ZK_KEYS;
-        s->hdr.cb_coerce[0] = (JSValue)step_arg(&s->hdr, 0);   /* borrowed: argv holds it */
-        *out_cb = s->hdr.cb_coerce; *out_argc = 0;
-        return 11;
+        s->hdr.stage = ZK_KEYS;   /* the ASK is issued from the stage that collects its answer */
     }
     if (s->hdr.stage == ZK_KEYS) {
-        /* the key list arrived as an ARRAY this engine built, of Strings and Symbols the invariant validated, so
+        /* the key list arrives as an ARRAY this engine built, of Strings and Symbols the invariant validated, so
            turning it into atoms invokes nothing. zipKeyed keeps BOTH kinds. */
-        JSValue keys = cb_result;
+        JSValue keys;
         uint32_t klen = 0;
+        r = step_ownkeys_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &keys, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
-        if (JS_IsException(keys)) return -1;
+        if (r) return r < 0 ? -1 : r;
         if (js_get_length32(ctx, &klen, keys)) { JS_FreeValue(ctx, keys); return -1; }
         s->atoms = klen ? js_mallocz(ctx, sizeof(JSAtom) * (size_t)klen) : NULL;
         if (klen && !s->atoms) { JS_FreeValue(ctx, keys); return -1; }
@@ -100954,7 +100964,7 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
         /* the enumerable-key walk is in flight: `res` is the last request's answer, not a reviver result. */
         JRFrame *f = &s->stack[s->sp - 1];
         JSValue *ekcb = NULL; int ekargc = 0;
-        int r = js_enum_keys_run(ctx, f->ek, res, &ekcb, &ekargc);
+        int r = js_enum_keys_run(ctx, &s->hdr, f->ek, res, &ekcb, &ekargc);
         if (r > 0) { s->ek_cb = ekcb; s->ek_argc = ekargc; return r; }
         if (r < 0) return -1;
         /* the survivors become the frame's key list; the cursor's allocation is handed over whole. 25.5.1.1
@@ -101883,7 +101893,7 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
 
         case SJ_KEYS: {
             uint32_t k;
-            r = js_enum_keys_run(ctx, f->ek, in, out_cb, out_argc);
+            r = js_enum_keys_run(ctx, &s->hdr, f->ek, in, out_cb, out_argc);
             in = JS_UNDEFINED;
             if (r != 0) return r;
             /* §25.5.4.5 step 6.a is "Let keys be ? EnumerableOwnProperties(value, key)." — the ENUMERABLE
