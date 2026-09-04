@@ -22353,6 +22353,33 @@ static JSVarRef *get_captured_cell(JSContext *ctx, JSStackFrame *sf, JSValue *pv
     return vr;
 }
 
+/* THE MINT'S ONE FAILURE, ASSERTED AT EVERY SITE THAT DEREFERENCES ITS RESULT. get_captured_cell returns NULL
+   on an allocation failure and nothing else, and each cell-addressed opcode reads `vr->pvalue` on the very
+   next line — so on a wasm target, where a load through NULL returns a value instead of faulting (see
+   engine/host/check.h), the missing binding would arrive as a plausible datum rather than as a crash. It is a
+   CHECK and not a DCHECK because check.h assigns allocation to CHECK by name: a flow that loses this
+   allocation is one the frontier still holds, and its closure and its own accesses would go on answering out
+   of two different storages. A MACRO so the abort names the OPCODE's own line — one function called from
+   six sites would report one line for all of them. */
+#define CHECK_CELL(vr)                                                                                  \
+    CHECK((vr) != NULL,                                                                                 \
+          "the frame could not mint the heap cell a captured binding is addressed through — its "        \
+          "closures, its mapped `arguments` and its own accesses would then answer out of different "    \
+          "storages, and the flow that lost the allocation is one the frontier still holds")
+
+/* THE COMPILER'S HALF OF THE CAPTURED-PARAMETER CONTRACT, ASSERTED AT THE TWELVE SITES THAT REST ON IT. A
+   fused OP_get_arg0..3 / OP_put_arg0..3 / OP_set_arg0..3 carries its index in the OPCODE and so has no operand
+   a cell-addressed arm could read; put_short_code refuses to emit one for a captured parameter for exactly
+   that reason, and this is where a violation of that refusal SAYS SO instead of quietly reading arg_buf for a
+   binding whose storage moved to the heap the moment a fork detached its cell. It is a MACRO rather than a
+   check inside a helper so the abort names the OPCODE's own line — the twelve are one line each. */
+#define DCHECK_ARG_PLAIN(b, i)                                                                          \
+    DCHECK(!(b)->vardefs[i].is_captured,                                                                \
+           "a FUSED argument op named a CAPTURED parameter — put_short_code refuses the short form for "  \
+           "one precisely so this op never has to answer the question, so an emitter has reached around " \
+           "it; this read takes arg_buf while the binding's storage is its frame-owned cell, which is "   \
+           "the same value until a fork detaches the cell and a different one afterwards")
+
 static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
                              bool is_arg)
 {
@@ -22378,8 +22405,12 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
        capturing closure); here the closure adds ITS ref on top of the frame's. This said the cell is CLOSED and
        "heap-resident from creation" — it is born OPEN over a slot in this frame's buffer, and it is a FORK that
        makes it heap-resident (close_var_refs_for_fork), which is what a snapshot fork's isolation of the
-       binding rests on. THIS CALL IS ALSO THE ONLY MINT OF A CAPTURED ARGUMENT'S CELL, so a parameter no
-       closure has captured has none — see the argument arm of close_var_refs_for_fork. */
+       binding rests on. THIS USED TO BE THE ONLY MINT OF A CAPTURED ARGUMENT'S CELL AND IT IS NOT ANY MORE:
+       OP_get_arg / OP_put_arg / OP_set_arg mint one too, on their `is_captured` arm, because a captured
+       parameter is addressed through its cell exactly as a captured local is. What is still true, and is what
+       the rest of this file leans on, is that a parameter NOTHING has captured has no cell at all —
+       get_captured_cell is reached only for a vardef whose is_captured is set, and an uncaptured parameter
+       keeps taking the plain arg_buf path. */
     if (vd->is_captured) {
         var_ref = get_captured_cell(ctx, sf, pvalue, vd->var_ref_idx);
         if (!var_ref) return NULL;
@@ -22719,18 +22750,33 @@ static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
    variable changed): the identical fork over an already-DETACHED cell is clean and over an OPEN one loses the
    write, and a real minified bundle turns that lost write into `<name> is not a function (it is undefined)` at
    a call whose callee was assigned earlier in the same flat `var` chain.
-   IT IS SEMANTICS-NEUTRAL FOR A CAPTURED LOCAL AND IT IS NOT FOR A CAPTURED ARGUMENT, which is why the two
-   arms differ instead of the loop being uniform. A captured local is addressed through its cell and NOWHERE
-   else: resolve_scope_var resolves every access to OP_get_loc_ref / OP_put_loc_ref at compile time, so no path
-   can observe the slot the cell used to alias. A captured ARGUMENT is addressed BOTH ways — OP_get_arg and
-   OP_put_arg read and write arg_buf directly, and it is only the open cell's aliasing of that same slot that
-   makes a capturing closure and a mapped `arguments` (JS_CLASS_MAPPED_ARGUMENTS reads var_refs[idx]->pvalue)
-   observe those writes. Detaching one would leave the frame and its own closures with two storages; sharing one
-   leaves the SIBLING with two. So that arm is an unbuilt capability and says so by name. */
+   IT IS SEMANTICS-NEUTRAL BECAUSE A CAPTURED BINDING IS CELL-ADDRESSED, AND THAT IS NOW TRUE OF BOTH KINDS,
+   which is why this loop is uniform. A captured local is addressed through its cell and nowhere else:
+   resolve_scope_var resolves every access to OP_get_loc_ref / OP_put_loc_ref, so no path can observe the slot
+   the cell used to alias. A captured ARGUMENT used to be addressed BOTH ways — OP_get_arg / OP_put_arg read
+   and wrote arg_buf directly and only the open cell's aliasing of that same slot made a capturing closure and
+   a mapped `arguments` observe those writes, so detaching one left the frame with two storages and sharing one
+   left the SIBLING with two, and this loop DFAILed on it. OP_get_arg / OP_put_arg / OP_set_arg now take the
+   cell for a captured index (JS_CallInternal's argument arms), and put_short_code refuses to fuse one into
+   the index-in-opcode forms that could not ask — so the cell is a parameter's sole storage exactly as it is a
+   local's. The question is asked at those three ops rather than resolved into a cell-addressed opcode pair
+   only because the opcode table is full at 256 with one dead slot; that is a constraint, not the design.
+   THE MAPPED `arguments` OBJECT IS NOT A SECOND STORAGE AND NEVER WAS: js_build_mapped_arguments takes its
+   entries from get_var_ref, which routes a captured vardef to get_captured_cell on the same var_ref_idx, so
+   JS_CLASS_MAPPED_ARGUMENTS reads and writes THE CELL. ECMA-262 §10.4.4 Arguments Exotic Objects defines that
+   correspondence over the BINDING rather than over any slot — §10.4.4.7.1 MakeArgGetter's closure is "Return
+   NormalCompletion(! envRecord.GetBindingValue(name, false))" and §10.4.4.7.2 MakeArgSetter's is "Return
+   NormalCompletion(! envRecord.SetMutableBinding(name, value, false))" — and §10.4.4 Note 3 says outright that
+   "An ECMAScript implementation does not need to actually create or use such objects to implement the
+   specified semantics". So the object and the parameter go on sharing one storage across the detach, which is
+   Note 2's "changing the property changes the corresponding value of the argument binding and vice-versa". */
 static void close_var_refs_for_fork(JSRuntime *rt, JSStackFrame *sf)
 {
+    int i;
+#if APICLIENT_DEV
     JSFunctionBytecode *b;
-    int i, j, nv;
+    int j, nv;
+#endif
 
     /* A CALL ROOT LEAVES FIRST AND IS NOT MERELY ASSERTED AWAY: its cur_func is a step CLOSURE whose union
        member is a JSCFunctionDataRecord, so the bytecode read below would come out of unrelated memory in a
@@ -22746,53 +22792,45 @@ static void close_var_refs_for_fork(JSRuntime *rt, JSStackFrame *sf)
     DCHECK(sf->cur_gc_obj == NULL || JS_REF_COUNT(sf->cur_gc_obj) > 1,
            "the frame being forked names an owner that only its own cells are holding — detaching one gives "
            "that reference back, and this fork is reading the frame it would free");
+#if APICLIENT_DEV
     b = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
     nv = b->arg_count + b->var_count;
+#endif
     for (i = 0; i < sf->var_ref_count; i++) {
         JSVarRef *vr = sf->var_refs[i];
-        bool is_arg = false;
 
         if (!vr || vr->is_detached)
             continue;
-        /* A CELL THIS FRAME DID NOT MINT ALIASES THE FRAME IT NAMES. Reachable only in a release build, where
-           the DFAIL below is compiled out and a captured-argument cell is still shared onward; detaching it
-           from here would snapshot ANOTHER frame's slot and freeze that flow's binding at this instant. */
+        /* A CELL THIS FRAME DID NOT MINT ALIASES THE FRAME IT NAMES, and detaching it from here would snapshot
+           ANOTHER frame's slot and freeze that flow's binding at this instant.
+           WHAT USED TO REACH THIS LINE IS GONE AND NOTHING IS KNOWN TO HAVE REPLACED IT, WHICH IS WHY IT IS
+           STILL A TEST AND NOT AN ASSERT. The named producer was a captured ARGUMENT's cell in a RELEASE
+           build, shared onward because the DFAIL that refused it here was compiled out; that arm no longer
+           exists in either build. Every clone path in this file fills its array by SHARING cells this function
+           has already detached, so the surviving population is empty as far as the paths named here go — but
+           `is_detached` is read one line above and this field is read only when that answered false, so the
+           cost of asking is one comparison and the cost of ASSUMING would be a silent snapshot of a stranger's
+           slot. Turning it into a DCHECK is the right next diff and it needs what this one could not do:
+           exercising every clone path against the assert, so a route that legitimately shares an open cell
+           says so instead of being converted into an abort nobody has run. */
         if (vr->stack_frame != sf)
             continue;
-        /* WHICH SLOT THIS CELL ALIASES, DERIVED FROM THE VARDEF THAT DECLARED THE BINDING rather than from a
-           pointer comparison against arg_buf: a trampolined activation may BORROW its arguments from the
-           caller's operand stack, so arg_buf and var_buf are then two different allocations and
+        /* THE FRAME'S ARRAY AND THE BYTECODE ARE ONE DECLARATION READ TWICE, asked in dev only because with
+           both kinds cell-addressed there is no arm left for the answer to select — this is now purely the
+           assertion that a cell sits at an index some vardef declared. It is derived from the VARDEF rather
+           than from a pointer comparison against arg_buf: a trampolined activation may BORROW its arguments
+           from the caller's operand stack, so arg_buf and var_buf are then two different allocations and
            `pvalue >= arg_buf` is not a defined question. vardefs is the one declaration get_var_ref and the
            compiler both read, and var_ref_idx is its key. */
+#if APICLIENT_DEV
         for (j = 0; j < nv; j++) {
-            if (b->vardefs[j].is_captured && b->vardefs[j].var_ref_idx == i) {
-                is_arg = (j < b->arg_count);
+            if (b->vardefs[j].is_captured && b->vardefs[j].var_ref_idx == i)
                 break;
-            }
         }
         DCHECK(j < nv,
                "a frame holds an open cell at a var-ref index no vardef declares — the frame's array and the "
                "bytecode are one declaration read twice and cannot disagree about which binding a slot is");
-        if (is_arg) {
-            /* WHAT THE NEXT DIFF BUILDS: resolve_scope_var's ARGUMENT_VAR_OFFSET arm decides on
-               `OP_get_arg + is_put` BEFORE it ever asks is_captured, so a captured parameter has no
-               cell-addressed op to be compiled to. Give it one — the way the is_captured arm one branch down
-               already gives a captured local OP_get_loc_ref — and the cell becomes a parameter's sole storage
-               exactly as it is a local's, after which this arm detaches like the other and this DFAIL goes.
-               HOW ITS ABSENCE SHOWS: a fork inside a function that has ALREADY created a closure over one of
-               its own parameters aborts here by name (nothing mints an argument's cell but get_var_ref, so a
-               parameter no closure has captured yet has no cell and never reaches this line), where before it
-               silently read the other arm's value for that parameter through the closure and its own value
-               through OP_get_arg. */
-            DFAIL("a fork owes the sibling storage of its own for a captured binding, and this cell aliases a "
-                  "captured ARGUMENT — OP_get_arg/OP_put_arg address arg_buf directly and only this cell's "
-                  "aliasing of that slot makes a capturing closure and a mapped `arguments` observe those "
-                  "writes, so the cell can neither be detached (the frame and its closures would then hold two "
-                  "storages for one binding) nor shared (the sibling would). Emit a cell-addressed op for a "
-                  "captured parameter in resolve_scope_var's ARGUMENT_VAR_OFFSET arm, which today decides "
-                  "before it asks is_captured, and this arm becomes the local one");
-            continue;
-        }
+#endif
         close_var_ref(rt, vr);
     }
 }
@@ -44577,6 +44615,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int idx = get_u16(pc); pc += 2;
                 JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+                CHECK_CELL(vr);
                 if (unlikely(JS_IsUninitialized(*vr->pvalue))) { JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx, false); goto exception; }
                 cow_capture_vr(ctx, vr);
                 *sp++ = js_dup(*vr->pvalue);
@@ -44586,6 +44625,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int idx = get_u16(pc); pc += 2;
                 JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+                CHECK_CELL(vr);
                 if (unlikely(JS_IsUninitialized(*vr->pvalue))) { JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx, false); goto exception; }
                 cow_capture_vr(ctx, vr);
                 set_value(ctx, vr->pvalue, sp[-1]); sp--;
@@ -44595,6 +44635,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int idx = get_u16(pc); pc += 2;
                 JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+                CHECK_CELL(vr);
                 cow_capture_vr(ctx, vr);
                 set_value(ctx, vr->pvalue, sp[-1]); sp--;
             }
@@ -44603,29 +44644,78 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int idx = get_u16(pc); pc += 2;
                 JSVarRef *vr = get_captured_cell(ctx, sf, &var_buf[idx], b->vardefs[b->arg_count + idx].var_ref_idx);
+                CHECK_CELL(vr);
                 if (unlikely(JS_IsUninitialized(*vr->pvalue))) { JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx, false); goto exception; }
                 cow_capture_vr(ctx, vr);
                 set_value(ctx, vr->pvalue, js_dup(sp[-1]));
             }
             BREAK;
-        /* Args stay on arg_buf; a captured arg's OPEN var_ref aliases that same slot, so closures / mapped-
-           arguments see writes automatically (spec-correct). No per-op cell routing. */
+        /* AN ARGUMENT'S STORAGE IS ITS FRAME-OWNED CELL WHEN SOMETHING HAS CAPTURED IT, AND arg_buf OTHERWISE.
+           It is the same rule the V8-Context block above states for a local — a captured binding is addressed
+           through its cell and nowhere else, so nothing can observe the slot the cell used to alias, which is
+           what makes close_var_refs_for_fork's detach semantics-neutral and a forked sibling's binding its
+           own. WITHOUT IT a captured parameter has TWO storages the instant a fork detaches its cell: the
+           closure and the mapped `arguments` follow the cell to the heap while these ops go on reading the
+           frame slot, so the fork had to refuse the case outright and every real bundle that closes over a
+           parameter and then forks died there.
+           WHY THE QUESTION IS ASKED HERE AND NOT RESOLVED INTO THE OPCODE, which is the one place this
+           differs from the local design and is a constraint rather than a preference: the loc pair works
+           because OP_get_loc_ref / OP_put_loc_ref EXIST, and the opcode table is FULL — `_Static_assert(
+           OP_COUNT == 256)` over a one-byte dispatch, with exactly one dead slot (OP_set_loc_ref, which
+           nothing emits) against the two a get/put pair needs. So the compile-time half of the decision is
+           the half that fits: put_short_code refuses a FUSED form for a captured parameter, which is what
+           keeps OP_get_arg0..3 and their siblings out of this question entirely and leaves it asked at
+           exactly these three ops. The read is of `is_captured` — THE SAME DECLARATION put_short_code read
+           when it refused the fusion, so the two cannot disagree about which parameters are cell-addressed.
+           A MAPPED `arguments` REACHES THE SAME CELL: js_build_mapped_arguments takes its entries from
+           get_var_ref, which routes a captured vardef to get_captured_cell on the same var_ref_idx. ECMA-262
+           §10.4.4 Arguments Exotic Objects defines that correspondence over the BINDING and not over any
+           slot — §10.4.4.7.1 MakeArgGetter's closure is "Return NormalCompletion(! envRecord.GetBindingValue(
+           name, false))" and §10.4.4.7.2 MakeArgSetter's is "Return NormalCompletion(! envRecord.
+           SetMutableBinding(name, value, false))" — and §10.4.4 Note 3 says outright that "An ECMAScript
+           implementation does not need to actually create or use such objects to implement the specified
+           semantics". One storage is what Note 2 requires ("changing the property changes the corresponding
+           value of the argument binding and vice-versa") and one storage is what this gives it, across the
+           detach as well as before it.
+           NO TDZ ARM, unlike the loc pair: a parameter is initialized by the call itself (the buffer is padded
+           with UNDEFINED before the body runs), so there is no uninitialized state to report. */
         CASE(OP_get_arg):
             {
                 int idx = get_u16(pc); pc += 2;
-                *sp++ = js_dup(arg_buf[idx]);
+                if (unlikely(b->vardefs[idx].is_captured)) {
+                    JSVarRef *vr = get_captured_cell(ctx, sf, &arg_buf[idx], b->vardefs[idx].var_ref_idx);
+                    CHECK_CELL(vr);
+                    cow_capture_vr(ctx, vr);
+                    *sp++ = js_dup(*vr->pvalue);
+                } else {
+                    *sp++ = js_dup(arg_buf[idx]);
+                }
             }
             BREAK;
         CASE(OP_put_arg):
             {
                 int idx = get_u16(pc); pc += 2;
-                set_value(ctx, &arg_buf[idx], sp[-1]); sp--;
+                if (unlikely(b->vardefs[idx].is_captured)) {
+                    JSVarRef *vr = get_captured_cell(ctx, sf, &arg_buf[idx], b->vardefs[idx].var_ref_idx);
+                    CHECK_CELL(vr);
+                    cow_capture_vr(ctx, vr);
+                    set_value(ctx, vr->pvalue, sp[-1]); sp--;
+                } else {
+                    set_value(ctx, &arg_buf[idx], sp[-1]); sp--;
+                }
             }
             BREAK;
         CASE(OP_set_arg):
             {
                 int idx = get_u16(pc); pc += 2;
-                set_value(ctx, &arg_buf[idx], js_dup(sp[-1]));
+                if (unlikely(b->vardefs[idx].is_captured)) {
+                    JSVarRef *vr = get_captured_cell(ctx, sf, &arg_buf[idx], b->vardefs[idx].var_ref_idx);
+                    CHECK_CELL(vr);
+                    cow_capture_vr(ctx, vr);
+                    set_value(ctx, vr->pvalue, js_dup(sp[-1]));
+                } else {
+                    set_value(ctx, &arg_buf[idx], js_dup(sp[-1]));
+                }
             }
             BREAK;
 
@@ -44653,18 +44743,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_set_loc1): set_value(ctx, &var_buf[1], js_dup(sp[-1])); BREAK;
         CASE(OP_set_loc2): set_value(ctx, &var_buf[2], js_dup(sp[-1])); BREAK;
         CASE(OP_set_loc3): set_value(ctx, &var_buf[3], js_dup(sp[-1])); BREAK;
-        CASE(OP_get_arg0): *sp++ = js_dup(arg_buf[0]); BREAK;
-        CASE(OP_get_arg1): *sp++ = js_dup(arg_buf[1]); BREAK;
-        CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
-        CASE(OP_get_arg3): *sp++ = js_dup(arg_buf[3]); BREAK;
-        CASE(OP_put_arg0): set_value(ctx, &arg_buf[0], *--sp); BREAK;
-        CASE(OP_put_arg1): set_value(ctx, &arg_buf[1], *--sp); BREAK;
-        CASE(OP_put_arg2): set_value(ctx, &arg_buf[2], *--sp); BREAK;
-        CASE(OP_put_arg3): set_value(ctx, &arg_buf[3], *--sp); BREAK;
-        CASE(OP_set_arg0): set_value(ctx, &arg_buf[0], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
+        /* THE FUSED ARGUMENT FORMS CARRY THEIR INDEX IN THE OPCODE, SO THEY HAVE NO CELL-ADDRESSED ARM AND MUST
+           NEVER MEET A CAPTURED PARAMETER. put_short_code refuses to emit one for a captured index, which is
+           the whole reason the question is answerable at the three long forms alone — so this asserts the
+           compiler's half of that contract at the twelve places that DEPEND on it, in dev, where an emitter
+           that reached around put_short_code would otherwise read arg_buf for a binding whose storage is its
+           cell and be wrong only after a fork had detached it. */
+        CASE(OP_get_arg0): DCHECK_ARG_PLAIN(b, 0); *sp++ = js_dup(arg_buf[0]); BREAK;
+        CASE(OP_get_arg1): DCHECK_ARG_PLAIN(b, 1); *sp++ = js_dup(arg_buf[1]); BREAK;
+        CASE(OP_get_arg2): DCHECK_ARG_PLAIN(b, 2); *sp++ = js_dup(arg_buf[2]); BREAK;
+        CASE(OP_get_arg3): DCHECK_ARG_PLAIN(b, 3); *sp++ = js_dup(arg_buf[3]); BREAK;
+        CASE(OP_put_arg0): DCHECK_ARG_PLAIN(b, 0); set_value(ctx, &arg_buf[0], *--sp); BREAK;
+        CASE(OP_put_arg1): DCHECK_ARG_PLAIN(b, 1); set_value(ctx, &arg_buf[1], *--sp); BREAK;
+        CASE(OP_put_arg2): DCHECK_ARG_PLAIN(b, 2); set_value(ctx, &arg_buf[2], *--sp); BREAK;
+        CASE(OP_put_arg3): DCHECK_ARG_PLAIN(b, 3); set_value(ctx, &arg_buf[3], *--sp); BREAK;
+        CASE(OP_set_arg0): DCHECK_ARG_PLAIN(b, 0); set_value(ctx, &arg_buf[0], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_arg1): DCHECK_ARG_PLAIN(b, 1); set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_arg2): DCHECK_ARG_PLAIN(b, 2); set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
+        CASE(OP_set_arg3): DCHECK_ARG_PLAIN(b, 3); set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
         CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
@@ -49509,11 +49605,15 @@ static void async_func_set_owner(JSRuntime *rt, JSAsyncFunctionState *s, JSGCObj
             continue;
         /* A CELL THIS FRAME DID NOT MINT ALIASES THE FRAME IT NAMES, NOT THIS ONE. A clone's array is filled by
            SHARING the source frame's cells (clone_susp_frame, which is every clone in this file) — DETACHED
-           now, so the loop above has already skipped them, and what remains reachable here is the one cell a
-           release build still shares open: a captured ARGUMENT's, which close_var_refs_for_fork refuses in dev
-           and cannot repair in release. Adopting it would root this owner for storage this owner does not hold,
-           and would take a second reference for a cell that has one — so the question asked is which frame the
-           cell aliases, which is the cell's own field and not a guess. */
+           now, so the loop above has already skipped them. THE ONE PRODUCER THIS COMMENT USED TO NAME IS GONE:
+           it was a captured ARGUMENT's cell, which close_var_refs_for_fork refused in dev and shared open in
+           release, and that function now detaches an argument's cell like any other because a captured
+           parameter is cell-addressed. No replacement producer is established, so this stays
+           a TEST rather than becoming an assert for the same reason the sibling test in
+           close_var_refs_for_fork does — see the paragraph there, which also names what the next diff needs in
+           order to promote both. Adopting a stranger's cell would root this owner for storage this owner does
+           not hold, and would take a second reference for a cell that has one — so the question asked is which
+           frame the cell aliases, which is the cell's own field and not a guess. */
         if (vr->stack_frame != sf)
             continue;
         DCHECK(!vr->is_coro,
@@ -71118,8 +71218,32 @@ static void push_short_int(DynBuf *bc_out, int val)
     dbuf_put_u32(bc_out, val);
 }
 
-static void put_short_code(DynBuf *bc_out, int op, int idx)
+/* THE ONE GATE BETWEEN AN ARGUMENT ACCESS AND A FUSED FORM, and it takes the function definition for exactly
+   that reason. Every short/fused spelling of an argument op in this file is emitted through here — the plain
+   `case OP_get_arg`, the `put_x get_x -> set_x` collapse, the post-inc/post-dec collapse, the add_loc source
+   operand — so a rule stated HERE cannot be forgotten by a fusion added later, which a rule repeated at each
+   of those sites could and would be (§CLAUDE.md: one convergence point, no per-site `if`).
+   THE RULE: a CAPTURED parameter never gets a fused form. Its storage is its frame-owned heap cell rather
+   than arg_buf (see the argument arms in JS_CallInternal and close_var_refs_for_fork), and the fused
+   OP_get_arg0..3 / OP_put_arg0..3 / OP_set_arg0..3 carry their index in the OPCODE, so there is no operand
+   for the cell-addressed arm to read and no room for one in a 256-slot table that is already full. Emitting
+   the long form costs a captured parameter two bytes and the fusion; it is the same trade a captured LOCAL
+   already takes, since OP_get_loc_ref has no short form either.
+   IT IS SAFE TO ASK HERE AND NOWHERE EARLIER: `is_captured` is final for an argument only after resolve_labels'
+   own mapped-`arguments` prologue has run ("mapped arguments need all args to be captured"), which is why
+   resolve_scope_var — where the LOCAL rule lives — cannot state this one. */
+static void put_short_code(JSFunctionDef *s, DynBuf *bc_out, int op, int idx)
 {
+    if (op == OP_get_arg || op == OP_put_arg || op == OP_set_arg) {
+        DCHECK(idx >= 0 && idx < s->arg_count,
+               "an argument op names an index this function does not declare — the operand and the args table "
+               "are one declaration read twice and cannot disagree about how many there are");
+        if (s->args[idx].is_captured) {
+            dbuf_putc(bc_out, op);
+            dbuf_put_u16(bc_out, idx);
+            return;
+        }
+    }
     if (idx < 4) {
         switch (op) {
         case OP_get_loc:
@@ -71214,19 +71338,19 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     if (s->home_object_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_HOME_OBJECT);
-        put_short_code(&bc_out, OP_put_loc, s->home_object_var_idx);
+        put_short_code(s, &bc_out, OP_put_loc, s->home_object_var_idx);
     }
     /* initialize the 'this.active_func' variable if needed */
     if (s->this_active_func_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_THIS_FUNC);
-        put_short_code(&bc_out, OP_put_loc, s->this_active_func_var_idx);
+        put_short_code(s, &bc_out, OP_put_loc, s->this_active_func_var_idx);
     }
     /* initialize the 'new.target' variable if needed */
     if (s->new_target_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_NEW_TARGET);
-        put_short_code(&bc_out, OP_put_loc, s->new_target_var_idx);
+        put_short_code(s, &bc_out, OP_put_loc, s->new_target_var_idx);
     }
     /* initialize the 'this' variable if needed. In a derived class
        constructor, this is initially uninitialized. */
@@ -71236,7 +71360,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             dbuf_put_u16(&bc_out, s->this_var_idx);
         } else {
             dbuf_putc(&bc_out, OP_push_this);
-            put_short_code(&bc_out, OP_put_loc, s->this_var_idx);
+            put_short_code(s, &bc_out, OP_put_loc, s->this_var_idx);
         }
     }
     /* initialize the 'arguments' variable if needed. A function with parameter expressions has the binding in
@@ -71256,27 +71380,27 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS);
         }
         if (s->arguments_arg_idx >= 0)
-            put_short_code(&bc_out, s->arguments_var_idx >= 0 ? OP_set_loc : OP_put_loc,
+            put_short_code(s, &bc_out, s->arguments_var_idx >= 0 ? OP_set_loc : OP_put_loc,
                            s->arguments_arg_idx);
         if (s->arguments_var_idx >= 0)
-            put_short_code(&bc_out, OP_put_loc, s->arguments_var_idx);
+            put_short_code(s, &bc_out, OP_put_loc, s->arguments_var_idx);
     }
     /* initialize a reference to the current function if needed */
     if (s->func_var_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_THIS_FUNC);
-        put_short_code(&bc_out, OP_put_loc, s->func_var_idx);
+        put_short_code(s, &bc_out, OP_put_loc, s->func_var_idx);
     }
     /* initialize the variable environment object if needed */
     if (s->var_object_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_VAR_OBJECT);
-        put_short_code(&bc_out, OP_put_loc, s->var_object_idx);
+        put_short_code(s, &bc_out, OP_put_loc, s->var_object_idx);
     }
     if (s->arg_var_object_idx >= 0) {
         dbuf_putc(&bc_out, OP_special_object);
         dbuf_putc(&bc_out, OP_SPECIAL_OBJECT_VAR_OBJECT);
-        put_short_code(&bc_out, OP_put_loc, s->arg_var_object_idx);
+        put_short_code(s, &bc_out, OP_put_loc, s->arg_var_object_idx);
     }
 
     for (pos = 0; pos < bc_len; pos = pos_next) {
@@ -71333,13 +71457,13 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
-                    put_short_code(&bc_out, op + 1, argc);
+                    put_short_code(s, &bc_out, op + 1, argc);
                     pos_next = skip_dead_code(s, bc_buf, bc_len, cc.pos,
                                               &line_num, &col_num);
                     break;
                 }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
-                put_short_code(&bc_out, op, argc);
+                put_short_code(s, &bc_out, op, argc);
                 break;
             }
             goto no_change;
@@ -71756,7 +71880,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                         }
                     }
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
-                    put_short_code(&bc_out, op1, cc.idx);
+                    put_short_code(s, &bc_out, op1, cc.idx);
                     if (line2 >= 0) line_num = line2;
                     break;
                 }
@@ -71836,7 +71960,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
-                    put_short_code(&bc_out, cc.op, cc.idx);
+                    put_short_code(s, &bc_out, cc.op, cc.idx);
                     dbuf_putc(&bc_out, OP_add_loc);
                     dbuf_putc(&bc_out, idx);
                     pos_next = cc.pos;
@@ -71852,7 +71976,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     break;
                 }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
-                put_short_code(&bc_out, op, idx);
+                put_short_code(s, &bc_out, op, idx);
             }
             break;
         case OP_get_arg:
@@ -71861,7 +71985,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 int idx;
                 idx = get_u16(bc_buf + pos + 1);
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
-                put_short_code(&bc_out, op, idx);
+                put_short_code(s, &bc_out, op, idx);
             }
             break;
         case OP_put_loc:
@@ -71875,12 +71999,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
-                    put_short_code(&bc_out, op + 1, idx);
+                    put_short_code(s, &bc_out, op + 1, idx);
                     pos_next = cc.pos;
                     break;
                 }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
-                put_short_code(&bc_out, op, idx);
+                put_short_code(s, &bc_out, op, idx);
             }
             break;
 
@@ -71908,7 +72032,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     }
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     dbuf_putc(&bc_out, OP_dec + (op - OP_post_dec));
-                    put_short_code(&bc_out, op1, idx);
+                    put_short_code(s, &bc_out, op1, idx);
                     break;
                 }
                 if (code_match(&cc, pos_next, OP_perm3, OP_put_field, OP_drop, -1)) {
