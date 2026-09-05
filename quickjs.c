@@ -89576,12 +89576,29 @@ typedef struct JSSyncDisposeWrap {
  * drives it through do_step_tramp like any other machine. `stepid` is what JS_RegisterStepDef handed out. */
 JSValue JS_NewStepClosure(JSContext *ctx, int stepid, int length, int data_len, JSValueConst *data)
 {
+    return JS_NewStepClosure2(ctx, stepid, NULL, length, data_len, data);
+}
+
+/* THE SAME MINT, NAMED — the `2` form, exactly as JS_NewCFunctionData2 is JS_NewCFunctionData's, and for the
+   identical reason: most closures are internal callbacks whose name no page can observe, and some are members
+   whose name a standard STATES. js_new_c_function_data has always taken the name; the unnamed entry above
+   passed NULL, so a component that needed one had no way to ask and the closure's `name` was the empty string.
+   That is not a missing convenience: Web IDL §3.7.6 Attributes mints an attribute getter with "the string
+   \"get \" prepended to attribute's identifier", so an accessor minted here without a name answers
+   `Object.getOwnPropertyDescriptor(o, "onerror").get.name` with "" where every browser and the corpus's own
+   idlharness say "get onerror". A member whose name is unobservable passes NULL and gets what it always got. */
+JSValue JS_NewStepClosure2(JSContext *ctx, int stepid, const char *name, int length, int data_len,
+                           JSValueConst *data)
+{
     JSRuntime *rt = ctx->rt;
 
     CHECK(stepid >= STEPDEF_COUNT && stepid - STEPDEF_COUNT < rt->host_step_def_count,
-          "JS_NewStepClosure was given an id JS_RegisterStepDef never handed out");
-    return js_new_step_closure(ctx, rt->host_step_defs[stepid - STEPDEF_COUNT],
-                               length, 0, data_len, data);
+          "JS_NewStepClosure2 was given an id JS_RegisterStepDef never handed out");
+    /* Straight to the naming mint rather than through js_new_step_closure, which exists to spell the NULL for
+       the engine's own fourteen internal reactions and would have to grow a parameter every one of them then
+       passes. One implementation either way — both entries end in js_new_c_function_data over the same def. */
+    return js_new_c_function_data(ctx, NULL, rt->host_step_defs[stepid - STEPDEF_COUNT], name,
+                                  length, 0, data_len, data);
 }
 
 JSValueConst JS_StepClosureData(const JSStepHdr *h, int i)

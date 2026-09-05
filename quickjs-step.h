@@ -779,6 +779,10 @@ JS_EXTERN int JS_RegisterStepDef(JSRuntime *rt, const JSTrampStepDef *def);
    the two were mutually exclusive from outside quickjs.c. `stepid` is what JS_RegisterStepDef handed out; the
    machine reads what it captured with JS_StepClosureData, off the callee its header already carries. */
 JS_EXTERN JSValue JS_NewStepClosure(JSContext *ctx, int stepid, int length, int data_len, JSValueConst *data);
+/* THE SAME MINT CARRYING §3.7.6's NAME. A closure whose name a page can READ — an IDL accessor is the case that
+   forced this — states it here; every internal reaction passes NULL through the entry above and is unchanged. */
+JS_EXTERN JSValue JS_NewStepClosure2(JSContext *ctx, int stepid, const char *name, int length, int data_len,
+                                     JSValueConst *data);
 JS_EXTERN JSValueConst JS_StepClosureData(const JSStepHdr *h, int i);
 
 /* WHAT step() RETURNS. A machine reports one of these at every stage, and a host machine reports them for the
