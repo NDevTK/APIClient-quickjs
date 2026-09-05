@@ -108471,6 +108471,43 @@ static void js_promise_resolve_function_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/* §27.5.2.2 NewPromiseResolveThenableJob's JOB, FOR A `then` THIS ENGINE CANNOT CALL. Step 1.b's
+   HostCallJobCallback over an UNKNOWN callee mints an unknown for the RESULT and models no effect on the
+   arguments at all, so the two capabilities it was handed are invoked by nothing — which is why the adopt world
+   is decided by an outcome fork (see PRF_ADOPT_OP) and PERFORMED here. The arm stands in for the CALL'S EFFECT
+   and for nothing else: step 1.b's `resolvingFuncs.[[Resolve]]`, or step 1.c.i's
+   `Call(resolvingFuncs.[[Reject]], undefined, « thenCallResult.[[Value]] »)`.
+   THE THIRD COMPLETION ENQUEUES NOTHING, WHICH IS WHY THIS FUNCTION HAS NO ARM FOR IT. A `then` that returns
+   having called neither leaves the promise pending for ever — the ordinary `{then(){}}` — and a job whose whole
+   body is "settle nothing" has no observable effect to be scheduled, so the ask simply does not enqueue one.
+   IT IS A JOB AND NOT AN INLINE SETTLEMENT BECAUSE §27.5.2.2'S OWN NOTE REQUIRES IT: "This Job uses the
+   supplied thenable and its then method to resolve the given promise. This process must take place as a Job to
+   ensure that the evaluation of the then method occurs after evaluation of any surrounding code has
+   completed." What the fork decides is WHICH completion; WHEN it lands is this enqueue's, exactly as it is for
+   a `then` the engine can call — and the ordering is observable, so deciding early and settling early are two
+   different things and only the first is what the fork does.
+   STEP 1.a IS PERFORMED RATHER THAN SKIPPED, and the fresh pair is not a formality: the OUTER resolving
+   function latched at step 2.c before it ever reached the ask, so settling through it would be a silent no-op
+   and this promise would stay pending on EVERY arm. The call runs as a CALL-ROOT FLOW for the reason every
+   other settle in this file does — a capability's resolve is the page's code where a subclass wraps it, and
+   the native one is a step machine whose own `then` read is a request, so settling from C would run that read
+   with no flow base. */
+static JSValue js_promise_unknown_thenable_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    JSValue funcs[2];
+    int is_reject, r;
+
+    DCHECK(argc == 3, "argc == 3");
+    is_reject = JS_ToBool(ctx, argv[2]);
+    if (js_create_resolving_functions(ctx, funcs, argv[0]) < 0)   /* 27.5.2.2 step 1.a */
+        return JS_EXCEPTION;
+    /* step 1.b's EFFECT, or step 1.c.i's — whichever completion the ask answered. */
+    r = js_settle_as_flow(ctx, funcs[is_reject], argv[1]);
+    JS_FreeValue(ctx, funcs[0]);
+    JS_FreeValue(ctx, funcs[1]);
+    return r < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+}
+
 /* 27.5.1.3's resolveSteps PromiseResolveFunction as a STEP MACHINE. Every step of it is C except one: `Get(resolution,
    "then")`, which on a thenable with an accessor or a Proxy is the page's code — and `res(thenable)` inside an
    executor is the ordinary way to reach it. The class `call` hook read it with JS_GetProperty, so a looping
@@ -108493,21 +108530,29 @@ typedef struct JSPromiseResolveFn {
 _Static_assert(offsetof(JSPromiseResolveFn, hdr) == 0, "JSStepHdr must be first in JSPromiseResolveFn");
 
 /* WHICH STEP OF THE PAIR EACH STAGE RESTS AT. ONE machine, TWO algorithms — which of them this is comes from the
-   CLASS, so one list names both and the reject half simply never reaches the second stage.
+   CLASS, so one list names both and the reject half never reaches any stage past PRF_HEAD.
    THE STAGE LABELS AND THE COMMENTS BESIDE THEM DISAGREED FOR A WHOLE EDITION, and that is the argument for the
    declaration in one sentence. CreateResolvingFunctions builds resolveSteps and rejectSteps as ABSTRACT
    CLOSURES under steps 2 and 4, so their own steps are LETTERED (2.a-2.m, 4.a-4.e) — there is no flat 1-15 list
    to be one low against any more. The labels here were moved to that lettering; every comment in the body was
    left behind at the flat numbering of the edition before it, and each of them read as authoritative. A stage
    that DECLARES its step is checked by the driver at every rest; a comment is checked by nobody.
-   The second stage names a RANGE because the machine rests inside the only page-visible operation in it: the
-   `then` read parks here, and steps 2.g-2.m that follow run no user code at all — the thenable's `then` is
-   ENQUEUED as a job rather than called. */
+   PRF_THEN names a RANGE because the machine rests inside the only page-visible operation in it: the `then`
+   read parks there, and steps 2.g-2.m that follow run no user code at all — the thenable's `then` is ENQUEUED
+   as a job rather than called. It is named rather than called "the last stage", because a stage added between
+   them would re-point that description in silence; PRF_ADOPT is exactly such an addition.
+   PRF_ADOPT NAMES A DIFFERENT ALGORITHM, which is why it is a stage of this machine and not of another: the
+   two forks are asked of ONE operand, neither is ever outstanding while the other is, and only the FIRST is a
+   question about 27.5.1.3 at all — the second is what §27.5.2.2's job does with the `then` the first one
+   established. They are two stages rather than two asks in one because a resume point is a STAGE (see
+   step_fork_answered_stage): a sibling of the second ask re-entering at the first would consume its answer. */
 #define PRF_STAGES(X) \
     X(PRF_HEAD, "27.5.1.3 steps 4.a-4.d / steps 2.a-2.f (the pair fires ONCE; a reject settles here, and " \
                 "so does a self resolution or a non-Object resolution)") \
     X(PRF_THENABLE, "27.5.1.3 step 2.i over a resolution carrying NO example (the fork: outcome 0 is not a " \
                     "thenable and fulfils, outcome 1 is the 2.j-2.l adoption)") \
+    X(PRF_ADOPT, "27.5.2.2 over a `then` this engine cannot call (the fork: outcome 0 is resolve called, 1 " \
+                 "is reject called or a throw, 2 is neither and the promise stays pending)") \
     X(PRF_THEN, "27.5.1.3 steps 2.g-2.m (then is Get(resolution, \"then\"); an abrupt read REJECTS; a callable " \
                 "thenAction enqueues NewPromiseResolveThenableJob)")
 enum { PRF_STAGES(JS_STEP_STAGE_ENUM) };
@@ -108521,6 +108566,45 @@ static const char *const js_promise_resolvefn_steps[] = { PRF_STAGES(JS_STEP_STA
    because step_fork_run keeps the POINTER on the header across the park and re-hashes the BYTES on the
    answer. */
 #define PRF_THENABLE_OP "27.5.1.3 resolution is a thenable"
+
+/* AND THE ADOPT WORLD'S OWN FORK, ASKED OF THE SAME OPERAND AND SHARING NOTHING WITH THE ONE ABOVE. The
+   constraint key is (operand, OPERATION, completion), so the operation string is what keeps the two apart: a
+   flow that has answered "this unknown IS a thenable" has said nothing whatever about what its `then` does
+   with the capabilities it is handed, and a shared string would let the first answer decide the second.
+   THE THREE COMPLETIONS ARE WHAT THE PAGE CAN OBSERVE OF `promiseToResolve`, WHICH IS NOT WHAT §27.5.2.2'S
+   PROSE ENUMERATES. Its job has a normal arm (step 1.d) and an abrupt one (step 1.c), and counting those gives
+   TWO — the count this file carried while it was only ever prose. A normal completion is not a settlement: a
+   `then` that returns having called neither capability leaves the promise PENDING, which is the ordinary
+   `{then(){}}` a browser really does leave pending for ever and is a world neither of the job's own arms
+   names. So the partition is over the promise's STATE and not over the algorithm's text:
+     0  resolve was called first — the promise adopts whatever it was handed;
+     1  reject was called first — including a `then` that THREW having called neither, because step 1.c.i
+        rejects with the thrown value rather than propagating it;
+     2  neither was called — the promise stays pending, and nothing is enqueued at all.
+   A THROW ADDS NO FOURTH COMPLETION, and the reason is the latch rather than an argument about likelihood:
+   steps 2.a/2.c and 4.a/4.c empty `promiseOrEmpty.[[Value]]` on the FIRST call, so a `then` that calls resolve
+   and then throws reaches step 1.c.i's reject as a no-op and is INDISTINGUISHABLE, to the page, from one that
+   merely called resolve. Which capability was called FIRST is the whole of what is observable, and that is a
+   three-way partition however many times the callee calls them.
+   OUTCOME 0 IS "RESOLVE WAS CALLED", and it is forced by the same numbering rule as PROTO_LINK_END and as the
+   ask above it, read against these three completions. The driver takes outcome 0 where no forking policy
+   answers — the @S candidate re-fire — so 0 must be an arm that lets that run FINISH ITS BUSINESS: outcome 2
+   settles nothing, so every reaction registered on this promise and every `await` of it would be left standing
+   in exactly the run that has no scheduler to come back for them, which is §scheduler's razor (a flow that is
+   forgotten rather than run is a cap, however it is spelled). Of the two that do settle, the reject arm takes
+   the `.catch` path and SKIPS every `.then` handler behind it — the burial §Attacker-sources exists to
+   prevent, and the very surface the read at PRF_HEAD was performed on the example to reach. So the arm that
+   both settles and carries the page on is the one a run with no policy takes, which is also what makes the two
+   asks in this stage agree: at both of them, outcome 0 is "the promise fulfils and the program goes on".
+   AND OUTCOME 0 TERMINATES RATHER THAN REGRESSING. The value it settles with is another unknown, so the fresh
+   resolving function re-enters this machine at PRF_HEAD and reaches this stage again — where a no-policy run
+   takes the ask above's outcome 0, "not a thenable", and fulfils. Two passes, not a walk.
+   UNDER A FORKING POLICY THAT CHAIN IS UNBOUNDED, AND THAT IS THE DESIGNED ANSWER RATHER THAN AN OVERSIGHT:
+   each arm-0 sibling mints a DISTINCT derivation and asks the thenable question of it, exactly as iterating an
+   unknown collection forks per iteration. §NO BOUNDS forbids the seen-set that would end it; what ends it in
+   practice is the WFQ, since the tail emits nothing new and is outranked and paged. */
+#define PRF_ADOPT_OP "27.5.2.2 what an unknown thenable's `then` calls"
+enum { PRF_ADOPT_RESOLVE = 0, PRF_ADOPT_REJECT, PRF_ADOPT_PENDING };
 
 /* [[AlreadyResolved]] latches in exactly two places — the step machine below and the C entry a JS_Call from C
    still reaches — so the time-travel capture of it lives WITH the latch rather than beside each of them. Both
@@ -108682,40 +108766,94 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
         if (r) return r;
         if (arm == 0)   /* step 2.i: IsCallable(thenAction) is false — FulfillPromise with the resolution */
             return js_promise_resolvefn_settle(ctx, s, resolution, false);
-        /* THE ADOPT ARM, AND WHAT IS MISSING IS NOT A STEP OF THIS ALGORITHM — IT IS THE CALL AT THE END OF
-           IT. Steps 2.j-2.l are three lines this machine could write today; §27.5.2.2's job then hands `then`
-           this promise's ONLY resolving functions, and calling an unknown mints a derived unknown for the
-           RESULT and models no effect on the arguments at all (solver/concolic.c's concolic_call is where the
-           result is minted and where that absence lives). So the capability this arm needs sits one level
-           below the promise: a fork over what an unknown CALLEE does with a capability it was handed. */
-        DFAIL("27.5.1.3 CreateResolvingFunctions ( toResolve ) reached its ADOPT arm — step 2.i answered "
-              "IsCallable TRUE for the `then` of an unknown resolution, so steps 2.j-2.l would enqueue "
-              "§27.5.2.2 NewPromiseResolveThenableJob, which hands `then` this promise's only resolving "
-              "functions. Calling an unknown mints an unknown for the RESULT and invokes NEITHER function, so "
-              "writing those three lines now would leave the promise pending for ever: no fulfilment, no "
-              "rejection, no error and no parked flow, which is a frontier that drains reporting a complete "
-              "run. WHAT THE NEXT DIFF BUILDS is the fork over what an unknown CALLEE does with a capability "
-              "it was handed — three completions, not two: resolve called with an unknown, reject called with "
-              "an unknown (which is also where a THROWING `then` lands, since §27.5.2.2 rejects with the "
-              "thrown value rather than propagating it), and the world where it calls neither and the promise "
-              "stays pending. concolic.c's concolic_call is where the call's result is minted and where the "
-              "effect on its arguments is modelled by nothing; the fork belongs on the JOB, because "
-              "§27.5.2.2's own Note requires the `then` call to happen as a job and the ordering is "
-              "observable");
-        /* RELEASE ONLY, AND IT IS A VISIBLE FAILURE RATHER THAN A MODEL. With the assert compiled out there
-           is no correct answer available — this world's settlement is exactly what is not built — and the two
-           wrong ones are not equally wrong: falling through would fulfil with `undefined`, which is a
-           fabricated success the page cannot tell from a real one, and enqueuing the uncallable job would
-           leave the promise pending with nothing anywhere to say so. A TypeError REJECTION is neither: it
-           settles, so no flow and no reaction is left hanging, and it names itself, so a page's own `catch`
-           sees a failure instead of a value nothing computed. */
+        /* THE ADOPT ARM, WHICH ADVANCES A STAGE RATHER THAN ASKING ITS OWN QUESTION HERE. Both asks are over
+           the SAME operand and neither is ever outstanding while the other is, which is the condition under
+           which two asks may share a stage — and sharing one would still be wrong, for the reason
+           step_fork_answered_stage states in its own words: a resume point is a STAGE, and the sibling's
+           snapshot is taken AT the ask, so a sibling of the SECOND ask re-enters at the top of the stage,
+           meets the FIRST ask holding the second's answer, and files one question's world as the other's. The
+           ask key catches that (the two spell different operations, deliberately), but a crash is not the
+           design; a stage of its own is, and this handoff is the one PRF_HEAD already makes to this stage. */
+        m->hdr.stage = PRF_ADOPT;
+        return JS_STEP_YIELD;   /* "I have more work; re-enter me" — see the stage below */
+    }
+    if (m->hdr.stage == PRF_ADOPT) {
+        /* §27.5.2.2's JOB OVER A `then` THIS ENGINE CANNOT CALL — steps 2.j-2.l with the CALL at the end of
+           them replaced by a fork over what it does. That job's step 1.b calls `then`, and calling an unknown
+           mints a derived unknown for the RESULT while modelling no effect on the arguments at all
+           (solver/concolic.c's concolic_call is where the result is minted and where that absence lives), so
+           the two capabilities it was handed would be invoked by nothing and this promise would settle NEVER.
+           The capability that world needs sits one level below the promise — what an unknown CALLEE does with
+           a capability it was handed — and it is an OUTCOME FORK rather than a model of the callee, asked
+           where a resume point exists and answered per flow like every other undetermined completion.
+           2.h IS NOT SKIPPED, IT IS ANSWERED BY THE ASK ABOVE. `thenAction` is `Get(resolution, "then")` and
+           this machine reaches here only where that read has no value to be performed on — the exotic [[Get]]
+           answers a CALLABLE unknown for every name, which is the defect the head of this machine exists to
+           avoid — so what 2.i needs of it is its CALLABILITY, and that is exactly what the thenable ask's arm
+           1 states. Reading it anyway, to hand a value to a job that will not call it, would be asking the
+           representation the question the fork just answered.
+           `real` IS UNSTATED HERE FOR THE STAGE ABOVE'S REASON AND ONE MORE OF ITS OWN: there is no example to
+           run the operation on, and the operation is not one this engine could run on an example anyway —
+           what a callee does with a capability is the page's, not a codec's. */
+        JSValueConst resolution = step_arg(&m->hdr, 0);
+        int adopt, ar;
+
+        JS_FreeValue(ctx, cb_result);
+        DCHECK(!is_reject,
+               "27.5.1.3's rejectSteps reached §27.5.2.2's adopt fork — steps 4.a-4.e hold no `then` read at "
+               "all, so a reject function standing here is one algorithm's stage reached through the other's "
+               "class");
+        DCHECK(s != NULL,
+               "a promise resolving function reached §27.5.2.2's adopt fork with no function data — this "
+               "machine holds a reference to the function object for as long as it runs, so the data cannot "
+               "have been finalized under it");
+        DCHECK(js_value_is_concolic(resolution),
+               "§27.5.2.2's adopt fork was reached for a resolution that is not unknown input — only the "
+               "thenable ask's arm 1 routes here, and that ask is asked of an unknown carrying no example");
+        DCHECK(JS_IsUndefined(m->cb[0]) && JS_IsUndefined(m->cb[1]),
+               "§27.5.2.2's adopt fork was reached with step 2.f's operands already on the machine — the "
+               "sibling's snapshot is taken AT the ask, so anything owned here is owned by two flows");
+        ar = step_fork_run(ctx, &m->hdr, resolution, PRF_ADOPT_OP, 3, JS_OUTCOME_REAL_UNSTATED, &adopt);
+        if (ar) return ar;
+        /* THE PENDING WORLD ENQUEUES NOTHING, AND THAT IS THE WHOLE OF STEPS 2.j-2.l IN IT. The job those
+           steps make is observable only through what its step 1.b call SETTLES, and in this completion
+           that call settles nothing — so a job carrying "settle nothing" and no job at all are the same
+           program, and the second is the one that does not pretend to have work.
+           NOTHING IS DROPPED AND THIS IS NOT THE RAZOR'S CASE. The machine completes normally, the latch
+           taken at step 2.c stands, and a reaction still waiting on this promise waits for exactly the
+           reason a real one waits on `{then(){}}` — which a browser really does leave pending for ever.
+           A flow the SCHEDULER forgot is a cap; a promise the PAGE never settles is the page. */
+        if (adopt == PRF_ADOPT_PENDING)
+            return 0;
         {
-            JSValue err;
-            JS_ThrowTypeError(ctx, "promise resolving function: 27.5.1.3 step 2.j-2.l adoption of an unknown "
-                                   "thenable is not implemented");
-            err = JS_GetException(ctx);
-            js_promise_resolvefn_settle(ctx, s, err, true);
-            JS_FreeValue(ctx, err);
+            /* WHAT THE CAPABILITY IS CALLED WITH IS UNKNOWN, SO IT IS AN UNKNOWN — never a fabricated
+               `undefined`, which the page could not tell from a value something computed. It is DERIVED
+               from the thenable, so it carries that source's identity and every gate downstream of the
+               settlement still forks and every sink downstream still solves for the original source; and
+               the two arms derive under DIFFERENT names, because the value a thenable resolves with and
+               the reason it rejects with are two holes an @S candidate is injected at separately. */
+            JSValue v, kind;
+            JSValueConst args[3];
+
+            DCHECK(adopt == PRF_ADOPT_RESOLVE || adopt == PRF_ADOPT_REJECT,
+                   "§27.5.2.2's adopt fork came back on a completion this machine did not declare — the "
+                   "pending world returns above, so the only arms that reach here are the two that CALL a "
+                   "capability, and a third arriving with them would settle this promise under the other "
+                   "one's name");
+            DCHECK(g_concolic.builtin != NULL,
+                   "a host installed the concolic value class without JSConcolicHooks.builtin — the two "
+                   "are one table set by one JS_SetConcolicHooks call, so §27.5.2.2's adopt arm could not "
+                   "derive the value its unknown thenable settles with and would settle this promise with "
+                   "a value that is not one");
+            v = js_concolic_derive(ctx, resolution,
+                                   adopt == PRF_ADOPT_REJECT ? "thenable.reject" : "thenable.resolve",
+                                   JS_UNDEFINED);
+            kind = JS_NewBool(ctx, adopt == PRF_ADOPT_REJECT);
+            args[0] = s->promise;
+            args[1] = v;
+            args[2] = kind;
+            JS_EnqueueJob(ctx, js_promise_unknown_thenable_job, 3, args);   /* steps 2.j-2.l */
+            JS_FreeValue(ctx, v);
             return 0;
         }
     }
@@ -108746,20 +108884,28 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
                parked, and the frontier drains reporting a clean run. The read above is performed on the value
                the run observed precisely so this cannot arise from the resolution itself; it stays asserted
                because a page's own `then` GETTER over unknown state can still answer one, and because the next
-               builtin that resolves a promise with an unknown must meet this line rather than this symptom. */
+               builtin that resolves a promise with an unknown must meet this line rather than this symptom.
+               THE FORK THIS USED TO ASK FOR EXISTS — see PRF_ADOPT_OP one stage up — so what is left here is a
+               ROUTE and not a mechanism, and the assert says so rather than sending the next reader to build a
+               thing the file already has. */
             DCHECK(!js_value_is_concolic(then),
                    "27.5.1.3 step 2.i answered IsCallable TRUE for a `then` that is the solver's unknown — "
                    "§27.5.2.2 NewPromiseResolveThenableJob would hand this promise's only resolving functions "
                    "to a callee that answers with another unknown and invokes neither, so the promise settles "
                    "NEVER: no rejection, no error, no parked flow, and a frontier that drains reporting a "
-                   "complete run. Build the call of an unknown thenable as a fork over its THREE completions "
-                   "rather than letting the adopt arm stand: resolve called with an unknown, reject called "
-                   "with an unknown, and the world where it calls neither. (This said TWO until the same "
-                   "fork was needed one stage up at PRF_THENABLE, where the completions had to be enumerated "
-                   "to be built. Two is what you count by reading §27.5.2.2's job, which has a normal arm and "
-                   "an abrupt arm; the abrupt arm is REJECTION, so the never-settling world — an ordinary "
-                   "`{then(){}}`, which a browser really does leave pending — is a third completion that the "
-                   "job's own two arms do not name. A two-way fork here would delete it.)");
+                   "complete run. THE FORK IS BUILT AND THIS ENTRY IS NOT ROUTED TO IT: PRF_THENABLE asks "
+                   "PRF_ADOPT_OP over three completions and enqueues js_promise_unknown_thenable_job, and "
+                   "everything that arm does is available here — the settled promise is `s->promise` and the "
+                   "derivation's operand is `resolution`, which is cb[1] and is named by this machine's "
+                   "visit. WHAT THE NEXT DIFF BUILDS is this stage's own re-entry shape for that ask, which "
+                   "is the one thing PRF_THENABLE did not need: `then` arrives as cb_result and is a LOCAL, "
+                   "so a fork asked here parks and comes back with the driver's filler in its place — release "
+                   "it BEFORE the ask and take the fork-answered entry apart from the request-answered one "
+                   "the way isPrototypeOf's walk does (`if (h->fork_phase != FORK_PH_ANSWERED)`), or the "
+                   "sibling re-enters, reads the filler as a non-callable thenAction and fulfils down step "
+                   "2.i's false arm — a wrong settlement, not a crash. ITS ABSENCE SHOWS as this abort on a "
+                   "page whose own `then` getter answers out of unknown state, which is a different entry "
+                   "from the one PRF_THENABLE covers and is why the two did not close together");
             args[0] = s->promise;
             args[1] = resolution;
             args[2] = then;
@@ -108787,7 +108933,8 @@ static const JSTrampStepDef js_promise_resolvefn_def = {
     /* body, body_proto, body_magic, precheck, midcheck, onerror */ {NULL}, 0, 0, NULL, NULL, NULL,
     .catches_abrupt = 1   /* step 2.g: a throwing `then` read REJECTS, it does not propagate */,
     .visit = js_promise_resolvefn_visit,
-    .algorithm = "27.5.1.3 CreateResolvingFunctions ( toResolve ) -- its rejectSteps / resolveSteps closures",
+    .algorithm = "27.5.1.3 CreateResolvingFunctions ( toResolve ) -- its rejectSteps / resolveSteps closures, "
+                 "and 27.5.2.2 NewPromiseResolveThenableJob's own decision for a `then` that cannot be called",
     .steps = js_promise_resolvefn_steps
 };
 
