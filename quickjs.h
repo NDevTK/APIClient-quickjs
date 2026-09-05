@@ -532,10 +532,23 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 #define JS_EVAL_TYPE_MASK     (3 << 0)
 
 #define JS_EVAL_FLAG_STRICT   (1 << 3) /* force 'strict' mode */
-/* INTERNAL: the source is the FUNCTION CONSTRUCTOR's body, not an eval. It compiles as an indirect eval and
-   is not one: `new Function("...")` creates a function whose code has no eval origin, and CallSite#isEval
-   must say so. The bit was `JS_EVAL_FLAG_UNUSED` and now says which of the two callers of indirect eval this
-   is — the only thing that can tell them apart, since everything else about the two calls is identical. */
+/* INTERNAL: PARSE THE WHOLE SOURCE AS ONE PARENTHESISED FunctionExpression, PINNED TO END OF INPUT — see
+   js_parse_fn_ctor_source. It has exactly two consumers and they are different questions, so read the one you
+   are asking for:
+     (1) THE PARSE. `s->fn_ctor_toplevel` routes the top-level parse to that entry, which is what §20.2.1.1.1
+   CreateDynamicFunction step 23's goal-symbol parse needs and what HTML §8.1.8.1 "Event handlers" step 3.7
+   needs to decide whether a handler body is parsable as a FunctionBody alone. Without it a Script parse
+   accepts a body that CLOSES the wrapper and the engine runs what follows.
+     (2) EVAL ORIGIN. `fd->from_eval` is `(eval_type == DIRECT || INDIRECT) && !FUNCTION_CTOR`: the source is
+   the FUNCTION CONSTRUCTOR's body, not an eval — `new Function("...")` creates a function whose code has no
+   eval origin, and CallSite#isEval must say so. The bit was `JS_EVAL_FLAG_UNUSED` and got its name from this
+   half, which is why the name says nothing about (1).
+     AT JS_EVAL_TYPE_GLOBAL, (2) IS ALREADY DECIDED BY THE TYPE — from_eval is false there whatever this flag
+   says — so a GLOBAL compile carrying this flag is asking for the pin and for nothing else. That is what makes
+   it usable by an algorithm that is neither an eval nor the Function constructor, without claiming to be one.
+   THIS COMMENT USED TO OPEN "the source is the FUNCTION CONSTRUCTOR's body, not an eval" and stop there, which
+   was true of the only caller there was and hid (1) entirely — an under-claim, so the reader who needed the
+   pin was told there was nothing here for them. */
 #define JS_EVAL_FLAG_FUNCTION_CTOR (1 << 4)
 /* compile but do not run. The result is an object with a
    JS_TAG_FUNCTION_BYTECODE or JS_TAG_MODULE tag. It can be executed

@@ -73056,6 +73056,12 @@ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
    FunctionExpression (step 2.2, and the corresponding step of each of the three other kinds), and §11.1.6
    Static Semantics: ParseText attempts "to parse sourceText using goalSymbol as the goal symbol", so the WHOLE
    text must be one FunctionExpression.
+     IT IS NOT ONLY 20.2.1.1.1'S ANY MORE. HTML §8.1.8.1 "Event handlers" step 3.7 asks whether a handler's
+   body "is not parsable as FunctionBody or if parsing detects an early error", and that is the same question
+   asked of the same shape — the body with step 3.9's parameterList, wrapped and pinned — so the host reaches
+   this entry through JS_EVAL_FLAG_FUNCTION_CTOR at JS_EVAL_TYPE_GLOBAL, where the flag's other consumer
+   (fd->from_eval) is already false and the pin is therefore the whole of what it selects. Nothing about this
+   function is specific to the Function constructor; what it owns is the end of input.
      WHY THIS IS A PRODUCTION AND NOT A PROGRAM PARSE. A Script's body is a StatementList, so a program parse
    of the synthesized `(function anonymous(P\n) {\nB\n})` accepts a B that CLOSES the wrapper: `}); f(); ({`
    makes the text three source elements — a function expression, a call, an object literal — every one of
@@ -73105,9 +73111,14 @@ static __exception int js_parse_fn_ctor_source(JSParseState *s)
        and the `*` before the name — so the prefix steps 2-5 chose needs no second spelling here, and a kind
        added to that switch cannot go missing from this one. */
     DCHECK(s->token.val == TOK_FUNCTION || token_is_pseudo_keyword(s, JS_ATOM_async),
-           "20.2.1.1.1's synthesized source does not begin `(function` or `(async function` — js_dynfunc_source "
-           "writes the prefix steps 2-5 chose and JS_EVAL_FLAG_FUNCTION_CTOR reaches this parse from nowhere "
-           "else, so a third spelling means a second producer of this source now exists");
+           "a source asking for the end-of-input FunctionExpression pin does not begin `(function` or "
+           "`(async function` — 20.2.1.1.1's is written by js_dynfunc_source from the prefix steps 2-5 chose, "
+           "and HTML §8.1.8.1 \"Event handlers\" step 3.7 asks for the same pin over `(function (event) {…})` "
+           "to decide whether a handler's body is parsable as a FunctionBody ALONE. THIS USED TO SAY "
+           "JS_EVAL_FLAG_FUNCTION_CTOR \"reaches this parse from nowhere else, so a third spelling means a "
+           "second producer of this source now exists\": there IS a second producer, it is not the Function "
+           "constructor, and the assertion was never about who wrote the text — it is about the SPELLING, "
+           "because everything this entry does after here assumes a parenthesised function expression");
     emit_source_loc(s);   /* the ExpressionStatement path this replaces emitted one here */
     if (js_parse_descent_at(s, PDS_FDECL, JS_PARSE_FUNC_EXPR, PF_IN_ACCEPTED, JS_FUNC_NORMAL,
                             s->token.ptr, s->token.line_num, s->token.col_num))
