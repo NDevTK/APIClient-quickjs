@@ -23869,7 +23869,7 @@ static int step_defidx_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, int64
 /* CreateDataProperty(O, key, v) for a NAMED key — the sibling of step_setprop_run, and the same request
    step_defidx_run issues for an index. On a Proxy it is the `defineProperty` trap.
    `or_throw` IS the spec's own distinction, not a convenience: CreateDataPropertyOrThrow raises a TypeError when
-   [[DefineOwnProperty]] answers false, and CreateDataProperty (25.5.1.1's, InternalizeJSONProperty) YIELDS that
+   [[DefineOwnProperty]] answers false, and CreateDataProperty (§25.5.2.4's, InternalizeJSONProperty) YIELDS that
    false and carries on. A trap returning false is what tells the two apart, so the caller names which one the
    step it is implementing says.
      0 = done, 10 = the caller must return that step code, -1 = threw.
@@ -23910,7 +23910,7 @@ static int step_defprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
     return 0;
 }
 
-/* The BARE `O.[[Delete]](key)` for a NAMED key — 25.5.1.1's, which yields its boolean rather than throwing on
+/* The BARE `O.[[Delete]](key)` for a NAMED key — §25.5.2.4's, which yields its boolean rather than throwing on
    false, so it is request 15 and not the DeletePropertyOrThrow step_delidx_run issues. On a Proxy it is the
    `deleteProperty` trap.
      0 = done, 15 = the caller must return that step code. */
@@ -23928,7 +23928,7 @@ static int step_delprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSAt
         return 15;
     }
     if (step_keyed_abrupt(ctx, h, in)) return -1;   /* a throwing `deleteProperty` trap */
-    JS_FreeValue(ctx, in);                  /* the boolean [[Delete]] answered is 25.5.1.1's to discard */
+    JS_FreeValue(ctx, in);                  /* the boolean [[Delete]] answered is §25.5.2.4's to discard */
     return 0;
 }
 
@@ -53788,9 +53788,9 @@ typedef struct JSJsonReviver {
     JSValue result;                 /* final revived value */
     JSValue cb_args[5];             /* [holder(this), reviver, name_val, val, context]; call_argv=&cb_args[2], argc=3 */
     JSValue *ek_cb; int ek_argc;    /* the key walk's request buffer, relayed to the driver unchanged */
-    JSValue text_str;               /* 25.5.1 step 1's ? ToString(text), held across the parse (owned) */
+    JSValue text_str;               /* §25.5.2 step 1's ? ToString(text), held across the parse (owned) */
     /* THE UNKNOWN TEXT THIS RUN IS THE PARSE ARM OF (owned), JS_UNDEFINED for an ordinary JSON.parse. Held
-       because the whole algorithm's completion is DERIVED FROM IT: the value 25.5.1 produces here is what the
+       because the whole algorithm's completion is DERIVED FROM IT: the value §25.5.2 produces here is what the
        real codec made of this source's EXAMPLE, and the value the page receives is that example carried by an
        unknown with this source's identity — so a later branch still forks and a later sink still solves for
        `location.hash` rather than for a string that happened to be lying around. */
@@ -101611,7 +101611,7 @@ static JSONParseRecord *jr_child_pr(JSContext *ctx, JSONParseRecord *holder_pr, 
    park. internalize_json_property — the recursive C walker that called the reviver through JS_Call — is
    deleted, so there is one walk, not two.
 
-   25.5.1 steps 2-3: START the parse. The tokenizer (jps) and the frame stack (jp) live ON THE MACHINE from here
+   §25.5.2 steps 2-3: START the parse. The tokenizer (jps) and the frame stack (jp) live ON THE MACHINE from here
    until js_json_parse_finish or js_json_parse_abandon, which is the whole point: every completed value in
    between is a place the flow can park with its position in the text intact. */
 
@@ -101754,18 +101754,29 @@ static const char *const js_json_parse_steps[] = { JSONPARSE_STAGES(JS_STEP_STAG
 static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]);
 static void js_json_reviver_visit(JSContext *ctx, void *st, JSStepVisit *v);
 
-/* CAN A JSON TEXT BEGIN WITH THIS CHARACTER? 25.5.1's grammar is `JSONText : JSONValue` with insignificant
-   whitespace either side, so the first character is whitespace or the first character of a value. 0 means the
-   domain guarantees nothing about it, and then every completion stays open.
+/* CAN A JSON TEXT BEGIN WITH THIS CHARACTER? What a JSON text IS is no longer ECMAScript's to say:
+   ECMAScript §25.5.2.1 "ParseJSON ( text )" step 1 hands the whole question to another standard — "If
+   StringToCodePoints(text) is not a valid JSON text as specified in ECMA-404, throw a SyntaxError
+   exception" — and ECMA-404 allows whitespace either side of the single value a text is, so the first
+   character is whitespace or the first character of a value. 0 means the domain guarantees nothing about
+   it, and then every completion stays open.
    The EMPTY string is not a JSON text either, which is what lets a DECLARED PREFIX answer for the whole domain
    rather than only for the values that carry it: `location.hash` is "" or "#" followed by the fragment, and
-   neither of those is a JSON text. */
+   neither of those is a JSON text.
+
+   THIS NUMBER'S RETIREMENT IS NOT A RENUMBER, WHICH IS WHY IT IS RECORDED SEPARATELY FROM THE ONE AT
+   JP_OUTCOME. It stood as `25.5.1's grammar`, naming a production `JSONText : JSONValue`. ECMAScript no
+   longer states that grammar ANYWHERE — the clause has no JSON grammar section and the word
+   "insignificant" does not occur in it — so the rule did not move to a new number here, it left the
+   standard, and the citation had to be re-aimed at the step that DELEGATES rather than at a section that
+   restates. ECMA-404 is a standard this tree indexes no corpus for, so nothing here can check a section
+   number in it and none is written. Read off the standard's text rather than recalled. */
 static bool json_text_may_start_with(int c)
 {
     if (c == 0)
         return true;
     switch (c) {
-    case ' ': case '\t': case '\n': case '\r':      /* 25.5.1's insignificant whitespace */
+    case ' ': case '\t': case '\n': case '\r':      /* ECMA-404's whitespace, either side of the value */
     case '{': case '[': case '"': case '-':
     case '0': case '1': case '2': case '3': case '4':
     case '5': case '6': case '7': case '8': case '9':
@@ -102024,7 +102035,7 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
             } else {
                 JS_FreeValue(ctx, example);
                 if (JS_IsFunction(ctx, step_arg(&s->hdr, 1)))
-                    DFAIL("JSON.parse over unknown text WITH a reviver and no example to parse — 25.5.1 step 9 "
+                    DFAIL("JSON.parse over unknown text WITH a reviver and no example to parse — §25.5.2 step 9 "
                           "calls the reviver once per node of a structure this arm does not have, so its calls "
                           "and their side effects would silently not happen; build the unknown-structure walk");
                 s->early = 1;   /* nothing to parse and no walk: the completion is the derived unknown */
@@ -102033,7 +102044,7 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         }
     }
     if (s->hdr.stage == JP_TOSTRING) {
-        /* 25.5.1 step 1: `? ToString(text)`. JS_ToCStringLen ran it from C, so `JSON.parse({toString(){…}})` had
+        /* §25.5.2 step 1: `? ToString(text)`. JS_ToCStringLen ran it from C, so `JSON.parse({toString(){…}})` had
            its toString driven with no flow base. */
         r = step_tostring_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->text_str, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
@@ -102066,7 +102077,7 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
                 JS_FreeValue(ctx, JS_GetException(ctx));
                 if (!s->early)
                     DFAIL("JSON.parse over unknown text WITH a reviver whose example is not a JSON text — the "
-                          "parse arm has no structure for 25.5.1 step 9 to walk, so the reviver's calls and "
+                          "parse arm has no structure for §25.5.2 step 9 to walk, so the reviver's calls and "
                           "their side effects would silently not happen; build the unknown-structure walk");
                 JS_FreeValue(ctx, s->text_str);
                 s->text_str = JS_UNDEFINED;
@@ -102092,9 +102103,10 @@ static int js_json_parse_vstep(JSContext *ctx, void *st, JSValue cb_result, JSVa
         if (r == 0) return 0;
     }
     if (r == 5 || r == 6 || r == 10 || r == 11 || r == 12 || r == 15) {
-        /* an operation the walk owes: 25.5.1.1's `Get(holder, P)`, LengthOfArrayLike's read and its ToLength, the
-           apply's CreateDataProperty or bare [[Delete]], or the enumerable-key cursor's [[OwnPropertyKeys]] /
-           [[GetOwnProperty]]. The machine relays the requester's own buffer, which holds the operands across the
+        /* an operation the walk owes: §25.5.2.4's `Get(holder, name)`, LengthOfArrayLike's read and its
+           ToLength, the apply's CreateDataProperty or bare [[Delete]], or the enumerable-key cursor's
+           [[OwnPropertyKeys]] / [[GetOwnProperty]]. The machine relays the requester's own buffer, which
+           holds the operands across the
            request. Every code the walk can produce is listed, and one it cannot answer for falls through to the
            reviver CALL below with an undefined callee — so the list is asserted rather than assumed. */
         *out_cb = s->ek_cb; *out_argc = s->ek_argc;
@@ -102112,7 +102124,7 @@ static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
 {
     JSJsonReviver *s = st;
     /* TAKEN BEFORE THE DISCHARGE, which is what frees this field. The derivation below is the last thing
-       25.5.1 does on this arm and it needs the source that named it. */
+       §25.5.2 does on this arm and it needs the source that named it. */
     JSValue unknown = s->unknown;
     JSValue r;
     s->unknown = JS_UNDEFINED;
@@ -102141,7 +102153,19 @@ static JSValue js_json_parse_vfini(JSContext *ctx, void *st, bool take_result)
 }
 
 /* Drive the DFS until the next reviver call is needed (return 1, out_args=[name,val,context]) or done (0).
-   `res` (owned) is the reviver's result for the just-completed node, or JS_UNDEFINED on the first call. */
+   `res` (owned) is the reviver's result for the just-completed node, or JS_UNDEFINED on the first call.
+
+   THE SUB-STEP NUMBERS IN THIS WALK MOVED WITH THE SECTION, AND NOT BY THE SAME OFFSET AS THE SECTION.
+   Every `25.5.1.1` here named InternalizeJSONProperty, which is
+   ECMAScript §25.5.2.4 "InternalizeJSONProperty ( holder, name, reviver, parseRecord )". Renumbering the
+   SECTION and keeping the
+   sub-numbers would have certified four wrong ones: the object arm's key read was `3.c` and is `5.c.i`, the
+   array arm's length read was `2.b.i` and is `5.b.ii`, and the write-back pair was `2.b.ii.3/4` and
+   `2.c.ii.2/3` and is `5.b.iv.4.a/5.a` and `5.c.ii.3.a/4.a` — the algorithm gained a parse-record arm ahead
+   of the object test, so what was step 2 is step 5. Only `step 1`, the `Get`, is where it was. The
+   OPERANDS were renamed with it (`val`/`P` are now `value`/`name`/`propertyKey`), and so was the operation
+   the key read calls: EnumerableOwnPropertyNames is now §7.3.23 EnumerableOwnProperties ( obj, kind ).
+   Counted against the section's own list with nesting depth tracked, not by a flat count of items. */
 static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, JSValueConst out_args[3]) {
     if (s->sp > 0 && s->stack[s->sp - 1].phase == 3) {
         /* the enumerable-key walk is in flight: `res` is the last request's answer, not a reviver result. */
@@ -102150,8 +102174,8 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
         int r = js_enum_keys_run(ctx, &s->hdr, f->ek, res, &ekcb, &ekargc);
         if (r > 0) { s->ek_cb = ekcb; s->ek_argc = ekargc; return r; }
         if (r < 0) return -1;
-        /* the survivors become the frame's key list; the cursor's allocation is handed over whole. 25.5.1.1
-           step 3.c is EnumerableOwnPropertyNames, so the non-enumerable ones go first. */
+        /* the survivors become the frame's key list; the cursor's allocation is handed over whole. §25.5.2.4
+           step 5.c.i is EnumerableOwnProperties, so the non-enumerable ones go first. */
         js_enum_keys_keep_enumerable(ctx, f->ek);
         f->atoms = f->ek->atoms; f->len = f->ek->kept;
         f->ek->atoms = NULL; f->ek->len = 0;
@@ -102175,9 +102199,10 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
         s->sp--;
         if (s->sp == 0) { JS_FreeAtom(ctx, fname); s->result = res; return 0; }   /* root: done */
         {
-            /* 25.5.1.1 steps 2.b.ii.3/4 (and 2.c.ii.2/3): `? val.[[Delete]](P)` or
-               `? CreateDataProperty(val, P, newElement)`. Both are the page's code the moment `val` is a Proxy or
-               carries a non-configurable/non-writable property — and a reviver runs BOTTOM-UP with `this` bound to
+            /* §25.5.2.4 steps 5.b.iv.4.a/5.a (and 5.c.ii.3.a/4.a): `? value.[[Delete]](propertyKey)` or
+               `? CreateDataProperty(value, propertyKey, newElement)`. Both are the page's code the moment
+               `value` is a Proxy or carries a non-configurable/non-writable property — and a reviver runs
+               BOTTOM-UP with `this` bound to
                the holder, so it can plant a proxy on the very object its parent is about to write back into.
                JS_DeleteProperty / JS_DefinePropertyValue ran both from C. The apply is now a parked
                sub-sequence, and the frame owns the operands across it because the machine's C locals are gone
@@ -102219,7 +102244,7 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
         DCHECK(s->sp <= s->cap && f->phase <= JR_PHASE_MAX, "s->sp <= s->cap && f->phase <= JR_PHASE_MAX");
         DCHECK(f->phase == 0 || f->phase == 4 || f->i <= f->len, "f->phase == 0 || f->phase == 4 || f->i <= f->len");
         if (f->phase == 0) {
-            /* 25.5.1.1 step 1: `Let val be ? Get(holder, P)`. The holder is parser-built at the root, but a
+            /* §25.5.2.4 step 1: `Let value be ? Get(holder, name)`. The holder is parser-built at the root, but a
                reviver returns arbitrary values into it, so by the time a deeper frame reads one the holder can be
                a Proxy — its `get` trap, run from C by JS_GetProperty with no flow base. A request now, parked in
                phase 4. */
@@ -102238,8 +102263,9 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
                 f->is_array = js_is_array(ctx, f->val);
                 if (f->is_array < 0) return -1;
                 if (f->is_array) {
-                    /* 25.5.1.1 step 2.b.i: `? LengthOfArrayLike(val)`, which is `? ToLength(? Get(val, "length"))`.
-                       js_get_length32 ran BOTH halves from C — the read is a Proxy `get` trap or an accessor, and
+                    /* §25.5.2.4 step 5.b.ii: `? LengthOfArrayLike(value)`, which is
+                       `? ToLength(? Get(value, "length"))`. js_get_length32 ran BOTH halves from C — the read
+                       is a Proxy `get` trap or an accessor, and
                        the ToLength coerces whatever it produced — and it truncated to 32 bits where ToLength
                        reaches 2^53-1. The shared sub-sequence performs both. */
                     f->phase = 6;
@@ -102247,7 +102273,7 @@ static int js_json_reviver_step(JSContext *ctx, JSJsonReviver *s, JSValue res, J
                     goto array_len;
                 }
                 else {
-                    /* 25.5.1.1 step 3.c: `? EnumerableOwnPropertyNames(val, key)`. It was JS_GPN_ENUM_ONLY from
+                    /* §25.5.2.4 step 5.c.i: `? EnumerableOwnProperties(value, key)`. It was JS_GPN_ENUM_ONLY from
                        C, which runs a Proxy's `ownKeys` and per-key `getOwnPropertyDescriptor` traps with no flow
                        base — reachable, because a reviver runs bottom-up with `this` bound to the holder and can
                        plant a proxy on a sibling key this walk has not reached yet. It is the shared cursor now:
