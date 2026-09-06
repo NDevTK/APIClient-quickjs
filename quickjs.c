@@ -23365,6 +23365,7 @@ JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which)
     switch (which) {
     case JS_WKS_ASYNC_ITERATOR: return JS_ATOM_Symbol_asyncIterator;
     case JS_WKS_TO_STRING_TAG: return JS_ATOM_Symbol_toStringTag;
+    case JS_WKS_UNSCOPABLES: return JS_ATOM_Symbol_unscopables;
     default:
         DCHECK(which == JS_WKS_ITERATOR, "a well-known symbol was asked for by a name this engine does not map");
         return JS_ATOM_Symbol_iterator;
@@ -47992,20 +47993,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (!JS_ToBoolFree(ctx, ret_val)) { ret_val = JS_UNDEFINED; goto with_absent; }
                     ret_val = JS_UNDEFINED;
                     if (!wh->is_with) goto with_resolved;
-                    /* 9.1.1.2.1 step 3: Get(bindingObject, @@unscopables). */
+                    /* 9.1.1.2.1 step 5: "Let unscopables be ? Get(bindingObj, %Symbol.unscopables%)."
+                       THESE FOUR NUMBERS READ 3, 3.b, 3.c AND 3.d, AND STEP 3 IS "If foundBinding is false,
+                       return false" — which has no sub-list at all, so a reader looking for 3.b found a step
+                       whose letters do not exist and could not tell a renumbering from a typo. Step 2's number
+                       above is right and always was, which is why the cluster survived: the drift starts at the
+                       SECOND member, and a spot-check reads the first. Corrected rather than deleted, because
+                       the shift is what a reader re-deriving from the neighbouring 2 would re-introduce. */
                     wh->phase = WH_UNSCOP_ARR;
                     gp_obj = obj; gp_atom = JS_ATOM_Symbol_unscopables; gp_op = GP_GET;
                     goto with_request;
                 case WH_UNSCOP_ARR:
                     wh->arr = ret_val; ret_val = JS_UNDEFINED;
-                    if (!JS_IsObject(wh->arr)) goto with_resolved;   /* step 3.b: not an object, nothing blocked */
-                    /* step 3.c: Get(unscopables, N). */
+                    /* step 6's condition failing — "If unscopables is an Object" is not met, so the algorithm
+                       falls straight to step 7's "Return true" and nothing is blocked. */
+                    if (!JS_IsObject(wh->arr)) goto with_resolved;
+                    /* step 6.a: "Let blocked be ToBoolean(? Get(unscopables, name))." */
                     wh->phase = WH_UNSCOP_KEY;
                     gp_obj = wh->arr; gp_atom = atom; gp_op = GP_GET;
                     goto with_request;
                 case WH_UNSCOP_KEY:
                     ret = JS_ToBoolFree(ctx, ret_val); ret_val = JS_UNDEFINED;
-                    if (ret) goto with_absent;   /* step 3.d: blocked, so the reference falls through */
+                    /* step 6.b: "If blocked is true, return false" — so the reference falls through to the
+                       enclosing scope, which is the whole observable Web IDL §3.3.14 [Unscopable] buys. */
+                    if (ret) goto with_absent;
                     goto with_resolved;
                 case WH_HAS2:
                     /* GetBindingValue 9.1.1.2.6 step 2 / SetMutableBinding 9.1.1.2.5 step 2 answered. It is a

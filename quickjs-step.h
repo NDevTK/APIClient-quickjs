@@ -1050,11 +1050,18 @@ JS_EXTERN int step_construct_run(JSContext *ctx, uint8_t *phase, JSValue *cb, in
    spec picks the sequence arm when the init is ITERABLE, and without this the closest available test was
    JS_IsArray, which is narrower — `new Headers(new Map(...))` is iterable, is not an array, and would have
    taken the record arm and produced an EMPTY header list. These are permanent atoms, so the answer needs
-   neither a dup nor a free. */
+   neither a dup nor a free.
+   @@unscopables is here for the same reason one step further out: it is a property key a host DEFINES rather
+   than reads, and Web IDL §3.7.3 Interface prototype object makes every interface that declares a
+   §3.3.14 [Unscopable] member define one on its prototype ("Perform ! DefinePropertyOrThrow(interfaceProtoObj,
+   %Symbol.unscopables%, desc)"). The engine already implements the READ side — 9.1.1.2.1 HasBinding's
+   `Get(bindingObject, @@unscopables)` is what makes a `with` statement skip the name — so without this the
+   host could build the object and had no way to name the key it goes under. */
 typedef enum {
     JS_WKS_ITERATOR = 0,
     JS_WKS_ASYNC_ITERATOR,
     JS_WKS_TO_STRING_TAG,
+    JS_WKS_UNSCOPABLES,
 } JSWellKnownSymbol;
 JS_EXTERN JSAtom JS_WellKnownSymbolAtom(JSWellKnownSymbol which);
 
