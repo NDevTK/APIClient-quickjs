@@ -1147,7 +1147,12 @@ JS_EXTERN JSValue JS_GetIteratorPrototype(JSContext *ctx);
    hand. Dup'd. */
 JS_EXTERN JSValue JS_GetAsyncIteratorPrototype(JSContext *ctx);
 
-/* 27.1.4.1 CreateAsyncFromSyncIterator — the ONE step of GetIterator(obj, ASYNC) a host cannot perform itself.
+/* ECMAScript §27.1.5.1 "CreateAsyncFromSyncIterator ( syncIteratorRecord )" — the ONE step of
+   GetIterator(obj, ASYNC) a host cannot perform itself. §27.1.4.1 stood here and is
+   "%AsyncIteratorPrototype% [ %Symbol.asyncDispose% ] ( )", a different operation entirely. The DEFINITION
+   of the function declared below carried the right number the whole time, so one operation's declaration
+   and definition disagreed inside one repository — a pair no instrument compares, because each half is
+   correct-looking alone and nothing makes a reader open the other.
    The @@asyncIterator read, the fallback @@iterator read and the method call are all requests this header
    already exports; the wrapper is an intrinsic whose `next` awaits the sync result's VALUE, which is what makes
    an iterable of promises yield what they resolve to. `sync_iter` and `next_method` are CONSUMED; *pnext is the
@@ -1167,8 +1172,19 @@ JS_EXTERN int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, J
                                JSValue **out_cb, int *out_argc);
 
 /* [[GetOwnProperty]] AS A REQUEST — the other half of a `record<K, V>` conversion, and the half that decides
-   whether a key counts at all. Web IDL §es-to-record step 5.1 asks for each key's DESCRIPTOR and step 5.2 keeps
-   the key only if it is present and ENUMERABLE; on a Proxy that is the page's `getOwnPropertyDescriptor` trap.
+   whether a key counts at all. Web IDL §3.2.23 "Records — record<K, V>"'s *convert a JavaScript value to
+   record* step 4.1 asks for each key's DESCRIPTOR and step 4.2 keeps the key only if it is present and
+   ENUMERABLE; on a Proxy that is the page's `getOwnPropertyDescriptor` trap. That section holds TWO
+   algorithms and the standard NAMES them, so a bare §3.2.23 step number picks neither; the host tree's
+   sibling citations of this same list write the name out, and this one had drifted from them unnoticed
+   because it cited an ANCHOR instead of a number and so shared no digits with any of them to compare.
+   THE NUMBERS `5.1` AND `5.2` STOOD HERE, and wpt's headers-record is why they survived: its own comments
+   number the descriptor read `5.1` and the [[Get]] `5.2`, so a reader checking the first digit against the
+   corroborator the sentence below names would have CONFIRMED it. The second was never even that — it stood
+   over the ENUMERABLE test, which that numbering gives no number of its own. And neither reading matches an
+   edition anyone can still fetch: in the one this tree's corpus records and in one from 2019 alike the list
+   has FIVE top-level steps with the loop at step 4. A stale number in a test corpus is not a second
+   opinion; it is the same recollection the citation was already making.
    Skipping it does not merely lose the trap — it silently includes non-enumerable properties, and wpt's
    headers-record pins the operation SEQUENCE (get @@iterator, ownKeys, then getOwnPropertyDescriptor and get per
    key), so the omission is observable as a count.
