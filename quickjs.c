@@ -31333,7 +31333,7 @@ enum { STRRECV_TRIM_START = 1, STRRECV_TRIM_END = 2, STRRECV_TRIM_BOTH = 3,
        STRRECV_SLICE, STRRECV_SUBSTR, STRRECV_REPEAT,
        STRRECV_PADSTART, STRRECV_PADEND, STRRECV_LOCALECOMPARE,
        STRRECV_TOLOWER, STRRECV_TOUPPER,
-       /* B.2.3 CreateHTML, one mode per tag: `arg` is STRRECV_HTML_BASE + the method's magic, so the thirteen
+       /* B.2.2 CreateHTML, one mode per tag: `arg` is STRRECV_HTML_BASE + the method's magic, so the thirteen
           share one machine and one body the way they shared one C function. */
        STRRECV_HTML_BASE };
 #define STRRECV_HTML_COUNT 13
@@ -87589,43 +87589,43 @@ static const JSTrampStepDef js_str_toUpper_def    = { sizeof(JSStrRecv), js_str_
 static const JSTrampStepDef js_str_html_defs[STRRECV_HTML_COUNT] = {
     [0] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 0,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.2 String.prototype.anchor", .steps = js_str_anchor_steps },
+             .algorithm = "B.2.2.2 String.prototype.anchor", .steps = js_str_anchor_steps },
     [1] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 1,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.3 String.prototype.big", .steps = js_str_big_steps },
+             .algorithm = "B.2.2.3 String.prototype.big", .steps = js_str_big_steps },
     [2] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 2,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.4 String.prototype.blink", .steps = js_str_blink_steps },
+             .algorithm = "B.2.2.4 String.prototype.blink", .steps = js_str_blink_steps },
     [3] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 3,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.5 String.prototype.bold", .steps = js_str_bold_steps },
+             .algorithm = "B.2.2.5 String.prototype.bold", .steps = js_str_bold_steps },
     [4] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 4,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.6 String.prototype.fixed", .steps = js_str_fixed_steps },
+             .algorithm = "B.2.2.6 String.prototype.fixed", .steps = js_str_fixed_steps },
     [5] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 5,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.7 String.prototype.fontcolor", .steps = js_str_fontcolor_steps },
+             .algorithm = "B.2.2.7 String.prototype.fontcolor", .steps = js_str_fontcolor_steps },
     [6] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 6,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.8 String.prototype.fontsize", .steps = js_str_fontsize_steps },
+             .algorithm = "B.2.2.8 String.prototype.fontsize", .steps = js_str_fontsize_steps },
     [7] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 7,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.9 String.prototype.italics", .steps = js_str_italics_steps },
+             .algorithm = "B.2.2.9 String.prototype.italics", .steps = js_str_italics_steps },
     [8] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 8,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.10 String.prototype.link", .steps = js_str_link_steps },
+             .algorithm = "B.2.2.10 String.prototype.link", .steps = js_str_link_steps },
     [9] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 9,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.11 String.prototype.small", .steps = js_str_small_steps },
+             .algorithm = "B.2.2.11 String.prototype.small", .steps = js_str_small_steps },
     [10] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 10,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.12 String.prototype.strike", .steps = js_str_strike_steps },
+             .algorithm = "B.2.2.12 String.prototype.strike", .steps = js_str_strike_steps },
     [11] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 11,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.13 String.prototype.sub", .steps = js_str_sub_steps },
+             .algorithm = "B.2.2.13 String.prototype.sub", .steps = js_str_sub_steps },
     [12] = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_HTML_BASE + 12,
              .visit = js_str_recv_visit,
-             .algorithm = "B.2.3.14 String.prototype.sup", .steps = js_str_sup_steps },
+             .algorithm = "B.2.2.14 String.prototype.sup", .steps = js_str_sup_steps },
 };
 #undef STR_HTML_DEF
 static const char *const js_ta_at_steps[];
@@ -95430,94 +95430,94 @@ static const char *const js_str_toUpper_steps[] = {
     NULL };
 static const char *const js_str_anchor_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.2 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.2 step 1, CreateHTML step 4.a (V is ToString(value) — the \"name\" attribute)",
+        "B.2.2.2 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.2 step 2, CreateHTML step 4.a (attrValueString is ToString(attrValue) — the \"name\" attribute)",
         SRV_NO_ARG1,
-        "B.2.3.2 step 1, CreateHTML steps 3-8 (<a> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.2 step 2, CreateHTML steps 3-8 (<a> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_big_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.3 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.3 — no step: CreateHTML step 4 does not run for <big>, which takes no attribute",
+        "B.2.2.3 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.3 — no step: CreateHTML step 4 does not run for <big>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.3 step 1, CreateHTML steps 3-8 (<big> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.3 step 2, CreateHTML steps 3-8 (<big> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_blink_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.4 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.4 — no step: CreateHTML step 4 does not run for <blink>, which takes no attribute",
+        "B.2.2.4 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.4 — no step: CreateHTML step 4 does not run for <blink>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.4 step 1, CreateHTML steps 3-8 (<blink> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.4 step 2, CreateHTML steps 3-8 (<blink> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_bold_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.5 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.5 — no step: CreateHTML step 4 does not run for <b>, which takes no attribute",
+        "B.2.2.5 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.5 — no step: CreateHTML step 4 does not run for <b>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.5 step 1, CreateHTML steps 3-8 (<b> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.5 step 2, CreateHTML steps 3-8 (<b> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_fixed_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.6 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.6 — no step: CreateHTML step 4 does not run for <tt>, which takes no attribute",
+        "B.2.2.6 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.6 — no step: CreateHTML step 4 does not run for <tt>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.6 step 1, CreateHTML steps 3-8 (<tt> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.6 step 2, CreateHTML steps 3-8 (<tt> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_fontcolor_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.7 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.7 step 1, CreateHTML step 4.a (V is ToString(value) — the \"color\" attribute)",
+        "B.2.2.7 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.7 step 2, CreateHTML step 4.a (attrValueString is ToString(attrValue) — the \"color\" attribute)",
         SRV_NO_ARG1,
-        "B.2.3.7 step 1, CreateHTML steps 3-8 (<font> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.7 step 2, CreateHTML steps 3-8 (<font> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_fontsize_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.8 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.8 step 1, CreateHTML step 4.a (V is ToString(value) — the \"size\" attribute)",
+        "B.2.2.8 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.8 step 2, CreateHTML step 4.a (attrValueString is ToString(attrValue) — the \"size\" attribute)",
         SRV_NO_ARG1,
-        "B.2.3.8 step 1, CreateHTML steps 3-8 (<font> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.8 step 2, CreateHTML steps 3-8 (<font> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_italics_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.9 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.9 — no step: CreateHTML step 4 does not run for <i>, which takes no attribute",
+        "B.2.2.9 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.9 — no step: CreateHTML step 4 does not run for <i>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.9 step 1, CreateHTML steps 3-8 (<i> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.9 step 2, CreateHTML steps 3-8 (<i> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_link_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.10 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.10 step 1, CreateHTML step 4.a (V is ToString(value) — the \"href\" attribute)",
+        "B.2.2.10 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.10 step 2, CreateHTML step 4.a (attrValueString is ToString(attrValue) — the \"href\" attribute)",
         SRV_NO_ARG1,
-        "B.2.3.10 step 1, CreateHTML steps 3-8 (<a> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.10 step 2, CreateHTML steps 3-8 (<a> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_small_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.11 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.11 — no step: CreateHTML step 4 does not run for <small>, which takes no attribute",
+        "B.2.2.11 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.11 — no step: CreateHTML step 4 does not run for <small>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.11 step 1, CreateHTML steps 3-8 (<small> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.11 step 2, CreateHTML steps 3-8 (<small> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_strike_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.12 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.12 — no step: CreateHTML step 4 does not run for <strike>, which takes no attribute",
+        "B.2.2.12 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.12 — no step: CreateHTML step 4 does not run for <strike>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.12 step 1, CreateHTML steps 3-8 (<strike> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.12 step 2, CreateHTML steps 3-8 (<strike> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_sub_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.13 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.13 — no step: CreateHTML step 4 does not run for <sub>, which takes no attribute",
+        "B.2.2.13 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.13 — no step: CreateHTML step 4 does not run for <sub>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.13 step 1, CreateHTML steps 3-8 (<sub> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.13 step 2, CreateHTML steps 3-8 (<sub> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 static const char *const js_str_sup_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.14 step 1, CreateHTML steps 1-2 (S is ToString(RequireObjectCoercible(this)))",
-        "B.2.3.14 — no step: CreateHTML step 4 does not run for <sup>, which takes no attribute",
+        "B.2.2.14 step 2, CreateHTML steps 1-2 (contentsString is ToString(RequireObjectCoercible(string)))",
+        "B.2.2.14 — no step: CreateHTML step 4 does not run for <sup>, which takes no attribute",
         SRV_NO_ARG1,
-        "B.2.3.14 step 1, CreateHTML steps 3-8 (<sup> around S, with the attribute quoted and its quotation marks escaped)")
+        "B.2.2.14 step 2, CreateHTML steps 3-8 (<sup> around contentsString, with the attribute quoted and its quotation marks escaped)")
     NULL };
 
 static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -97521,7 +97521,7 @@ enum {
     magic_string_sup,
 };
 
-/* B.2.3.2.1 CreateHTML from step 3 on: the receiver's RequireObjectCoercible + ToString (steps 1-2) and the
+/* B.2.2.2.1 CreateHTML from step 3 on: the receiver's RequireObjectCoercible + ToString (steps 1-2) and the
    attribute value's ToString (step 4.a) are the page's code and are performed by js_str_recv_step as requests.
    `valuev` is the ALREADY-COERCED attribute string, or UNINITIALIZED for a tag that takes none. */
 static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst strv, JSValueConst valuev, int magic)
