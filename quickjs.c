@@ -95344,10 +95344,10 @@ static const char *const js_str_normalize_steps[] = {
     NULL };
 static const char *const js_str_charAt_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.2 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.2 step 3 (position is ToIntegerOrInfinity(pos))",
+        "22.1.3.2 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.2 step 4 (position is ToIntegerOrInfinity(position))",
         SRV_NO_ARG1,
-        "22.1.3.2 steps 4-6 (size; the empty String when out of range, else the one-code-unit substring)")
+        "22.1.3.2 steps 5-7 (size; the empty String when out of range, else the one-code-unit substring)")
     NULL };
 static const char *const js_str_charCodeAt_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
