@@ -6553,7 +6553,15 @@ static void js_why_backtrace(JSContext *ctx, char *dst, size_t n);
    solver observer asking for bytes an algorithm never produced. Both arrivals are asserted here now, and both
    messages carry the consumer's file:line in their FIRST sentence for the reason the concolic one already did.
    `file`/`line` are the CONSUMER's, captured by the macro — see the contract above the declarations in
-   quickjs.h for why the operand cannot supply them. */
+   quickjs.h for why the operand cannot supply them.
+   THE TWO MESSAGES BELOW WRITE ONE SENTENCE AND USED TO WRITE IT TWO WAYS. The unknown arm said
+   §7.1.19 `steps 9-12` send an Object to ToPrimitive, and 11 and 12 are the two that do NOT:
+   §7.1.19 step 11 is "Assert: primitiveValue is not an Object" and step 12 recurses on the primitive
+   step 11 has just asserted is not one. 9-12 is the right span for the whole ARM, which is how
+   step_tostring_run writes it; it is the wrong span for THIS predicate. Both spans lie inside a 12-step
+   algorithm and the citation audit accused neither — a `steps 9-97` planted here raises no finding
+   either, so a span is not something that channel judges. What named it was the object arm twelve lines
+   down, and this banner, already writing 9 and 10 for the same hop. */
 static JSValue js_force_tostring(JSContext *ctx, JSValueConst val1, const char *file, int line)
 {
     JSObject *p;
@@ -6596,7 +6604,7 @@ static JSValue js_force_tostring(JSContext *ctx, JSValueConst val1, const char *
         snprintf(why, sizeof why,
                  "ToString over UNKNOWN EXTERNAL INPUT `%.240s`, asked for by the BYTE CONSUMER at %s:%d. "
                  "That call wants BYTES, and a `const char *` cannot carry a concolic — ECMAScript §7.1.19 "
-                 "ToString ( arg ) steps 9-12 send an Object to §7.1.1 ToPrimitive ( input [ , preferredType "
+                 "ToString ( arg ) steps 9-10 send an Object to §7.1.1 ToPrimitive ( input [ , preferredType "
                  "] ), which over an unknown is the identity, so there is nothing for this boundary to derive "
                  "into and no coercion it can perform. FIX IT AT THAT FILE:LINE, not here. If the site wants "
                  "a NAME (a selector, an attribute, a header, a key), an unknown denotes its own display "
@@ -14240,8 +14248,16 @@ JSAtom JS_ValueToAtomAt(JSContext *ctx, JSValueConst val, const char *file, int 
    ( refRecord ) returns false for BOTH an Environment Record base and an unresolvable one, which is the whole
    of what OP_get_ref_value / OP_put_ref_value are emitted for (get_lvalue reaches them only from
    OP_scope_get_var; a member lvalue becomes OP_get_field / OP_get_array_el instead). So §6.2.5.5 GetValue
-   ( refRecord ) step 5 and §6.2.5.6 PutValue ( refRecord, value ) steps 2.c and 6 hand the name straight to
-   Set / SetMutableBinding, and there is NO ToPropertyKey step anywhere on this path.
+   ( refRecord ) step 6 and §6.2.5.6 PutValue ( refRecord, value ) steps 2.c and 6 hand the name straight to
+   GetBindingValue / Set / SetMutableBinding, and there is NO ToPropertyKey step anywhere on this path.
+   (Both this comment and the crash below cited GetValue's `step 5`, and §6.2.5.5 step 5 is "Assert: base
+   is an Environment Record" — it hands the name nowhere. Step 6 is the GetBindingValue that does, and it
+   is PutValue's own `6` in this same sentence, for this same role. The citation audit reported NOTHING at
+   either site, and the reason is NOT NAMED HERE because it was probed and not found: a flatly impossible
+   `step 97` planted here raises no finding either, on one line or two, with or without the argument list
+   standing between the term and the step. So the step channel is silent about this site for a cause that
+   is still open, and a reader who needs that cause probes the tool rather than trusting this sentence.
+   What named the defect was the asymmetry against the counterpart beside it, doing the same job at `6`.)
    A JS_ValueToAtom here was therefore not a redundant conversion but a wrong one, twice over. SPEC-wrong,
    because ToPropertyKey on an object calls the page's toString at a point the algorithm performs no coercion
    at all, so a conforming engine cannot produce that observable. And DIAGNOSTICALLY wrong, because when a
@@ -14299,7 +14315,7 @@ static JSAtom js_referenced_name_atom(JSContext *ctx, JSValueConst base,
                  "[[ReferencedName]] to be a String whenever [[Base]] is an Environment Record, and "
                  "§6.2.5.1 IsPropertyReference ( refRecord ) is false for both an Environment Record base and "
                  "an unresolvable one — which is every reference OP_get_ref_value / OP_put_ref_value are "
-                 "emitted for. DO NOT MAKE THIS SITE CONVERT: §6.2.5.5 GetValue ( refRecord ) step 5 and "
+                 "emitted for. DO NOT MAKE THIS SITE CONVERT: §6.2.5.5 GetValue ( refRecord ) step 6 and "
                  "§6.2.5.6 PutValue ( refRecord, value ) steps 2.c and 6 perform no ToPropertyKey, so a "
                  "coercion here would call the page's toString where the spec calls nothing, and it is what "
                  "used to send this crash one frame down into JS_ToStringInternal — a `@WHY` about routing a "
@@ -46749,8 +46765,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 }
                 sf->cur_pc = pc;
-                /* 6.2.5.5 PutValue step 5.a ToObject(base) precedes step 3.c ToPropertyKey, so a NULLISH base
-                   throws its TypeError before the key is coerced at all. */
+                /* 6.2.5.6 PutValue step 3.a ToObject(base) precedes step 3.c ToPropertyKey, so a NULLISH base
+                   throws its TypeError before the key is coerced at all. This sentence was copied from the
+                   two GetValue sites above and only half-adapted: it cited `6.2.5.5`, which is GetValue,
+                   at `step 5.a`. PutValue's ToObject is step 3.a, and §6.2.5.6 step 5 is "Assert: base is
+                   an Environment Record", which holds no sub-list for an `a` to name at all. Only the
+                   SECTION half was ever reported, because `PutValue` stands beside the number and
+                   resolves elsewhere. The STEP half was not, and that is not because the site cannot be
+                   judged: substituting a sub-step whose letter is far enough down the alphabet to name
+                   no position anywhere DOES raise STEP-OUT-OF-RANGE on this line, with the section
+                   right, while `step 5.a` stays silent — a lettered `a` denotes a position that exists
+                   SOMEWHERE, so it lands in the step check's own counted-but-not-decided band. Do not
+                   write that probe spelling out here: the step channel judges it through the backticks,
+                   so a note demonstrating the gap becomes a finding of its own — measured, once. What
+                   named the defect was the two siblings writing this same sentence at 3.a. */
                 if (JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT
                     && !JS_IsUndefined(sp[-3]) && !JS_IsNull(sp[-3])) { tp_slot = -2; tp_op_byte = pc - 1;
                                                             tp_resume_at = TPR_PUT_ARRAY_EL_KEY; goto key_toprim; }
