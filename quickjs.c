@@ -96070,7 +96070,7 @@ static int64_t string_advance_index(JSString *p, int64_t index, bool unicode)
     return index;
 }
 
-/* 22.1.3.11 isWellFormed / 22.1.3.34 toWellFormed. Their ONLY page-visible step is the receiver's
+/* 22.1.3.10 isWellFormed / 22.1.3.34 toWellFormed. Their ONLY page-visible step is the receiver's
    `? RequireObjectCoercible(this)` then `? ToString(this)`, which they performed with JS_ToStringCheckObject from
    C — the case step_thisstring_run's own note names, "even a ZERO-ARGUMENT one could not stay a C body". The scan
    that follows sees only a JSString and invokes nothing, so the body keeps it and takes the coerced string. */
