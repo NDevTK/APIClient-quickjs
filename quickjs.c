@@ -24421,6 +24421,28 @@ int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *o
     return step_fork_ask(ctx, h, over, op, n, real, JS_FORK_KIND_OUTCOME, parm);
 }
 
+/* IS ONE OF THIS MACHINE'S FORKS OUTSTANDING? — the question `fork_phase` was being asked and cannot answer.
+   A machine re-entered at a stage that both ISSUES A REQUEST and FORKS must know whether `cb_result` is its
+   request's answer or the driver's filler, and there are THREE ways in rather than two: the request answering
+   (nothing outstanding); the PARENT's fork delivery (FORK_PH_ANSWERED, re-entered with JS_UNDEFINED); and the
+   SIBLING that fork minted, which carries FORK_PH_ASK ON PURPOSE — the clone is taken AT the ask so it re-asks
+   and replays its arm out of its own decision vector — and is re-entered with its `park_in`, JS_UNDEFINED.
+   SO `fork_phase != FORK_PH_ANSWERED` IS A TWO-WAY TEST OVER THREE ROUTES, and it groups the SIBLING with the
+   request. Every prototype-chain walk in this file spelled it that way, and on every sibling arm each took the
+   driver's UNDEFINED as its next LINK: the enumeration walk handed it to [[OwnPropertyKeys]] and aborted, two
+   walks answered `false` for a chain nothing had walked, and the legacy accessor lookup dereferenced it as an
+   object. One loud and three silent, from one predicate. The machines that got it right (JSON.parse's outcome
+   fork, the array-callback coercion, the promise resolving function) all keep their operand on their own state
+   and RELEASE `cb_result`, which is the shape that has no question to get wrong.
+   THE ASK KEY IS THE FACT AND IT ALREADY EXISTED — written on every ask, cleared only when the answer is
+   consumed, so it is set across BOTH entries that carry no link and clear on the one that does. Named here,
+   beside the bookkeeping that owns it, because a fact answered from one place is what stops four sites
+   disagreeing about it a fifth time. */
+bool step_fork_pending(const JSStepHdr *h)
+{
+    return h->fork_ask_key != 0;
+}
+
 /* §7.1.2 ToBoolean ( arg ) AS A STEP MACHINE'S OWN — see quickjs-step.h for the whole argument. */
 int step_tobool_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, const char *op, int *pres)
 {
@@ -30801,6 +30823,24 @@ static bool for_in_is_ordinary(JSContext *ctx, JSObject *p)
 #define PROTO_CHAIN_ENDS 0   /* the chain ends at this link: this walk is over */
 #define PROTO_CHAIN_MORE 1   /* there is another link: ask this one for ITS [[GetPrototypeOf]] */
 
+/* THE TYPE CONSTRAINT ON A CHAIN LINK, ASSERTED WHERE THE LINK IS TAKEN. A walk that hands its enumeration or
+   its comparison something that is not an Object and not null has a broken invariant whatever produced it, so
+   the check belongs at the one line each walk turns a delivery INTO a link.
+   §6.1.7.2's general statement and not §10.1.1's, because a link may be a Proxy and answer through §10.5.1
+   while §10.1.1 is the ORDINARY object's method. EXPANDED AT EACH SITE rather than called: a DCHECK inside a
+   helper stamps the helper's line for every caller, and four walks share this one, so the abort would name an
+   action with no object. Asked only on the entry that CARRIES a link — a fork's re-entry carries none, which
+   is step_fork_pending's question and not this one's. */
+#define STEP_CHECK_PROTO_LINK(v)                                                                              \
+    DCHECKF(JS_IsNull(v) || JS_IsObject(v),                                                                   \
+            "[[GetPrototypeOf]] answered a chain link that is neither an Object nor null, tag %d "            \
+            "(quickjs.h JS_TAG_*: 2 NULL, 3 UNDEFINED). "                                                     \
+            "ECMAScript §6.1.7.2 \"Object Internal Methods and Internal Slots\" says it "                      \
+            "\"returns either a normal completion containing either an Object or null, or a throw completion\"" \
+            " — so either the step-18 delivery answered what no [[GetPrototypeOf]] may, or this arm ran on an " \
+            "entry carrying NO link that step_fork_pending did not exclude",                                  \
+            (int)JS_VALUE_GET_TAG(v))
+
 typedef struct JSForIn {
     JSStepHdr hdr;         /* MUST be first — enforced by STEP_STATE_HDR_FIRST below */
     JSValue enum_obj;      /* the JS_CLASS_FOR_IN_ITERATOR being built (owned) */
@@ -30985,16 +31025,20 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
 
         default:
             DCHECK(s->hdr.stage == FI_PROTO, "the for-in key walk resumed in no phase");
-            /* TWO WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 5.c's request answering,
-               whose result IS the link, or this stage's own fork being answered, where `cb_result` is the
-               driver's filler rather than a value from the algorithm and taking it as the link would
-               overwrite the very operand the fork was asked about. js_proto_chain_step and js_instanceof_step
-               are the same pair of entries and tell them apart the same way. */
-            if (s->hdr.fork_phase != FORK_PH_ANSWERED) {
+            /* THREE WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 5.c's request answering,
+               whose result IS the link; this stage's own fork being ANSWERED; and the SIBLING that fork
+               minted, resuming at the ask. The last two carry the driver's filler rather than a value from
+               the algorithm, and taking it as the link overwrites the very operand the fork was asked about.
+               step_fork_pending is what tells them apart and `fork_phase` is NOT — see its definition. This
+               arm read the sibling as a link and handed JS_UNDEFINED to the enumeration seam, which is where
+               it aborted; js_proto_chain_step, js_lookup_acc_step and js_instanceof_step had the same entry
+               and failed silently. */
+            if (!step_fork_pending(&s->hdr)) {
                 JS_FreeValue(ctx, s->cur);
                 s->cur = cb_result;
                 cb_result = JS_UNDEFINED;
                 if (JS_IsException(s->cur)) { s->cur = JS_UNDEFINED; return -1; }
+                STEP_CHECK_PROTO_LINK(s->cur);
             }
             /* ASKED OF THE LINK THAT ARRIVED AND NOT OF THE STARTING OBJECT, which is the whole of why this
                sits here rather than at FI_LINK. `for (k in rec)` over an unknown RECORD is supported: its own
@@ -79666,14 +79710,18 @@ static int js_proto_chain_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         goto ask;
     }
     DCHECK(s->hdr.stage == PROTOCHAIN_LINK, "isPrototypeOf's walk resumed in no stage");
-    /* TWO WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 3.a's request answering, or this
-       stage's own fork being answered, where `cb_result` is the driver's filler and taking it as the link
-       would overwrite the very operand the fork was asked about. See the instanceof walk, which is the same
-       algorithm and has the same pair of entries. */
-    if (s->hdr.fork_phase != FORK_PH_ANSWERED) {
+    /* THREE WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 3.a's request answering; this
+       stage's own fork being ANSWERED; and the SIBLING that fork minted, resuming at the ask. The last two
+       carry the driver's filler, and taking it as the link would overwrite the very operand the fork was
+       asked about. step_fork_pending is what tells them apart and `fork_phase` is NOT — see its definition.
+       This arm read the sibling as a link, and since JS_UNDEFINED is neither concolic nor null and its
+       [[GetPrototypeOf]] is null, the walk answered `false` for a chain it had not walked: the SILENT half of
+       the defect the enumeration walk aborts on. See the instanceof walk, which is the same algorithm. */
+    if (!step_fork_pending(&s->hdr)) {
         if (JS_IsException(cb_result)) return -1;
         JS_FreeValue(ctx, s->cur);
         s->cur = cb_result;                                           /* step 3.a's answer */
+        STEP_CHECK_PROTO_LINK(s->cur);
     }
     /* STEPS 3.b AND 3.c OVER AN UNKNOWN LINK ARE NOT DECIDABLE IN C. Both are identity comparisons and an
        unknown rides an ordinary Object, so both tests below would silently take the keep-walking arm at every
@@ -79824,14 +79872,19 @@ static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
         return 18;
     }
     DCHECK(s->hdr.stage == LA_PROTO, "__lookupGetter__'s walk resumed in no stage");
-    /* TWO WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 3.c's request answering, whose
-       result IS the link, or this stage's own fork being answered, where `cb_result` is the driver's filler
-       and taking it as the link would overwrite the operand the fork was asked about. */
-    if (s->hdr.fork_phase != FORK_PH_ANSWERED) {
+    /* THREE WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK — step 3.c's request answering, whose
+       result IS the link; this stage's own fork being ANSWERED; and the SIBLING that fork minted, resuming at
+       the ask. The last two carry the driver's filler, and taking it as the link would overwrite the operand
+       the fork was asked about. step_fork_pending is what tells them apart and `fork_phase` is NOT — see its
+       definition. This arm read the sibling as a link and carried JS_UNDEFINED into step 3.a's
+       [[GetOwnProperty]] request, whose trapless arm takes JS_VALUE_GET_OBJ of its operand: not a wrong
+       answer but a NULL dereference, and the worst of the four consequences one predicate had. */
+    if (!step_fork_pending(&s->hdr)) {
         if (JS_IsException(cb_result)) return -1;
         JS_FreeValue(ctx, s->cur);
         s->cur = cb_result;
         cb_result = JS_UNDEFINED;
+        STEP_CHECK_PROTO_LINK(s->cur);
     }
     /* STEP 3.d OVER AN UNKNOWN LINK IS NOT DECIDABLE IN C. `If obj is null` is this Repeat's only stopping
        test that the walk itself owns, and an unknown rides an ordinary Object, so the C test below would take
@@ -81233,15 +81286,21 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
             return 18;
         }
         DCHECK(s->hdr.stage == IO_LINK_GOT, "the instanceof machine resumed in no stage");
-        /* TWO WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK. The ordinary one is step 6.a's request
-           answering, whose result IS the link. The other is this stage's own fork being answered, and there
-           `cb_result` is the driver's filler rather than a value from the algorithm — taking it as the link
-           would overwrite the very operand the fork was asked about. `fork_phase` is what tells them apart;
-           it is FORK_PH_ASK on every entry that is not a fork's delivery, including the first. */
-        if (s->hdr.fork_phase != FORK_PH_ANSWERED) {
+        /* THREE WAYS TO ARRIVE HERE AND ONLY ONE OF THEM CARRIES A LINK. The ordinary one is step 6.a's
+           request answering, whose result IS the link. The second is this stage's own fork being answered,
+           and there `cb_result` is the driver's filler rather than a value from the algorithm — taking it as
+           the link would overwrite the very operand the fork was asked about. THE THIRD is the SIBLING that
+           fork minted, resuming at the ask. `fork_phase` was what told them apart and it CANNOT — it is
+           FORK_PH_ASK on the request-answered entry AND in the sibling's snapshot, deliberately, so the
+           sentence that stood here ("FORK_PH_ASK on every entry that is not a fork's delivery") was true of
+           the value and false of what it was read to mean. step_fork_pending is the predicate; this arm read
+           the sibling as a link, and js_instanceof_walk takes the `while` false for a non-object, so
+           `x instanceof C` answered FALSE on the very arm the fork existed to explore. */
+        if (!step_fork_pending(&s->hdr)) {
             if (JS_IsException(cb_result)) return -1;
             JS_FreeValue(ctx, s->val);
             s->val = cb_result; cb_result = JS_UNDEFINED;
+            STEP_CHECK_PROTO_LINK(s->val);
         }
         /* STEP 6.b AND 6.c OVER AN UNKNOWN LINK ARE NOT DECIDABLE IN C, so they are asked. Both are identity
            comparisons — `is null`, and SameValue against `proto` — and an unknown answers neither: it is an
@@ -109174,10 +109233,13 @@ static int js_promise_resolvefn_step(JSContext *ctx, void *st, JSValue cb_result
                    "visit. WHAT THE NEXT DIFF BUILDS is this stage's own re-entry shape for that ask, which "
                    "is the one thing PRF_THENABLE did not need: `then` arrives as cb_result and is a LOCAL, "
                    "so a fork asked here parks and comes back with the driver's filler in its place — release "
-                   "it BEFORE the ask and take the fork-answered entry apart from the request-answered one "
-                   "the way isPrototypeOf's walk does (`if (h->fork_phase != FORK_PH_ANSWERED)`), or the "
-                   "sibling re-enters, reads the filler as a non-callable thenAction and fulfils down step "
-                   "2.i's false arm — a wrong settlement, not a crash. ITS ABSENCE SHOWS as this abort on a "
+                   "it BEFORE the ask and take the entries that carry NO value apart from the request-answered "
+                   "one with `if (!step_fork_pending(h))`, or the sibling re-enters, reads the filler as a "
+                   "non-callable thenAction and fulfils down step 2.i's false arm — a wrong settlement, not a "
+                   "crash. THIS CLAUSE NAMED `h->fork_phase != FORK_PH_ANSWERED` AND THAT WAS THE DEFECT "
+                   "ITSELF: the sibling's snapshot carries FORK_PH_ASK on purpose, so that test admits exactly "
+                   "the entry the sentence above says to exclude, and the four prototype-chain walks it cited "
+                   "as precedent were each broken by it. ITS ABSENCE SHOWS as this abort on a "
                    "page whose own `then` getter answers out of unknown state, which is a different entry "
                    "from the one PRF_THENABLE covers and is why the two did not close together");
             args[0] = s->promise;

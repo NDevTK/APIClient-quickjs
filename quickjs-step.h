@@ -586,11 +586,18 @@ typedef struct JSStepHdr {
        `fork_real` IS RESET TO JS_OUTCOME_REAL_UNSTATED AND NOT TO ZERO, which is the whole reason the sentinel
        has a name: zero is a legal completion, so a stale zero left behind by a finished request would read as
        the positive claim "a real session takes outcome 0" at the next ask that forgot to state one.
-       `fork_arm` is the answer and `fork_phase` says whether one is outstanding — 0 is "ask", and it is 0 in
-       the sibling's snapshot ON PURPOSE: the sibling re-enters at the same point, ASKS AGAIN, and its own
-       decision vector replays the arm it was forked for. That is what makes a parked and resumed sibling take
-       the same arm in the next session as in this one; an arm baked into the clone would be a second, weaker
-       answer to a question the vector already answers. */
+       `fork_arm` is the answer and `fork_phase` says WHICH HALF OF THE ASK/ANSWER PAIR this entry is — 0 is
+       "ask", and it is 0 in the sibling's snapshot ON PURPOSE: the sibling re-enters at the same point, ASKS
+       AGAIN, and its own decision vector replays the arm it was forked for. That is what makes a parked and
+       resumed sibling take the same arm in the next session as in this one; an arm baked into the clone would
+       be a second, weaker answer to a question the vector already answers.
+       IT DOES NOT SAY WHETHER AN ASK IS OUTSTANDING, AND THIS SENTENCE SAID IT DID — a claim its own next
+       clause contradicts, since the sibling carries 0 and IS outstanding. A machine re-entered at a stage that
+       both issues a REQUEST and forks needs that second fact to know whether `cb_result` is its request's
+       answer or the driver's filler, and reading `fork_phase != FORK_PH_ANSWERED` for it is a two-way test
+       over three routes: it groups the SIBLING with the request. Every prototype-chain walk in the engine was
+       written from this sentence and took the filler as its next chain link — one aborting loudly and three
+       answering wrongly in silence. `step_fork_pending` is the fact; `fork_ask_key` below is what it reads. */
     JSValueConst fork_over;
     const char  *fork_op;
     int          fork_n;
@@ -1239,6 +1246,16 @@ JS_EXTERN int step_getownprop_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj
  * resume land back on the ask, which re-derives the same arm from the flow's decision vector. */
 JS_EXTERN int step_fork_run(JSContext *ctx, JSStepHdr *h, JSValueConst over, const char *op, int n, int real,
                             int *parm);
+
+/* IS ONE OF THIS MACHINE'S FORKS OUTSTANDING? — true across BOTH entries a fork produces (the parent's
+ * delivery and the sibling's resume) and false on a request's answer, which is the one distinction a machine
+ * re-entered at a stage that both REQUESTS and FORKS has to make: on the two fork entries `cb_result` is the
+ * driver's filler, and taking it as a value overwrites the very operand the fork was asked about.
+ * DECLARED HERE AND NOT LEFT TO EACH MACHINE because the header used to state the hazard and offer no exit —
+ * "it is 0 in the sibling's snapshot ON PURPOSE" is a warning a caller could not act on, and the predicate
+ * every caller then reached for instead (`fork_phase != FORK_PH_ANSWERED`) is the one that fails on it. A host
+ * step machine meets the same three entries, so it gets the same one answer rather than deriving a fifth. */
+JS_EXTERN bool step_fork_pending(const JSStepHdr *h);
 
 /* §7.1.2 ToBoolean ( arg ) AS A STEP MACHINE'S OWN, which is what a C builtin that branches on what the
  * page's callback returned is performing. `arr.filter(x => x.isAdmin)` over a collection whose fields are
