@@ -101390,10 +101390,12 @@ static int json_parse_step(JSParseState *s, JSONParse *p)
        shipped extension has ever delivered aborted at it.
        So the machine yields at every completed value and the ONE consultation belongs to whichever driver
        took the MORE — the interpreter asks the preempt hook and parks, the embedder's loop re-enters. That is
-       the contract every other step machine already has ("when nobody is waiting the machine is simply
-       re-entered, which costs one predicted call per back-edge and is why a machine may ask at every
-       iteration"), which is why this is a DELETION and not a guard: a guard would be a second predicate
-       deciding which of two behaviours a builtin gets. */
+       the contract every other step machine already has: quickjs-step.h's JS_STEP_YIELD, "when nobody is
+       waiting it is re-entered immediately, which costs one predicted call per iteration". Which is why this
+       is a DELETION and not a guard: a guard would be a second predicate deciding which of two behaviours a
+       builtin gets. This site paraphrased that sentence INSIDE QUOTATION MARKS and named no file to check it
+       against — the words were "per back-edge" and "a machine may ask", and the second of those is the very
+       claim the paragraph it was quoted from refuses. */
     p->resume = JPR_DONE_VALUE;
     JSON_SAVE();
     return 1;

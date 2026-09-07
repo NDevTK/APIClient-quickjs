@@ -798,11 +798,21 @@ JS_EXTERN JSValueConst JS_StepClosureData(const JSStepHdr *h, int i);
    inside document.createElement. A number with no name is also how a driver's dispatch and a machine's return
    drift apart, which is the same reason the stage labels are a declaration rather than an integer. */
 #define JS_STEP_CONSTRUCT 4
-/* "I HAVE MORE WORK; PREEMPT ME IF YOU WANT." The bytecode half of this is a loop back-edge asking the flow
-   control whether to yield; a machine that walks a structure of the PAGE'S SIZE — a DOM subtree, a token list,
-   a document to serialise, a parse — needs the same, because otherwise it runs to completion inside one opcode
-   however carefully the frames beneath it were flattened. Running no user code is NOT what makes a C body safe
-   to leave un-parkable; being O(1) is, and almost nothing that walks a page is.
+/* "I HAVE MORE WORK; RE-ENTER ME." IT ASKS NOTHING, AND THAT IS THE POINT. This headline said `PREEMPT ME IF
+   YOU WANT` and stated a channel the code does not have: the driver's arm reads nothing off the machine, sets
+   the delivery to JS_UNDEFINED and jumps to do_step_step, and the offer there is made on EVERY re-entry of
+   every machine with the kind fixed at that label — so a machine that returns this expresses no preference and
+   one that returns a request expresses none either. It USED to ask, at the driver's own arm, and that made the
+   only C span this driver could be preempted inside the one a machine had explicitly declared, which left a
+   walk built out of keyed requests — most of them — with no rest point at all. The paragraph directly below
+   has said the corrected thing throughout; where two declarations of one contract disagree, the CONSUMER is
+   what settles it — and the driver's arm, plus the two sites that gloss a `return JS_STEP_YIELD` at all,
+   already spell it "I have more work; re-enter me".
+   WHAT THE CODE STILL DOES IS PRODUCE A RE-ENTRY, which is where the offer already is. The bytecode half of
+   that is a loop back-edge; a machine that walks a structure of the PAGE'S SIZE — a DOM subtree, a token list,
+   a document to serialise, a parse — needs the same, because otherwise it runs to completion inside one
+   `def->step()` call however carefully the frames beneath it were flattened. Running no user code is NOT what
+   makes a C body safe to leave un-parkable; being O(1) is, and almost nothing that walks a page is.
    Return it with no request pending; the machine is re-entered with JS_UNDEFINED, and when nobody is waiting it
    is re-entered immediately, which costs one predicted call per iteration. That is cheap enough to ask at every
    step of a walk, which is where it belongs. */
