@@ -95405,10 +95405,11 @@ static const char *const js_str_localeCmp_steps[] = {
     NULL };
 static const char *const js_str_toLower_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.28 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
+        "22.1.3.28 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
         SRV_NO_ARG0,
         SRV_NO_ARG1,
-        "22.1.3.28 steps 3-5 (sText is StringToCodePoints(S); lowerText is toLowercase(sText); L)")
+        "22.1.3.28 steps 4-7 (sText is StringToCodePoints(string); lowerText is toLowercase(sText); "
+        "lowercaseString is CodePointsToString(lowerText))")
     NULL };
 static const char *const js_str_toUpper_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
