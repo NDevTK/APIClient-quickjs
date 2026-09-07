@@ -95945,9 +95945,9 @@ static int js_str_concat_join(JSContext *ctx, JSStrConcat *s, JSValue val, bool 
    here it HUNG — the delivery was read as "nothing arrived", the cursor never moved, and the machine re-issued
    the same request forever. A stage cannot be confused with a value. */
 #define SCC_STAGES(X) \
-    X(SCC_RECV, "22.1.3.5 step 1 (O is RequireObjectCoercible(this value))") \
-    X(SCC_THIS, "22.1.3.5 step 2 (S is ToString(O)) — the ToPrimitive inside it, which is the page's code") \
-    X(SCC_ARG,  "22.1.3.5 step 4.a (nextString is ToString(next)) — its ToPrimitive, once per argument")
+    X(SCC_RECV, "22.1.3.5 steps 1-2 (thisValue is the this value, RequireObjectCoercible'd)") \
+    X(SCC_THIS, "22.1.3.5 step 3 (string is ToString(thisValue)) — the ToPrimitive inside it, which is the page's code") \
+    X(SCC_ARG,  "22.1.3.5 step 5.a (nextString is ToString(next)) — its ToPrimitive, once per argument")
 enum { SCC_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_str_concat_steps[] = { SCC_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
