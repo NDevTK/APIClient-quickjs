@@ -24443,6 +24443,20 @@ bool step_fork_pending(const JSStepHdr *h)
     return h->fork_ask_key != 0;
 }
 
+/* ADOPT A [[GetPrototypeOf]] ANSWER AS THIS WALK'S NEXT LINK. Taking `answer` BY POINTER and clearing it is
+   the whole content: `cb_result` is an owned reference the step must release exactly once, so a bare
+   `field = cb_result` leaves a SECOND NAME for the reference the field now owns, and any later free on that
+   path drops the reference the field is standing on. The field is then handed to the solver seam a few lines
+   down, where the use-after-free surfaces as the concolic brand check failing on a value that WAS concolic —
+   an abort naming decide.c for a defect in this file. Four walks here adopt a link and three cleared by hand;
+   consuming the source leaves a fifth nothing to forget. */
+static void step_adopt_link(JSContext *ctx, JSValue *field, JSValue *answer)
+{
+    JS_FreeValue(ctx, *field);
+    *field = *answer;
+    *answer = JS_UNDEFINED;
+}
+
 /* §7.1.2 ToBoolean ( arg ) AS A STEP MACHINE'S OWN — see quickjs-step.h for the whole argument. */
 int step_tobool_run(JSContext *ctx, JSStepHdr *h, JSValueConst v, const char *op, int *pres)
 {
@@ -31034,9 +31048,7 @@ static int js_for_in_step(JSContext *ctx, void *st, JSValue cb_result, JSValue *
                it aborted; js_proto_chain_step, js_lookup_acc_step and js_instanceof_step had the same entry
                and failed silently. */
             if (!step_fork_pending(&s->hdr)) {
-                JS_FreeValue(ctx, s->cur);
-                s->cur = cb_result;
-                cb_result = JS_UNDEFINED;
+                step_adopt_link(ctx, &s->cur, &cb_result);
                 if (JS_IsException(s->cur)) { s->cur = JS_UNDEFINED; return -1; }
                 STEP_CHECK_PROTO_LINK(s->cur);
             }
@@ -79719,8 +79731,7 @@ static int js_proto_chain_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
        the defect the enumeration walk aborts on. See the instanceof walk, which is the same algorithm. */
     if (!step_fork_pending(&s->hdr)) {
         if (JS_IsException(cb_result)) return -1;
-        JS_FreeValue(ctx, s->cur);
-        s->cur = cb_result;                                           /* step 3.a's answer */
+        step_adopt_link(ctx, &s->cur, &cb_result);                    /* step 3.a's answer */
         STEP_CHECK_PROTO_LINK(s->cur);
     }
     /* STEPS 3.b AND 3.c OVER AN UNKNOWN LINK ARE NOT DECIDABLE IN C. Both are identity comparisons and an
@@ -79881,9 +79892,7 @@ static int js_lookup_acc_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
        answer but a NULL dereference, and the worst of the four consequences one predicate had. */
     if (!step_fork_pending(&s->hdr)) {
         if (JS_IsException(cb_result)) return -1;
-        JS_FreeValue(ctx, s->cur);
-        s->cur = cb_result;
-        cb_result = JS_UNDEFINED;
+        step_adopt_link(ctx, &s->cur, &cb_result);
         STEP_CHECK_PROTO_LINK(s->cur);
     }
     /* STEP 3.d OVER AN UNKNOWN LINK IS NOT DECIDABLE IN C. `If obj is null` is this Repeat's only stopping
@@ -81298,8 +81307,7 @@ static int js_instanceof_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
            `x instanceof C` answered FALSE on the very arm the fork existed to explore. */
         if (!step_fork_pending(&s->hdr)) {
             if (JS_IsException(cb_result)) return -1;
-            JS_FreeValue(ctx, s->val);
-            s->val = cb_result; cb_result = JS_UNDEFINED;
+            step_adopt_link(ctx, &s->val, &cb_result);
             STEP_CHECK_PROTO_LINK(s->val);
         }
         /* STEP 6.b AND 6.c OVER AN UNKNOWN LINK ARE NOT DECIDABLE IN C, so they are asked. Both are identity
