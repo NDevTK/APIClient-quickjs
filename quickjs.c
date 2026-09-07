@@ -91275,23 +91275,23 @@ static const char *const js_array_splice_steps[] = {
     ASLICE_STAGES(JS_STEP_STAGE_LABEL,
         "23.1.3.31 step 1 (O is ToObject(this value))",
         "23.1.3.31 step 2 (len is LengthOfArrayLike(O))",
-        "23.1.3.31 steps 3-6 (relativeStart is ToIntegerOrInfinity(start); actualStart)",
-        "23.1.3.31 steps 7-11 (itemCount; actualDeleteCount, clamped from ToIntegerOrInfinity(deleteCount); "
+        "23.1.3.31 step 3 (actualStart is ToClampedIndex(start, len))",
+        "23.1.3.31 steps 4-8 (itemCount; actualDeleteCount, clamped from ToIntegerOrInfinity(deleteCount); "
         "the 2^53-1 length check)",
-        "23.1.3.31 steps 12-14 (A is ArraySpeciesCreate(O, actualDeleteCount); k is 0; a dense source's prefix "
+        "23.1.3.31 steps 9-11 (A is ArraySpeciesCreate(O, actualDeleteCount); k is 0; a dense source's prefix "
         "is copied with nothing observable in it)",
-        "23.1.3.31 step 14.b (HasProperty(O, from))",
-        "23.1.3.31 step 14.b.i (fromValue is Get(O, from))",
-        "23.1.3.31 step 14.b.ii (CreateDataPropertyOrThrow(A, ToString(k), fromValue))",
-        "23.1.3.31 step 15 (Set(A, \"length\", actualDeleteCount, true)) - and steps 16-17's choice of shift "
+        "23.1.3.31 step 11.b (HasProperty(O, from))",
+        "23.1.3.31 step 11.b.i (fromValue is Get(O, from))",
+        "23.1.3.31 step 11.b.ii (CreateDataPropertyOrThrow(A, ToString(k), fromValue))",
+        "23.1.3.31 step 12 (Set(A, \"length\", actualDeleteCount, true)) - and steps 13-14's choice of shift "
         "direction")
     ASPLICE_EXTRA(JS_STEP_STAGE_LABEL,
-        "23.1.3.31 steps 16.b and 17.b (the element shift: HasProperty(O, from), Get(O, from), then "
+        "23.1.3.31 steps 13.b and 14.b (the element shift: HasProperty(O, from), Get(O, from), then "
         "Set(O, to, fromValue, true) or DeletePropertyOrThrow(O, to))",
-        "23.1.3.31 steps 16.c-16.d (Repeat while k > len - actualDeleteCount + itemCount: "
+        "23.1.3.31 steps 13.c-13.d (Repeat while k > len - actualDeleteCount + itemCount: "
         "DeletePropertyOrThrow(O, ToString(k - 1)))",
-        "23.1.3.31 steps 18-19 (k is actualStart; for each element E of items, Set(O, ToString(k), E, true))",
-        "23.1.3.31 step 20 (Set(O, \"length\", len - actualDeleteCount + itemCount, true)) - and step 21, "
+        "23.1.3.31 steps 15-16 (k is actualStart; for each element E of items, Set(O, ToString(k), E, true))",
+        "23.1.3.31 step 17 (Set(O, \"length\", len - actualDeleteCount + itemCount, true)) - and step 18, "
         "Return A")
     NULL };
 
@@ -91409,7 +91409,7 @@ static int js_array_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSVa
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         if (!splice) return 0;
-        /* steps 16-17 pick which way the tail moves. Arithmetic with no request in it, so it belongs to the
+        /* steps 13-14 pick which way the tail moves. Arithmetic with no request in it, so it belongs to the
            stage that produced its operands rather than to one of its own that nothing could park at. */
         s->new_len = s->len + s->item_count - s->del_count;
         s->cs_i = 0;
