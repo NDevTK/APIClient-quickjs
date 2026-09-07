@@ -52116,10 +52116,14 @@ static int js_async_function_await_finish(JSContext *ctx, JSAsyncPost *p)
 }
 
 /* 27.10.5.3 Await ( arg ) for an async FUNCTION, as a STEP MACHINE — the third algorithm built on
-   step_promiseresolve_run and the last of the three sites this file used to name as unbuilt. Step 1 is
+   step_promiseresolve_run and the last of the three sites this file used to name as unbuilt. Step 2 is
    PromiseResolve(%Promise%, value), whose `constructor` read on an already-native promise and whose resolve on
-   a thenable are both the page's code; steps 2-3 (the continuation's resolving functions and PerformPromiseThen)
-   invoke nothing, so the machine finishes the algorithm and answers nothing.
+   a thenable are both the page's code; the steps after it (the two resolving-function closures, their
+   CreateBuiltinFunction and PerformPromiseThen) invoke nothing, so the machine finishes the algorithm and
+   answers nothing. This prose used to call the PromiseResolve the algorithm's FIRST step and give the range
+   after it as the two that follow: 27.10.5.3's first step is `asyncContext is the running execution context`
+   and the operation ends at PerformPromiseThen, which is what AWA_STAGES below has always said — ONE algorithm
+   numbered two ways in one file, and the stage table was the half that was right.
    The async function's state rides FUNC_DATA as one of its own resolving-function objects — the engine's JSValue
    handle for a JSAsyncFunctionData, so the refcounting and GC marking are already right — because the two routes
    into this machine (an interpreter chain and a call-root flow) differ in everything except func_data. */
@@ -111082,7 +111086,9 @@ static int step_wrap_run(JSContext *ctx, JSStepHdr *h, JSWrapSeq *w, JSContext *
             return 0;
         }
         if (!JS_IsFunction(ctx, value)) {
-            /* step 1.b: a non-callable object cannot cross the membrane at all. */
+            /* step 1.a: a non-callable object cannot cross the membrane at all. The lettering used to name
+               the arm AFTER this one — GetWrappedValue's object arm throws on a non-callable and only then
+               wraps, so the throw is the FIRST of the two and the wrap the second. */
             /* the TypeError is the RUNNING realm's, not the one the wrapper would have been created in:
                10.4.x runs a wrapped function's [[Call]] in its caller's context, and a test that catches this
                compares constructor identity. */
