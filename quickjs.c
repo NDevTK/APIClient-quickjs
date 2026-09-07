@@ -115979,10 +115979,11 @@ static bool ta_slice_toprim(JSTASlice *s, int i, JSValue **out_cb, int *out_argc
    after it. */
 #define TASLICE_STAGES(X) \
     X(TASLICE_VALIDATE, "23.2.3.27 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); srcArrayLength)") \
-    X(TASLICE_START,    "23.2.3.27 steps 4-7 (relativeStart is ToIntegerOrInfinity(start); k)") \
-    X(TASLICE_END,      "23.2.3.27 steps 8-12 (relativeEnd is ToIntegerOrInfinity(end); final; count)") \
-    X(TASLICE_SPECIES,  "23.2.3.27 step 13 via 7.3.22 (C is Get(O, \"constructor\"), then S is Get(C, @@species))") \
-    X(TASLICE_CREATE,   "23.2.3.27 steps 13-14 (A is Construct(ctor, <<count>>); the elements are copied)")
+    X(TASLICE_START,    "23.2.3.27 step 4 (startIndex is ToClampedIndex(start, srcArrayLength))") \
+    X(TASLICE_END,      "23.2.3.27 steps 5-6 (an undefined end is srcArrayLength, else endIndex is " \
+                        "ToClampedIndex(end, srcArrayLength); countBytes is max(endIndex - startIndex, 0))") \
+    X(TASLICE_SPECIES,  "23.2.3.27 step 7 via 7.3.22 (C is Get(O, \"constructor\"), then S is Get(C, @@species))") \
+    X(TASLICE_CREATE,   "23.2.3.27 steps 7-8 (A is Construct(ctor, <<count>>); the elements are copied)")
 enum { TASLICE_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_ta_slice_steps[] = { TASLICE_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -116095,7 +116096,7 @@ static int js_ta_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
                 uint8_t *dst = p1->u.array.u.uint8_ptr;
                 const uint8_t *src = p->u.array.u.uint8_ptr + (s->start << shift);
                 size_t nbytes = (size_t)count << shift, bi;
-                /* 23.2.3.27 step 14.g.ix copies FORWARD, one unit at a time. When @@species returns a view on
+                /* 23.2.3.27 step 8.f.ix copies FORWARD, one unit at a time. When @@species returns a view on
                    the SAME buffer at a HIGHER offset, that propagates the first element through the overlap —
                    memmove deliberately does the opposite (it preserves the source), producing [20,30,40,…]
                    where the spec produces [20,20,20,…]. Overlap the other way, and non-overlap, are identical
