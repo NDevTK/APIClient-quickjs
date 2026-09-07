@@ -96213,12 +96213,14 @@ static JSRegExp *js_get_regexp(JSContext *ctx, JSValueConst obj, bool throw_erro
 enum { SINC_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0) };
 static const char *const js_str_includes_steps[] = {
     SINC_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.8 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O)) and IsRegExp step 1's "
-        "`searchString is an Object` test",
-        "22.1.3.8 steps 3-4 (isRegExp is IsRegExp(searchString) — its Get(searchString, @@match); the TypeError)",
-        "22.1.3.8 step 5 (searchStr is ToString(searchString))",
-        "22.1.3.8 step 6 (pos is ToIntegerOrInfinity(position)), then steps 7-12 (start is pos clamped into "
-        "[0, len]; whether StringIndexOf(S, searchStr, start) is -1)")
+        "22.1.3.8 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue)) and "
+        "7.2.6 IsRegExp step 1's `searchString is an Object` test",
+        "22.1.3.8 steps 4-5 (isRegexp is IsRegExp(searchString) — its Get(searchString, %Symbol.match%); "
+        "the TypeError)",
+        "22.1.3.8 step 6 (searchString is set to ToString(searchString))",
+        "22.1.3.8 step 8 (start clamps ToIntegerOrInfinity(position) between 0 and length) - only its "
+        "ToIntegerOrInfinity half runs here, then steps 7, 9-12 (length; the assert; whether "
+        "StringIndexOf(string, searchString, start) is not-found)")
     NULL };
 static const char *const js_str_endswith_steps[] = {
     SINC_STAGES(JS_STEP_STAGE_LABEL,
