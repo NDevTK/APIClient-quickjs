@@ -96085,8 +96085,8 @@ static JSValue js_string_toWellFormed_body(JSContext *ctx, JSValueConst strv);
 enum { SWF_STAGES(JS_STEP_STAGE_ENUM, 0) };
 static const char *const js_str_iswellformed_steps[] = {
     SWF_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.10 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O)), then step 3 "
-        "(IsStringWellFormedUnicode(S))")
+        "22.1.3.10 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue)), "
+        "then step 4 (IsStringWellFormedUnicode(string))")
     NULL };
 static const char *const js_str_towellformed_steps[] = {
     SWF_STAGES(JS_STEP_STAGE_LABEL,
