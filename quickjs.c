@@ -96425,13 +96425,14 @@ static const char *const js_str_matchAll_steps[] = {
     NULL };
 static const char *const js_str_search_steps[] = {
     STRMATCH_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.21 step 1 (O is RequireObjectCoercible(this)) and step 2's `regexp is an Object` test",
-        "22.1.3.21 step 2.a (searcher is GetMethod(regexp, @@search))",
-        "22.1.3.21 step 2.b.i (return Call(searcher, regexp, «O»))",
-        "22.1.3.21 step 3 (string is ToString(O))",
-        "22.1.3.21 step 4 (rx is RegExpCreate(regexp, undefined))",
-        "22.1.3.21 step 5 (Invoke's Get(rx, @@search))",
-        "22.1.3.21 step 5 (Invoke's Call(searcher, rx, «string»))")
+        "22.1.3.21 steps 1-2 (thisValue is RequireObjectCoercible'd) and step 3's `regexpOrPattern is an "
+        "Object` test",
+        "22.1.3.21 step 3.a (searcher is GetMethod(regexpOrPattern, %Symbol.search%))",
+        "22.1.3.21 step 3.b.i (return Call(searcher, regexpOrPattern, «thisValue»))",
+        "22.1.3.21 step 4 (string is ToString(thisValue))",
+        "22.1.3.21 step 5 (regexp is RegExpCreate(regexpOrPattern, undefined))",
+        "22.1.3.21 step 6 (Invoke's Get(regexp, %Symbol.search%))",
+        "22.1.3.21 step 6 (Invoke's Call(searcher, regexp, «string»))")
     NULL };
 
 static int js_str_match_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
