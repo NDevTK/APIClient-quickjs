@@ -1950,7 +1950,7 @@ enum {   /* the STEPDEF_* ids used at the registration sites */
     F(HOURS,            0x371, "21.4.4.22", "steps 4-7") F(UTC_HOURS,       0x370, "21.4.4.30", "steps 4-7") \
     F(DATE,             0x231, "21.4.4.20", "step 4")   F(UTC_DATE,        0x230, "21.4.4.28", "step 4")    \
     F(MONTH,            0x131, "21.4.4.25", "steps 4-5") F(UTC_MONTH,       0x130, "21.4.4.33", "steps 4-5") \
-    F(FULLYEAR,         0x031, "21.4.4.21", "steps 4-6") F(UTC_FULLYEAR,    0x030, "21.4.4.29", "steps 4-6")
+    F(FULLYEAR,         0x031, "21.4.4.21", "steps 4, 6-7") F(UTC_FULLYEAR, 0x030, "21.4.4.29", "steps 5-7")
 #define DATE_SET_ID(N, M, SEC, CO) STEPDEF_DATE_SET_##N,
     DATE_SET_LIST(DATE_SET_ID)
 #undef DATE_SET_ID
