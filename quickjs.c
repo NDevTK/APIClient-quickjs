@@ -86908,10 +86908,13 @@ static JSValue js_iter_helper_return_fini(JSContext *ctx, void *st, bool take_re
     return r;
 }
 
-/* 7.3.36 SetterThatIgnoresPrototypeProperties(thisValue, home, p, v), which %Iterator.prototype% uses for BOTH of
-   its writable-looking accessors — `constructor` and @@toStringTag. Steps 3-5 are the page's: thisValue
-   .[[GetOwnProperty]](p), then either CreateDataPropertyOrThrow or Set(thisValue, p, v, true) — a trap apiece on
-   a Proxy receiver, and an inherited setter otherwise. TWO C bodies ran all of it, both through
+/* 7.3.37 "SetterThatIgnoresPrototypeProperties ( thisValue, home, propertyKey, value )", which
+   %Iterator.prototype% uses for BOTH of its writable-looking accessors — `constructor` and @@toStringTag.
+   These sites said `7.3.36`, which in the edition the editors maintain is GetOptionsObject ( options ): a real
+   clause that still resolves, so the retired number named an algorithm this machine does not run rather than
+   naming nothing. Steps 3-5 are the page's: thisValue.[[GetOwnProperty]](p), then either
+   CreateDataPropertyOrThrow or Set(thisValue, p, v, true) — a trap apiece on a Proxy receiver, and an
+   inherited setter otherwise. TWO C bodies ran all of it, both through
    JS_GetOwnProperty, which is what kept that public entry alive.
    ONE machine, because the two differ only in p — and p IS the arg, so the difference is a spec operand rather
    than a second implementation. `home` is %Iterator.prototype% for both.
@@ -86923,7 +86926,7 @@ typedef struct JSIterSetter {
     JSValue result;   /* DONE (owned) */
 } JSIterSetter;
 
-/* WHICH STEP OF 7.3.36 EACH STAGE RESTS AT, for each of the THREE accessors that are one call to it. The stage
+/* WHICH STEP OF 7.3.37 EACH STAGE RESTS AT, for each of the THREE accessors that are one call to it. The stage
    list is expanded once per accessor with that accessor's own clause and key, so a stage cannot move in one
    without moving in all three and each definition still names the algorithm a parked flow is really in.
    ITS_OWN_GOT is gone: the [[GetOwnProperty]] was an ISSUE stage and a CONSUME stage, so the machine parked one
@@ -86936,27 +86939,27 @@ typedef struct JSIterSetter {
 enum { ITS_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0) };
 static const char *const js_iter_set_ctor_steps[] = {
     ITS_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.1.2 step 1 -> 7.3.36 steps 1-2 (thisValue is an Object and is not %Iterator.prototype%)",
-        "27.1.4.1.2 step 1 -> 7.3.36 step 3 (desc is thisValue.[[GetOwnProperty]](\"constructor\"))",
-        "27.1.4.1.2 step 1 -> 7.3.36 step 4.a (CreateDataPropertyOrThrow(thisValue, \"constructor\", v))",
-        "27.1.4.1.2 step 1 -> 7.3.36 step 5.a (Set(thisValue, \"constructor\", v, true))")
+        "27.1.4.1.2 step 1 -> 7.3.37 steps 1-2 (thisValue is an Object and is not %Iterator.prototype%)",
+        "27.1.4.1.2 step 1 -> 7.3.37 step 3 (desc is thisValue.[[GetOwnProperty]](\"constructor\"))",
+        "27.1.4.1.2 step 1 -> 7.3.37 step 4.a (CreateDataPropertyOrThrow(thisValue, \"constructor\", v))",
+        "27.1.4.1.2 step 1 -> 7.3.37 step 5.a (Set(thisValue, \"constructor\", v, true))")
     NULL };
 static const char *const js_iter_set_tag_steps[] = {
     ITS_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.14.2 step 1 -> 7.3.36 steps 1-2 (thisValue is an Object and is not %Iterator.prototype%)",
-        "27.1.4.14.2 step 1 -> 7.3.36 step 3 (desc is thisValue.[[GetOwnProperty]](%Symbol.toStringTag%))",
-        "27.1.4.14.2 step 1 -> 7.3.36 step 4.a (CreateDataPropertyOrThrow(thisValue, %Symbol.toStringTag%, v))",
-        "27.1.4.14.2 step 1 -> 7.3.36 step 5.a (Set(thisValue, %Symbol.toStringTag%, v, true))")
+        "27.1.4.14.2 step 1 -> 7.3.37 steps 1-2 (thisValue is an Object and is not %Iterator.prototype%)",
+        "27.1.4.14.2 step 1 -> 7.3.37 step 3 (desc is thisValue.[[GetOwnProperty]](%Symbol.toStringTag%))",
+        "27.1.4.14.2 step 1 -> 7.3.37 step 4.a (CreateDataPropertyOrThrow(thisValue, %Symbol.toStringTag%, v))",
+        "27.1.4.14.2 step 1 -> 7.3.37 step 5.a (Set(thisValue, %Symbol.toStringTag%, v, true))")
     NULL };
-/* The error-stack accessor interposes its own validation between 7.3.36's two leading tests, which is what the
+/* The error-stack accessor interposes its own validation between 7.3.37's two leading tests, which is what the
    definition's `precheck` carries — so its first stage names both. */
 static const char *const js_error_set_stack_steps[] = {
     ITS_STAGES(JS_STEP_STAGE_LABEL,
-        "set Error.prototype.stack step 1 -> 7.3.36 steps 1-2 (thisValue is an Object, value is a String, and "
+        "set Error.prototype.stack step 1 -> 7.3.37 steps 1-2 (thisValue is an Object, value is a String, and "
         "thisValue is not %Error.prototype%)",
-        "set Error.prototype.stack step 1 -> 7.3.36 step 3 (desc is thisValue.[[GetOwnProperty]](\"stack\"))",
-        "set Error.prototype.stack step 1 -> 7.3.36 step 4.a (CreateDataPropertyOrThrow(thisValue, \"stack\", v))",
-        "set Error.prototype.stack step 1 -> 7.3.36 step 5.a (Set(thisValue, \"stack\", v, true))")
+        "set Error.prototype.stack step 1 -> 7.3.37 step 3 (desc is thisValue.[[GetOwnProperty]](\"stack\"))",
+        "set Error.prototype.stack step 1 -> 7.3.37 step 4.a (CreateDataPropertyOrThrow(thisValue, \"stack\", v))",
+        "set Error.prototype.stack step 1 -> 7.3.37 step 5.a (Set(thisValue, \"stack\", v, true))")
     NULL };
 
 static int js_iter_setter_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
