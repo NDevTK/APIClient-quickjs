@@ -95398,10 +95398,11 @@ static const char *const js_str_padEnd_steps[] = {
     NULL };
 static const char *const js_str_localeCmp_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.12 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.12 step 3 (thatValue is ToString(that))",
+        "22.1.3.12 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.12 step 4 (thatValue is ToString(that))",
         SRV_NO_ARG1,
-        "22.1.3.12 step 4 (the implementation-defined comparison of S and thatValue)")
+        "22.1.3.12 states NO step for the comparison - its four steps only PREPARE the Strings, and the "
+        "implementation-defined locale-sensitive comparison of string and thatValue is the section's prose")
     NULL };
 static const char *const js_str_toLower_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
