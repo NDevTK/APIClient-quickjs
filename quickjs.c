@@ -96070,7 +96070,7 @@ static int64_t string_advance_index(JSString *p, int64_t index, bool unicode)
     return index;
 }
 
-/* 22.1.3.10 isWellFormed / 22.1.3.34 toWellFormed. Their ONLY page-visible step is the receiver's
+/* 22.1.3.10 isWellFormed / 22.1.3.31 toWellFormed. Their ONLY page-visible step is the receiver's
    `? RequireObjectCoercible(this)` then `? ToString(this)`, which they performed with JS_ToStringCheckObject from
    C — the case step_thisstring_run's own note names, "even a ZERO-ARGUMENT one could not stay a C body". The scan
    that follows sees only a JSString and invokes nothing, so the body keeps it and takes the coerced string. */
@@ -96090,8 +96090,8 @@ static const char *const js_str_iswellformed_steps[] = {
     NULL };
 static const char *const js_str_towellformed_steps[] = {
     SWF_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.31 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O)), then steps 3-7 "
-        "(each unpaired surrogate replaced with U+FFFD)")
+        "22.1.3.31 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue)), "
+        "then steps 4-8 (each unpaired surrogate replaced with U+FFFD)")
     NULL };
 
 static int js_string_wellformed_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
