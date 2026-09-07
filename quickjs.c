@@ -86115,10 +86115,10 @@ static const char *const js_array_includes_steps[] = {
     ASRCH_STAGES(JS_STEP_STAGE_LABEL,
                  "23.1.3.16 step 1 (O is ToObject(this value))",
                  "23.1.3.16 step 2 (len is LengthOfArrayLike(O))",
-                 "23.1.3.16 steps 4-7 (n is ToIntegerOrInfinity(fromIndex), resolved into k)",
-                 "23.1.3.16 step 8 (includes asks no HasProperty — a hole IS undefined to SameValueZero — so "
+                 "23.1.3.16 step 4 (k is ToClampedIndex(fromIndex, len))",
+                 "23.1.3.16 step 5 (includes asks no HasProperty — a hole IS undefined to SameValueZero — so "
                  "this stage falls straight through to the element read)",
-                 "23.1.3.16 step 8.a (elementK is Get(O, ToString(k)))") NULL };
+                 "23.1.3.16 step 5.a (elementK is Get(O, ToString(k)))") NULL };
 
 static int js_array_search_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
 {
