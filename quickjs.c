@@ -30504,7 +30504,7 @@ static int js_desc_object_is_enumerable(JSContext *ctx, JSValueConst desc)
     return JS_ToBoolFree(ctx, en);
 }
 
-/* EnumerableOwnPropertyNames' key half (7.3.23 steps 1-3.a), as a resumable cursor. It is [[OwnPropertyKeys]]
+/* EnumerableOwnProperties' key half (§7.3.23 steps 1-3.a), as a resumable cursor. It is [[OwnPropertyKeys]]
    followed by a [[GetOwnProperty]] per key for the enumerability test — on a Proxy the `ownKeys` trap and then
    the `getOwnPropertyDescriptor` trap per key, so BOTH are the page's code and both have to be requests.
    Six C callers still ask for this by passing JS_GPN_ENUM_ONLY to a names walk, which runs those traps from C;
@@ -30551,7 +30551,7 @@ static void js_enum_keys_free(JSContext *ctx, JSEnumKeys *c)
 
 /* The cursor performs the SEQUENCE — [[OwnPropertyKeys]] then one [[GetOwnProperty]] per string key — and
    reports the FACTS: which keys still exist and whether each is enumerable. It does not apply anyone's rule.
-   EnumerableOwnPropertyNames wants the enumerable ones (js_enum_keys_keep_enumerable); 14.7.5.10.2.1's for-in wants
+   EnumerableOwnProperties wants the enumerable ones (js_enum_keys_keep_enumerable); 14.7.5.10.2.1's for-in wants
    ALL of them, because a non-enumerable key SHADOWS an enumerable one deeper in the prototype chain and
    dropping it would enumerate a hidden property. Filtering here would have made for-in a second walk.
    `in` is the previous request's answer (UNDEFINED on entry). Returns 11 / 12 for the next request, 0 when the
@@ -30662,7 +30662,7 @@ static int js_enum_keys_run(JSContext *ctx, JSStepHdr *h, JSEnumKeys *c, JSValue
     }
 }
 
-/* 7.3.23 EnumerableOwnPropertyNames' rule, applied to a COMPLETED cursor: drop the keys whose descriptor said
+/* §7.3.23 EnumerableOwnProperties' rule, applied to a COMPLETED cursor: drop the keys whose descriptor said
    not enumerable. Its consumers hand the surviving allocation on, so the drop compacts in place and shrinks
    `kept` rather than allocating a second list. */
 static void js_enum_keys_keep_enumerable(JSContext *ctx, JSEnumKeys *c)
@@ -31376,7 +31376,7 @@ typedef struct JSTASlice {
 
    js_json_check + js_json_to_str were a RECURSIVE C walker that ran seven of the page's operations straight out
    of C with no flow base: the `toJSON` read and its call, the replacer call, LengthOfArrayLike, every element
-   and every member read, and EnumerableOwnPropertyNames' `ownKeys` plus its per-key `getOwnPropertyDescriptor`
+   and every member read, and EnumerableOwnProperties' `ownKeys` plus its per-key `getOwnPropertyDescriptor`
    traps. Any of them can hold a loop, so any of them preempted in an activation with no flow base; and the C
    recursion meant a deep document could not be parked at any depth at all. The prologue was the same story —
    LengthOfArrayLike and the element reads of a replacer ARRAY, and the ToString/ToNumber of a wrapper `space`.
@@ -31414,7 +31414,7 @@ typedef struct JSSJFrame {
     uint8_t raw;           /* 1 = a JSON.rawJSON payload: its text is the output, NOT a quoted string */
     uint8_t has_content;   /* an object node has written something between its braces */
     uint8_t pushed;        /* this node is on the cycle-detection stack and owes a pop */
-    struct JSEnumKeys *ek; /* SJ_KEYS: EnumerableOwnPropertyNames' key half, resumable (owned) */
+    struct JSEnumKeys *ek; /* SJ_KEYS: EnumerableOwnProperties' key half, resumable (owned) */
 } JSSJFrame;
 
 enum {
@@ -53765,7 +53765,7 @@ typedef struct JRFrame {
                                        3=the enumerable-key walk is in flight (an OBJECT val only),
                                        4=`Get(holder, P)` is in flight, 5=the child's apply is in flight,
                                        6=LengthOfArrayLike is in flight */
-    struct JSEnumKeys *ek;          /* phase 3: EnumerableOwnPropertyNames' key half, resumable (owned) */
+    struct JSEnumKeys *ek;          /* phase 3: EnumerableOwnProperties' key half, resumable (owned) */
     JSValue applied;                /* phase 5: the child's revived value, owned across the CreateDataProperty */
     JSAtom apply_name;              /* phase 5: the child's key (owned) */
     uint8_t apply_del;              /* phase 5: 1 = the child revived to undefined, so the apply is a [[Delete]] */
@@ -103082,8 +103082,11 @@ static int js_json_str_walk(JSContext *ctx, JSJsonStr *s, JSValue in, JSValue **
                 f->phase = SJ_LOOP;
                 continue;
             }
-            /* step 3: `? EnumerableOwnPropertyNames(value, key)` — the `ownKeys` trap and one
-               `getOwnPropertyDescriptor` per key, both of which the C body ran with no flow base. */
+            /* §25.5.4.5 step 6.a: "Let keys be ? EnumerableOwnProperties(value, key)." — the `ownKeys`
+               trap and one `getOwnPropertyDescriptor` per key, both of which the C body ran with no flow
+               base. This site cited `step 3`, which is "Let stepback be state.[[Indent]]" — a number IN
+               RANGE for a 13-step algorithm, so the step channel had nothing to fail on and only the
+               sibling at SJ_KEYS, which already cited 6.a, disagreed with it. */
             f->ek = js_mallocz(ctx, sizeof(*f->ek));
             if (!f->ek) return -1;
             js_enum_keys_init(f->ek);
