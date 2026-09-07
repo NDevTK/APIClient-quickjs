@@ -87815,7 +87815,7 @@ static int js_date_this_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result);
 static void js_date_set_visit(JSContext *ctx, void *st, JSStepVisit *v);
-/* 21.4.4.20-.28 and B.2.3.1. Each setter reads [[DateValue]] at step 2, ToNumbers every argument the spec names
+/* 21.4.4.20-.28 and B.2.3.2. Each setter reads [[DateValue]] at step 2, ToNumbers every argument the spec names
    at steps 3-6 — unconditionally, which is why the C body carried a comment saying so — and computes from both.
    set_date_field ran those coercions with JS_ToFloat64 from its C entry, so
    `new Date(0).setFullYear({valueOf(){for(;;){}}})` preempted with no flow base.
@@ -87827,7 +87827,7 @@ static void js_date_set_visit(JSContext *ctx, void *st, JSStepVisit *v);
    captured fields have to live on the state, which is what makes this a machine.
 
    `arg` is the same 0xFEL magic the C body took — first field, end field, is_local — plus DATE_SET_MAKEFULLYEAR
-   for setYear, whose only difference from setFullYear is B.2.3.1 step 5's MakeFullYear on the coerced value. */
+   for setYear, whose only difference from setFullYear is B.2.3.2 step 5's MakeFullYear on the coerced value. */
 #define DATE_SET_MAKEFULLYEAR 0x1000
 #define DATE_SET_DEF(magic, alg, stagelist) \
     { sizeof(JSDateSet), js_date_set_step, js_date_set_fini, (magic), .visit = js_date_set_visit, \
@@ -87853,11 +87853,11 @@ DATE_SET_LIST(DATE_SET_TABLE)
 #undef DATE_SET_TABLE
 static const char *const js_date_setYear_steps[] = {
     DATESET_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.1 steps 1-3 (dateObject has [[DateValue]]; t is dateObject.[[DateValue]])",
-        "B.2.3.1 steps 4-5 (y is ToNumber(year), then MakeFullYear(y))")
+        "B.2.3.2 steps 1-3 (dateObj has [[DateValue]]; time is dateObj.[[DateValue]])",
+        "B.2.3.2 step 5 (fullYear is MakeFullYear(? ToNumber(year)))")
     NULL };
 static const JSTrampStepDef js_date_setYear_def = DATE_SET_DEF(0x011 | DATE_SET_MAKEFULLYEAR,
-                                                              "B.2.3.1 Date.prototype.setYear",
+                                                              "B.2.3.2 Date.prototype.setYear",
                                                               js_date_setYear_steps);
 /* 21.4.4.27 setTime is the one that reads NOTHING from the stored value — step 2 validates the slot and step 3's
    ToNumber is the whole input — so it IS a coerce-then-compute declaration, with the RequireInternalSlot as the
@@ -112396,7 +112396,7 @@ static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         cb_result = JS_UNDEFINED;
         s->result = JS_UNDEFINED;
         /* steps 1-3: RequireInternalSlot and the [[DateValue]] read, both BEFORE the first coercion. `first_field
-           == 0` is B.2.3.1 step 4 / 21.4.4.21 step 4 — the setters that write the YEAR treat a NaN time value as
+           == 0` is B.2.3.2 step 4 / 21.4.4.21 step 5 — the setters that write the YEAR treat a NaN time value as
            +0 instead of returning early. */
         s->res = get_date_fields(ctx, s->hdr.this_val, s->fields, is_local, first_field == 0);
         if (s->res < 0)
@@ -112414,7 +112414,7 @@ static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
         if (magic & DATE_SET_MAKEFULLYEAR) {
-            /* B.2.3.1 step 5 MakeFullYear: a two-digit year is 1900-relative, and a NaN stays NaN. */
+            /* B.2.3.2 step 5 MakeFullYear: a two-digit year is 1900-relative, and a NaN stays NaN. */
             if (isfinite(a)) {
                 a = trunc(a);
                 if (a >= 0 && a < 100)
