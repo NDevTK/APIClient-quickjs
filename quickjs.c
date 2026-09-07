@@ -968,8 +968,12 @@ typedef struct JSClosureVar {
 #define ARG_SCOPE_INDEX 1
 #define ARG_SCOPE_END (-2)
 
-/* One provisional Annex B.3.2.1 var store: the name it writes, the scope the FunctionDeclaration lives in, and
-   where its OP_scope_put_var_env sits in the byte code. `bc_pos` is -1 once the store has been patched out. */
+/* One provisional Annex B var store: the name it writes, the scope the FunctionDeclaration lives in, and
+   where its OP_scope_put_var_env sits in the byte code. `bc_pos` is -1 once the store has been patched out.
+   10.2.11 FunctionDeclarationInstantiation step 32.a.i.2.c is the store; its step 32.a.i.2 condition is what
+   decides whether the store is made at all, and that is what PROVISIONAL means here. Annex B B.3.2 states the
+   feature and no longer states the algorithm: the maintained edition writes these steps inline in 10.2.11 and
+   B.3.2 only points at them, which is why no B.3.2.x subsection exists to cite. */
 typedef struct JSAnnexBFuncVar {
     JSAtom name;
     int scope_level;
@@ -53567,11 +53571,12 @@ typedef struct JSFunctionDef {
     int using_decl_size;
     JSUsingDecl *using_decls;
 
-    /* B.3.2.1's var stores that are still PROVISIONAL. The condition "replacing the FunctionDeclaration with a
-       VariableStatement would produce no Early Error" is false when a block ENCLOSING the function's own
-       declares the name lexically — and that declaration can be written AFTER the block the function sits in,
-       so it is not known where the store is emitted. Each entry names the store's byte position; a later
-       lexical declaration that encloses it patches the store out. */
+    /* 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2.c's var stores that are still PROVISIONAL. Its
+       step 32.a.i.2 condition, "replacing the FunctionDeclaration funcDecl with a VariableStatement that has
+       funcName as a BindingIdentifier would not produce any Early Errors for func", is false when a block
+       ENCLOSING the function's own declares the name lexically — and that declaration can be written AFTER the
+       block the function sits in, so it is not known where the store is emitted. Each entry names the store's
+       byte position; a later lexical declaration that encloses it patches the store out. */
     int annexb_var_count;
     int annexb_var_size;
     JSAnnexBFuncVar *annexb_vars;
@@ -56140,9 +56145,9 @@ static void annexb_func_var_record(JSParseState *s, JSFunctionDef *fd, JSAtom na
 
 /* A lexical declaration of `name` has just been added to `scope_level`. Every provisional Annex B store for that
    name whose FunctionDeclaration lives in a scope this one ENCLOSES loses its condition: the VariableStatement
-   replacement would be an Early Error, so B.3.2.1 does not apply. Patch the store out in place — OP_drop plus
-   nops is exactly the seven bytes OP_scope_put_var_env occupies, and the value the OP_dup above pushed still has to
-   go. */
+   replacement would be an Early Error, so 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2 no longer
+   admits it. Patch the store out in place — OP_drop plus nops is exactly the seven bytes OP_scope_put_var_env
+   occupies, and the value the OP_dup above pushed still has to go. */
 static void annexb_func_var_revoke(JSContext *ctx, JSFunctionDef *fd, JSAtom name, int scope_level)
 {
     int i, sl;
@@ -56479,9 +56484,10 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
         }
 
         /* A lexical declaration HERE retracts every provisional Annex B store this scope encloses: the
-           VariableStatement replacement B.3.2.1 tests would now be an Early Error. The `let` can be written
-           after the block the function sits in — `{ { function x(){} } let x; }` — which is why the store is
-           provisional rather than decided where it was emitted. A function declaration is not one of these
+           VariableStatement replacement 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2 tests would now
+           be an Early Error. The `let` can be written after the block the function sits in —
+           `{ { function x(){} } let x; }` — which is why the store is provisional rather than decided where it
+           was emitted. A function declaration is not one of these
            kinds; B.3.3.4 lets those redefine each other. */
         if (var_def_type == JS_VAR_DEF_LET || var_def_type == JS_VAR_DEF_CONST ||
             var_def_type == JS_VAR_DEF_USING)
@@ -63011,8 +63017,9 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
    out-parameter and the export flag, all seeded by PD_CALL_P.
 
    st_fd is the function def this production is BUILDING. It starts as the ENCLOSING def, because every name
-   the header resolves (the B.3.2.1 var lookup, the lexical redefinition check) must resolve against the
-   enclosing scope, and js_new_function_def then REPLACES it with the new def. So st_fd cannot be re-derived
+   the header resolves (the Annex B var lookup of 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2, the
+   lexical redefinition check) must resolve against the enclosing scope, and js_new_function_def then REPLACES
+   it with the new def. So st_fd cannot be re-derived
    from s->cur_func at either point, and fd2_fail — reachable only after that replacement — unwinds through
    st_fd->parent exactly as the recursive body's `fd` local did.
 
@@ -63105,10 +63112,10 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
     }
 
     if (f->level == JS_PARSE_FUNC_VAR) {
-        /* B.3.2.1's condition, in the order it states it. A lexical declaration of the same name is what makes
-           "replacing the FunctionDeclaration with a VariableStatement would produce an Early Error" true — with
-           ONE exception: the binding this very declaration is about to create, or the one an EARLIER function
-           declaration in the same block already created, which B.3.3.4 explicitly allows to be redefined.
+        /* 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2's condition, in the order it states it. A
+           lexical declaration of the same name is what FAILS its "would not produce any Early Errors for func"
+           half — with ONE exception: the binding this very declaration is about to create, or the one an
+           EARLIER function declaration in the same block already created, which B.3.3.4 explicitly allows to be redefined.
            Excluding those too meant only the FIRST of `{ function f(){3}; function f(){4} }` reached the var, so
            the outer binding kept the function the block's own binding no longer held. */
         int lex_idx = find_lexical_decl(ctx, f->st_fd, f->st_idx, f->st_fd->scope_first, false);
@@ -63591,8 +63598,8 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
         } else if (f->level == JS_PARSE_FUNC_VAR) {
             if (f->st_pos_a >= 0)
                 s->cur_func->vars[f->st_pos_a].func_pool_idx = idx;   /* initialized on entering the scope */
-            /* THE VALUE the Annex B store writes. B.3.2.1 step 3 is
-                   fobj = benv.GetBindingValue(F);  genv.SetMutableBinding(F, fobj)
+            /* THE VALUE the Annex B store writes. 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2.c is
+                   funcObj = blockEnv.GetBindingValue(funcName);  funcEnv.SetMutableBinding(funcName, funcObj)
                — it reads the BLOCK's binding, it does not build a second function. For a block-scoped
                declaration this code made a whole new closure here and stored THAT, so
                `{ function x(){} o = x; }` left the outer `x` and the inner one two different objects, and with
@@ -63658,7 +63665,8 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
                 }
                 /* store directly into the var, bypassing the lexical scope. The store is PROVISIONAL: an
                    enclosing block may declare the name lexically LATER, and then the VariableStatement
-                   replacement B.3.2.1 tests would be an Early Error. define_var patches it out if that happens. */
+                   replacement 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2 tests would be an
+                   Early Error. define_var patches it out if that happens. */
                 annexb_func_var_record(s, s->cur_func, f->st_idx, s->cur_func->byte_code.size);
                 emit_op(s, OP_scope_put_var_env);
                 emit_atom(s, f->st_idx);
