@@ -96236,12 +96236,14 @@ static const char *const js_str_endswith_steps[] = {
     NULL };
 static const char *const js_str_startswith_steps[] = {
     SINC_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.24 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O)) and IsRegExp step 1's "
-        "`searchString is an Object` test",
-        "22.1.3.24 steps 3-4 (isRegExp is IsRegExp(searchString) — its Get(searchString, @@match); the TypeError)",
-        "22.1.3.24 step 5 (searchStr is ToString(searchString))",
-        "22.1.3.24 step 7 (pos is 0 when position is undefined, else ToIntegerOrInfinity(position)), then "
-        "steps 6, 8-13 (start is pos clamped; end is start + searchLength; the substring compare)")
+        "22.1.3.24 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue)) and "
+        "7.2.6 IsRegExp step 1's `searchString is an Object` test",
+        "22.1.3.24 steps 4-5 (isRegexp is IsRegExp(searchString) — its Get(searchString, %Symbol.match%); "
+        "the TypeError)",
+        "22.1.3.24 step 6 (searchString is set to ToString(searchString))",
+        "22.1.3.24 step 8 (start clamps ToIntegerOrInfinity(position) between 0 and length) - only its "
+        "ToIntegerOrInfinity half runs here, then steps 7, 9-16 (length; the assert; searchLength; true "
+        "when it is 0; end is start + searchLength; false when end exceeds length; the substring compare)")
     NULL };
 
 static JSValue js_string_includes_search(JSContext *ctx, JSValueConst strv, JSValueConst vv, int pos_in,
