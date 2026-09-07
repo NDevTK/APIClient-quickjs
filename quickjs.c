@@ -91469,30 +91469,30 @@ static JSValue js_array_slice_fini(JSContext *ctx, void *st, bool take_result)
 /* 23.1.3.35 Array.prototype.toSpliced — splice without mutating the receiver. It does not consult
    Array[@@species]; the result is always a dense base Array, so every write into it is a `!`
    CreateDataPropertyOrThrow on an engine-private object and reaches no page code. The READS are the page's:
-   LengthOfArrayLike, ToIntegerOrInfinity of `start` and of `skipCount` (a `valueOf` runs there), and steps 14.b
-   and 16.c's `? Get(O, Pi)` for every copied element. js_array_toSpliced ran all of them from C, so a loop in
+   LengthOfArrayLike, ToIntegerOrInfinity of `start` and of `skipCount` (a `valueOf` runs there), and steps 15.b
+   and 17.c's `? Get(O, Pi)` for every copied element. js_array_toSpliced ran all of them from C, so a loop in
    any of them had no flow base and aborted at its back-edge.
-   It also asked HasProperty before every read (JS_TryGetPropertyInt64), which 14.b and 16.c do NOT: on a Proxy
+   It also asked HasProperty before every read (JS_TryGetPropertyInt64), which 15.b and 17.c do NOT: on a Proxy
    whose `has` says false and whose `get` returns a value, that produced undefined where the spec yields the
    value. The step sub-sequence is the plain Get the spec names.
    The FAST-ARRAY span stays: js_get_fast_array is precisely the statement that no accessor, no Proxy trap and no
    prototype lookup is reachable, so it is the same computation with no observable step. */
 
 /* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). This machine's own
-   comments cited steps 14, 15 and 16 for the three walks; 23.1.3.35 numbers them 16, 17 and 18, and a comment
+   comments cited steps 14, 15 and 16 for the three walks; 23.1.3.35 numbers them 15, 16 and 17, and a comment
    that cites a step nobody can look up is exactly the private numbering the declaration replaces.
    The inserted-items copy had a stage of its own and rested at NO step: it was entered and left inside one
    step() call (it runs no request), so no park could ever name it. It sits at the head walk's exit now. */
 #define ATSP_STAGES(X) \
     X(ATSP_TOOBJECT, "23.1.3.35 step 1 (O is ToObject(this value))") \
     X(ATSP_LENGTH,   "23.1.3.35 step 2 (len is LengthOfArrayLike(O))") \
-    X(ATSP_START,    "23.1.3.35 steps 3-6 (relativeStart is ToIntegerOrInfinity(start); actualStart)") \
-    X(ATSP_CREATE,   "23.1.3.35 steps 7-15 (insertCount; actualSkipCount, clamped from " \
-                     "ToIntegerOrInfinity(skipCount); newLen and its 2^53-1 check; A is ArrayCreate(newLen); " \
-                     "i is 0; r is actualStart + actualSkipCount)") \
-    X(ATSP_HEAD,     "23.1.3.35 step 16 (Repeat while i < actualStart: iValue is Get(O, Pi)) - and step 17, " \
+    X(ATSP_START,    "23.1.3.35 step 3 (actualStart is ToClampedIndex(start, len))") \
+    X(ATSP_CREATE,   "23.1.3.35 steps 4-14 (insertCount; maxSkipCount; actualSkipCount, clamped from " \
+                     "ToIntegerOrInfinity(skipCount); newLen, its assertion and its 2^53-1 check; A is " \
+                     "ArrayCreate(newLen); i is 0; r is actualStart + actualSkipCount)") \
+    X(ATSP_HEAD,     "23.1.3.35 step 15 (Repeat while i < actualStart: iValue is Get(O, Pi)) - and step 16, " \
                      "the copy of the inserted items") \
-    X(ATSP_TAIL,     "23.1.3.35 step 18 (Repeat while i < newLen: fromValue is Get(O, from)) - and step 19, " \
+    X(ATSP_TAIL,     "23.1.3.35 step 17 (Repeat while i < newLen: fromValue is Get(O, from)) - and step 18, " \
                      "Return A")
 enum { ATSP_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_array_tospliced_steps[] = { ATSP_STAGES(JS_STEP_STAGE_LABEL) NULL };
@@ -91520,7 +91520,8 @@ static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, 
         s->hdr.stage = ATSP_START;
     }
     if (s->hdr.stage == ATSP_START) {
-        /* steps 3-6: ToIntegerOrInfinity(start), then the negative-relative clamp into [0, len]. */
+        /* step 3: ToClampedIndex(start, len) is ToIntegerOrInfinity(start), then the negative-relative
+           clamp into [0, len]. */
         r = step_toint64_run(ctx, &s->hdr, step_arg(&s->hdr, 0), cb_result, &s->start, out_cb, out_argc);
         cb_result = JS_UNDEFINED;
         if (r) return r < 0 ? -1 : r;
@@ -91528,7 +91529,7 @@ static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, 
         s->hdr.stage = ATSP_CREATE;
     }
     if (s->hdr.stage == ATSP_CREATE) {
-        /* steps 8-10: `start` absent skips nothing, `skipCount` absent skips the whole tail, and only the
+        /* steps 6-8: `start` absent skips nothing, `skipCount` absent skips the whole tail, and only the
            present-and-given case coerces — which is why this reads argc and not the padded operand. */
         if (s->hdr.argc == 0) {
             s->del = 0;
@@ -91567,10 +91568,10 @@ static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, 
         s->from = s->start + s->del;
         s->hdr.stage = ATSP_HEAD;
     }
-    /* step 16: the head, `? Get(O, Pi)` for i < actualStart. */
+    /* step 15: the head, `? Get(O, Pi)` for i < actualStart. */
     while (s->hdr.stage == ATSP_HEAD) {
         if (s->i >= s->start) {
-            /* step 17: the inserted items, which are already values — nothing observable happens here, so
+            /* step 16: the inserted items, which are already values — nothing observable happens here, so
                there is no request to park on and no stage of its own to park at. */
             int64_t j;
             for (j = 0; j < s->add; j++, s->i++)
@@ -91585,7 +91586,7 @@ static int js_array_tospliced_step(JSContext *ctx, void *st, JSValue cb_result, 
         s->el = JS_UNDEFINED;
         s->i++;
     }
-    /* step 18: the tail, `? Get(O, from)` written at Pi — two cursors, because the copy is a shift. */
+    /* step 17: the tail, `? Get(O, from)` written at Pi — two cursors, because the copy is a shift. */
     for (;;) {
         if (s->i >= s->newlen) {
             JS_FreeValue(ctx, cb_result);
