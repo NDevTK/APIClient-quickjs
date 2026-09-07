@@ -116138,7 +116138,8 @@ static JSValue js_ta_slice_fini(JSContext *ctx, void *st, bool take_result)
     X(TAIDX_INDEX,    INDEX)    \
     TAIL(X)
 #define TAIDX_TAIL_AT(X) \
-    X(TAIDX_READ, "23.2.3.1 steps 5-8 (k is relativeIndex or len + relativeIndex; Get(O, ToString(k)))")
+    X(TAIDX_READ, "23.2.3.1 steps 5-6 (out of range returns undefined, else Get(O, ToString(k))) - and " \
+                  "step 4's negative-relative half, which resolves here")
 #define TAIDX_TAIL_SET(X) \
     X(TAIDX_SRC,   "23.2.3.26 steps 5-6 (source is ToObject(source); a typed-array source is set whole)") \
     X(TAIDX_LEN,   "23.2.3.26.1 step 3 (srcLength is LengthOfArrayLike(src))") \
@@ -116150,7 +116151,8 @@ enum { TAIDX_SET_TAIL_BASE = TAIDX_INDEX, TAIDX_TAIL_SET(JS_STEP_STAGE_ENUM) };
 static const char *const js_ta_at_steps[] = {
     TAIDX_STAGES(JS_STEP_STAGE_LABEL,
         "23.2.3.1 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))",
-        "23.2.3.1 step 4 (relativeIndex is ToIntegerOrInfinity(index))", TAIDX_TAIL_AT)
+        "23.2.3.1 step 4 (k is ToAbsoluteIndex(index, len)) - only its ToIntegerOrInfinity half runs "
+        "in this stage, and that half is the page's code", TAIDX_TAIL_AT)
     NULL };
 static const char *const js_ta_set_steps[] = {
     TAIDX_STAGES(JS_STEP_STAGE_LABEL,
