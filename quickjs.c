@@ -56453,8 +56453,13 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
         if (idx >= 0) {
             if (idx < GLOBAL_VAR_OFFSET) {
                 if (fd->vars[idx].scope_level == fd->scope_level) {
-                    /* same scope: in non strict mode, functions
-                       can be redefined (annex B.3.3.4). */
+                    /* same scope: in non strict mode, functions can be redefined. 14.2.1's early error for
+                       `Block : { StatementList }` waives its duplicate-LexicallyDeclaredNames Syntax Error
+                       where the host supports Block-Level Function Declarations Web Legacy Compatibility
+                       Semantics, IsStrict is false, and "The duplicate entries are only bound by
+                       FunctionDeclarations". The host condition holds by construction here; the test below is
+                       the other two — non-strict, and BOTH the standing binding and the new one are
+                       FunctionDeclarations. */
                     if (!(!fd->is_strict_mode &&
                           var_def_type == JS_VAR_DEF_FUNCTION_DECL &&
                           fd->vars[idx].var_kind == JS_VAR_FUNCTION_DECL)) {
@@ -56488,7 +56493,7 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
            be an Early Error. The `let` can be written after the block the function sits in —
            `{ { function x(){} } let x; }` — which is why the store is provisional rather than decided where it
            was emitted. A function declaration is not one of these
-           kinds; B.3.3.4 lets those redefine each other. */
+           kinds; 14.2.1's waived Block early error lets those redefine each other. */
         if (var_def_type == JS_VAR_DEF_LET || var_def_type == JS_VAR_DEF_CONST ||
             var_def_type == JS_VAR_DEF_USING)
             annexb_func_var_revoke(ctx, fd, name, fd->scope_level);
@@ -63115,7 +63120,8 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
         /* 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2's condition, in the order it states it. A
            lexical declaration of the same name is what FAILS its "would not produce any Early Errors for func"
            half — with ONE exception: the binding this very declaration is about to create, or the one an
-           EARLIER function declaration in the same block already created, which B.3.3.4 explicitly allows to be redefined.
+           EARLIER function declaration in the same block already created, which 14.2.1's waived Block early
+           error explicitly allows to be redefined.
            Excluding those too meant only the FIRST of `{ function f(){3}; function f(){4} }` reached the var, so
            the outer binding kept the function the block's own binding no longer held. */
         int lex_idx = find_lexical_decl(ctx, f->st_fd, f->st_idx, f->st_fd->scope_first, false);
@@ -63625,9 +63631,12 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
                     hf = add_global_var(ctx, s->cur_func, f->st_idx);
                     if (!hf)
                         goto fd2_fail;
-                    /* it is considered as defined at the top level
-                       (needed for annex B.3.3.4 and B.3.3.5
-                       checks) */
+                    /* it is considered as defined at the top level (needed for the two Annex B duplicate-name
+                       early-error waivers: 14.2.1 for `Block : { StatementList }` and 14.12.1 for
+                       `SwitchStatement : switch ( Expression ) CaseBlock`. Both are titled "Static Semantics:
+                       Early Errors", which is a title dozens of this standard's sections share — derive the
+                       count with a heading scan if you want it — so the PRODUCTION is what names these two and
+                       the shared title is not evidence about either.) */
                     hf->scope_level = 0;
                     hf->force_init = s->cur_func->is_strict_mode;
                 } else {
