@@ -95384,10 +95384,13 @@ static const char *const js_str_repeat_steps[] = {
     NULL };
 static const char *const js_str_padStart_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.17 step 1, StringPaddingBuiltinsImpl step 1 (S is ToString(RequireObjectCoercible(this)))",
-        "22.1.3.17 StringPaddingBuiltinsImpl step 2 (intMaxLength is ToLength(maxLength))",
-        "22.1.3.17 StringPaddingBuiltinsImpl steps 3-6 (only when intMaxLength exceeds the length: filler is ToString(fillString), or the code unit 0x0020 when it is undefined)",
-        "22.1.3.17 StringPaddingBuiltinsImpl step 7, StringPad (the filler repeated BEFORE S)")
+        "22.1.3.17 steps 1-2 (thisValue is RequireObjectCoercible'd), then step 3's 22.1.3.17.1 "
+        "StringPaddingBuiltinsImpl step 1 (string is ToString(thisValue))",
+        "22.1.3.17.1 StringPaddingBuiltinsImpl step 2 (intMaxLength is ToLength(maxLength))",
+        "22.1.3.17.1 StringPaddingBuiltinsImpl steps 3-6 (only when intMaxLength exceeds stringLength: "
+        "fillString is set to ToString(fillString), or to the code unit 0x0020 when it is undefined)",
+        "22.1.3.17.1 StringPaddingBuiltinsImpl step 7, 22.1.3.17.2 StringPad (the fill repeated BEFORE "
+        "string)")
     NULL };
 static const char *const js_str_padEnd_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
