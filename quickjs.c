@@ -95376,10 +95376,11 @@ static const char *const js_str_substr_steps[] = {
     NULL };
 static const char *const js_str_repeat_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.18 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.18 step 3 (n is ToIntegerOrInfinity(count))",
+        "22.1.3.18 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.18 step 4 (n is ToIntegerOrInfinity(count))",
         SRV_NO_ARG1,
-        "22.1.3.18 steps 4-6 (the RangeError for a negative or infinite n; n copies of S)")
+        "22.1.3.18 steps 5-7 (the RangeError for a negative or infinite n; the empty String when n is 0; "
+        "n copies of string)")
     NULL };
 static const char *const js_str_padStart_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
