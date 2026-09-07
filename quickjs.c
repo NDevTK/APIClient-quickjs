@@ -12670,6 +12670,36 @@ static JSValue js_absent_ask(JSContext *ctx, JSValueConst obj, JSAtom prop)
     return g_concolic.absent(ctx, obj, prop);
 }
 
+/* THE SAME MISS, REACHED BY AN OPERATOR THAT PERFORMS NO [[Get]] — and therefore a RECORDING and never an ask.
+   ECMAScript §13.5.3 The typeof Operator's §13.5.3.1 Runtime Semantics: Evaluation step 2.a is "If
+   IsUnresolvableReference(value) is true, return "undefined".", which settles the operator BEFORE step 2.b's
+   `Set value to ? GetValue(value)` — so there is no read to answer, and a host that answered one would make
+   step 2.b run and the operator say "object" for a name every browser says "undefined" for. The arm below
+   therefore calls this and then pushes exactly what it pushed before.
+   IT IS A FUNCTION AND NOT AN `if` AT THE ARM for the reason js_absent_ask is one: the conditions under which
+   this file speaks to that host — the hook being installed, and the key rule — are ONE thing to keep in step,
+   and a second spelling of them at a call site is a second thing to keep in step. What it does NOT share with
+   the ask is the BASE test, and that is not an omission: an unresolvable Reference is a miss whose last link
+   WAS the global record, which the arm has already established by reaching it, so there is no base here to
+   ask about.
+   THE KEY RULE IS ASSERTED RATHER THAN TESTED, which is the one place this differs from js_absent_ask and is a
+   fact about the operand rather than a relaxation. The ask answers for a key any [[Get]] can carry, including
+   a well-known symbol, which is why it filters; this one is reached only from OP_get_var_undef, whose atom is
+   an IDENTIFIER's — §12.7 Names and Keywords gives no IdentifierStart that is a decimal digit, so it is
+   neither a symbol nor the canonical numeric string §6.1.7 The Object Type makes a tagged integer atom of.
+   A filter here would silently drop a route that should never exist; the assert names it. */
+static void js_absent_note_unresolved(JSContext *ctx, JSAtom prop)
+{
+    if (likely(g_concolic.absent_unresolved == NULL))
+        return;
+    DCHECK(JS_AtomIsPublishedName(ctx->rt, prop),
+           "a `typeof` on an unresolvable name reached the injected-state channel with a key the channel "
+           "cannot NAME — this arm is entered only from OP_get_var_undef, whose atom is an identifier's and "
+           "therefore a string atom by the grammar, so a symbol or an index here is an opcode routed to the "
+           "typeof arm that is not a typeof");
+    g_concolic.absent_unresolved(ctx, prop);
+}
+
 /* THE INTERFACE'S OWN NAME, FOR AN ASSERT THAT WOULD OTHERWISE NAME A HUNDRED COMPONENTS AT ONCE.
    The accessor assertions below identify a read by the RECEIVER's class and the HOLDER's class, and that
    argument holds only while a component has a JSClassID of its own. It does not hold for the shape a Web IDL
@@ -48230,6 +48260,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (wop == OP_get_var_undef || wop == OP_delete_var) {
                         /* 13.5.3 typeof and 13.5.1.2 step 3 delete are DEFINED on an unresolvable Reference,
                            and neither throws for one. */
+                        /* AND THE `typeof` IS RECORDED ON THE WAY PAST, WHICH IS THE ONE THING THIS ARM'S
+                           CORRECTNESS COSTS. The answer is unchanged and must be — see
+                           js_absent_note_unresolved for why a host may not decide here — but the arm above is
+                           the spelling a transpiled bundle actually writes for a feature detect, so leaving it
+                           silent means a page that took the false arm on every guard it has produces a census
+                           of unanswered platform names that reads CLEAN. What is lost is not the line, it is
+                           every endpoint and every sink behind the guard.
+                           ONLY `typeof`, AND `delete` IS NOT AN OVERSIGHT: 13.5.1.2 step 3's `delete` on an
+                           unresolvable Reference returns true without ever asking what the name would have
+                           held, so it is not a READ of the name and the census's population is reads. Sharing
+                           an arm is not sharing a question. */
+                        if (wop == OP_get_var_undef)
+                            js_absent_note_unresolved(ctx, atom);
                         js_with_has_free(ctx, wh);
                         *sp++ = (wop == OP_delete_var) ? js_bool(true) : JS_UNDEFINED;
                         BREAK;

@@ -2285,6 +2285,24 @@ typedef struct JSConcolicHooks {
     int (*cmp)(JSContext *ctx, JSValue *sp, int is_neq, JSConcolicEqOp op);
     int (*is)(JSValueConst v);
     JSValue (*absent)(JSContext *ctx, JSValueConst obj, JSAtom name);
+    /* THE SAME MISS ON THE GLOBAL, REACHED BY AN OPERATOR THAT PERFORMS NO [[Get]] AT ALL — `typeof X` where
+       nothing binds X. RECORDING ONLY, AND THE VOID RETURN IS THE CONTRACT rather than a convenience: ECMAScript
+       §13.5.3 The typeof Operator's §13.5.3.1 Runtime Semantics: Evaluation step 2.a is "If
+       IsUnresolvableReference(value) is true, return "undefined"." — the operator answers BEFORE step 2.b's
+       GetValue, so there is no read for a host to answer and a value handed back here would make step 2.b run
+       and the operator say "object" where every browser says "undefined". `.absent` may decide a read; this may
+       only watch one.
+       WHY IT EXISTS AT ALL, since the decision is unchanged: the suppression `.absent` performs for a name a
+       standard owns is CORRECT and SILENT, and `typeof X` is the spelling that never reaches it. A bundle whose
+       whole feature detection is written `typeof X !== "undefined"` — the dominant shape in transpiled code —
+       takes the false arm on every guard while the host's census of unanswered names reads clean, so what is
+       lost is not the line but every endpoint and every sink behind the guard. The host counts it; nothing
+       forks and nothing is minted.
+       `name` is the identifier's atom, which is a string atom by the grammar, so the key rule
+       JS_AtomIsPublishedName states holds here by construction and the engine asserts it rather than filtering.
+       Installed with `.absent` or not at all: a host that takes one spelling of one miss and not the other has
+       a census whose zero is a fact about which opcode the page happened to use. */
+    void (*absent_unresolved)(JSContext *ctx, JSAtom name);
     /* THE HIT ON A PUBLISHED RECORD — see the paragraph above. `holder` is the record the own data slot was
        found on and `value` is what it holds, BORROWED. */
     JSValue (*present)(JSContext *ctx, JSValueConst holder, JSAtom name, JSValueConst value);
