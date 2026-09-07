@@ -87564,7 +87564,7 @@ static const JSTrampStepDef js_str_slice_def      = { sizeof(JSStrRecv), js_str_
                                                     .algorithm = "22.1.3.22 String.prototype.slice",
                                                     .steps = js_str_slice_steps };
 static const JSTrampStepDef js_str_substr_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_SUBSTR, .visit = js_str_recv_visit,
-                                                    .algorithm = "B.2.3.1 String.prototype.substr",
+                                                    .algorithm = "B.2.2.1 String.prototype.substr",
                                                     .steps = js_str_substr_steps };
 static const JSTrampStepDef js_str_repeat_def     = { sizeof(JSStrRecv), js_str_recv_step, js_str_recv_fini, STRRECV_REPEAT, .visit = js_str_recv_visit,
                                                     .algorithm = "22.1.3.18 String.prototype.repeat",
@@ -95369,10 +95369,12 @@ static const char *const js_str_slice_steps[] = {
     NULL };
 static const char *const js_str_substr_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.3.1 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "B.2.3.1 step 4 (intStart is ToIntegerOrInfinity(start))",
-        "B.2.3.1 step 8 (intLength is size when length is undefined, else ToIntegerOrInfinity(length))",
-        "B.2.3.1 steps 3, 5-7, 9-12 (size; intStart relative to size when negative; intEnd; the substring)")
+        "B.2.2.1 steps 1-3 (obj is RequireObjectCoercible'd; string is ToString(obj))",
+        "B.2.2.1 step 5 (intStart is ToClampedIndex(start, size)) - only its ToIntegerOrInfinity half runs here",
+        "B.2.2.1 step 6 (intLength is size when length is undefined, else the clamp of "
+        "ToIntegerOrInfinity(length) into [0, size]) - only its ToIntegerOrInfinity half runs here",
+        "B.2.2.1 steps 4, 7-8 (size; intEnd is min(intStart + intLength, size); the substring) - and step "
+        "5's relative-index half, which resolves with them")
     NULL };
 static const char *const js_str_repeat_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
@@ -95651,7 +95653,7 @@ static int js_str_recv_step(JSContext *ctx, void *st, JSValue cb_result, JSValue
         return JS_IsException(s->result) ? (s->result = JS_UNDEFINED, -1) : 0;
     }
     if (mode == STRRECV_SLICE || mode == STRRECV_SUBSTR) {
-        /* 22.1.3.22 slice / B.2.3.1 substr: the SAME two coercions as substring in the same order, differing only
+        /* 22.1.3.22 slice / B.2.2.1 substr: the SAME two coercions as substring in the same order, differing only
            in how the pair is clamped — slice takes [start, end) with a negative index relative to the end, substr
            takes [start, start+length). The C bodies did both JS_ToInt32Clamp calls from a C entry, which is where
            `"abc".slice({valueOf(){ while(x){} }})` preempted with no flow base. */
