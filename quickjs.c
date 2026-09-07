@@ -95323,10 +95323,12 @@ static const char *const js_str_substring_steps[] = {
     NULL };
 static const char *const js_str_indexOf_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.9 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.9 step 3 (searchStr is ToString(searchString))",
-        "22.1.3.9 step 4 (pos is ToIntegerOrInfinity(position))",
-        "22.1.3.9 steps 5-8 (len; start is pos clamped into [0, len]; StringIndexOf(S, searchStr, start))")
+        "22.1.3.9 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.9 step 4 (searchString is set to ToString(searchString))",
+        "22.1.3.9 step 6 (start clamps ToIntegerOrInfinity(position) between 0 and length) - only its "
+        "ToIntegerOrInfinity half runs here",
+        "22.1.3.9 steps 5, 7-10 (length; the assert; StringIndexOf(string, searchString, start); -1 when "
+        "not-found) - and step 6's clamping half, which resolves with them")
     NULL };
 static const char *const js_str_lastIndexOf_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
