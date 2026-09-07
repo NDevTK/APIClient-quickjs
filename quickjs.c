@@ -95341,10 +95341,10 @@ static const char *const js_str_lastIndexOf_steps[] = {
     NULL };
 static const char *const js_str_normalize_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.15 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.15 steps 3-4 (f is \"NFC\" when form is undefined, else ToString(form))",
+        "22.1.3.15 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.15 steps 4-5 (form is set to \"NFC\" when it is undefined, else to ToString(form))",
         SRV_NO_ARG1,
-        "22.1.3.15 steps 5-7 (the RangeError for an unknown form; ns is S normalized into f)")
+        "22.1.3.15 steps 6-8 (the RangeError for an unknown form; normal is string normalized into form)")
     NULL };
 static const char *const js_str_charAt_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
