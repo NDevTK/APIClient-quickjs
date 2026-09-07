@@ -91234,7 +91234,7 @@ static JSValue js_array_toreversed_fini(JSContext *ctx, void *st, bool take_resu
    a second implementation of one. */
 
 /* ONE list expanded twice, so a renumber carries its label with it (JSTrampStepDef.steps). TWO algorithms over
-   one walk: slice ends at its step 16 and splice keeps going, so the shared prefix is one list and splice's tail
+   one walk: slice ends at its step 10 and splice keeps going, so the shared prefix is one list and splice's tail
    is a second one appended to it — slice's array simply ENDS there, which makes a slice that ever rested in the
    tail a stage past the end of its own algorithm rather than a stage wearing a borrowed label.
    Two stages were dropped in the conversion because they rested at NO step: the dense-prefix copy and the
@@ -91261,14 +91261,15 @@ static const char *const js_array_slice_steps[] = {
     ASLICE_STAGES(JS_STEP_STAGE_LABEL,
         "23.1.3.28 step 1 (O is ToObject(this value))",
         "23.1.3.28 step 2 (len is LengthOfArrayLike(O))",
-        "23.1.3.28 steps 3-6 (relativeStart is ToIntegerOrInfinity(start); k)",
-        "23.1.3.28 steps 7-11 (relativeEnd is ToIntegerOrInfinity(end); final; count is max(final - k, 0))",
-        "23.1.3.28 steps 12-14 (A is ArraySpeciesCreate(O, count); n is 0; a dense source's prefix is copied "
+        "23.1.3.28 step 3 (k is ToClampedIndex(start, len))",
+        "23.1.3.28 steps 4-5 (an undefined end is len, else final is ToClampedIndex(end, len); count is "
+        "max(final - k, 0))",
+        "23.1.3.28 steps 6-8 (A is ArraySpeciesCreate(O, count); n is 0; a dense source's prefix is copied "
         "with nothing observable in it)",
-        "23.1.3.28 step 14.b (kPresent is HasProperty(O, Pk))",
-        "23.1.3.28 step 14.c.i (kValue is Get(O, Pk))",
-        "23.1.3.28 step 14.c.ii (CreateDataPropertyOrThrow(A, ToString(n), kValue))",
-        "23.1.3.28 step 15 (Set(A, \"length\", n, true)) - and step 16, Return A")
+        "23.1.3.28 step 8.b (kPresent is HasProperty(O, Pk))",
+        "23.1.3.28 step 8.c.i (kValue is Get(O, Pk))",
+        "23.1.3.28 step 8.c.ii (CreateDataPropertyOrThrow(A, ToString(n), kValue))",
+        "23.1.3.28 step 9 (Set(A, \"length\", n, true)) - and step 10, Return A")
     NULL };
 static const char *const js_array_splice_steps[] = {
     ASLICE_STAGES(JS_STEP_STAGE_LABEL,
