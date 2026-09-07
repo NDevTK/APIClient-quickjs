@@ -97154,17 +97154,17 @@ static JSValue js_str_replace_fini(JSContext *ctx, void *st, bool take_result)
 }
 
 
-/* 22.1.3.23 String.prototype.split, AS THE SPEC NUMBERS IT. The walk after step 5 runs none of the page's code —
+/* 22.1.3.23 String.prototype.split, AS THE SPEC NUMBERS IT. The walk after step 6 runs none of the page's code —
    the array it fills is one this engine built and nothing on it is reachable until it is returned — so ONE stage
    names that whole range, and the label says which range it is. */
 #define SPLIT_STAGES(X) \
-    X(SPL_RECV,     "22.1.3.23 step 1 (O is RequireObjectCoercible(this)) and step 2's `separator is an Object` test") \
-    X(SPL_SPLITTER, "22.1.3.23 step 2.a (splitter is GetMethod(separator, @@split))") \
-    X(SPL_CALLED,   "22.1.3.23 step 2.b.i (return Call(splitter, separator, «O, limit»))") \
-    X(SPL_STR,      "22.1.3.23 step 3 (S is ToString(O))") \
-    X(SPL_LIM,      "22.1.3.23 step 4 (lim is ToUint32(limit), or 2**32-1 when it is undefined)") \
-    X(SPL_SEP,      "22.1.3.23 step 5 (R is ToString(separator))") \
-    X(SPL_WALK,     "22.1.3.23 steps 6-16 (the scan and CreateArrayFromList — no page-observable operation)")
+    X(SPL_RECV,     "22.1.3.23 steps 1-2 (thisValue is RequireObjectCoercible'd) and step 3's `separator is an Object` test") \
+    X(SPL_SPLITTER, "22.1.3.23 step 3.a (splitter is GetMethod(separator, %Symbol.split%))") \
+    X(SPL_CALLED,   "22.1.3.23 step 3.b.i (return Call(splitter, separator, «thisValue, limit»))") \
+    X(SPL_STR,      "22.1.3.23 step 4 (string is ToString(thisValue))") \
+    X(SPL_LIM,      "22.1.3.23 step 5 (lim is ToUint32(limit), or 2**32-1 when it is undefined)") \
+    X(SPL_SEP,      "22.1.3.23 step 6 (separatorString is ToString(separator))") \
+    X(SPL_WALK,     "22.1.3.23 steps 7-18 (the scan and CreateArrayFromList — no page-observable operation)")
 enum { SPLIT_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_str_split_steps[] = { SPLIT_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
