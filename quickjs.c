@@ -83974,9 +83974,11 @@ static int JS_isConcatSpreadable(JSContext *ctx, JSValueConst obj)
 #define AAT_STAGES(X) \
     X(AAT_TOOBJECT, "23.1.3.1 step 1 (O is ToObject(this value))") \
     X(AAT_LENGTH,   "23.1.3.1 step 2 (len is LengthOfArrayLike(O): ToLength(Get(O, \"length\")))") \
-    X(AAT_INDEX,    "23.1.3.1 step 3 (relativeIndex is ToIntegerOrInfinity(index))") \
-    X(AAT_RESOLVE,  "23.1.3.1 steps 4-5 (k from relativeIndex; out of range returns undefined)") \
-    X(AAT_GET,      "23.1.3.1 step 6 (Get(O, ToString(k)))")
+    X(AAT_INDEX,    "23.1.3.1 step 3 (k is ToAbsoluteIndex(index, len)) - only its ToIntegerOrInfinity " \
+                    "half runs in this stage, and that half is the page's code") \
+    X(AAT_RESOLVE,  "23.1.3.1 step 3's negative-relative half (a finite negative int becomes len + int), " \
+                    "then step 4 (out of range returns undefined)") \
+    X(AAT_GET,      "23.1.3.1 step 5 (Get(O, ToString(k)))")
 enum { AAT_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_array_at_steps[] = { AAT_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
