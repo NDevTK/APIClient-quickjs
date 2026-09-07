@@ -85053,12 +85053,13 @@ static JSValue js_array_fill_fini(JSContext *ctx, void *st, bool take_result)
 #define AWITH_STAGES(X) \
     X(AWITH_TOOBJECT, "23.1.3.39 step 1 (O is ToObject(this value))") \
     X(AWITH_LENGTH,   "23.1.3.39 step 2 (len is LengthOfArrayLike(O))") \
-    X(AWITH_INDEX,    "23.1.3.39 step 3 (relativeIndex is ToIntegerOrInfinity(index))") \
-    X(AWITH_CREATE,   "23.1.3.39 steps 4-7 (actualIndex; a RangeError when it is out of range; " \
-                      "A is ArrayCreate(len))") \
-    X(AWITH_READ,     "23.1.3.39 steps 9.a-9.c (Repeat while k < len: Pk; fromValue is value at actualIndex, " \
+    X(AWITH_INDEX,    "23.1.3.39 step 3 (actualIndex is ToAbsoluteIndex(index, len)) - only its " \
+                      "ToIntegerOrInfinity half runs in this stage, and that half is the page's code") \
+    X(AWITH_CREATE,   "23.1.3.39 steps 4-6 (a RangeError when actualIndex is out of range; A is " \
+                      "ArrayCreate(len); k is 0) - and step 3's negative-relative half, which resolves here") \
+    X(AWITH_READ,     "23.1.3.39 steps 7.a-7.c (Repeat while k < len: Pk; fromValue is value at actualIndex, " \
                       "else Get(O, Pk))") \
-    X(AWITH_DEFINE,   "23.1.3.39 step 9.d (CreateDataPropertyOrThrow(A, Pk, fromValue))")
+    X(AWITH_DEFINE,   "23.1.3.39 step 7.d (CreateDataPropertyOrThrow(A, Pk, fromValue))")
 enum { AWITH_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_array_with_steps[] = { AWITH_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -85115,7 +85116,7 @@ static int js_array_with_step(JSContext *ctx, void *st, JSValue cb_result, JSVal
     }
     for (;;) {
         if (s->hdr.stage == AWITH_READ) {
-            /* step 9's loop condition, and step 10's Return A: the machine is finished at the head it rests at,
+            /* step 7's loop condition, and step 8's Return A: the machine is finished at the head it rests at,
                with no stage the algorithm does not name. */
             if (s->i >= s->len) { JS_FreeValue(ctx, cb_result); return 0; }
             if (s->i == s->idx) {
