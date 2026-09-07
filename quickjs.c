@@ -29901,7 +29901,7 @@ static JSValue js_typed_array_indexof_build(JSContext *ctx, JSValueConst this_va
                                             int special, int len);
 
 /* 23.2.3.36 %TypedArray%.prototype.with. Its index and its value are BOTH the page's code, and js_typed_array_with
-   coerced them with JS_ToInt64Sat / JS_ToPrimitive from a C entry. The length is captured at step 2, BEFORE either
+   coerced them with JS_ToInt64Sat / JS_ToPrimitive from a C entry. The length is captured at step 3, BEFORE either
    coercion, because a resizable buffer shrunk by a valueOf must still yield a result of the ORIGINAL length —
    which is why this cannot be a coerce-then-compute declaration. */
 typedef struct JSTAWith {
@@ -84907,12 +84907,12 @@ static JSValue js_ta_coerce_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* Steps 9-12 build the result from primitives this machine already holds, so the last coercion's stage carries
+/* Steps 7-10 build the result from primitives this machine already holds, so the last coercion's stage carries
    them. */
 #define TAWITH_STAGES(X) \
     X(TAWITH_VALIDATE, "23.2.3.36 steps 1-3 (taRecord is ValidateTypedArray(O, seq-cst); len is TypedArrayLength(taRecord))") \
-    X(TAWITH_INDEX,    "23.2.3.36 steps 4-6 (relativeIndex is ToIntegerOrInfinity(index); actualIndex)") \
-    X(TAWITH_VALUE,    "23.2.3.36 steps 7-8 (numericValue is ToBigInt(value) or ToNumber(value))")
+    X(TAWITH_INDEX,    "23.2.3.36 step 4 (actualIndex is ToAbsoluteIndex(index, len))") \
+    X(TAWITH_VALUE,    "23.2.3.36 steps 5-6 (numericValue is ToBigInt(value) or ToNumber(value))")
 enum { TAWITH_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_ta_with_steps[] = { TAWITH_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -115333,7 +115333,7 @@ range_error:
 }
 
 
-/* 23.2.3.36 steps 7 onwards, with the index and the value ALREADY coerced and `len` captured at step 2 — a
+/* 23.2.3.36 steps 7 onwards, with the index and the value ALREADY coerced and `len` captured at step 3 — a
    resizable buffer shrunk by the page's valueOf must still yield a result of the original length, which is why
    the caller holds it. Nothing below runs user code. */
 static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, int64_t idx, JSValue val,
@@ -115351,7 +115351,7 @@ static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, 
         JS_FreeValue(ctx, val);
         return JS_EXCEPTION;
     }
-    /* Step 9 is ONE predicate — IsValidIntegerIndex(O, actualIndex) — and its failure is ONE error. A detached or
+    /* Step 7 is ONE predicate — IsValidIntegerIndex(O, actualIndex) — and its failure is ONE error. A detached or
        out-of-bounds view makes it false at its first clause exactly as an out-of-range index does at its last, so
        `ta.with(0, {valueOf(){ detach(ta.buffer); return 0 }})` is a RangeError. Splitting the OOB clause out into
        a TypeError of its own answered a step the spec does not have. */
@@ -115378,8 +115378,8 @@ static JSValue js_typed_array_with_build(JSContext *ctx, JSValueConst this_val, 
         JS_FreeValue(ctx, arr);
         return JS_EXCEPTION;
     }
-    /* Steps 10-11 (TypedArrayCreateSameType with an undefined new_target, then the backing buffer) run NO page
-       code, so the view step 9 just validated cannot have become out-of-bounds underneath them. This was a
+    /* Steps 8-9 (TypedArrayCreateSameType with an undefined new_target, then the backing buffer) run NO page
+       code, so the view step 7 just validated cannot have become out-of-bounds underneath them. This was a
        second OOB test answering a step that does not exist; the invariant is what it was really asserting. */
     DCHECK(!typed_array_is_oob(p), "the source view went out of bounds with no page code in between");
     abuf = JS_GetOpaque(buffer, JS_CLASS_ARRAY_BUFFER);
