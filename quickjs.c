@@ -28355,7 +28355,7 @@ typedef struct JSIteratorHelperData {
     void *consumer;          /* ITH_CONSUME: the consumer step awaiting this helper's {value,done} — a JSIteratorHelperData
                                 (helper-drives-helper), a JSIterConsume (Array.from/spread/Set/Map), etc. per consumer_kind */
     uint8_t consumer_kind;   /* CONT_* of `consumer`: CONT_ITER_HELPER / CONT_ITER_CONSUME / ... — how to re-enter it */
-    uint8_t read_closes_source;  /* 1 = this read is inside 27.1.4.6 Iterator.prototype.flatMap's IfAbruptCloseIterator — the flatMap
+    uint8_t read_closes_source;  /* 1 = this read is inside 27.1.3.3.6 Iterator.prototype.flatMap's IfAbruptCloseIterator — the flatMap
                                     acquire's @@iterator and nextMethod reads — so an abrupt one closes the
                                     SOURCE before propagating. The source's own result reads are not: there the
                                     source is what went wrong, and 7.4.x propagates without closing it. */
@@ -31221,7 +31221,7 @@ typedef struct JSCoerce1 {
 /* the Function constructor ToStrings EVERY argument, however many there are — a mask of positions cannot say
    that, so "all of them" is its own bit rather than a mask wide enough for today's tests. */
 #define PRIMARGS_ALL 0x200
-/* THE ITERATOR-HELPER FACTORY (27.1.4.11/.2/.8/.4/.6 take/drop/map/filter/flatMap). Its last spec step is
+/* THE ITERATOR-HELPER FACTORY (27.1.3.3.11/.2/.8/.4/.6 take/drop/map/filter/flatMap). Its last spec step is
    GetIteratorDirect(this), whose `Get(iterator, "next")` is the page's own code — an accessor, a Proxy trap —
    and it ran from the C body, where a loop in it has no flow base. take/drop were already a coerce-then-compute
    machine and map/filter/flatMap were plain C functions, so the read existed in a body shared by both shapes and
@@ -35396,7 +35396,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             goto do_groupby_consume_tramp;
                         }
                         if (csink >= ITERCONS_ITERTERM_BASE) {
-                            /* GetIteratorDirect(this) requires an Object — 27.1.4.x step 1, validation with no
+                            /* GetIteratorDirect(this) requires an Object — 27.1.3.3.x step 1, validation with no
                                user code in it. The recognizer used to DECLINE a non-Object and let the C entry
                                throw, which is one silent fallback per narrowing condition. The CALLBACK check
                                stays in the arm below, because an invalid callback still owes the iterator an
@@ -37019,7 +37019,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValueConst iterobj = crecv;
                 JSIterConsume *s;
                 JSValue nextm, acc;
-                /* the METHOD's realm, not the caller's: 27.1.4.x's TypeError and toArray's Array both belong to
+                /* the METHOD's realm, not the caller's: 27.1.3.3.x's TypeError and toArray's Array both belong to
                    the function being invoked, which is what js_call_c_function would have switched to for a C
                    body and what step_realm gives every step machine. */
                 JSContext *mrealm = js_callee_realm(ctx, call_argv[-1]);
@@ -41415,7 +41415,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 TAKE_CALL_SHAPE();
                 it->orig_cfirst = call_first_r; it->orig_cargc = call_pop;
                 it->orig_is_tail = tramp_is_tail;
-                /* The .next() ARGUMENT is discarded by 27.1.4 (a helper's next takes none), so a reshaped call's
+                /* The .next() ARGUMENT is discarded by 27.1.2.1.1 (a helper's next takes none), so a reshaped call's
                    OWNED list has nothing left to hand over and is released here — the same point do_tramp_call
                    releases its own once the frame has dup'd out of it. Only the caller's STACK operands outlive
                    this, and the shape above is what drops them. */
@@ -48692,16 +48692,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                must happen HERE - the spec closes the underlying iterator when the callback throws, and skipping it is
                what mapper-throws / mapper-throws-then-closing-iterator-also-throws detect. */
             /* ...EXCEPT when the call that threw was the record's own `next`. 7.4.9 IteratorStepValue step 2
-               marks the record DONE on an abrupt `next`, and 27.1.4.x's helper reads it with a plain
+               marks the record DONE on an abrupt `next`, and 27.1.3.3.x's helper reads it with a plain
                `? IteratorStepValue(...)`, so that throw closes nothing. `drive_pending` says which call this
                was, and only a successful delivery clears it — the eager terminals had the same gap and it is
                the same rule. */
             JSIteratorHelperData *cit = (JSIteratorHelperData *)xcs;
             /* WHICH RECORD the abrupt `next` belonged to is the whole question. flatMap holds TWO: an abrupt on
-               the INNER is 27.1.4.6 Iterator.prototype.flatMap step 6.c.i.ii's IfAbruptCloseIterator(innerNext, ITERATED) — it closes the
-               OUTER — while an abrupt on the outer's own `next` is 7.4.9 step 2, which marks that record done
-               and closes nothing. `drive_close` is take's close-on-limit `.return()`, whose own throw
-               propagates rather than provoking a second close. */
+               the INNER is 27.1.3.3.6 Iterator.prototype.flatMap step 6.b.viii.2's
+               IfAbruptCloseIterator(innerValue, iterated) — it closes the OUTER — while an abrupt on the
+               outer's own `next` is 7.4.9 step 2, which marks that record done and closes nothing.
+               `drive_close` is take's close-on-limit `.return()`, whose own throw propagates rather than
+               provoking a second close. */
             int close_owed = !cit->drive_pending || cit->drive_inner;
             JS_FreeValue(ctx, cit->cb_value); cit->cb_value = JS_UNDEFINED;
             cit->done = 1;
@@ -48873,9 +48874,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             if (gouter && gk2 == CONT_ITER_HELPER_GET) {
                 /* the helper's `done`/`value` read threw: the source is [[Done]] for this helper and the throw
                    propagates, which is what the step's own -1 does — release the unpack and take that path.
-                   The flatMap ACQUIRE's reads are the exception: they sit inside 27.1.4.6 Iterator.prototype.flatMap's
-                   IfAbruptCloseIterator, so the SOURCE is closed first. The read itself says which it is, because
-                   only the step that issued it knows. */
+                   The flatMap ACQUIRE's reads are the exception: they sit inside 27.1.3.3.6
+                   Iterator.prototype.flatMap's IfAbruptCloseIterator, so the SOURCE is closed first. The read
+                   itself says which it is, because only the step that issued it knows. */
                 JSIteratorHelperData *hit = gouter;
                 bool closes = (hit->read_closes_source != 0);
                 hit->read_closes_source = 0;
@@ -86774,9 +86775,11 @@ typedef struct JSIterHelperReturn {
     uint8_t call_phase;
 } JSIterHelperReturn;
 
-/* WHICH STEP OF 27.1.2.1.2 EACH STAGE RESTS AT. The prose here said 27.1.4.1.3, which in ES2025 does not exist —
-   Iterator.prototype is 27.1.4 and its `find` is .5; %IteratorHelperPrototype% is 27.1.2.1 and its `return` is
-   its second member. The stages also parked one PAST each operation: a stage issued the `return` read and the
+/* WHICH STEP OF 27.1.2.1.2 EACH STAGE RESTS AT. The prose here said `27.1.4.1.3`, which no edition numbers;
+   %IteratorHelperPrototype% is 27.1.2.1 and its `return` is its second member. The clause beside it placed
+   Iterator.prototype's own members at 27.1.4, which is the ES2025 reading this file has now left: in the
+   maintained edition 27.1.4 is The %AsyncIteratorPrototype% Object and `find` is 27.1.3.3.5.
+   The stages also parked one PAST each operation: a stage issued the `return` read and the
    machine rested at the stage that consumed it, so a park inside the read named the validation after it. Both
    halves of 7.4.11 are a sub-sequence now, and the machine rests at the operation it is inside — which this
    machine performs TWICE, once for flatMap's active inner and once for the source, so a rest point that names
@@ -86917,7 +86920,9 @@ static JSValue js_iter_helper_return_fini(JSContext *ctx, void *st, bool take_re
    JS_GetOwnProperty, which is what kept that public entry alive.
    ONE machine, because the two differ only in p — and p IS the arg, so the difference is a spec operand rather
    than a second implementation. `home` is %Iterator.prototype% for both.
-   The prose said 27.1.4.2, which is Iterator.prototype.drop. The operation is an ABSTRACT one and lives with the
+   The prose said `27.1.4.2`, which was Iterator.prototype.drop under the ES2025 numbering this file has now
+   left and is %AsyncIteratorPrototype% [ %Symbol.asyncIterator% ] ( ) in the maintained edition. Iterator
+   .prototype.drop is 27.1.3.3.2. The operation is an ABSTRACT one and lives with the
    other operations on objects; naming it by the section of the first accessor that happened to use it is the
    same mistake a private stage number makes, one level up. */
 typedef struct JSIterSetter {
@@ -86938,17 +86943,17 @@ typedef struct JSIterSetter {
 enum { ITS_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0) };
 static const char *const js_iter_set_ctor_steps[] = {
     ITS_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.1.2 step 1 -> 7.3.37 steps 1-2 (thisValue is an Object and is not %Iterator.prototype%)",
-        "27.1.4.1.2 step 1 -> 7.3.37 step 3 (desc is thisValue.[[GetOwnProperty]](\"constructor\"))",
-        "27.1.4.1.2 step 1 -> 7.3.37 step 4.a (CreateDataPropertyOrThrow(thisValue, \"constructor\", v))",
-        "27.1.4.1.2 step 1 -> 7.3.37 step 5.a (Set(thisValue, \"constructor\", v, true))")
+        "27.1.3.3.1.2 step 1 -> 7.3.37 steps 1-2 (thisValue is an Object and is not %Iterator.prototype%)",
+        "27.1.3.3.1.2 step 1 -> 7.3.37 step 3 (desc is thisValue.[[GetOwnProperty]](\"constructor\"))",
+        "27.1.3.3.1.2 step 1 -> 7.3.37 step 4.a (CreateDataPropertyOrThrow(thisValue, \"constructor\", v))",
+        "27.1.3.3.1.2 step 1 -> 7.3.37 step 5.a (Set(thisValue, \"constructor\", v, true))")
     NULL };
 static const char *const js_iter_set_tag_steps[] = {
     ITS_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.14.2 step 1 -> 7.3.37 steps 1-2 (thisValue is an Object and is not %Iterator.prototype%)",
-        "27.1.4.14.2 step 1 -> 7.3.37 step 3 (desc is thisValue.[[GetOwnProperty]](%Symbol.toStringTag%))",
-        "27.1.4.14.2 step 1 -> 7.3.37 step 4.a (CreateDataPropertyOrThrow(thisValue, %Symbol.toStringTag%, v))",
-        "27.1.4.14.2 step 1 -> 7.3.37 step 5.a (Set(thisValue, %Symbol.toStringTag%, v, true))")
+        "27.1.3.3.15.2 step 1 -> 7.3.37 steps 1-2 (thisValue is an Object and is not %Iterator.prototype%)",
+        "27.1.3.3.15.2 step 1 -> 7.3.37 step 3 (desc is thisValue.[[GetOwnProperty]](%Symbol.toStringTag%))",
+        "27.1.3.3.15.2 step 1 -> 7.3.37 step 4.a (CreateDataPropertyOrThrow(thisValue, %Symbol.toStringTag%, v))",
+        "27.1.3.3.15.2 step 1 -> 7.3.37 step 5.a (Set(thisValue, %Symbol.toStringTag%, v, true))")
     NULL };
 /* The error-stack accessor interposes its own validation between 7.3.37's two leading tests, which is what the
    definition's `precheck` carries — so its first stage names both. */
@@ -87040,11 +87045,11 @@ static const JSTrampStepDef js_func_bind_def   = { sizeof(JSFuncBind), js_func_b
                         .algorithm = "20.2.3.2 Function.prototype.bind", .steps = js_func_bind_steps };
 static const JSTrampStepDef js_iter_set_ctor_def = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_constructor,
                                                     .home_class = JS_CLASS_ITERATOR, .visit = js_iter_setter_visit,
-                                                    .algorithm = "27.1.4.1.2 set Iterator.prototype.constructor",
+                                                    .algorithm = "27.1.3.3.1.2 set Iterator.prototype.constructor",
                                                     .steps = js_iter_set_ctor_steps };
 static const JSTrampStepDef js_iter_set_tag_def  = { sizeof(JSIterSetter), js_iter_setter_step, js_iter_setter_fini, JS_ATOM_Symbol_toStringTag,
                                                     .home_class = JS_CLASS_ITERATOR, .visit = js_iter_setter_visit,
-                                                    .algorithm = "27.1.4.14.2 set Iterator.prototype [ %Symbol.toStringTag% ]",
+                                                    .algorithm = "27.1.3.3.15.2 set Iterator.prototype [ %Symbol.toStringTag% ]",
                                                     .steps = js_iter_set_tag_steps };
 static const JSTrampStepDef js_error_get_stack_def = { sizeof(JSErrGetStack), js_error_get_stack_step, js_error_get_stack_fini, 0, .visit = js_error_get_stack_visit,
                         .algorithm = "V8 stack-trace API: the Error.prototype.stack getter",
@@ -87992,15 +87997,15 @@ static const char *const js_iter_flatmap_steps[];
       (kind), NULL, NULL, js_iterator_helper_close, .visit = js_iter_helper_new_visit, \
       .algorithm = (alg), .steps = (stps) }
 static const JSTrampStepDef js_iter_take_def      = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_TAKE,
-                                                        "27.1.4.11 Iterator.prototype.take", js_iter_take_steps);
+                                                        "27.1.3.3.11 Iterator.prototype.take", js_iter_take_steps);
 static const JSTrampStepDef js_iter_drop_def      = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_DROP,
-                                                        "27.1.4.2 Iterator.prototype.drop", js_iter_drop_steps);
+                                                        "27.1.3.3.2 Iterator.prototype.drop", js_iter_drop_steps);
 static const JSTrampStepDef js_iter_map_def       = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_MAP,
-                                                        "27.1.4.8 Iterator.prototype.map", js_iter_map_steps);
+                                                        "27.1.3.3.8 Iterator.prototype.map", js_iter_map_steps);
 static const JSTrampStepDef js_iter_filter_def    = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_FILTER,
-                                                        "27.1.4.4 Iterator.prototype.filter", js_iter_filter_steps);
+                                                        "27.1.3.3.4 Iterator.prototype.filter", js_iter_filter_steps);
 static const JSTrampStepDef js_iter_flatmap_def   = ITER_HELPER_NEW_DEF(JS_ITERATOR_HELPER_KIND_FLAT_MAP,
-                                                        "27.1.4.6 Iterator.prototype.flatMap", js_iter_flatmap_steps);
+                                                        "27.1.3.3.6 Iterator.prototype.flatMap", js_iter_flatmap_steps);
 /* resize/grow and the three transfers are the same declared shape: ONE numeric argument, then a tail that runs
    no user code. The receiver validation the spec orders ahead of the coercion is the precheck. */
 static const JSTrampStepDef js_ab_resize_def     = PRIMARGS_DEF_PRE(PRIMARGS(0x1, HINT_NUMBER, 1), generic_magic, js_array_buffer_resize, JS_CLASS_ARRAY_BUFFER, js_array_buffer_resize_precheck, NULL, "25.1.6.6 ArrayBuffer.prototype.resize ( newLength )");
@@ -88575,20 +88580,26 @@ static int zip_close_run(JSContext *ctx, JSStepHdr *h, uint8_t *phase, JSValue *
    this engine implements, since ES2025 numbers none of DisposableStack, Iterator.concat, Iterator.zip or
    Iterator.prototype [ %Symbol.dispose% ]. A draft renumbers, so EVERY citation carries its clause TITLE beside
    the number; a number whose neighbouring title no longer matches the clause is the drift, showing itself.
-   TWO deliberate exceptions, each because the draft clause is not the algorithm the machine runs, and a reader
+   ONE deliberate exception, because the draft clause is not the algorithm the machine runs, and a reader
    sent to a clause the code does not follow is worse off than one sent nowhere.
    Iterator.zip and Iterator.zipKeyed: the draft DOES number these (27.1.3.2.4 and 27.1.3.2.5) and the number is
    withheld anyway, because the padding moved from a keyed lookup to a positional list and the step list
    renumbered with it. Naming proposal-joint-iteration is a citation with a number in it — the proposal's own —
    exactly as the ArrayBuffer-base64 machines are (B64OP_STAGES).
-   Iterator.prototype's helpers (every 27.1.4.x here — the five factories, `constructor` and
-   [ %Symbol.toStringTag% ]) are read out of ES2025, where 27.1.4 is The %Iterator.prototype% Object. Under the
-   draft those same numbers land on The %AsyncIteratorPrototype% Object, so they are read against the edition
-   named here or not at all. They stayed behind because their step text is older than either edition — it calls
-   the record's construction GetIteratorDirect(O), and BOTH editions build the Iterator Record with
-   [[NextMethod]]: undefined and no such read — so renumbering alone would put a freshly checked clause number on
-   step prose that is independently wrong. What that stage actually reads is a question for the code.
-   Reconciling either machine with its published clause is a change to the machine, not to this comment. */
+   THERE WAS A SECOND EXCEPTION AND ITS REASON WAS FALSE, which is the half worth keeping. Iterator.prototype's
+   helpers — the five factories, `constructor` and [ %Symbol.toStringTag% ] — were held at ES2025's numbers,
+   under which that clause carried Iterator.prototype's own members, on the ground that their step text was
+   `older than either edition`: that it called the record's CONSTRUCTION GetIteratorDirect(O) while both
+   editions build the Iterator Record with [[NextMethod]]: undefined and perform no such read. THE DRAFT DOES
+   BOTH. Step 3 builds the record with [[NextMethod]]: undefined and a LATER step sets iterated to
+   GetIteratorDirect(obj) — step 5
+   for map, filter and flatMap, step 10 for take and drop — and the labels below already named those two
+   separately, so no step prose was independently wrong. The helpers now cite 27.1.3.3.x like everything else,
+   and the only drift the move exposed was take's and drop's tail: their limit validation runs to step 9 and
+   their GetIteratorDirect is step 10, where the labels said 8 and 9.
+   A DECISION IS NOT EVIDENCE. This one read as settled because it named a reason, and the reason was a claim
+   about the standard that one read of the standard refutes; a reader who meets a deliberate exception owes it
+   the fetch its author's argument rests on, not the deference its confidence invites. */
 #define ZIP_STAGES(X) \
     X(ZS_INIT,      "proposal-joint-iteration Iterator.zip steps 2-3 (iterables and options are Objects) - and " \
                     "the dispatch of step 4's Get(options, \"mode\")") \
@@ -92771,9 +92782,10 @@ static JSValue js_iterator_wrap_next(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;   /* JS_GetOpaque2 already threw RequireInternalSlot's TypeError */
 }
 
-/* WHICH STEP OF 27.1.3.2.2.1.2 EACH STAGE RESTS AT. The prose here said 27.1.4.2.2, which is a step of
-   Iterator.prototype.drop; %WrapForValidIteratorPrototype% is a sub-clause of Iterator.from, and `return` is its
-   second member. Two fidelity bugs went with the old C body: it forwarded its own ARGUMENTS to `return` (the
+/* WHICH STEP OF 27.1.3.2.2.1.2 EACH STAGE RESTS AT. The prose here said `27.1.4.2.2`, which no edition numbers
+   as a clause — it was a STEP of Iterator.prototype.drop, whose clause is 27.1.3.3.2;
+   %WrapForValidIteratorPrototype% is a sub-clause of Iterator.from, and `return` is its second member.
+   Two fidelity bugs went with the old C body: it forwarded its own ARGUMENTS to `return` (the
    spec calls it with none) and it required the result to be an Object (step 7 returns the call's result
    verbatim — only .next's IteratorNext imposes that check).
    The Call was an ISSUE stage and a CONSUME stage, so the machine parked one past the operation it was in. */
@@ -93618,11 +93630,12 @@ fail:
 }
 
 /* WHICH STEP OF EACH FACTORY'S ALGORITHM EACH STAGE RESTS AT. ONE walk, FIVE algorithms the standard numbers
-   separately — take and drop validate a NUMBER (steps 4-8), map, filter and flatMap a CALLABLE (step 4) — so one
+   separately — take and drop validate a NUMBER (steps 4-9), map, filter and flatMap a CALLABLE (step 4) — so one
    stage list is expanded once per algorithm with that algorithm's own step text. A stage cannot move in one of
    them without moving in all five, and each definition still names the steps of ITS algorithm and nobody else's.
-   The prose here said "27.1.4.3/.5", which is `every` and `find`; the factories are drop, filter, flatMap, map
-   and take, and none of them is either of those. A private stage number cannot be wrong about which algorithm it
+   The prose here said `27.1.4.3/.5`, which was `every` and `find` under the ES2025 numbering this file has now
+   left; they are 27.1.3.3.3 and 27.1.3.3.5. The factories are drop, filter, flatMap, map and take, and none of
+   them is either of those. A private stage number cannot be wrong about which algorithm it
    is in because it does not say — which is exactly why it had gone unnoticed. */
 #define IHN_STAGES(X, HEAD, ARG, DIRECT) \
     X(IHN_HEAD,   HEAD) \
@@ -93631,33 +93644,33 @@ fail:
 enum { IHN_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
 static const char *const js_iter_take_steps[] = {
     IHN_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.11 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
-        "27.1.4.11 steps 4-8 (numLimit is ToNumber(limit); NaN and negative close iterated with a RangeError)",
-        "27.1.4.11 step 9 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+        "27.1.3.3.11 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.3.3.11 steps 4-9 (numLimit is ToNumber(limit); NaN and negative close iterated with a RangeError)",
+        "27.1.3.3.11 step 10 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
     NULL };
 static const char *const js_iter_drop_steps[] = {
     IHN_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.2 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
-        "27.1.4.2 steps 4-8 (numLimit is ToNumber(limit); NaN and negative close iterated with a RangeError)",
-        "27.1.4.2 step 9 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+        "27.1.3.3.2 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.3.3.2 steps 4-9 (numLimit is ToNumber(limit); NaN and negative close iterated with a RangeError)",
+        "27.1.3.3.2 step 10 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
     NULL };
 static const char *const js_iter_map_steps[] = {
     IHN_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.8 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
-        "27.1.4.8 step 4 (IsCallable(mapper); a non-callable closes iterated with a TypeError)",
-        "27.1.4.8 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+        "27.1.3.3.8 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.3.3.8 step 4 (IsCallable(mapper); a non-callable closes iterated with a TypeError)",
+        "27.1.3.3.8 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
     NULL };
 static const char *const js_iter_filter_steps[] = {
     IHN_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.4 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
-        "27.1.4.4 step 4 (IsCallable(predicate); a non-callable closes iterated with a TypeError)",
-        "27.1.4.4 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+        "27.1.3.3.4 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.3.3.4 step 4 (IsCallable(predicate); a non-callable closes iterated with a TypeError)",
+        "27.1.3.3.4 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
     NULL };
 static const char *const js_iter_flatmap_steps[] = {
     IHN_STAGES(JS_STEP_STAGE_LABEL,
-        "27.1.4.6 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
-        "27.1.4.6 step 4 (IsCallable(mapper); a non-callable closes iterated with a TypeError)",
-        "27.1.4.6 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
+        "27.1.3.3.6 steps 1-3 (O is an Object; iterated is the Iterator Record over it)",
+        "27.1.3.3.6 step 4 (IsCallable(mapper); a non-callable closes iterated with a TypeError)",
+        "27.1.3.3.6 step 5 (iterated is GetIteratorDirect(O) — the Get(O, \"next\"))")
     NULL };
 
 static int js_iter_helper_new_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -93996,10 +94009,11 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
         return 1;   /* drive the inner iterator */
     }
     case ITHP_FLATMAP_INNER:
-        /* res = INNER {value,done}: 27.1.4.6 Iterator.prototype.flatMap's inner loop does IteratorStepValue — IteratorComplete then
-           IteratorValue — and YIELDS the value, so the helper builds a fresh CreateIterResultObject around it.
-           Emitting the inner's own result OBJECT instead (what this did) leaked the delegate's object identity
-           through `helper.next()`, and moved the `value` read from inside the helper to whoever consumed it. */
+        /* res = INNER {value,done}: 27.1.3.3.6 Iterator.prototype.flatMap's inner loop does IteratorStepValue
+           — IteratorComplete then IteratorValue — and YIELDS the value, so the helper builds a fresh
+           CreateIterResultObject around it. Emitting the inner's own result OBJECT instead (what this did)
+           leaked the delegate's object identity through `helper.next()`, and moved the `value` read from
+           inside the helper to whoever consumed it. */
         if (!JS_IsObject(res)) {   /* 7.4.2 step 3 */
             JS_FreeValue(ctx, res);
             JS_ThrowTypeError(ctx, "iterator result not an object");
@@ -94047,12 +94061,12 @@ static int js_iter_helper_step(JSContext *ctx, JSIteratorHelperData *it, JSValue
 /* Can a drive BEGIN on this receiver? Not which builtin the callee is — that is the declaration's answer now
    (tramp_is_iter_drive), and comparing against js_iterator_helper_next's address was the identity test the
    recognizer ban is about. What is left is about the RECEIVER: `.next` is reachable off %IteratorHelperPrototype%
-   with any `this`, and 27.1.4 requires the internal slot; and a helper that is already driving cannot be
+   with any `this`, and 27.1.2.1.1 requires the internal slot; and a helper that is already driving cannot be
    re-entered, which is GeneratorValidate's TypeError. Both answers belong to js_call_c_function's iterdrive arm,
    which is where a decline lands — the drive itself cannot give the second one, because entry is what raises the
    flag it tests. */
 /* The two answers a DECLINED drive owes, which is everything js_iterator_helper_next had left. Both are spec
-   answers and neither is an algorithm: 27.1.4 requires the internal slot, and a helper already driving is
+   answers and neither is an algorithm: 27.1.2.1.1 requires the internal slot, and a helper already driving is
    GeneratorValidate's TypeError. Reaching here for any OTHER reason is an unrouted call site, and the DCHECK
    says so rather than letting it read as a TypeError the page asked for. */
 static JSValue js_iter_helper_declined(JSContext *ctx, JSValueConst this_obj)
@@ -110491,8 +110505,9 @@ static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx,
    { … }` — and a coroutine body must suspend on the tramp, which a JS_Call out of a C reaction body cannot do.
    This machine NEVER completes normally: 7.4.11 step 5 says a throw completion is the result whatever the close
    did, so every exit is the stored error, re-thrown by fini over anything the close itself raised.
-   The prose said 27.1.4.4 step 11; 27.1.4.4 is Iterator.prototype.filter, and AsyncFromSyncIteratorContinuation
-   is 27.1.5.4 with the closure at step 13.a. Its 7.4.11 step numbers were one low throughout, for the same
+   The prose said `27.1.4.4` step 11, which was Iterator.prototype.filter under the ES2025 numbering this file
+   has now left — filter is 27.1.3.3.4 — and AsyncFromSyncIteratorContinuation is 27.1.5.4 with the closure at
+   step 13.a. Its 7.4.11 step numbers were one low throughout, for the same
    reason every other unchecked comment in this file was. */
 typedef struct JSIterCloseThrow {
     JSStepHdr hdr;       /* MUST be first: the driver casts state -> JSStepHdr * */
