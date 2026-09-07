@@ -44553,9 +44553,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (unlikely(!wh)) { JS_ThrowOutOfMemory(ctx); goto exception; }
                 /* PAST the DeclarativeRecord the two opcodes are ONE operation, so the record carries one.
                    InitializeBinding is what tells them apart and it applies only to a LEXICAL binding; a
-                   var-scoped one lives on the global OBJECT, which is how AnnexB B.3.2's labelled function
-                   declaration — `l: function g(){}` in sloppy code — reaches here as OP_put_var_init with a
-                   binding that was never in global_var_obj at all. */
+                   var-scoped one lives on the global OBJECT, which is how Annex B B.3.1 Labelled Function
+                   Declarations — `l: function g(){}` in sloppy code — reaches here as OP_put_var_init with a
+                   binding that was never in global_var_obj at all. (B.3.2 stood here, which is that number in
+                   an edition that put __proto__ Property Names in Object Initializers at B.3.1; the maintained
+                   one numbers Block-Level Function Declarations Web Legacy Compatibility Semantics B.3.2, so
+                   the old digit now names a different feature rather than nothing.) */
                 wh->atom = atom; wh->op = OP_put_var; wh->phase = WH_HAS; wh->arr = JS_UNDEFINED;
                 wh->vdepth = 1;
                 gp_obj = ctx->global_obj; gp_atom = atom; gp_op = GP_HAS; gp_val = JS_UNDEFINED;
@@ -60450,11 +60453,12 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
             if (s->cur_func->is_strict_mode)
                 f->st_mask = 0;
             else
-                f->st_mask = DECL_MASK_FUNC; /* Annex B.3.4 */
+                f->st_mask = DECL_MASK_FUNC; /* Annex B.3.3 */
 
-            /* B.3.4 makes `if (x) function f(){}` mean `if (x) { function f(){} }` — each CLAUSE is its own
-               Block, so each has its own binding for the name. The scope pushed above is the if-statement's own
-               (it is what lets `let f; if (1) function f(){}` be legal); sharing it between the two clauses put
+            /* B.3.3 FunctionDeclarations in IfStatement Statement Clauses makes `if (x) function f(){}` mean
+               `if (x) { function f(){} }` — each CLAUSE is its own Block, so each has its own binding for the
+               name. The scope pushed above is the if-statement's own (it is what lets
+               `let f; if (1) function f(){}` be legal); sharing it between the two clauses put
                both declarations in ONE scope, where the scope-entry hoisting created them both and the later
                one won regardless of which branch ran. */
             PD_CALL(PDS_IFC, 0, f->st_mask, 0, PDS_SOD_08);
@@ -61133,7 +61137,18 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
         }
         break;
     case TOK_FUNCTION:
-        /* ES6 Annex B.3.2 and B.3.3 semantics */
+        /* A FunctionDeclaration where a Statement is expected. The ordinary grammar admits one only in a
+           StatementList, and two Annex B features put DECL_MASK_FUNC on positions that are not one, both
+           non-strict only: B.3.1 Labelled Function Declarations, which adds no production and instead
+           suppresses the Syntax Error that 14.13.1 raises for a LabelledItem that is a FunctionDeclaration,
+           and B.3.3
+           FunctionDeclarations in IfStatement Statement Clauses, which adds four IfStatement productions.
+           NEITHER names a GeneratorDeclaration — B.3.3's four alternatives all say FunctionDeclaration — which
+           is why `function*` additionally demands DECL_MASK_OTHER and is legal only where a HoistableDeclaration
+           already is. This read "ES6 Annex B.3.2 and B.3.3", and in that edition's numbering those digits are
+           Labelled Function Declarations and Block-Level Function Declarations Web Legacy Compatibility
+           Semantics; which feature the second was meant to name is not recoverable from the code, so this
+           states what the MASK admits rather than repairing a number by guess. */
         if (!(f->flags & DECL_MASK_FUNC))
             goto func_decl_error;
         if (!(f->flags & DECL_MASK_OTHER) && peek_token(s, false) == '*')
@@ -64096,9 +64111,12 @@ static void set_eval_ret_undefined(JSParseState *s)
     }
 }
 
-/* One CLAUSE of an if-statement. B.3.4's productions name a FunctionDeclaration in that position and mean the
-   Block `{ FunctionDeclaration }`, so the clause gets its own scope — and only then, because every other clause
-   is an ordinary Statement that must not gain one. */
+/* One CLAUSE of an if-statement. B.3.3 FunctionDeclarations in IfStatement Statement Clauses augments the
+   IfStatement production with FOUR alternatives, and every one of them names a FunctionDeclaration in a clause
+   position and means the Block `{ FunctionDeclaration }`, so the clause gets its own scope — and only then,
+   because every other clause is an ordinary Statement that must not gain one. (This cited B.3.4, which is that
+   number in a retired edition; the maintained one numbers VariableStatements in Catch Blocks B.3.4, so the old
+   digit now names an unrelated feature rather than nothing.) */
 #endif // QJS_DISABLE_PARSER
 
 /* 'name' is freed */
