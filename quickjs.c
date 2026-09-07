@@ -95308,10 +95308,10 @@ static const char *const js_str_at_steps[] = {
     NULL };
 static const char *const js_str_codePointAt_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.4 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.4 step 3 (position is ToIntegerOrInfinity(pos))",
+        "22.1.3.4 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.4 step 4 (position is ToIntegerOrInfinity(position))",
         SRV_NO_ARG1,
-        "22.1.3.4 steps 4-7 (size; undefined when out of range, else CodePointAt(S, position))")
+        "22.1.3.4 steps 5-8 (size; undefined when out of range, else CodePointAt(string, position))")
     NULL };
 static const char *const js_str_substring_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
