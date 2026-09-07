@@ -87815,16 +87815,23 @@ static int js_date_this_precheck(JSContext *ctx, const JSStepHdr *h);
 static int js_date_set_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc);
 static JSValue js_date_set_fini(JSContext *ctx, void *st, bool take_result);
 static void js_date_set_visit(JSContext *ctx, void *st, JSStepVisit *v);
-/* 21.4.4.20-.28 and B.2.3.2. Each setter reads [[DateValue]] at step 2, ToNumbers every argument the spec names
-   at steps 3-6 — unconditionally, which is why the C body carried a comment saying so — and computes from both.
+/* 21.4.4.20-.26, .28-.34 and B.2.3.2 — .27 setTime is NOT one of these and is declared separately below.
+   Each setter reads [[DateValue]] at step 3, ToNumbers every argument the spec names somewhere in steps 4-7 —
+   unconditionally, which is why the C body carried a comment saying so — and computes from both. WHICH of those
+   steps a given setter coerces at is per-setter and is carried once, in DATE_SET_LIST, never restated here.
+
    set_date_field ran those coercions with JS_ToFloat64 from its C entry, so
    `new Date(0).setFullYear({valueOf(){for(;;){}}})` preempted with no flow base.
 
    It is NOT a coerce-then-compute declaration, for the reason 23.2.3.36's %TypedArray%.prototype.with is not:
-   step 2 reads the time value BEFORE the coercions and step 7 tests THAT value, so a valueOf that calls
-   `dt.setTime(NaN)` must not change the answer. Declaring it as one made the body re-read the slot afterwards
-   and test262's date-value-read-before-tonumber-when-date-is-valid caught it across a dozen setters. The
-   captured fields have to live on the state, which is what makes this a machine.
+   the time value is read ONCE, at step 3, and every later test of it reads THAT value and never the slot again,
+   so a valueOf that calls `dt.setTime(NaN)` must not change the answer. The single read is the only coordinate
+   this banner may state: which step tests the value is per-setter, and in 21.4.4.29 setUTCFullYear that test is
+   step 4, ahead of the year coercion at step 5 — so even the ORDER of test against coercion does not generalise,
+   and a family-wide step number here is the drift this comment was carrying. Declaring it as one made the
+   body re-read the slot afterwards and test262's date-value-read-before-tonumber-when-date-is-valid caught
+   it across a dozen setters. The captured fields have to live on the state, which is what makes this a
+   machine.
 
    `arg` is the same 0xFEL magic the C body took — first field, end field, is_local — plus DATE_SET_MAKEFULLYEAR
    for setYear, whose only difference from setFullYear is B.2.3.2 step 5's MakeFullYear on the coerced value. */
