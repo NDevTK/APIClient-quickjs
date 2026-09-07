@@ -70450,11 +70450,15 @@ static bool code_match(CodeContext *s, int pos, ...)
 }
 
 /* Is this closure variable a binding of the enclosing function's VARIABLE environment?
-   16.1.7 EvalDeclarationInstantiation step 9 creates a direct eval's `var` in varEnv unless varEnv ALREADY has
-   that binding — and only the enclosing function's parameters and top-level `var`s are in varEnv. A `let`/`const`
-   /block-scoped function lives in a declarative env INSIDE varEnv; a catch parameter lives in the catch clause's
-   own env (which B.3.4 explicitly walks PAST rather than erroring on); a function expression's self-name lives in
-   the funcEnv OUTSIDE varEnv. Treating any of those as "varEnv already has it" made the eval's declaration
+   19.2.1.3 EvalDeclarationInstantiation step 18.b creates a direct eval's `var` in varEnv unless varEnv ALREADY
+   has that binding — `Let bindingExists be ! variableEnv.HasBinding(variableName)`, then CreateMutableBinding
+   and InitializeBinding only `If bindingExists is false` — and only the enclosing function's parameters and
+   top-level `var`s are in varEnv. A `let`/`const`/block-scoped function lives in a declarative env INSIDE
+   varEnv; a catch parameter lives in the catch clause's own env, which B.3.4 VariableStatements in Catch Blocks
+   explicitly walks PAST rather than erroring on — step 3.d.i.2.a.i of this same algorithm, and that B.3.4 is
+   CORRECT against the maintained edition, checked when the B.3.2.1/B.3.3.4/B.3.3.5 cluster in this file was
+   found to name sections no edition has. A function expression's self-name lives in the funcEnv OUTSIDE varEnv.
+   Treating any of those as "varEnv already has it" made the eval's declaration
    vanish entirely: `try{}catch(x){ eval("var x=42") }` never created x in the function, so a later write to x
    escaped to the global, and `(function f(){ eval("var f=1"); return f })()` returned the function. */
 static bool closure_var_is_var_env(const JSFunctionDef *s, const JSClosureVar *cv)
