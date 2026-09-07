@@ -23605,10 +23605,27 @@ int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in,
            is about a POSITION, and lives at the outcome seam where it belongs — see step_ownkeys_chain.
            HELD ON THE HEADER, NOT IN A C LOCAL, because the ask suspends: step_tobool_run's operand must live
            somewhere the sibling's snapshot carries, and this function's frame is gone when the answer lands. */
-        DCHECK(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
-               "[[OwnPropertyKeys]] was requested over a value that is not an Object — §10.1.11 is an OBJECT "
-               "internal method and the request's delivery reads the operand as one, so a coercion owed by the "
-               "asking algorithm's own spec step was skipped at its call site");
+        /* THE TAG IS IN THE MESSAGE BECAUSE THE OPERAND IS THE ONE FACT THIS CRASH COULD NOT STATE. SIX call
+           sites reach this wrapper — five in this file and the host's record_cursor_run — so "its call site"
+           named an action with no object, and the remedy it prescribed (a skipped coercion) is only ONE of the
+           two shapes that land here: the other is an operand a CHAIN WALK produced, which no caller could have
+           coerced. Nothing told those two apart, and they take opposite work. The tag does, for free.
+           Measured: a `for-in` over a concolic record aborts here while `Object.keys` and
+           `Object.getOwnPropertyNames` over the SAME record complete and fork normally — so the operand is one
+           the enumeration seam never saw. The CALLER is already recoverable from the abort's frame list, which
+           is why the site is not threaded here as well.
+           THE TAG IS FIRST BECAUSE THIS HEADER'S BUFFER CUTS SILENTLY. quickjs-check.h composes into
+           APICLIENT_QJS_REASON_CAP (512) with a bare snprintf and no reserved marker — unlike the host
+           emitter, which labels a cut — so a message that outgrows it loses its tail with nothing to say so.
+           The payload therefore sits at the front, where a future edit lengthening this cannot take it. */
+        DCHECKF(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
+                "[[OwnPropertyKeys]] over a NON-OBJECT operand, tag %d (quickjs.h JS_TAG_*: -7 STRING, 0 INT, "
+                "2 NULL, 3 UNDEFINED, 4 UNINITIALIZED). §10.1.11 is an OBJECT internal method and this "
+                "request's delivery reads the operand as one, so either a coercion owed by the asking "
+                "algorithm's own spec step was skipped at its call site, or a CHAIN WALK handed on a link its "
+                "own last request answered — no caller could have coerced the second, and the tag tells them "
+                "apart",
+                (int)JS_VALUE_GET_TAG(obj));
         /* THE NULL TEST IS THE HOST'S ANSWER AND NOT A FALLBACK: a host that installs no concolic value class
            at all (a conformance run) has no record to ask about, and there is no second implementation for this
            to select between — the hook itself answers JS_UNINITIALIZED for every object that carries no
