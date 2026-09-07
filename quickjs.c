@@ -56456,10 +56456,10 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
         if (idx >= 0) {
             if (idx < GLOBAL_VAR_OFFSET) {
                 if (fd->vars[idx].scope_level == fd->scope_level) {
-                    /* same scope: in non strict mode, functions can be redefined. 14.2.1's early error for
-                       `Block : { StatementList }` waives its duplicate-LexicallyDeclaredNames Syntax Error
-                       where the host supports Block-Level Function Declarations Web Legacy Compatibility
-                       Semantics, IsStrict is false, and "The duplicate entries are only bound by
+                    /* same scope: in non strict mode, functions can be redefined. The duplicate-name Syntax
+                       Error that 14.2.1 raises for `Block : { StatementList }` is waived where the host
+                       supports Block-Level Function Declarations Web Legacy Compatibility Semantics, IsStrict
+                       is false, and "The duplicate entries are only bound by
                        FunctionDeclarations". The host condition holds by construction here; the test below is
                        the other two — non-strict, and BOTH the standing binding and the new one are
                        FunctionDeclarations. */
@@ -56496,7 +56496,7 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
            be an Early Error. The `let` can be written after the block the function sits in —
            `{ { function x(){} } let x; }` — which is why the store is provisional rather than decided where it
            was emitted. A function declaration is not one of these
-           kinds; 14.2.1's waived Block early error lets those redefine each other. */
+           kinds; the waiver 14.2.1 grants for `Block : { StatementList }` lets those redefine each other. */
         if (var_def_type == JS_VAR_DEF_LET || var_def_type == JS_VAR_DEF_CONST ||
             var_def_type == JS_VAR_DEF_USING)
             annexb_func_var_revoke(ctx, fd, name, fd->scope_level);
@@ -61145,7 +61145,7 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
            FunctionDeclarations in IfStatement Statement Clauses, which adds four IfStatement productions.
            NEITHER names a GeneratorDeclaration — B.3.3's four alternatives all say FunctionDeclaration — which
            is why `function*` additionally demands DECL_MASK_OTHER and is legal only where a HoistableDeclaration
-           already is. This read "ES6 Annex B.3.2 and B.3.3", and in that edition's numbering those digits are
+           already is. This read `ES6 Annex B.3.2 and B.3.3`, and in that edition's numbering those digits are
            Labelled Function Declarations and Block-Level Function Declarations Web Legacy Compatibility
            Semantics; which feature the second was meant to name is not recoverable from the code, so this
            states what the MASK admits rather than repairing a number by guess. */
@@ -63135,8 +63135,8 @@ static __exception int js_parse_drive(JSParseState *s, int entry, int level,
         /* 10.2.11 FunctionDeclarationInstantiation step 32.a.i.2's condition, in the order it states it. A
            lexical declaration of the same name is what FAILS its "would not produce any Early Errors for func"
            half — with ONE exception: the binding this very declaration is about to create, or the one an
-           EARLIER function declaration in the same block already created, which 14.2.1's waived Block early
-           error explicitly allows to be redefined.
+           EARLIER function declaration in the same block already created, which the waiver 14.2.1 grants for
+           `Block : { StatementList }` explicitly allows to be redefined.
            Excluding those too meant only the FIRST of `{ function f(){3}; function f(){4} }` reached the var, so
            the outer binding kept the function the block's own binding no longer held. */
         int lex_idx = find_lexical_decl(ctx, f->st_fd, f->st_idx, f->st_fd->scope_first, false);
