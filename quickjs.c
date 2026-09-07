@@ -95297,10 +95297,11 @@ static const char *const js_str_trimEnd_steps[] = {
     NULL };
 static const char *const js_str_at_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.1 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.1 step 4 (relativeIndex is ToIntegerOrInfinity(index))",
+        "22.1.3.1 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.1 step 5 (k is ToAbsoluteIndex(index, length)) - only its ToIntegerOrInfinity half runs here",
         SRV_NO_ARG1,
-        "22.1.3.1 steps 3, 5-8 (len; k from relativeIndex; undefined when out of range, else the substring)")
+        "22.1.3.1 steps 4, 6-7 (length; undefined when out of range, else the substring) - and step 5's "
+        "negative-relative half, which resolves with them")
     NULL };
 static const char *const js_str_codePointAt_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
