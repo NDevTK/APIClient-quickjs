@@ -24077,7 +24077,6 @@ static int step_length_value(JSContext *ctx, JSStepHdr *h, JSValue v, int64_t *p
      4/6 = the caller must return that step code; it will be re-entered at the same stage
      -1  = threw. */
 enum { SPC_START = 0, SPC_CTOR, SPC_SPECIES, SPC_CONSTRUCT };
-static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
 
 /* Steps 7-9, shared by "the constructor was not an object" and "the @@species read settled": undefined means a
    plain Array of that length, and ANYTHING else is Construct'ed — where a non-constructor throws, which IS step
@@ -49289,15 +49288,15 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
 
 /* warning: the refcount of the context is not incremented. Return
    NULL in case of exception (case of revoked proxy only) */
-/* 10.5.14 GetFunctionRealm. THE DEPTH IS THE PAGE'S: steps 3 and 4 hand the question to a Proxy's target and a
-   bound function's target, and `new Proxy(new Proxy(…))` or `f.bind().bind()…` nests either as far as the page
-   likes. Both of those steps are TAIL positions in the spec's own text, so the recursion was never structure —
-   it was a C frame per link, and the one this fork may not spend. A loop over the current object is the same
-   algorithm with the same answer at every step.
+/* ECMAScript §7.3.24 "GetFunctionRealm ( func )". THE DEPTH IS THE PAGE'S: steps 2 and 3 hand the question to a
+   bound function's target and a Proxy's target, and `new Proxy(new Proxy(…))` or `f.bind().bind()…` nests either
+   as far as the page likes. Both of those steps are TAIL positions in the spec's own text, so the recursion was
+   never structure — it was a C frame per link, and the one this fork may not spend. A loop over the current
+   object is the same algorithm with the same answer at every step.
    It was invisible while it sat inside the interpreter's cycle, and then inside the error/property one; it
    surfaced as its own recursion the moment js_create_from_ctor stopped dragging JS_GetProperty along, which is
    the whole point of measuring cycles rather than counting call sites. */
-static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
+JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
 {
     JSValueConst cur = func_obj;
 
@@ -49323,14 +49322,14 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
                     JS_ThrowTypeErrorRevokedProxy(ctx);
                     return NULL;
                 }
-                cur = s->target;          /* step 3, in tail position */
+                cur = s->target;          /* step 3.d, in tail position */
             }
             break;
         case JS_CLASS_BOUND_FUNCTION:
-            cur = p->u.bound_function->func_obj;   /* step 4, in tail position */
+            cur = p->u.bound_function->func_obj;   /* step 2.b, in tail position */
             break;
         case JS_CLASS_WRAPPED_FUNCTION:
-            /* step 2: an ordinary object with a [[Realm]] answers with it. A wrapped function has one — that
+            /* step 1: an object that HAS a [[Realm]] slot answers with it. A wrapped function has one — that
                is the realm its arguments are wrapped INTO when it is called. */
             return p->u.wrapped_function_data->realm;
         default:

@@ -758,6 +758,28 @@ JS_EXTERN void JS_SetClassCtor(JSContext *ctx, JSClassID class_id, JSValue obj);
 JS_EXTERN JSValue JS_GetClassCtor(JSContext *ctx, JSClassID class_id);
 JS_EXTERN JSValue JS_GetFunctionProto(JSContext *ctx);
 
+/* THE REALM A FUNCTION OBJECT ANSWERS FOR — ECMAScript §7.3.24 "GetFunctionRealm ( func )", the operation a
+   spec step spells `? GetFunctionRealm(f)`. Step 1 answers a function that HAS a [[Realm]] slot with it; steps
+   2 and 3 forward a bound function to its [[BoundTargetFunction]] and a Proxy to its [[ProxyTarget]], so
+   `f.bind().bind()` and `new Proxy(new Proxy(f, h), h)` answer for `f`; step 4 falls back to `ctx`.
+   IT IS EXPORTED BECAUSE A HOST STEP ASKS FOR IT BY NAME. HTML §3.2.3 "HTML element constructors" step 11.1 is
+   `Let realm be ? GetFunctionRealm(NewTarget)`, and NewTarget is whatever the page passed to `Reflect.construct`
+   or wrote after `new` — so the realm a custom element's fallback prototype comes from is the PAGE's choice and
+   cannot be derived from the running one.
+   THE ANSWER IS BORROWED, NOT OWNED: no reference is taken, exactly as `JS_GetRuntime` takes none. It is valid
+   while the caller holds `func_obj`, which is what keeps the realm reachable — a function object references the
+   realm it was minted in, so the realm cannot die under a live reference to a function that names it.
+   NULL IS A THROW AND NOT AN ABSENCE — it is the `?` in the spec's own spelling. Step 3.a is
+   `Perform ? ValidateNonRevokedProxy(func)` (ECMAScript §10.5.14), so a REVOKED Proxy anywhere along the chain
+   raises a TypeError on `ctx` and answers NULL; every other input answers a realm. A caller propagates it.
+   IT IS NOT WEB IDL'S "associated realm", and the difference is exactly steps 2 and 3. Web IDL §3.1
+   "JavaScript environment" defines that term only "for non-exotic function objects (i.e. not callable proxies,
+   and not bound functions)", where it is "the value of the function object's [[Realm]] internal slot" — this
+   operation's step 1, and the same answer. For the two exotic kinds the standard defines NO association, so a
+   caller reaching for Web IDL's term gets a defined answer here where its own standard gives none; that is a
+   choice the caller is making and states, never a step it is performing. */
+JS_EXTERN JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
+
 /* the following functions are used to select the intrinsic object to
    save memory */
 JS_EXTERN JSContext *JS_NewContextRaw(JSRuntime *rt);
