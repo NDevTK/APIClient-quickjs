@@ -92591,14 +92591,14 @@ static JSValue js_create_array_iterator(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-/* 22.1.3.36 String.prototype[@@iterator]. Its two opening steps are the page's code — RequireObjectCoercible and
-   then ToString on the RECEIVER — and step_thisstring_run is exactly that pair as a request. A receiver whose
-   toString loops aborted at its back-edge in an activation with no flow base. */
+/* 22.1.3.36 String.prototype[%Symbol.iterator%]. Two of its three opening steps are the page's code —
+   RequireObjectCoercible and then ToString on the RECEIVER — and step_thisstring_run is exactly that pair as a
+   request. A receiver whose toString loops aborted at its back-edge in an activation with no flow base. */
 /* ONE STAGE, for the reason the well-formed pair have one: the receiver's ToString is the only step that runs
    the page's code, and CreateIteratorFromClosure builds an object out of nothing the page can reach. */
 #define SITER_STAGES(X) \
-    X(SITER_THIS, "22.1.3.36 steps 1-2 (O is RequireObjectCoercible(this); s is ToString(O)), then steps 3-4 " \
-                  "(the closure over s, and CreateIteratorFromClosure)")
+    X(SITER_THIS, "22.1.3.36 steps 1-3 (string is the this value, RequireObjectCoercible'd, then SET to " \
+                  "ToString(string)), then steps 4-5 (the closure over string, and CreateIteratorFromClosure)")
 enum { SITER_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_str_iterator_steps[] = { SITER_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
