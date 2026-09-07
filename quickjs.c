@@ -77593,7 +77593,12 @@ static JSValue js_has_own_enum_fini(JSContext *ctx, void *st, bool take_result)
     return r;
 }
 
-/* B.2.2.2 / B.2.2.3 Object.prototype.__defineGetter__ / __defineSetter__. Step 5 is
+/* 20.1.3.9.1 "Object.prototype.__defineGetter__ ( key, getter )" /
+   20.1.3.9.2 "Object.prototype.__defineSetter__ ( key, setter )". These sites cited `B.2.2.2` and `B.2.2.3`,
+   which in the edition the editors maintain are String.prototype.anchor ( name ) and String.prototype.big ( ) —
+   Annex B numbers that still RESOLVE, so the retired citation read as authoritative and sent the reader to a
+   clause about markup. The TITLE beside the number is what makes a move like that visible instead of silent,
+   which is why every citation of these two carries one now. Step 5 is
    `? DefinePropertyOrThrow(O, key, desc)` — on a Proxy the `defineProperty` trap plus 10.5.6's invariant, the
    page's code — and step 4's ToPropertyKey is the page's code too. JS_DefineProperty ran the first from C, which
    is what `Object.prototype.__defineGetter__.call(new Proxy({}, {defineProperty(){for(;;){}}}), "x", f)` aborted
@@ -77616,13 +77621,13 @@ typedef struct JSObjDefAccessor {
 enum { DEFACC_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
 static const char *const js_obj_defgetter_steps[] = {
     DEFACC_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.2 steps 1-4 (O is ToObject(this value); IsCallable(getter); desc; key is ToPropertyKey(P))",
-        "B.2.2.2 step 5 (DefinePropertyOrThrow(O, key, desc))")
+        "20.1.3.9.1 steps 1-4 (O is ToObject(this value); IsCallable(getter); desc; key is ToPropertyKey(P))",
+        "20.1.3.9.1 step 5 (DefinePropertyOrThrow(O, key, desc))")
     NULL };
 static const char *const js_obj_defsetter_steps[] = {
     DEFACC_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.3 steps 1-4 (O is ToObject(this value); IsCallable(setter); desc; key is ToPropertyKey(P))",
-        "B.2.2.3 step 5 (DefinePropertyOrThrow(O, key, desc))")
+        "20.1.3.9.2 steps 1-4 (O is ToObject(this value); IsCallable(setter); desc; key is ToPropertyKey(P))",
+        "20.1.3.9.2 step 5 (DefinePropertyOrThrow(O, key, desc))")
     NULL };
 
 static int js_obj_defaccessor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -79329,7 +79334,10 @@ static JSValue js_object_is(JSContext *ctx, JSValueConst this_val,
 /* DELETED: JS_SpeciesConstructor. 7.3.22's two reads are step_speciesctor_run, and %TypedArray%.prototype.slice
    was the last site still performing them from C. */
 
-/* B.2.2.1.1 / B.2.2.1.2 — Object.prototype.__proto__, BOTH halves. Each is one internal method on the receiver:
+/* 20.1.3.8.1 "get Object.prototype.__proto__" / 20.1.3.8.2 "set Object.prototype.__proto__" — BOTH halves of
+   Object.prototype.__proto__. These sites cited `B.2.2.1.1` and `B.2.2.1.2`, which the edition the editors
+   maintain numbers nothing at all: the accessors are 20.1.3.8's, and Annex B's
+   `B.2.2.1` is String.prototype.substr ( start, length ). Each half is one internal method on the receiver:
    the getter's `? O.[[GetPrototypeOf]]()` and the setter's `? O.[[SetPrototypeOf]](proto)`. On a Proxy those are
    the `getPrototypeOf` / `setPrototypeOf` traps plus 10.5.1 / 10.5.2's invariants — the page's code — and
    JS_GetPrototype / JS_SetPrototypeInternal ran them from C, so `proxy.__proto__` aborted at a looping trap's
@@ -79416,13 +79424,13 @@ enum { PROTOACC_GET = 0, PROTOACC_SET };
 enum { PROTOACC_STAGES(JS_STEP_STAGE_ENUM, 0, 0) };
 static const char *const js_proto_get_steps[] = {
     PROTOACC_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.1.1 step 1 (O is ToObject(this value))",
-        "B.2.2.1.1 step 2 (O.[[GetPrototypeOf]]())")
+        "20.1.3.8.1 step 1 (O is ToObject(this value))",
+        "20.1.3.8.1 step 2 (O.[[GetPrototypeOf]]())")
     NULL };
 static const char *const js_proto_set_steps[] = {
     PROTOACC_STAGES(JS_STEP_STAGE_LABEL,
-        "B.2.2.1.2 steps 1-4 (RequireObjectCoercible(this value); proto is an Object or null; O is an Object)",
-        "B.2.2.1.2 step 5 (status is O.[[SetPrototypeOf]](proto))")
+        "20.1.3.8.2 steps 1-4 (RequireObjectCoercible(this value); proto is an Object or null; O is an Object)",
+        "20.1.3.8.2 step 5 (status is O.[[SetPrototypeOf]](proto))")
     NULL };
 
 static int js_proto_accessor_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -79435,7 +79443,7 @@ static int js_proto_accessor_step(JSContext *ctx, void *st, JSValue cb_result, J
         s->result = JS_UNDEFINED;
         s->obj = JS_UNDEFINED;
         if (is_set) {
-            /* B.2.2.1.2 steps 1-4: RequireObjectCoercible, then a non-object non-null VALUE is a no-op and so is a
+            /* 20.1.3.8.2 steps 1-4: RequireObjectCoercible, then a non-object non-null VALUE is a no-op and so is a
                non-object receiver — both decided BEFORE any internal method runs. */
             JSValueConst proto = step_arg(&s->hdr, 0);
             if (JS_IsUndefined(s->hdr.this_val) || JS_IsNull(s->hdr.this_val)) {
@@ -79453,7 +79461,7 @@ static int js_proto_accessor_step(JSContext *ctx, void *st, JSValue cb_result, J
             *out_cb = s->hdr.cb_coerce; *out_argc = 0;
             return 21;                                 /* SETPROTO */
         }
-        s->obj = JS_ToObject(ctx, s->hdr.this_val);     /* B.2.2.1.1 step 1 */
+        s->obj = JS_ToObject(ctx, s->hdr.this_val);     /* 20.1.3.8.1 step 1 */
         if (JS_IsException(s->obj)) { s->obj = JS_UNDEFINED; return -1; }
         s->hdr.stage = PROTOACC_OP;
         s->hdr.cb_coerce[0] = s->obj;
@@ -79463,8 +79471,8 @@ static int js_proto_accessor_step(JSContext *ctx, void *st, JSValue cb_result, J
     DCHECK(s->hdr.stage == PROTOACC_OP, "the __proto__ accessor's machine resumed in no stage");
     if (JS_IsException(cb_result)) return -1;
     if (is_set) {
-        /* B.2.2.1.2 step 5: a FALSE status is a TypeError, which is the accessor's own step and not the internal
-           method's — Reflect.setPrototypeOf yields the same boolean instead. Discarding it made
+        /* 20.1.3.8.2 step 6: a FALSE status from step 5 is a TypeError, which is the accessor's own step and not
+           the internal method's — Reflect.setPrototypeOf yields the same boolean instead. Discarding it made
            `__proto__ = cycle` and a non-extensible receiver silently succeed, which set-cycle.js and
            set-non-extensible.js caught. */
         bool ok = JS_ToBool(ctx, cb_result);
@@ -79819,8 +79827,9 @@ static const JSCFunctionListEntry js_object_proto_funcs[] = {
     JS_CFUNC_STEP_DEF("hasOwnProperty", 1, STEPDEF_OBJ_HASOWNPROP ),
     JS_CFUNC_STEP_DEF("isPrototypeOf", 1, STEPDEF_PROTO_CHAIN ),
     JS_CFUNC_STEP_DEF("propertyIsEnumerable", 1, STEPDEF_PROP_IS_ENUM ),
-    /* B.2.2.1 Object.prototype.__proto__: BOTH halves are step machines, because each performs ONE internal
-       method on the receiver and on a Proxy that is a trap. */
+    /* 20.1.3.8 "Object.prototype.__proto__" (this said `B.2.2.1`, which is String.prototype.substr): BOTH
+       halves are step machines, because each performs ONE internal method on the receiver and on a Proxy that
+       is a trap. */
     JS_CGETSET_STEP_BOTH_DEF("__proto__", STEPDEF_PROTO_GET, STEPDEF_PROTO_SET ),
     JS_CFUNC_STEP_DEF("__defineGetter__", 2, STEPDEF_OBJ_DEFGETTER ),
     JS_CFUNC_STEP_DEF("__defineSetter__", 2, STEPDEF_OBJ_DEFSETTER ),
@@ -87642,10 +87651,10 @@ static const JSTrampStepDef js_regexp_flags_def   = { sizeof(JSRegExpFlags), js_
                                                     .algorithm = "22.2.6.4 get RegExp.prototype.flags",
                                                     .steps = js_regexp_flags_steps };
 static const JSTrampStepDef js_proto_get_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_GET, .visit = js_proto_accessor_visit,
-                        .algorithm = "B.2.2.1.1 get Object.prototype.__proto__",
+                        .algorithm = "20.1.3.8.1 get Object.prototype.__proto__",
                         .steps = js_proto_get_steps };
 static const JSTrampStepDef js_proto_set_def      = { sizeof(JSProtoAccessor), js_proto_accessor_step, js_proto_accessor_fini, PROTOACC_SET, .visit = js_proto_accessor_visit,
-                        .algorithm = "B.2.2.1.2 set Object.prototype.__proto__",
+                        .algorithm = "20.1.3.8.2 set Object.prototype.__proto__",
                         .steps = js_proto_set_steps };
 static const JSTrampStepDef js_prop_is_enum_def   = { sizeof(JSHasOwnEnum), js_has_own_enum_step, js_has_own_enum_fini, 0, .visit = js_has_own_enum_visit,
                                                      .algorithm = "20.1.3.4 Object.prototype.propertyIsEnumerable",
@@ -87654,10 +87663,10 @@ static const JSTrampStepDef js_obj_defprop_def    = { sizeof(JSObjDefProp), js_o
                                                      .algorithm = "20.1.2.4 Object.defineProperty",
                                                      .steps = js_obj_defprop_steps };
 static const JSTrampStepDef js_obj_defgetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 0, .visit = js_obj_defaccessor_visit,
-                                                     .algorithm = "B.2.2.2 Object.prototype.__defineGetter__",
+                                                     .algorithm = "20.1.3.9.1 Object.prototype.__defineGetter__",
                                                      .steps = js_obj_defgetter_steps };
 static const JSTrampStepDef js_obj_defsetter_def  = { sizeof(JSObjDefAccessor), js_obj_defaccessor_step, js_obj_defaccessor_fini, 1, .visit = js_obj_defaccessor_visit,
-                                                     .algorithm = "B.2.2.3 Object.prototype.__defineSetter__",
+                                                     .algorithm = "20.1.3.9.2 Object.prototype.__defineSetter__",
                                                      .steps = js_obj_defsetter_steps };
 static const JSTrampStepDef js_refl_defprop_def   = { sizeof(JSObjDefProp), js_obj_defprop_step, js_obj_defprop_fini, 1, .visit = js_obj_defprop_visit,
                                                      .algorithm = "28.1.3 Reflect.defineProperty",
