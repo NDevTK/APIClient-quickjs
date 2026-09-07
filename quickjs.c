@@ -23614,10 +23614,14 @@ int step_ownkeys_run(JSContext *ctx, JSStepHdr *h, JSValueConst obj, JSValue in,
            `Object.getOwnPropertyNames` over the SAME record complete and fork normally — so the operand is one
            the enumeration seam never saw. The CALLER is already recoverable from the abort's frame list, which
            is why the site is not threaded here as well.
-           THE TAG IS FIRST BECAUSE THIS HEADER'S BUFFER CUTS SILENTLY. quickjs-check.h composes into
-           APICLIENT_QJS_REASON_CAP (512) with a bare snprintf and no reserved marker — unlike the host
-           emitter, which labels a cut — so a message that outgrows it loses its tail with nothing to say so.
-           The payload therefore sits at the front, where a future edit lengthening this cannot take it. */
+           THE TAG IS FIRST BECAUSE A CUT STILL COSTS THE TAIL, WHICH IS A WEAKER REASON THAN THE ONE THAT
+           STOOD HERE. This said the buffer "cuts silently" and that the payload sat at the front where a
+           lengthening edit could not take it — a workaround for a missing primitive, and the primitive is
+           built: quickjs-check.h composes with the same bare cap, then reads snprintf's own return and LABELS
+           an overlong reason, so a future edit that outgrows 512 now says how much of itself is missing
+           instead of dropping its end in silence. What labelling does NOT do is give the tail back. So the
+           ordering stays and its reason changes: the operand is the one fact this crash could not otherwise
+           state, and it belongs where only a cut that ate the whole reason could reach it. */
         DCHECKF(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT,
                 "[[OwnPropertyKeys]] over a NON-OBJECT operand, tag %d (quickjs.h JS_TAG_*: -7 STRING, 0 INT, "
                 "2 NULL, 3 UNDEFINED, 4 UNINITIALIZED). §10.1.11 is an OBJECT internal method and this "
