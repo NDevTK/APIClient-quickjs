@@ -30163,7 +30163,7 @@ typedef struct JSDateToJSON {
 } JSDateToJSON;
 
 /* Array.prototype.copyWithin, 23.1.3.4. ToObject, LengthOfArrayLike, THREE index coercions, then a walk that
-   for each position either copies the source element or DELETES the target one (step 14.d.ii, when the source is
+   for each position either copies the source element or DELETES the target one (step 9.e.ii, when the source is
    absent) — a Get, a Set and a Delete, every one of them the page's code on an accessor or a Proxy. JS_CopySubArray
    did the whole walk from C. Its dense fast path is a different algorithm and stays: contiguous slots moved with
    no protocol at all. */
@@ -84049,15 +84049,15 @@ static int64_t arr_clamp_idx(int64_t v, int64_t len)
 #define ACW_STAGES(X) \
     X(ACW_TOOBJECT, "23.1.3.4 step 1 (O is ToObject(this value))") \
     X(ACW_LENGTH,   "23.1.3.4 step 2 (len is LengthOfArrayLike(O))") \
-    X(ACW_TARGET,   "23.1.3.4 steps 3-5 (relativeTarget is ToIntegerOrInfinity(target), clamped into to)") \
-    X(ACW_START,    "23.1.3.4 steps 6-8 (relativeStart is ToIntegerOrInfinity(start), clamped into from)") \
-    X(ACW_END,      "23.1.3.4 steps 9-13 (an undefined end is len and coerces nothing; otherwise " \
-                    "ToIntegerOrInfinity(end), clamped into final — then count, and step 14's direction)") \
-    X(ACW_HAS,      "23.1.3.4 step 15.c (fromPresent is HasProperty(O, fromKey))") \
-    X(ACW_GET,      "23.1.3.4 step 15.d.i (fromValue is Get(O, fromKey))") \
-    X(ACW_PUT,      "23.1.3.4 step 15.d.ii / 15.e (Set(O, toKey, fromValue, true), or " \
+    X(ACW_TARGET,   "23.1.3.4 step 3 (to is ToClampedIndex(target, len))") \
+    X(ACW_START,    "23.1.3.4 step 4 (from is ToClampedIndex(start, len))") \
+    X(ACW_END,      "23.1.3.4 step 5 (an undefined end is len and coerces nothing; otherwise final is " \
+                    "ToClampedIndex(end, len)) — then step 6's count and steps 7-8's direction") \
+    X(ACW_HAS,      "23.1.3.4 step 9.c (fromPresent is HasProperty(O, fromKey))") \
+    X(ACW_GET,      "23.1.3.4 step 9.d.i (fromValue is Get(O, fromKey))") \
+    X(ACW_PUT,      "23.1.3.4 step 9.d.ii / 9.e.ii (Set(O, toKey, fromValue, true), or " \
                     "DeletePropertyOrThrow(O, toKey) when the source slot is absent)") \
-    X(ACW_DONE,     "23.1.3.4 step 16 (the copy is finished; return O)")
+    X(ACW_DONE,     "23.1.3.4 step 10 (the copy is finished; return O)")
 enum { ACW_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_array_copyWithin_steps[] = { ACW_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -84515,10 +84515,10 @@ enum { ABSLICE_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0) };
 static const char *const js_ab_slice_steps[] = {
     ABSLICE_STAGES(JS_STEP_STAGE_LABEL,
         "25.1.6.7 steps 1-5 (O has [[ArrayBufferData]], is not detached; len is O.[[ArrayBufferByteLength]])",
-        "25.1.6.7 steps 6-14 (start and end are ToIntegerOrInfinity; newLen)",
-        "25.1.6.7 step 15 via 7.3.22 step 1 (C is Get(O, \"constructor\"))",
-        "25.1.6.7 step 15 via 7.3.22 step 3 (S is Get(C, @@species))",
-        "25.1.6.7 step 16 (new is Construct(ctor, <<newLen>>))")
+        "25.1.6.7 steps 6-8 (first and final are ToClampedIndex; newLen)",
+        "25.1.6.7 step 9 via 7.3.22 step 1 (C is Get(O, \"constructor\"))",
+        "25.1.6.7 step 9 via 7.3.22 step 4 (S is Get(C, @@species))",
+        "25.1.6.7 step 10 (new is Construct(ctor, <<newLen>>))")
     NULL };
 /* sliceToImmutable never reaches the species stages — it has no step for them — so its two labels say so rather
    than naming steps of an algorithm it does not perform. */
@@ -84533,10 +84533,10 @@ static const char *const js_ab_sliceImm_steps[] = {
 static const char *const js_sab_slice_steps[] = {
     ABSLICE_STAGES(JS_STEP_STAGE_LABEL,
         "25.2.5.6 steps 1-4 (O has [[ArrayBufferData]] and is shared; len is O.[[ArrayBufferByteLength]])",
-        "25.2.5.6 steps 5-13 (start and end are ToIntegerOrInfinity; newLen)",
-        "25.2.5.6 step 14 via 7.3.22 step 1 (C is Get(O, \"constructor\"))",
-        "25.2.5.6 step 14 via 7.3.22 step 3 (S is Get(C, @@species))",
-        "25.2.5.6 step 15 (new is Construct(ctor, <<newLen>>))")
+        "25.2.5.6 steps 5-7 (first and final are ToClampedIndex; newLen)",
+        "25.2.5.6 step 8 via 7.3.22 step 1 (C is Get(O, \"constructor\"))",
+        "25.2.5.6 step 8 via 7.3.22 step 4 (S is Get(C, @@species))",
+        "25.2.5.6 step 9 (new is Construct(ctor, <<newLen>>))")
     NULL };
 
 static int js_ab_slice_step(JSContext *ctx, void *st, JSValue cb_result, JSValue **out_cb, int *out_argc)
@@ -84650,7 +84650,7 @@ static JSValue js_ab_slice_fini(JSContext *ctx, void *st, bool take_result)
     X(TASUB_VALIDATE, "23.2.3.30 steps 1-3 (O has [[TypedArrayName]]; buffer is O.[[ViewedArrayBuffer]]; srcLength)") \
     X(TASUB_BOUNDS,   "23.2.3.30 steps 4-16 (start and end are ToIntegerOrInfinity; the argumentsList)") \
     X(TASUB_CTOR,     "23.2.3.30 step 17 via 7.3.22 step 1 (C is Get(O, \"constructor\"))") \
-    X(TASUB_SPECIES,  "23.2.3.30 step 17 via 7.3.22 step 3 (S is Get(C, @@species))") \
+    X(TASUB_SPECIES,  "23.2.3.30 step 17 via 7.3.22 step 4 (S is Get(C, @@species))") \
     X(TASUB_NEW,      "23.2.3.30 step 17 (TypedArraySpeciesCreate's Construct(ctor, argumentsList))")
 enum { TASUB_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_ta_subarray_steps[] = { TASUB_STAGES(JS_STEP_STAGE_LABEL) NULL };
@@ -84972,10 +84972,10 @@ static JSValue js_ta_with_fini(JSContext *ctx, void *st, bool take_result)
 #define AFILL_STAGES(X) \
     X(AFILL_TOOBJECT, "23.1.3.7 step 1 (O is ToObject(this value))") \
     X(AFILL_LENGTH,   "23.1.3.7 step 2 (len is LengthOfArrayLike(O))") \
-    X(AFILL_START,    "23.1.3.7 steps 3-4 (relativeStart is ToIntegerOrInfinity(start), clamped into k)") \
-    X(AFILL_END,      "23.1.3.7 steps 5-6 (an undefined end is len and coerces nothing; otherwise " \
-                      "ToIntegerOrInfinity(end), clamped into final)") \
-    X(AFILL_SET,      "23.1.3.7 step 7.b (Set(O, ToString(k), value, true)), one element per step")
+    X(AFILL_START,    "23.1.3.7 step 3 (k is ToClampedIndex(start, len))") \
+    X(AFILL_END,      "23.1.3.7 step 4 (an undefined end is len and coerces nothing; otherwise final " \
+                      "is ToClampedIndex(end, len))") \
+    X(AFILL_SET,      "23.1.3.7 step 5.b (Set(O, propertyKey, value, true)), one element per step")
 enum { AFILL_STAGES(JS_STEP_STAGE_ENUM) };
 static const char *const js_array_fill_steps[] = { AFILL_STAGES(JS_STEP_STAGE_LABEL) NULL };
 
@@ -86098,16 +86098,16 @@ static const char *const js_array_indexOf_steps[] = {
     ASRCH_STAGES(JS_STEP_STAGE_LABEL,
                  "23.1.3.17 step 1 (O is ToObject(this value))",
                  "23.1.3.17 step 2 (len is LengthOfArrayLike(O))",
-                 "23.1.3.17 steps 4-7 (n is ToIntegerOrInfinity(fromIndex), resolved into k)",
-                 "23.1.3.17 step 8.a (kPresent is HasProperty(O, ToString(k)))",
-                 "23.1.3.17 step 8.b.i (elementK is Get(O, ToString(k)))") NULL };
+                 "23.1.3.17 step 4 (k is ToClampedIndex(fromIndex, len))",
+                 "23.1.3.17 step 5.b (kPresent is HasProperty(O, propertyKey))",
+                 "23.1.3.17 step 5.c.i (elementK is Get(O, propertyKey))") NULL };
 static const char *const js_array_lastIndexOf_steps[] = {
     ASRCH_STAGES(JS_STEP_STAGE_LABEL,
                  "23.1.3.20 step 1 (O is ToObject(this value))",
                  "23.1.3.20 step 2 (len is LengthOfArrayLike(O))",
-                 "23.1.3.20 steps 4-6 (n is ToIntegerOrInfinity(fromIndex), resolved into k)",
-                 "23.1.3.20 step 7.a (kPresent is HasProperty(O, ToString(k)))",
-                 "23.1.3.20 step 7.b.i (elementK is Get(O, ToString(k)))") NULL };
+                 "23.1.3.20 step 4 (k is len - 1, or min(ToAbsoluteIndex(fromIndex, len), len - 1))",
+                 "23.1.3.20 step 5.b (kPresent is HasProperty(O, propertyKey))",
+                 "23.1.3.20 step 5.c.i (elementK is Get(O, propertyKey))") NULL };
 static const char *const js_array_includes_steps[] = {
     ASRCH_STAGES(JS_STEP_STAGE_LABEL,
                  "23.1.3.16 step 1 (O is ToObject(this value))",
@@ -90423,10 +90423,10 @@ static const char *const js_array_join_steps[] = {
     JOIN_STAGES(JS_STEP_STAGE_LABEL,
         "23.1.3.18 step 1 (O is ToObject(this value))",
         "23.1.3.18 step 2 (len is LengthOfArrayLike(O))",
-        "23.1.3.18 steps 3-5 (sep is \",\" or ToString(separator); R is the empty String; k is 0)",
-        "23.1.3.18 steps 6 and 6.a (Repeat while k < len: if k > 0, R is R and sep) - and step 7, Return R",
-        "23.1.3.18 step 6.b (element is Get(O, ToString(k))) - and step 6.c's nullish test",
-        "23.1.3.18 steps 6.c.i-6.c.ii (S is ToString(element); R is R and S)")
+        "23.1.3.18 steps 3-6 (sep is \",\" or ToString(separator); R is the empty String; k is 0)",
+        "23.1.3.18 steps 7 and 7.a (Repeat while k < len: if k > 0, R is R and sep) - and step 8, Return R",
+        "23.1.3.18 step 7.b (element is Get(O, ToString(k))) - and step 7.c's nullish test",
+        "23.1.3.18 steps 7.c.i-7.c.ii (S is ToString(element); R is R and S)")
     NULL };
 static const char *const js_array_tolocale_steps[] = {
     JOIN_STAGES(JS_STEP_STAGE_LABEL,
@@ -90444,10 +90444,10 @@ static const char *const js_ta_join_steps[] = {
     JOIN_STAGES(JS_STEP_STAGE_LABEL,
         "23.2.3.18 steps 1-2 (O is the this value; taRecord is ValidateTypedArray(O, seq-cst))",
         "23.2.3.18 step 3 (len is TypedArrayLength(taRecord) - the count, never a property read)",
-        "23.2.3.18 steps 4-6 (sep is \",\" or ToString(separator); R is the empty String; k is 0)",
-        "23.2.3.18 steps 7 and 7.a (Repeat while k < len: if k > 0, R is R and sep) - and step 8, Return R",
-        "23.2.3.18 step 7.b.i (element is Get(O, ToString(k)))",
-        "23.2.3.18 steps 7.b.ii-7.b.iii (S is ToString(element); R is R and S)")
+        "23.2.3.18 steps 4-7 (sep is \",\" or ToString(separator); R is the empty String; k is 0)",
+        "23.2.3.18 steps 8 and 8.a (Repeat while k < len: if k > 0, R is R and sep) - and step 9, Return R",
+        "23.2.3.18 step 8.b (element is Get(O, ToString(k)))",
+        "23.2.3.18 steps 8.c.i-8.c.ii (S is ToString(element); R is R and S)")
     NULL };
 static const char *const js_ta_tolocale_steps[] = {
     JOIN_STAGES(JS_STEP_STAGE_LABEL,
@@ -95309,10 +95309,11 @@ static const char *const js_str_codePointAt_steps[] = {
     NULL };
 static const char *const js_str_substring_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.25 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.25 step 4 (intStart is ToIntegerOrInfinity(start))",
-        "22.1.3.25 step 5 (intEnd is len when end is undefined, else ToIntegerOrInfinity(end))",
-        "22.1.3.25 steps 3, 6-10 (len; clamp both; from is the smaller and to the larger; the substring)")
+        "22.1.3.25 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.25 step 5 (finalStart clamps ToIntegerOrInfinity(start) between 0 and len)",
+        "22.1.3.25 step 7 (finalEnd is len when end is undefined, else the same clamp of end)",
+        "22.1.3.25 steps 4, 6 and 8-10 (len; the assert; from is the smaller and to the larger; the "
+        "substring)")
     NULL };
 static const char *const js_str_indexOf_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
@@ -95351,10 +95352,10 @@ static const char *const js_str_charCodeAt_steps[] = {
     NULL };
 static const char *const js_str_slice_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.22 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.22 step 4 (intStart is ToIntegerOrInfinity(start))",
-        "22.1.3.22 step 8 (intEnd is len when end is undefined, else ToIntegerOrInfinity(end))",
-        "22.1.3.22 steps 3, 5-7, 9-13 (len; from and to, each relative to len when negative; the substring)")
+        "22.1.3.22 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.22 step 5 (from is ToClampedIndex(start, len))",
+        "22.1.3.22 step 6 (to is len when end is undefined, else ToClampedIndex(end, len))",
+        "22.1.3.22 steps 4, 7-8 (len; an empty result when from is not below to; the substring)")
     NULL };
 static const char *const js_str_substr_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
@@ -96754,29 +96755,31 @@ enum { STRREP_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0, 0, 0, 0)
        STRREP_ALL_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
 static const char *const js_str_replace_steps[] = {
     STRREP_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.19 step 1 (O is RequireObjectCoercible(this)) and step 2's `searchValue is an Object` test",
-        "22.1.3.19 step 2.a (replacer is GetMethod(searchValue, @@replace))",
-        "22.1.3.19 step 2.b.i (return Call(replacer, searchValue, «O, replaceValue»))",
-        "22.1.3.19 step 3 (string is ToString(O))",
-        "22.1.3.19 step 4 (searchString is ToString(searchValue))",
-        "22.1.3.19 steps 5-6.a (functionalReplace is IsCallable(replaceValue); if not, ToString it)",
-        "22.1.3.19 step 12.a (Call(replaceValue, undefined, «searchString, position, string»))",
-        "22.1.3.19 step 12.a (ToString of what that Call returned)")
+        "22.1.3.19 steps 1-2 (thisValue is RequireObjectCoercible'd) and step 3's `searchValue is an "
+        "Object` test",
+        "22.1.3.19 step 3.a (replacer is GetMethod(searchValue, @@replace))",
+        "22.1.3.19 step 3.b.i (return Call(replacer, searchValue, «thisValue, replaceValue»))",
+        "22.1.3.19 step 4 (string is ToString(thisValue))",
+        "22.1.3.19 step 5 (searchString is ToString(searchValue))",
+        "22.1.3.19 steps 6-7.a (functionalReplace is IsCallable(replaceValue); if not, ToString it)",
+        "22.1.3.19 step 13.a (Call(replaceValue, undefined, «searchString, position, string»))",
+        "22.1.3.19 step 13.a (ToString of what that Call returned)")
     NULL };
 static const char *const js_str_replaceAll_steps[] = {
     STRREP_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.20 step 1 (O is RequireObjectCoercible(this)) and step 2's `searchValue is an Object` test",
-        "22.1.3.20 step 2.c (replacer is GetMethod(searchValue, @@replace))",
-        "22.1.3.20 step 2.d.i (return Call(replacer, searchValue, «O, replaceValue»))",
-        "22.1.3.20 step 3 (string is ToString(O))",
-        "22.1.3.20 step 4 (searchString is ToString(searchValue))",
-        "22.1.3.20 steps 5-6.a (functionalReplace is IsCallable(replaceValue); if not, ToString it)",
-        "22.1.3.20 step 14.b.i (Call(replaceValue, undefined, «searchString, p, string»))",
-        "22.1.3.20 step 14.b.i (ToString of what that Call returned)")
+        "22.1.3.20 steps 1-2 (thisValue is RequireObjectCoercible'd) and step 3's `searchValue is an "
+        "Object` test",
+        "22.1.3.20 step 3.c (replacer is GetMethod(searchValue, @@replace))",
+        "22.1.3.20 step 3.d.i (return Call(replacer, searchValue, «thisValue, replaceValue»))",
+        "22.1.3.20 step 4 (string is ToString(thisValue))",
+        "22.1.3.20 step 5 (searchString is ToString(searchValue))",
+        "22.1.3.20 steps 6-7.a (functionalReplace is IsCallable(replaceValue); if not, ToString it)",
+        "22.1.3.20 step 15.b.i (Call(replaceValue, undefined, «searchString, matchPosition, string»))",
+        "22.1.3.20 step 15.b.i (ToString of what that Call returned)")
     STRREP_ALL_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.20 step 2.a (isRegExp is IsRegExp(searchValue) — its Get(searchValue, @@match))",
-        "22.1.3.20 steps 2.b.i-ii (flags is Get(searchValue, \"flags\"); RequireObjectCoercible(flags))",
-        "22.1.3.20 step 2.b.iii (whether ToString(flags) contains \"g\")")
+        "22.1.3.20 step 3.a (isRegExp is IsRegExp(searchValue) — its Get(searchValue, @@match))",
+        "22.1.3.20 steps 3.b.i-ii (flags is Get(searchValue, \"flags\"); RequireObjectCoercible(flags))",
+        "22.1.3.20 step 3.b.iii (whether ToString(flags) contains \"g\")")
     NULL };
 
 /* 0 = DONE (s->result is the answer), 3 = CALL the replacer on the tramp, 5 = ToString on its result, -1 = error.
@@ -96844,7 +96847,7 @@ static int js_str_replace_step(JSContext *ctx, JSStrReplace *s, JSValue cb_resul
             break;
         }
         if (!s->functional) {
-            /* same walk, different substitution SOURCE: GetSubstitution (22.1.3.19 step 13.c) instead of the
+            /* same walk, different substitution SOURCE: GetSubstitution (22.1.3.19 step 14.c) instead of the
                callback, spliced by the SAME three lines the callback's answer is — one splice, not two copies
                of it. Not a separate no-callback body. */
             s->gs.stage = GS_START;
@@ -96884,7 +96887,7 @@ finish:
    itself a step builtin, so calling it from C ran its callbacks through an inline JS_Call that cannot suspend.
    The dispatch is now step code 3 — @@replace is invoked ON THE TRAMP like any other call — so the whole chain
    (str.replace -> @@replace -> the replacer) is preemptible end to end, and no recognizer is involved anywhere. */
-/* 22.1.3.19 step 2 and 22.1.3.20 step 2. FOUR reads of the page's code lived in a prologue that cannot suspend:
+/* 22.1.3.19 step 3 and 22.1.3.20 step 3. FOUR reads of the page's code lived in a prologue that cannot suspend:
    IsRegExp's `? Get(searchValue, %Symbol.match%)`, replaceAll's `? Get(searchValue, "flags")`, the ToString on
    that result, and `? GetMethod(searchValue, %Symbol.replace%)`. Each was a JS_GetProperty / JS_ToStringFree
    straight out of C, so an accessor, a Proxy trap or a toString containing a loop had no flow base and aborted.
@@ -110347,7 +110350,7 @@ _Static_assert(offsetof(JSPromiseFinally, hdr) == 0, "JSStepHdr must be first in
    AND THE DEFAULT WAS WRONG. The inlined copy left `ctor` UNDEFINED for SpeciesConstructor's default rather
    than %Promise%, and that undefined was captured into both reaction closures as their [[Constructor]] — so
    step 6's PromiseResolve(C, result) ran with C undefined and threw a TypeError from inside the reaction, for
-   any promise whose `constructor` is absent or whose @@species is nullish. 7.3.22 step 3 returns
+   any promise whose `constructor` is absent or whose @@species is nullish. 7.3.22 steps 2 and 5 return
    defaultConstructor, which is what the sub-sequence gives it. */
 #define PFIN_STAGES(X) \
     X(PFIN_OBJ,      "27.5.5.3 step 2 (promise is an Object)") \
