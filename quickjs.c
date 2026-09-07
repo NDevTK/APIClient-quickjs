@@ -44555,7 +44555,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    InitializeBinding is what tells them apart and it applies only to a LEXICAL binding; a
                    var-scoped one lives on the global OBJECT, which is how Annex B B.3.1 Labelled Function
                    Declarations — `l: function g(){}` in sloppy code — reaches here as OP_put_var_init with a
-                   binding that was never in global_var_obj at all. (B.3.2 stood here, which is that number in
+                   binding that was never in global_var_obj at all. (`B.3.2` stood here, which is that number in
                    an edition that put __proto__ Property Names in Object Initializers at B.3.1; the maintained
                    one numbers Block-Level Function Declarations Web Legacy Compatibility Semantics B.3.2, so
                    the old digit now names a different feature rather than nothing.) */
@@ -64114,7 +64114,7 @@ static void set_eval_ret_undefined(JSParseState *s)
 /* One CLAUSE of an if-statement. B.3.3 FunctionDeclarations in IfStatement Statement Clauses augments the
    IfStatement production with FOUR alternatives, and every one of them names a FunctionDeclaration in a clause
    position and means the Block `{ FunctionDeclaration }`, so the clause gets its own scope — and only then,
-   because every other clause is an ordinary Statement that must not gain one. (This cited B.3.4, which is that
+   because every other clause is an ordinary Statement that must not gain one. (This cited `B.3.4`, which is that
    number in a retired edition; the maintained one numbers VariableStatements in Catch Blocks B.3.4, so the old
    digit now names an unrelated feature rather than nothing.) */
 #endif // QJS_DISABLE_PARSER
@@ -70474,7 +70474,7 @@ static bool code_match(CodeContext *s, int pos, ...)
    top-level `var`s are in varEnv. A `let`/`const`/block-scoped function lives in a declarative env INSIDE
    varEnv; a catch parameter lives in the catch clause's own env, which B.3.4 VariableStatements in Catch Blocks
    explicitly walks PAST rather than erroring on — step 3.d.i.2.a.i of this same algorithm, and that B.3.4 is
-   CORRECT against the maintained edition, checked when the B.3.2.1/B.3.3.4/B.3.3.5 cluster in this file was
+   CORRECT against the maintained edition, checked when the `B.3.2.1`/`B.3.3.4`/`B.3.3.5` cluster in this file was
    found to name sections no edition has. A function expression's self-name lives in the funcEnv OUTSIDE varEnv.
    Treating any of those as "varEnv already has it" made the eval's declaration
    vanish entirely: `try{}catch(x){ eval("var x=42") }` never created x in the function, so a later write to x
