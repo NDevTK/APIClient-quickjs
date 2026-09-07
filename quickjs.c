@@ -96397,13 +96397,14 @@ enum { STRMATCH_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0, 0, 0, 0, 0)
        STRMATCH_ALL_STAGES(JS_STEP_STAGE_ENUM, 0, 0, 0) };
 static const char *const js_str_match_steps[] = {
     STRMATCH_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.13 step 1 (O is RequireObjectCoercible(this)) and step 2's `regexp is an Object` test",
-        "22.1.3.13 step 2.a (matcher is GetMethod(regexp, @@match))",
-        "22.1.3.13 step 2.b.i (return Call(matcher, regexp, «O»))",
-        "22.1.3.13 step 3 (S is ToString(O))",
-        "22.1.3.13 step 4 (rx is RegExpCreate(regexp, undefined))",
-        "22.1.3.13 step 5 (Invoke's Get(rx, @@match))",
-        "22.1.3.13 step 5 (Invoke's Call(matcher, rx, «S»))")
+        "22.1.3.13 steps 1-2 (thisValue is RequireObjectCoercible'd) and step 3's `regexpOrPattern is an "
+        "Object` test",
+        "22.1.3.13 step 3.a (matcher is GetMethod(regexpOrPattern, %Symbol.match%))",
+        "22.1.3.13 step 3.b.i (return Call(matcher, regexpOrPattern, «thisValue»))",
+        "22.1.3.13 step 4 (string is ToString(thisValue))",
+        "22.1.3.13 step 5 (regexp is RegExpCreate(regexpOrPattern, undefined))",
+        "22.1.3.13 step 6 (Invoke's Get(regexp, %Symbol.match%))",
+        "22.1.3.13 step 6 (Invoke's Call(matcher, regexp, «string»))")
     NULL };
 static const char *const js_str_matchAll_steps[] = {
     STRMATCH_STAGES(JS_STEP_STAGE_LABEL,
