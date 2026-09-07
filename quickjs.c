@@ -96408,17 +96408,20 @@ static const char *const js_str_match_steps[] = {
     NULL };
 static const char *const js_str_matchAll_steps[] = {
     STRMATCH_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.14 step 1 (O is RequireObjectCoercible(this)) and step 2's `regexp is an Object` test",
-        "22.1.3.14 step 2.c (matcher is GetMethod(regexp, @@matchAll))",
-        "22.1.3.14 step 2.d.i (return Call(matcher, regexp, «O»))",
-        "22.1.3.14 step 3 (S is ToString(O))",
-        "22.1.3.14 step 4 (rx is RegExpCreate(regexp, \"g\"))",
-        "22.1.3.14 step 5 (Invoke's Get(rx, @@matchAll))",
-        "22.1.3.14 step 5 (Invoke's Call(matcher, rx, «S»))")
+        "22.1.3.14 steps 1-2 (thisValue is RequireObjectCoercible'd) and step 3's `regexpOrPattern is an "
+        "Object` test",
+        "22.1.3.14 step 3.c (matcher is GetMethod(regexpOrPattern, %Symbol.matchAll%))",
+        "22.1.3.14 step 3.d.i (return Call(matcher, regexpOrPattern, «thisValue»))",
+        "22.1.3.14 step 4 (string is ToString(thisValue))",
+        "22.1.3.14 step 5 (regexp is RegExpCreate(regexpOrPattern, \"g\"))",
+        "22.1.3.14 step 6 (Invoke's Get(regexp, %Symbol.matchAll%))",
+        "22.1.3.14 step 6 (Invoke's Call(matcher, regexp, «string»))")
     STRMATCH_ALL_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.14 step 2.a (isRegExp is IsRegExp(regexp) — its Get(regexp, @@match))",
-        "22.1.3.14 steps 2.b.i-ii (flags is Get(regexp, \"flags\"); RequireObjectCoercible(flags))",
-        "22.1.3.14 step 2.b.iii (whether ToString(flags) contains \"g\")")
+        "22.1.3.14 step 3.a (isRegexp is IsRegExp(regexpOrPattern) — its Get(regexpOrPattern, "
+        "%Symbol.match%))",
+        "22.1.3.14 steps 3.b.i-ii (flags is Get(regexpOrPattern, \"flags\"); "
+        "RequireObjectCoercible(flags))",
+        "22.1.3.14 step 3.b.iii (whether ToString(flags) contains \"g\")")
     NULL };
 static const char *const js_str_search_steps[] = {
     STRMATCH_STAGES(JS_STEP_STAGE_LABEL,
