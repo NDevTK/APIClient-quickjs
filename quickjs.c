@@ -95332,10 +95332,12 @@ static const char *const js_str_indexOf_steps[] = {
     NULL };
 static const char *const js_str_lastIndexOf_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
-        "22.1.3.11 steps 1-2 (O is RequireObjectCoercible(this); S is ToString(O))",
-        "22.1.3.11 step 3 (searchStr is ToString(searchString))",
-        "22.1.3.11 step 4 (numPos is ToNumber(position))",
-        "22.1.3.11 steps 5-10 (pos is +INFINITY when numPos is NaN; StringLastIndexOf(S, searchStr, start))")
+        "22.1.3.11 steps 1-3 (thisValue is RequireObjectCoercible'd; string is ToString(thisValue))",
+        "22.1.3.11 step 4 (searchString is set to ToString(searchString))",
+        "22.1.3.11 step 5 (numberPosition is ToNumber(position))",
+        "22.1.3.11 steps 6-14 (length; searchLength; maxStart, and -1 when it is negative; start is "
+        "maxStart when numberPosition is NaN, else the clamp into [0, maxStart]; the assert; "
+        "StringLastIndexOf(string, searchString, start))")
     NULL };
 static const char *const js_str_normalize_steps[] = {
     STRRECV_STAGES(JS_STEP_STAGE_LABEL,
