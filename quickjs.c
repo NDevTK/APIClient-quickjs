@@ -652,6 +652,12 @@ enum {
     RE_LEGACY_COUNT = RE_LEGACY_PAREN1 + 9
 };
 
+/* HOW MANY DISTINCT ORIGINS ONE REALM'S REFERENCES MAY COME FROM — the width of the per-realm attribution
+   below. It is not a bound on anything the engine does: a realm whose references come from more origins than
+   this ABORTS in a dev build naming this constant, rather than dropping a row and reporting a breakdown that
+   silently does not add up. Raise it; there is nothing to re-derive. */
+#define JS_CTX_REF_SITES_MAX 24
+
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
     JSRuntime *rt;
@@ -807,6 +813,36 @@ struct JSContext {
                              const char *filename, int line, int flags, int scope_idx,
                              JSStackFrame *caller_sf);
     void *user_opaque;
+#if APICLIENT_DEV
+    /* WHO TOOK EACH OF THIS REALM'S REFERENCES — the per-origin breakdown of the number JS_ContextRefCount
+       answers, which states HOW MANY hold a realm and never WHICH edges they are. A census reading only the
+       total can say a realm is held by some thousands and name none of them, so a repair has nothing to aim at
+       and no way to score itself; core/frame/navigable.h's realm census is the reader this exists for.
+       THE ORIGIN IS THE CALLER'S `__func__`, WHICH IS DERIVED AND NEVER A LIST. Every increment of a realm's
+       count goes through ONE function, and this file spells that function as a macro that hands the CALLER's
+       enclosing function name down — so the set of origins is whatever the code contains and a take site added
+       later opens its own row with nothing anywhere to edit. A hand-kept table of who holds a realm would be a
+       second copy of a fact the code already states, which is the copy that drifts.
+       `__func__` RATHER THAN A `file:line`, because an origin is published and therefore compared across runs:
+       a line number renames its own row the first time anything above it is edited, while a function name
+       survives that and names the holder better — JS_NewCFunction3 IS "a C function object of this realm",
+       JS_DefineAutoInitProperty IS "a lazily built intrinsic property".
+       `taken` IS GROSS AND `ref_released_n` IS NOT ATTRIBUTED, because attributing a release means storing the
+       origin WITH every reference and a realm's references live in places that have no room for one (a
+       bit-packed property slot among them). The breakdown therefore reconciles against the total THROUGH the
+       release count rather than being the live attribution, and a reader of a realm whose `released` is
+       nonzero is reading gross takes — which the census says in its own output rather than leaving to be
+       inferred.
+       THE THREE NUMBERS ARE AN IDENTITY AND NOT AN EXPECTATION: JS_NewContextRaw sets the count to 1,
+       JS_DupContext is its only increment and JS_FreeContext its only decrement, so
+       `1 + ref_taken_n - ref_released_n == JS_REF_COUNT(ctx)` holds at every instant. It is asserted at each
+       take and each release, which is what catches a reference taken through a spelling this table never saw —
+       including the exported JS_DupContext, which is outside the macro and rows up under its own name. */
+    struct { const char *site; int taken; } ref_sites[JS_CTX_REF_SITES_MAX];
+    int ref_sites_n;
+    int ref_taken_n;
+    int ref_released_n;
+#endif
 };
 
 typedef union JSFloat64Union {
@@ -4361,11 +4397,84 @@ JSValue JS_GetFunctionProto(JSContext *ctx)
    JS_FreeContext, which walks the list itself once per half. Freeing them early was also what made a module
    value held by a promise reaction dangle. */
 
-JSContext *JS_DupContext(JSContext *ctx)
+#if APICLIENT_DEV
+/* THE THREE NUMBERS RECONCILE, ASSERTED WHERE ONE OF THEM HAS JUST MOVED — see the fields' own note on
+   struct JSContext. `rc` is passed rather than read here so the caller states the count it just wrote, which
+   is what makes this an assertion about the ARITHMETIC rather than a second reading of the same word. */
+static void js_context_refs_check(JSContext *ctx, int rc)
 {
+    /* NOT INSIDE A COLLECTION, AND THAT IS THE INVARIANT RATHER THAN AN EXEMPTION FROM IT. A realm is a
+       GC object, so gc_decref subtracts one from its count for every edge naming it and gc_scan puts back
+       what it finds reachable — the count is DELIBERATELY wrong for the length of those two phases, and
+       this file's own free_object arms already read gc_phase for the same reason. A realm released from
+       inside a collection (which is the ordinary way a realm dies: every C function object of a realm
+       holds a reference to it, so a page nothing points at is a cycle) therefore lands here mid-walk. The
+       counters stay exact across it because both phases are symmetric; only the comparison has to wait. */
+    if (ctx->rt->gc_phase != JS_GC_PHASE_NONE)
+        return;
+    DCHECK(1 + ctx->ref_taken_n - ctx->ref_released_n == rc,
+           "a realm's reference count does not match the references this build watched being taken and given "
+           "back — JS_NewContextRaw sets the count to 1, JS_DupContext is the only increment and "
+           "JS_FreeContext the only decrement, so the three cannot disagree unless a reference was taken or "
+           "released through a spelling the per-origin attribution never saw. The published breakdown "
+           "(core/frame/navigable.h's realm census) is then a set of parts that do not add up to the total "
+           "beside them, which is worse than having no breakdown: route the new spelling through "
+           "JS_DupContext/JS_FreeContext rather than widening this");
+}
+#define JS_CTX_REFS_CHECK(ctx, rc) js_context_refs_check(ctx, rc)
+
+/* ONE REFERENCE, CHARGED TO THE FUNCTION THAT TOOK IT. The row is found by POINTER first — one translation
+   unit gives each function its own `__func__` array, so the common case is a single compare — with a `strcmp`
+   behind it so a merged or duplicated literal cannot open a second row for one origin. */
+static JSContext *JS_DupContextAt(JSContext *ctx, const char *site)
+{
+    int i;
+
+    for (i = 0; i < ctx->ref_sites_n; i++) {
+        if (ctx->ref_sites[i].site == site || !strcmp(ctx->ref_sites[i].site, site)) {
+            ctx->ref_sites[i].taken++;
+            goto counted;
+        }
+    }
+    DCHECK(ctx->ref_sites_n < JS_CTX_REF_SITES_MAX,
+           "a realm's references come from more distinct origins than the attribution has room for — the "
+           "alternative to this abort is a dropped row, which publishes a breakdown that does not add up to "
+           "the total printed beside it. Raise JS_CTX_REF_SITES_MAX; nothing is derived from its value");
+    ctx->ref_sites[ctx->ref_sites_n].site  = site;
+    ctx->ref_sites[ctx->ref_sites_n].taken = 1;
+    ctx->ref_sites_n++;
+counted:
+    ctx->ref_taken_n++;
     JS_REF_COUNT(ctx)++;
+    JS_CTX_REFS_CHECK(ctx, JS_REF_COUNT(ctx));
     return ctx;
 }
+#else
+#define JS_CTX_REFS_CHECK(ctx, rc) ((void)0)
+#endif
+
+JSContext *JS_DupContext(JSContext *ctx)
+{
+#if APICLIENT_DEV
+    /* THE EXPORTED ENTRY IS ITS OWN ORIGIN AND IS NOT THE ONE THIS FILE USES. Below this definition
+       `JS_DupContext` is a macro naming the caller's own function, so every reference taken INSIDE this file
+       rows up under the function that took it; a caller outside it reaches the symbol and rows up here. That
+       is a row a reader should read as a question — no host in this tree calls it — rather than as noise. */
+    return JS_DupContextAt(ctx, "JS_DupContext_exported");
+#else
+    JS_REF_COUNT(ctx)++;
+    return ctx;
+#endif
+}
+
+#if APICLIENT_DEV
+/* EVERY TAKE INSIDE THIS FILE NAMES ITS OWN FUNCTION, and does so without one call site saying anything: the
+   site travels with the operation instead of being derived at the helper, which is the same rule that stops an
+   assert inside a shared helper reporting the helper for all of its callers. A take site added after this line
+   is attributed with nothing to edit; one added ABOVE it is attributed to the exported entry, which is the
+   only way this can be wrong and is visible in the output as a row nobody expects. */
+#define JS_DupContext(ctx) JS_DupContextAt(ctx, __func__)
+#endif
 
 /* used by the GC */
 static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
@@ -4564,10 +4673,21 @@ static void js_context_free_tables(JSRuntime *rt, JSContext *ctx)
 void JS_FreeContext(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
+    int left;
 
-    if (--JS_REF_COUNT(ctx) > 0)
+#if APICLIENT_DEV
+    /* THE RELEASE SIDE OF THE PER-ORIGIN ATTRIBUTION, AND IT IS A SCALAR RATHER THAN A BREAKDOWN — see the
+       `ref_sites` note on struct JSContext for why a release is charged to no origin. It is counted here
+       because without it the published parts cannot be reconciled against the published total: a realm's
+       count is `1 + taken - released`, so a breakdown of the takes alone exceeds the count it sits beside and
+       a reader has no way to tell that from a breakdown that is simply wrong. */
+    ctx->ref_released_n++;
+#endif
+    left = --JS_REF_COUNT(ctx);
+    JS_CTX_REFS_CHECK(ctx, left);
+    if (left > 0)
         return;
-    DCHECK(JS_REF_COUNT(ctx) == 0, "JS_REF_COUNT(ctx) == 0");
+    DCHECK(left == 0, "JS_REF_COUNT(ctx) == 0");
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOMS
     if (check_dump_flag(rt, JS_DUMP_ATOMS))
@@ -4638,7 +4758,47 @@ JSContextMarkFunc *JS_GetContextMarkHook(JSRuntime *rt)
 
 int JS_ContextRefCount(JSContext *ctx)
 {
+    JS_CTX_REFS_CHECK(ctx, JS_REF_COUNT(ctx));
     return JS_REF_COUNT(ctx);
+}
+
+/* WHICH EDGES THE COUNT ABOVE IS MADE OF — see quickjs.h for the contract and struct JSContext for the
+   mechanism. `-1` from the count is "this build carries no attribution" and is a value a population cannot
+   take, so a release build says so positively instead of answering 0 and reading as a realm nobody holds. */
+int JS_ContextRefSiteCount(JSContext *ctx)
+{
+#if APICLIENT_DEV
+    return ctx->ref_sites_n;
+#else
+    (void)ctx;
+    return -1;
+#endif
+}
+
+const char *JS_ContextRefSite(JSContext *ctx, int i, int *taken)
+{
+#if APICLIENT_DEV
+    DCHECK(i >= 0 && i < ctx->ref_sites_n,
+           "a realm's reference origins were walked past their end — JS_ContextRefSiteCount is the extent and "
+           "an index outside it names no origin at all, so the row a caller is about to publish would be "
+           "whatever the attribution array was zeroed with");
+    if (taken) *taken = ctx->ref_sites[i].taken;
+    return ctx->ref_sites[i].site;
+#else
+    (void)ctx; (void)i;
+    if (taken) *taken = -1;
+    return NULL;
+#endif
+}
+
+int JS_ContextRefReleased(JSContext *ctx)
+{
+#if APICLIENT_DEV
+    return ctx->ref_released_n;
+#else
+    (void)ctx;
+    return -1;
+#endif
 }
 
 int JS_ValueRefCount(JSValueConst v)

@@ -720,6 +720,39 @@ JS_EXTERN JSContextMarkFunc *JS_GetContextMarkHook(JSRuntime *rt);
  * input — a host that branches on this is guessing at a lifetime the collector owns. */
 JS_EXTERN int JS_ContextRefCount(JSContext *ctx);
 
+/* WHICH EDGES THAT COUNT IS MADE OF — the same reading broken down by the FUNCTION that took each reference,
+ * under the same restriction: it STATES who holds a realm and decides nothing.
+ *
+ * IT EXISTS BECAUSE THE COUNT ALONE NAMES NOBODY. A host census can report that every live child realm is held
+ * by some thousands of references and cannot name one of them, so a reader who wants to give a realm back has
+ * nothing to aim at and no way to score a repair: an edge removed and an edge never taken read alike in a
+ * total. These three make that total an addition of parts a reader can enumerate.
+ *
+ * THE ORIGIN IS A FUNCTION NAME AND IT IS DERIVED, not a list anyone keeps: every increment of a realm's count
+ * goes through one function, which inside quickjs.c is spelled so that the CALLER's `__func__` comes with it.
+ * A take site added later rows up under its own name with nothing to edit; the exported JS_DupContext is
+ * outside that spelling and rows up as `JS_DupContext_exported`, which is how a caller in another translation
+ * unit makes itself visible instead of hiding inside somebody else's row.
+ *
+ * `taken` IS GROSS AND JS_ContextRefReleased IS NOT ATTRIBUTED. A release is charged to no origin, because
+ * charging one means storing the origin WITH each reference and a realm's references live in places that have
+ * no room for it. So the three reconcile as `1 + the sum of taken - released == JS_ContextRefCount(ctx)` — an
+ * identity rather than an expectation, asserted at every take and every release — and a caller that publishes
+ * the breakdown publishes `released` beside it so a reader can perform the same addition. Where `released` is
+ * 0 the breakdown IS the live attribution; where it is not, it is the gross takes and says so.
+ *
+ * A BUILD WITH NO ATTRIBUTION ANSWERS -1, from the count and from `taken`. Zero is a population a realm can
+ * genuinely have, so "this build does not watch references" would be indistinguishable from "nothing holds
+ * this realm"; -1 is a value neither can take, which makes the absence a positive statement. In such a build
+ * JS_ContextRefSite answers NULL and must not be called at all — the count of -1 is what says so.
+ *
+ * `i` IS IN [0, JS_ContextRefSiteCount(ctx)) AND THE ORDER IS ARRIVAL: the row a realm opened first comes
+ * first, which is stable within one realm and is NOT comparable between two. The name returned is a literal of
+ * the engine's own image and outlives the realm; `taken` may be NULL. */
+JS_EXTERN int JS_ContextRefSiteCount(JSContext *ctx);
+JS_EXTERN const char *JS_ContextRefSite(JSContext *ctx, int i, int *taken);
+JS_EXTERN int JS_ContextRefReleased(JSContext *ctx);
+
 /* A REF-COUNTED VALUE'S REFERENCE COUNT, for the same purpose and under the same restriction as the realm's
  * above: STATING an ownership invariant, never deciding on one. A host that branches on this is guessing at a
  * lifetime the collector owns; a host that ASSERTS on it is saying, at the one moment the answer is decidable,
